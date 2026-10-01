@@ -7,3 +7,8 @@ version.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+uuid.workspace = true
+blake3.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
