@@ -206,7 +206,11 @@ impl Db {
         let conn = Connection::open(path)?;
         // busy_timeout first so the remaining setup also waits out concurrent openers.
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        let mode: String =
+            conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            return Err(DbError::Corrupt(format!("journal_mode is {mode}, expected wal")));
+        }
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
@@ -227,6 +231,11 @@ impl Db {
 
     fn immediate(&self) -> Result<Transaction<'_>> {
         Ok(Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?)
+    }
+
+    /// Snapshot read: deferred, so it never takes the write lock and does not block writers under WAL.
+    fn read(&self) -> Result<Transaction<'_>> {
+        Ok(Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?)
     }
 
     pub fn create_task(&self, contract: &Contract, contract_digest: &Digest) -> Result<TaskId> {
@@ -290,12 +299,12 @@ impl Db {
     }
 
     pub fn task(&self, id: &TaskId) -> Result<Task> {
-        let tx = self.immediate()?;
+        let tx = self.read()?;
         Ok(load_task(&tx, id)?.0)
     }
 
     pub fn events(&self, id: &TaskId) -> Result<Vec<StoredEvent>> {
-        let tx = self.immediate()?;
+        let tx = self.read()?;
         load_task(&tx, id)?;
         let mut stmt = tx.prepare(
             "SELECT seq, type, payload, ts FROM events WHERE task_id = ?1 ORDER BY seq",

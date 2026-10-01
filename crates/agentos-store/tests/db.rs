@@ -171,6 +171,9 @@ fn pragmas_are_applied() {
     assert_eq!(db.pragma_string("synchronous").unwrap(), "2");
     assert_eq!(db.pragma_string("foreign_keys").unwrap(), "1");
     assert_eq!(db.pragma_string("busy_timeout").unwrap(), "5000");
+    drop(db);
+    let db = open(&dir);
+    assert_eq!(db.pragma_string("journal_mode").unwrap(), "wal");
 }
 
 #[test]
@@ -265,3 +268,63 @@ fn all_spec_tables_exist() {
     }
 }
 
+
+#[test]
+fn reads_do_not_block_on_an_open_write_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("agentos.db");
+    let writer = Db::open(&path).unwrap();
+    let id = running(&writer);
+    let before_task = writer.task(&id).unwrap();
+    let before_events = writer.events(&id).unwrap();
+
+    let raw = Connection::open(&path).unwrap();
+    raw.execute_batch("BEGIN IMMEDIATE").unwrap();
+    raw.execute("UPDATE tasks SET actions_used = 42 WHERE id = ?1", [id.as_str()]).unwrap();
+
+    let reader = Db::open(&path).unwrap();
+    let start = std::time::Instant::now();
+    assert_eq!(reader.task(&id).unwrap(), before_task);
+    assert_eq!(reader.events(&id).unwrap(), before_events);
+    assert!(start.elapsed() < std::time::Duration::from_millis(500), "{:?}", start.elapsed());
+    raw.execute_batch("ROLLBACK").unwrap();
+}
+
+fn inject_failure(path: &std::path::Path, event_type: &str) {
+    let raw = Connection::open(path).unwrap();
+    raw.execute_batch(&format!(
+        "CREATE TRIGGER fail_ins BEFORE INSERT ON events WHEN NEW.type='{event_type}'
+         BEGIN SELECT RAISE(ABORT,'injected'); END;"
+    ))
+    .unwrap();
+}
+
+#[test]
+fn failed_event_insert_rolls_back_the_state_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("agentos.db");
+    let db = Db::open(&path).unwrap();
+    let id = running(&db);
+    let task_before = db.task(&id).unwrap();
+    let events_before = db.events(&id).unwrap();
+    inject_failure(&path, "ActionUsed");
+
+    assert!(matches!(db.append(&id, &TaskEvent::ActionUsed), Err(DbError::Sqlite(_))));
+    assert_eq!(db.task(&id).unwrap(), task_before);
+    assert_eq!(db.events(&id).unwrap(), events_before);
+    // Handle remains usable afterwards.
+    db.append(&id, &TaskEvent::Paused).unwrap();
+}
+
+#[test]
+fn failed_create_task_leaves_no_task_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("agentos.db");
+    let db = Db::open(&path).unwrap();
+    inject_failure(&path, "TaskCreated");
+    let (c, d) = contract();
+    assert!(db.create_task(&c, &d).is_err());
+    let raw = Connection::open(&path).unwrap();
+    let n: i64 = raw.query_row("SELECT count(*) FROM tasks", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 0);
+}
