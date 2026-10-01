@@ -51,6 +51,7 @@ impl BlobStore {
 
         let placed = fs::create_dir_all(shard).and_then(|()| {
             if dest.is_file() {
+                // Existing object is kept even if corrupt; `get` reports InvalidData.
                 fs::remove_file(&tmp_path)
             } else {
                 fs::rename(&tmp_path, &dest)
@@ -84,6 +85,11 @@ impl BlobStore {
     /// Removes every object not in `referenced` and every leftover temp file.
     /// Returns the number of files removed. Names that are not valid object
     /// names are left untouched.
+    ///
+    /// Only safe with NO concurrent writers: it clears `tmp/` (an in-flight
+    /// `put`'s temp file would vanish and its rename fail) and it would delete
+    /// a just-published blob whose metadata is not committed yet. Run it only
+    /// during recovery, before dispatching work.
     pub fn gc(&self, referenced: &HashSet<Digest>) -> io::Result<usize> {
         let mut removed = 0;
         for shard in fs::read_dir(&self.objects)? {
@@ -124,7 +130,7 @@ impl BlobStore {
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
 
     fn store() -> (tempfile::TempDir, BlobStore) {
         let dir = tempfile::tempdir().unwrap();
@@ -249,10 +255,15 @@ mod tests {
     fn concurrent_identical_puts_all_succeed() {
         let (t, s) = store();
         let s = Arc::new(s);
+        let barrier = Arc::new(Barrier::new(8));
         let handles: Vec<_> = (0..8)
             .map(|_| {
                 let s = Arc::clone(&s);
-                std::thread::spawn(move || s.put(b"contended payload").unwrap())
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    s.put(b"contended payload").unwrap()
+                })
             })
             .collect();
         let digests: Vec<Digest> = handles.into_iter().map(|h| h.join().unwrap()).collect();
