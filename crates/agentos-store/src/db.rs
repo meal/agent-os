@@ -123,6 +123,12 @@ pub enum DbError {
     StaleLease { stored: u64, got: u64 },
     #[error("artifact {0} is not registered; publish and register it before completing the effect")]
     ArtifactNotPublished(Digest),
+    #[error("a successful completion of effect {0} must reference a published artifact")]
+    ArtifactRequired(EffectId),
+    #[error("artifact {artifact} is registered for effect {actual:?}, not {expected}")]
+    ArtifactEffectMismatch { artifact: Digest, expected: EffectId, actual: Option<EffectId> },
+    #[error("receipt result digest {receipt} does not match artifact {artifact}")]
+    ReceiptArtifactMismatch { artifact: Digest, receipt: Digest },
 }
 
 pub type Result<T> = std::result::Result<T, DbError>;

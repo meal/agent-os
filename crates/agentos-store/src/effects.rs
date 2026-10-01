@@ -4,18 +4,25 @@
 //! same transaction, so the journal never disagrees with the effect, usage and task rows.
 //!
 //! Publish ordering (engine contract): write result bytes with `BlobStore::put` FIRST, then
-//! `register_artifact`, then `complete_effect`. `complete_effect` refuses an artifact that is
-//! not registered, so a committed effect never references a blob that was not published.
+//! `register_artifact(digest, size, type, Some(effect), provenance)`, then `complete_effect`.
+//! A successful completion must name its artifact, and the artifact must be registered for
+//! that same effect; `effects.result_digest` is set only from that artifact (a failure may
+//! name an error artifact under the same rules, or none). So a committed effect never
+//! references a blob that was not published. New workspace digests travel in the follow-up
+//! `TaskEvent`, not in `result_digest`.
 //!
 //! Effect ids are derived from the task's step at intent time. Recording an intent for
 //! `ReadSnapshot`/`ApplyPatch` also applies `ActionUsed`, which advances the step, so a retry
-//! of that same intent finds it at `step - 1`. Because every accepted task event advances the
-//! step, a hit there means nothing happened since; after any other event the same request is
-//! a new effect.
+//! of that same intent finds it at `step - 1`. The idempotency window is "no other accepted
+//! `TaskEvent`": every accepted event advances the step, while dispatch, completion, artifact
+//! and audit rows do not. So a repeated intent after the effect completed still returns the
+//! existing (now finished) record, and only after another task event is the same request a
+//! new effect.
 //!
 //! Usage: one row per effect. Status `Reserved` -> `Settled` on a receipt, or `Reserved` ->
 //! `Uncertain` when the effect becomes unknown; an uncertain reservation is never released
-//! because the effect may have run, and it settles if a late receipt arrives.
+//! because the effect may have run. It stays `Uncertain` across a re-dispatch and settles
+//! when a receipt finally arrives.
 
 use agentos_core::budget::{check_model_budget, tool_actions_for, BudgetError, Reservation, UsageTotals};
 use agentos_core::effect::{
@@ -291,8 +298,9 @@ impl Db {
         Ok(record)
     }
 
-    /// INTENDED -> DISPATCHED, or a re-dispatch of a DISPATCHED effect under a newer lease
-    /// (the superseded attempt is closed). Refused once the task may no longer dispatch.
+    /// INTENDED -> DISPATCHED, or a re-dispatch of a DISPATCHED or UNKNOWN effect under a
+    /// strictly newer lease (the superseded attempt is closed). Refused unless the task may
+    /// dispatch (Running or Verifying, no cancel pending).
     pub fn mark_dispatched(
         &self,
         effect: &EffectId,
@@ -304,7 +312,7 @@ impl Db {
         let rec = load_effect(&tx, effect)?;
         let stale = match rec.state {
             EffectState::Intended => lease_generation < rec.lease_generation,
-            EffectState::Dispatched => lease_generation <= rec.lease_generation,
+            EffectState::Dispatched | EffectState::Unknown => lease_generation <= rec.lease_generation,
             from => {
                 return Err(DbError::InvalidEffectTransition {
                     effect: effect.clone(),
@@ -359,9 +367,11 @@ impl Db {
     }
 
     /// Applies a worker receipt. On `Apply` the effect result, usage settlement, attempt
-    /// closure, completion event and `follow_up` commit together; a follow-up the reducer
-    /// rejects is journaled as `TaskEventRejected` without undoing the completion. Any other
-    /// verdict only appends an audit event.
+    /// closure, completion event and `follow_up` commit together. A follow-up the reducer
+    /// rejects because cancellation is pending or the task is terminal is journaled as
+    /// `TaskEventRejected` without undoing the completion; any other rejection returns
+    /// `DbError::Transition` and nothing is written. Any other verdict only appends an audit
+    /// event. See the module doc for the artifact rules.
     pub fn complete_effect(
         &self,
         effect: &EffectId,
@@ -393,14 +403,30 @@ impl Db {
             tx.commit()?;
             return Ok(verdict);
         }
-        if let Some(artifact) = result_artifact {
-            let registered: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM artifacts WHERE digest = ?1)",
-                [artifact.to_string()],
-                |r| r.get(0),
-            )?;
-            if !registered {
-                return Err(DbError::ArtifactNotPublished(*artifact));
+        match result_artifact {
+            None if receipt.outcome == Outcome::Success => {
+                return Err(DbError::ArtifactRequired(effect.clone()))
+            }
+            None => {}
+            Some(artifact) => {
+                let owner: Option<Option<String>> = tx
+                    .query_row(
+                        "SELECT effect_id FROM artifacts WHERE digest = ?1",
+                        [artifact.to_string()],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                let owner = owner.ok_or(DbError::ArtifactNotPublished(*artifact))?;
+                if owner.as_deref() != Some(effect.as_str()) {
+                    return Err(DbError::ArtifactEffectMismatch {
+                        artifact: *artifact,
+                        expected: effect.clone(),
+                        actual: owner.map(|o| serde_json::from_value(serde_json::Value::String(o))).transpose()?,
+                    });
+                }
+                if let Some(d) = receipt.result_digest.filter(|d| d != artifact) {
+                    return Err(DbError::ReceiptArtifactMismatch { artifact: *artifact, receipt: d });
+                }
             }
         }
         let (task, contract) = load_task(&tx, &rec.task_id)?;
@@ -415,7 +441,7 @@ impl Db {
             params![
                 effect.as_str(),
                 effect_state_str(state),
-                receipt.result_digest.map(|d| d.to_string()),
+                result_artifact.map(|d| d.to_string()),
                 now
             ],
         )?;
@@ -450,7 +476,7 @@ impl Db {
                     store_task(&tx, &next)?;
                     insert_event(&tx, &rec.task_id, &event_name(&ev)?, &serde_json::to_value(&ev)?)?;
                 }
-                Err(e) => {
+                Err(e @ (TransitionError::Terminal(_) | TransitionError::CancelRequested { .. })) => {
                     insert_event(
                         &tx,
                         &rec.task_id,
@@ -458,6 +484,8 @@ impl Db {
                         &json!({ "event": ev, "reason": e.to_string(), "effect_id": effect }),
                     )?;
                 }
+                // Dropping `tx` rolls back the completion too.
+                Err(e) => return Err(e.into()),
             }
         }
         tx.commit()?;
@@ -522,7 +550,7 @@ impl Db {
             params![effect.as_str(), effect_state_str(EffectState::Unknown), now_ts()],
         )?;
         let n = tx.execute(
-            "UPDATE usage SET status = 'Uncertain' WHERE effect_id = ?1 AND status = 'Reserved'",
+            "UPDATE usage SET status = 'Uncertain' WHERE effect_id = ?1 AND status IN ('Reserved', 'Uncertain')",
             [effect.as_str()],
         )?;
         expect_one(n, "usage uncertainty", effect)?;

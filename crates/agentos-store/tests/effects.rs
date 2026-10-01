@@ -89,6 +89,27 @@ impl Fx {
         self.db.mark_dispatched(&e.effect_id, &a, "worker-1", lease).unwrap();
         (e, a)
     }
+    fn blobs(&self) -> BlobStore {
+        BlobStore::open(self.path.parent().unwrap().join("blobs")).unwrap()
+    }
+    /// Engine publish order, steps 1 and 2: put the blob, then register it for the effect.
+    fn publish(&self, e: &EffectRecord, bytes: &[u8]) -> Digest {
+        let d = self.blobs().put(bytes).unwrap();
+        self.db.register_artifact(&d, bytes.len() as u64, "result", Some(&e.effect_id), "worker-1").unwrap();
+        d
+    }
+    /// Publish a result for `e`, then complete it successfully (step 3).
+    fn succeed(
+        &self,
+        e: &EffectRecord,
+        a: &AttemptId,
+        lease: u64,
+        follow_up: Option<TaskEvent>,
+    ) -> Result<ReceiptVerdict, DbError> {
+        let art = self.publish(e, e.effect_id.as_str().as_bytes());
+        let r = Receipt { result_digest: Some(art), ..receipt(e, a, lease, Outcome::Success) };
+        self.db.complete_effect(&e.effect_id, &r, Some(&art), follow_up)
+    }
     /// Everything a rejected or ignored call must leave untouched.
     fn snapshot(&self, effect: &EffectId) -> (Task, EffectRecord, UsageSummary, i64) {
         (
@@ -120,7 +141,7 @@ fn receipt(e: &EffectRecord, attempt: &AttemptId, lease: u64, outcome: Outcome) 
         attempt_id: attempt.clone(),
         lease_generation: lease,
         outcome,
-        result_digest: Some(Digest::of(b"result")),
+        result_digest: None,
     }
 }
 
@@ -181,6 +202,23 @@ fn same_request_after_an_intervening_state_change_is_a_new_effect() {
     assert_eq!(fx.count("SELECT count(*) FROM effects"), 2);
     assert_eq!(fx.task().actions_used, 2);
     assert_eq!(EffectId::derive(&b.task_id, b.step, &b.kind, &b.request_digest), b.effect_id);
+}
+
+#[test]
+fn repeated_intent_after_completion_returns_the_finished_record() {
+    let fx = setup();
+    let (e, a) = fx.dispatched(b"req", 1);
+    fx.succeed(&e, &a, 1, None).unwrap();
+    let done = fx.db.effect(&e.effect_id).unwrap();
+    assert_eq!(done.state, EffectState::Completed);
+    let (task, effects, usage) = (fx.task(), fx.count("SELECT count(*) FROM effects"), fx.usage());
+    let events = fx.events();
+    // Dispatch, completion and artifact rows do not advance the step, so this is still a retry.
+    assert_eq!(fx.read(b"req", 1).unwrap(), done);
+    assert_eq!(fx.task(), task);
+    assert_eq!(fx.count("SELECT count(*) FROM effects"), effects);
+    assert_eq!(fx.usage(), usage);
+    assert_eq!(fx.events(), events);
 }
 
 #[test]
@@ -245,7 +283,7 @@ fn model_request_reservation_over_the_limit_is_rejected_and_writes_nothing() {
 fn settled_usage_counts_once_toward_the_model_limit() {
     let fx = setup_with(ALL_CAPS, 3, 100);
     let (e, a) = fx.dispatched(b"a", 1);
-    fx.db.complete_effect(&e.effect_id, &receipt(&e, &a, 1, Outcome::Success), None, None).unwrap();
+    fx.succeed(&e, &a, 1, None).unwrap();
     assert_eq!(fx.usage().settled_model_requests, 1);
     assert_eq!(fx.usage().reserved_model_requests, 0);
     // 1 settled + 2 new == limit: allowed.
@@ -437,19 +475,61 @@ fn redispatch_requires_a_strictly_newer_lease_and_closes_the_old_attempt() {
 }
 
 #[test]
-fn dispatch_of_finished_or_unknown_effects_is_rejected() {
+fn dispatch_of_finished_effects_is_rejected() {
     let fx = setup();
     let (e, a) = fx.dispatched(b"r", 1);
-    fx.db.complete_effect(&e.effect_id, &receipt(&e, &a, 1, Outcome::Success), None, None).unwrap();
+    fx.succeed(&e, &a, 1, None).unwrap();
     let err = fx.db.mark_dispatched(&e.effect_id, &AttemptId::new(), "w", 5).unwrap_err();
     assert!(
         matches!(err, DbError::InvalidEffectTransition { from: EffectState::Completed, to: EffectState::Dispatched, .. }),
         "{err:?}"
     );
-    let (f, _) = fx.dispatched(b"f", 1);
-    fx.db.mark_unknown(&f.effect_id).unwrap();
+    let (f, fa) = fx.dispatched(b"f", 1);
+    fx.db.complete_effect(&f.effect_id, &receipt(&f, &fa, 1, Outcome::Failure("x".into())), None, None).unwrap();
     let err = fx.db.mark_dispatched(&f.effect_id, &AttemptId::new(), "w", 5).unwrap_err();
-    assert!(matches!(err, DbError::InvalidEffectTransition { from: EffectState::Unknown, .. }), "{err:?}");
+    assert!(matches!(err, DbError::InvalidEffectTransition { from: EffectState::Failed, .. }), "{err:?}");
+}
+
+#[test]
+fn unknown_effect_redispatches_only_under_a_strictly_newer_lease() {
+    let fx = setup();
+    let (e, _a1) = fx.dispatched(b"r", 3);
+    fx.db.mark_unknown(&e.effect_id).unwrap();
+    for stale in [2, 3] {
+        let err = fx.db.mark_dispatched(&e.effect_id, &AttemptId::new(), "w2", stale).unwrap_err();
+        assert!(matches!(err, DbError::StaleLease { stored: 3, got } if got == stale), "{err:?}");
+    }
+    assert_eq!(fx.db.effect(&e.effect_id).unwrap().state, EffectState::Unknown);
+    let a2 = AttemptId::new();
+    fx.db.mark_dispatched(&e.effect_id, &a2, "w2", 4).unwrap();
+    let d = fx.db.effect(&e.effect_id).unwrap();
+    assert_eq!((d.state, d.lease_generation), (EffectState::Dispatched, 4));
+    assert_eq!(fx.count("SELECT count(*) FROM attempts WHERE finished_ts IS NULL"), 1);
+    // The reservation stays uncertain: the first attempt may still have run.
+    assert_eq!(fx.count("SELECT count(*) FROM usage WHERE status = 'Uncertain'"), 1);
+    assert_eq!(fx.usage().uncertain_model_requests, 1);
+    // It can go unknown again and still settles exactly once.
+    fx.db.mark_unknown(&e.effect_id).unwrap();
+    fx.db.mark_dispatched(&e.effect_id, &AttemptId::new(), "w3", 5).unwrap();
+    fx.succeed(&e, &a2, 5, None).unwrap();
+    let u = fx.usage();
+    assert_eq!((u.reserved_model_requests, u.uncertain_model_requests, u.settled_model_requests), (0, 0, 1));
+    assert_eq!(fx.count("SELECT count(*) FROM usage"), 1);
+}
+
+#[test]
+fn dispatch_is_refused_while_paused_or_waiting() {
+    for park in [TaskEvent::Paused, TaskEvent::Waiting] {
+        let fx = setup();
+        let e = fx.read(b"r", 1).unwrap();
+        fx.db.append(&fx.id, &park).unwrap();
+        let events = fx.events();
+        let err = fx.db.mark_dispatched(&e.effect_id, &AttemptId::new(), "w", 1).unwrap_err();
+        assert!(matches!(err, DbError::NotDispatchable { cancel_requested: false, .. }), "{park:?} {err:?}");
+        assert_eq!(fx.db.effect(&e.effect_id).unwrap().state, EffectState::Intended);
+        assert_eq!(fx.events(), events);
+        assert_eq!(fx.count("SELECT count(*) FROM attempts"), 0);
+    }
 }
 
 #[test]
@@ -501,7 +581,7 @@ fn happy_path_apply_patch_completes_and_advances_the_workspace() {
         .register_artifact(&artifact, bytes.len() as u64, "patch", Some(&e.effect_id), "worker-1")
         .unwrap();
     let new_ws = Digest::of(b"workspace-after-patch");
-    let r = Receipt { result_digest: Some(new_ws), ..receipt(&e, &a, 1, Outcome::Success) };
+    let r = Receipt { result_digest: Some(artifact), ..receipt(&e, &a, 1, Outcome::Success) };
     let v = fx
         .db
         .complete_effect(&e.effect_id, &r, Some(&artifact), Some(TaskEvent::WorkspaceUpdated { digest: new_ws }))
@@ -509,7 +589,8 @@ fn happy_path_apply_patch_completes_and_advances_the_workspace() {
     assert_eq!(v, ReceiptVerdict::Apply);
 
     let done = fx.db.effect(&e.effect_id).unwrap();
-    assert_eq!((done.state, done.result_digest), (EffectState::Completed, Some(new_ws)));
+    // The effect references the published blob; the new workspace digest travels in the follow-up.
+    assert_eq!((done.state, done.result_digest), (EffectState::Completed, Some(artifact)));
     assert_eq!(fx.task().workspace_digest, new_ws);
     assert_eq!(fx.task().verified_digest, None);
     let u = fx.usage();
@@ -537,13 +618,85 @@ fn failure_outcome_marks_the_effect_failed_and_settles_usage() {
     let ev = fx.events().into_iter().last().unwrap();
     assert_eq!(ev.event_type, "EffectFailed");
     assert_eq!(ev.payload["outcome"], json!({"Failure": "exit 2"}));
+    assert_eq!(fx.db.effect(&e.effect_id).unwrap().result_digest, None);
+}
+
+#[test]
+fn failure_may_reference_a_published_error_artifact() {
+    let fx = setup();
+    let (e, a) = fx.dispatched(b"r", 1);
+    let log = fx.publish(&e, b"stderr: boom");
+    let r = receipt(&e, &a, 1, Outcome::Failure("exit 2".into()));
+    assert_eq!(fx.db.complete_effect(&e.effect_id, &r, Some(&log), None).unwrap(), ReceiptVerdict::Apply);
+    let f = fx.db.effect(&e.effect_id).unwrap();
+    assert_eq!((f.state, f.result_digest), (EffectState::Failed, Some(log)));
+}
+
+#[test]
+fn success_without_an_artifact_is_refused_and_nothing_changes() {
+    let fx = setup();
+    let (e, a) = fx.dispatched(b"r", 1);
+    let before = fx.snapshot(&e.effect_id);
+    let events = fx.events();
+    let r = Receipt { result_digest: Some(Digest::of(b"never published")), ..receipt(&e, &a, 1, Outcome::Success) };
+    for receipt in [r.clone(), Receipt { result_digest: None, ..r }] {
+        let err = fx.db.complete_effect(&e.effect_id, &receipt, None, Some(TaskEvent::ActionUsed)).unwrap_err();
+        assert!(matches!(err, DbError::ArtifactRequired(ref id) if *id == e.effect_id), "{err:?}");
+    }
+    assert_eq!(fx.snapshot(&e.effect_id), before);
+    assert_eq!(fx.events(), events);
+}
+
+#[test]
+fn artifact_registered_for_another_effect_or_none_is_refused() {
+    let fx = setup();
+    let (e, a) = fx.dispatched(b"r", 1);
+    let other = fx.read(b"other", 0).unwrap();
+    let foreign = fx.publish(&other, b"other result");
+    let loose = fx.blobs().put(b"loose").unwrap();
+    fx.db.register_artifact(&loose, 5, "log", None, "test").unwrap();
+    let before = fx.snapshot(&e.effect_id);
+    let events = fx.events();
+    let r = receipt(&e, &a, 1, Outcome::Success);
+    let err = fx.db.complete_effect(&e.effect_id, &r, Some(&foreign), None).unwrap_err();
+    assert!(
+        matches!(&err, DbError::ArtifactEffectMismatch { artifact, expected, actual }
+            if *artifact == foreign && *expected == e.effect_id && *actual == Some(other.effect_id.clone())),
+        "{err:?}"
+    );
+    let err = fx.db.complete_effect(&e.effect_id, &r, Some(&loose), None).unwrap_err();
+    assert!(matches!(&err, DbError::ArtifactEffectMismatch { actual: None, .. }), "{err:?}");
+    assert_eq!(fx.snapshot(&e.effect_id), before);
+    assert_eq!(fx.events(), events);
+}
+
+#[test]
+fn receipt_digest_disagreeing_with_the_artifact_is_refused() {
+    let fx = setup();
+    let (e, a) = fx.dispatched(b"r", 1);
+    let art = fx.publish(&e, b"result");
+    let before = fx.snapshot(&e.effect_id);
+    let events = fx.events();
+    let wrong = Digest::of(b"something else");
+    let r = Receipt { result_digest: Some(wrong), ..receipt(&e, &a, 1, Outcome::Success) };
+    let err = fx.db.complete_effect(&e.effect_id, &r, Some(&art), None).unwrap_err();
+    assert!(
+        matches!(err, DbError::ReceiptArtifactMismatch { artifact, receipt } if artifact == art && receipt == wrong),
+        "{err:?}"
+    );
+    assert_eq!(fx.snapshot(&e.effect_id), before);
+    assert_eq!(fx.events(), events);
+    // A receipt that carries no digest defers to the registered artifact.
+    let r = receipt(&e, &a, 1, Outcome::Success);
+    assert_eq!(fx.db.complete_effect(&e.effect_id, &r, Some(&art), None).unwrap(), ReceiptVerdict::Apply);
+    assert_eq!(fx.db.effect(&e.effect_id).unwrap().result_digest, Some(art));
 }
 
 #[test]
 fn receipt_with_a_newer_lease_than_stored_is_applied() {
     let fx = setup();
     let (e, a) = fx.dispatched(b"r", 1);
-    let v = fx.db.complete_effect(&e.effect_id, &receipt(&e, &a, 7, Outcome::Success), None, None).unwrap();
+    let v = fx.succeed(&e, &a, 7, None).unwrap();
     assert_eq!(v, ReceiptVerdict::Apply);
     assert_eq!(fx.db.effect(&e.effect_id).unwrap().state, EffectState::Completed);
 }
@@ -552,11 +705,12 @@ fn receipt_with_a_newer_lease_than_stored_is_applied() {
 fn duplicate_receipt_changes_nothing_and_adds_one_audit_event() {
     let fx = setup();
     let (e, a) = fx.dispatched(b"r", 1);
-    let r = receipt(&e, &a, 1, Outcome::Success);
-    fx.db.complete_effect(&e.effect_id, &r, None, Some(TaskEvent::ActionUsed)).unwrap();
+    let art = fx.publish(&e, b"result");
+    let r = Receipt { result_digest: Some(art), ..receipt(&e, &a, 1, Outcome::Success) };
+    fx.db.complete_effect(&e.effect_id, &r, Some(&art), Some(TaskEvent::ActionUsed)).unwrap();
     let before = fx.snapshot(&e.effect_id);
     let events = fx.events();
-    let v = fx.db.complete_effect(&e.effect_id, &r, None, Some(TaskEvent::ActionUsed)).unwrap();
+    let v = fx.db.complete_effect(&e.effect_id, &r, Some(&art), Some(TaskEvent::ActionUsed)).unwrap();
     assert_eq!(v, ReceiptVerdict::DuplicateIgnored);
     assert_eq!(fx.snapshot(&e.effect_id), before);
     let after = fx.reopen().events(&fx.id).unwrap();
@@ -682,15 +836,7 @@ fn follow_up_rejected_by_pending_cancel_still_completes_the_effect() {
     fx.db.append(&fx.id, &TaskEvent::CancelRequested).unwrap();
     let task_before = fx.task();
     let new_ws = Digest::of(b"w-new");
-    let v = fx
-        .db
-        .complete_effect(
-            &e.effect_id,
-            &receipt(&e, &a, 1, Outcome::Success),
-            None,
-            Some(TaskEvent::WorkspaceUpdated { digest: new_ws }),
-        )
-        .unwrap();
+    let v = fx.succeed(&e, &a, 1, Some(TaskEvent::WorkspaceUpdated { digest: new_ws })).unwrap();
     assert_eq!(v, ReceiptVerdict::Apply);
     assert_eq!(fx.db.effect(&e.effect_id).unwrap().state, EffectState::Completed);
     assert_eq!(fx.usage().settled_model_requests, 1);
@@ -708,14 +854,60 @@ fn follow_up_rejected_on_a_terminal_task_still_completes_the_effect() {
     let fx = setup();
     let (e, a) = fx.dispatched(b"r", 1);
     fx.db.append(&fx.id, &TaskEvent::Failed { reason: "deadline".into() }).unwrap();
-    let v = fx
-        .db
-        .complete_effect(&e.effect_id, &receipt(&e, &a, 1, Outcome::Success), None, Some(TaskEvent::ActionUsed))
-        .unwrap();
+    let v = fx.succeed(&e, &a, 1, Some(TaskEvent::ActionUsed)).unwrap();
     assert_eq!(v, ReceiptVerdict::Apply);
     assert_eq!(fx.db.effect(&e.effect_id).unwrap().state, EffectState::Completed);
     assert_eq!(fx.task().state, TaskState::Failed);
     assert_eq!(fx.events().last().unwrap().event_type, "TaskEventRejected");
+}
+
+#[test]
+fn invalid_follow_up_rolls_back_the_whole_completion() {
+    let fx = setup();
+    let (e, a) = fx.dispatched(b"r", 1);
+    let art = fx.publish(&e, b"result");
+    let before = fx.snapshot(&e.effect_id);
+    let events = fx.events();
+    let r = Receipt { result_digest: Some(art), ..receipt(&e, &a, 1, Outcome::Success) };
+    // Started is not valid in Running.
+    let err = fx.db.complete_effect(&e.effect_id, &r, Some(&art), Some(TaskEvent::Started)).unwrap_err();
+    assert!(
+        matches!(err, DbError::Transition(TransitionError::InvalidTransition { state: TaskState::Running, .. })),
+        "{err:?}"
+    );
+    assert_eq!(fx.snapshot(&e.effect_id), before);
+    assert_eq!(fx.db.effect(&e.effect_id).unwrap().state, EffectState::Dispatched);
+    assert_eq!(fx.count("SELECT count(*) FROM usage WHERE status = 'Reserved'"), 1);
+    assert_eq!(fx.reopen().events(&fx.id).unwrap(), events);
+    assert_eq!(fx.count_events("EffectCompleted"), 0);
+}
+
+#[test]
+fn digest_mismatched_verify_follow_up_rolls_back_the_whole_completion() {
+    let fx = setup();
+    fx.db.append(&fx.id, &TaskEvent::VerifyStarted).unwrap();
+    let e = fx.verify(b"v", 1).unwrap();
+    let a = AttemptId::new();
+    fx.db.mark_dispatched(&e.effect_id, &a, "worker-1", 1).unwrap();
+    let art = fx.publish(&e, b"evidence");
+    let before = fx.snapshot(&e.effect_id);
+    let events = fx.events();
+    let r = Receipt { result_digest: Some(art), ..receipt(&e, &a, 1, Outcome::Success) };
+    let wrong = Digest::of(b"not the workspace");
+    let err = fx
+        .db
+        .complete_effect(&e.effect_id, &r, Some(&art), Some(TaskEvent::VerifyPassed { digest: wrong }))
+        .unwrap_err();
+    assert!(matches!(err, DbError::Transition(TransitionError::DigestMismatch { .. })), "{err:?}");
+    assert_eq!(fx.snapshot(&e.effect_id), before);
+    assert_eq!(fx.task().state, TaskState::Verifying);
+    assert_eq!(fx.count("SELECT count(*) FROM usage WHERE status = 'Reserved'"), 1);
+    assert_eq!(fx.reopen().events(&fx.id).unwrap(), events);
+    // The correct evidence then completes the effect and the task.
+    let ws = fx.base();
+    let v = fx.db.complete_effect(&e.effect_id, &r, Some(&art), Some(TaskEvent::VerifyPassed { digest: ws })).unwrap();
+    assert_eq!(v, ReceiptVerdict::Apply);
+    assert_eq!(fx.task().state, TaskState::Succeeded);
 }
 
 // ---------- unknown ----------
@@ -740,7 +932,7 @@ fn unknown_effect_keeps_its_reservation_and_a_late_receipt_settles_it() {
     // Survives a reopen.
     assert_eq!(fx.reopen().usage_summary(&fx.id).unwrap(), u);
 
-    let v = fx.db.complete_effect(&e.effect_id, &receipt(&e, &a, 1, Outcome::Success), None, None).unwrap();
+    let v = fx.succeed(&e, &a, 1, None).unwrap();
     assert_eq!(v, ReceiptVerdict::Apply);
     let u = fx.usage();
     assert_eq!(
@@ -759,7 +951,7 @@ fn mark_unknown_is_only_valid_from_dispatched() {
     let (d, a) = fx.dispatched(b"d", 1);
     fx.db.mark_unknown(&d.effect_id).unwrap();
     assert!(matches!(fx.db.mark_unknown(&d.effect_id), Err(DbError::InvalidEffectTransition { from: EffectState::Unknown, .. })));
-    fx.db.complete_effect(&d.effect_id, &receipt(&d, &a, 1, Outcome::Success), None, None).unwrap();
+    fx.succeed(&d, &a, 1, None).unwrap();
     assert!(matches!(fx.db.mark_unknown(&d.effect_id), Err(DbError::InvalidEffectTransition { from: EffectState::Completed, .. })));
     assert_eq!(fx.count_events("EffectUnknown"), 1);
 }
@@ -776,7 +968,7 @@ fn outstanding_effects_are_in_creation_order_and_exclude_finished() {
     fx.db.mark_unknown(&e4.effect_id).unwrap();
     let ids: Vec<EffectId> = fx.db.outstanding_effects(&fx.id).unwrap().into_iter().map(|e| e.effect_id).collect();
     assert_eq!(ids, vec![e1.effect_id.clone(), e2.effect_id.clone(), e3.effect_id.clone(), e4.effect_id.clone()]);
-    fx.db.complete_effect(&e2.effect_id, &receipt(&e2, &a2, 1, Outcome::Success), None, None).unwrap();
+    fx.succeed(&e2, &a2, 1, None).unwrap();
     let out = fx.db.outstanding_effects(&fx.id).unwrap();
     let got: Vec<(EffectId, EffectState)> = out.into_iter().map(|e| (e.effect_id, e.state)).collect();
     assert_eq!(
@@ -803,16 +995,27 @@ fn outstanding_effects_are_scoped_to_their_task() {
 
 #[test]
 fn failed_completion_event_rolls_back_effect_usage_and_task() {
+    completion_fault_rolls_back_everything("EffectCompleted");
+}
+
+#[test]
+fn failed_follow_up_event_rolls_back_effect_usage_and_task() {
+    // Catches committing the effect before applying the follow-up.
+    completion_fault_rolls_back_everything("WorkspaceUpdated");
+}
+
+fn completion_fault_rolls_back_everything(failing_event: &str) {
     let fx = setup();
     let (e, a) = fx.dispatched(b"r", 1);
+    let art = fx.publish(&e, b"result");
     let before = fx.snapshot(&e.effect_id);
     let events = fx.events();
-    inject_failure(&fx.path, "EffectCompleted");
+    inject_failure(&fx.path, failing_event);
 
-    let r = receipt(&e, &a, 1, Outcome::Success);
+    let r = Receipt { result_digest: Some(art), ..receipt(&e, &a, 1, Outcome::Success) };
     let err = fx
         .db
-        .complete_effect(&e.effect_id, &r, None, Some(TaskEvent::WorkspaceUpdated { digest: Digest::of(b"w") }))
+        .complete_effect(&e.effect_id, &r, Some(&art), Some(TaskEvent::WorkspaceUpdated { digest: Digest::of(b"w") }))
         .unwrap_err();
     assert!(matches!(err, DbError::Sqlite(_)), "{err:?}");
     assert_eq!(fx.snapshot(&e.effect_id), before);
@@ -821,16 +1024,28 @@ fn failed_completion_event_rolls_back_effect_usage_and_task() {
     let db = fx.reopen();
     assert_eq!(db.task(&fx.id).unwrap(), before.0);
     assert_eq!(db.effect(&e.effect_id).unwrap(), before.1);
+    assert_eq!(db.effect(&e.effect_id).unwrap().state, EffectState::Dispatched);
     assert_eq!(db.usage_summary(&fx.id).unwrap(), before.2);
+    assert_eq!(fx.count("SELECT count(*) FROM usage WHERE status = 'Reserved'"), 1);
     assert_eq!(db.outstanding_effects(&fx.id).unwrap(), vec![before.1.clone()]);
     assert_eq!(db.events(&fx.id).unwrap(), events);
 }
 
 #[test]
 fn failed_intent_event_rolls_back_effect_usage_and_action() {
+    intent_fault_rolls_back_everything("EffectIntended");
+}
+
+#[test]
+fn failed_action_used_event_rolls_back_effect_and_usage() {
+    // Catches committing after EffectIntended and consuming the action in a second transaction.
+    intent_fault_rolls_back_everything("ActionUsed");
+}
+
+fn intent_fault_rolls_back_everything(failing_event: &str) {
     let fx = setup();
     let (task, events) = (fx.task(), fx.events());
-    inject_failure(&fx.path, "EffectIntended");
+    inject_failure(&fx.path, failing_event);
     assert!(matches!(fx.read(b"r", 1), Err(DbError::Sqlite(_))));
     let db = fx.reopen();
     assert_eq!(db.task(&fx.id).unwrap(), task);
@@ -843,7 +1058,7 @@ fn failed_intent_event_rolls_back_effect_usage_and_action() {
 fn reopened_database_shows_identical_effects_and_usage() {
     let fx = setup();
     let (e1, a1) = fx.dispatched(b"1", 1);
-    fx.db.complete_effect(&e1.effect_id, &receipt(&e1, &a1, 1, Outcome::Success), None, None).unwrap();
+    fx.succeed(&e1, &a1, 1, None).unwrap();
     let (e2, _) = fx.dispatched(b"2", 3);
     fx.db.mark_unknown(&e2.effect_id).unwrap();
     fx.verify(b"3", 2).unwrap();
