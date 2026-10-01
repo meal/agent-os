@@ -87,16 +87,11 @@ impl TaskEvent {
         }
     }
 
-    /// Events that begin new work and are therefore refused once cancellation is requested.
-    fn starts_work(&self) -> bool {
+    /// Once cancellation is requested only these events are accepted; cancel always wins.
+    fn allowed_during_cancel(&self) -> bool {
         matches!(
             self,
-            TaskEvent::Started
-                | TaskEvent::Resumed
-                | TaskEvent::VerifyStarted
-                | TaskEvent::ActionUsed
-                | TaskEvent::Woken
-                | TaskEvent::WorkspaceUpdated { .. }
+            TaskEvent::CancelRequested | TaskEvent::CancelCompleted | TaskEvent::Failed { .. }
         )
     }
 }
@@ -125,7 +120,7 @@ pub fn reduce(task: &Task, ev: &TaskEvent, limits: &Limits) -> Result<Task, Tran
     if task.state.is_terminal() {
         return Err(TransitionError::Terminal(task.state));
     }
-    if task.cancel_requested && ev.starts_work() {
+    if task.cancel_requested && !ev.allowed_during_cancel() {
         return Err(TransitionError::CancelRequested { event: ev.name() });
     }
     let invalid = || TransitionError::InvalidTransition {
@@ -349,25 +344,53 @@ mod tests {
     }
 
     #[test]
-    fn cancel_requested_rejects_new_work_but_allows_closure() {
+    fn cancel_requested_accepts_only_cancel_and_failure_events() {
         let l = limits();
-        let rejected = [
-            (TaskState::Ready, Started),
-            (TaskState::Paused, Resumed),
-            (TaskState::Waiting, Woken),
-            (TaskState::Running, VerifyStarted),
-            (TaskState::Running, ActionUsed),
-            (TaskState::Running, WorkspaceUpdated { digest: d("w") }),
-        ];
-        for (s, ev) in rejected {
+        for s in [TaskState::Running, TaskState::Verifying] {
             let t = Task { cancel_requested: true, ..at(s) };
-            assert!(
-                matches!(reduce(&t, &ev, &l), Err(TransitionError::CancelRequested { .. })),
-                "{s:?} {ev:?}"
-            );
+            let mut events = all_events();
+            events.push(VerifyPassed { digest: t.workspace_digest });
+            for ev in events {
+                let allowed = matches!(ev, CancelRequested | CancelCompleted | Failed { .. });
+                let res = reduce(&t, &ev, &l);
+                assert_eq!(res.is_ok(), allowed, "{s:?} {ev:?}");
+                if !allowed {
+                    assert!(
+                        matches!(res, Err(TransitionError::CancelRequested { .. })),
+                        "{s:?} {ev:?}"
+                    );
+                }
+            }
         }
+    }
+
+    #[test]
+    fn pending_cancel_rejects_matching_verify_passed() {
+        let l = limits();
+        let t = reduce(&running(), &WorkspaceUpdated { digest: d("w1") }, &l).unwrap();
+        let t = reduce(&t, &VerifyStarted, &l).unwrap();
+        let t = reduce(&t, &CancelRequested, &l).unwrap();
+        assert!(matches!(
+            reduce(&t, &VerifyPassed { digest: d("w1") }, &l),
+            Err(TransitionError::CancelRequested { .. })
+        ));
+        assert!(reduce(&t, &VerifyFailed, &l).is_err());
+    }
+
+    #[test]
+    fn repeated_cancel_request_is_idempotent_and_counts_as_a_step() {
+        let l = limits();
+        let t = reduce(&running(), &CancelRequested, &l).unwrap();
+        let t2 = reduce(&t, &CancelRequested, &l).unwrap();
+        assert!(t2.cancel_requested);
+        assert_eq!(t2.state, TaskState::Running);
+        assert_eq!(t2.step, t.step + 1);
+    }
+
+    #[test]
+    fn failed_still_allowed_while_cancel_pending() {
         let t = Task { cancel_requested: true, ..running() };
-        let f = reduce(&t, &Failed { reason: "x".into() }, &l).unwrap();
+        let f = reduce(&t, &Failed { reason: "x".into() }, &limits()).unwrap();
         assert_eq!(f.state, TaskState::Failed);
     }
 

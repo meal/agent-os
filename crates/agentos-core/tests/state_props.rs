@@ -53,13 +53,13 @@ proptest! {
                     }
                     task = next;
                 }
-                Err(_) => {
-                    // rejected events leave the input untouched (pure)
-                    prop_assert_eq!(&task, &before);
-                }
+                Err(_) => {}
             }
             if before.state.is_terminal() {
                 prop_assert_eq!(&task, &before);
+            }
+            if task.cancel_requested {
+                prop_assert_ne!(task.state, TaskState::Succeeded);
             }
             if task.state == TaskState::Succeeded {
                 prop_assert_eq!(task.verified_digest, Some(task.workspace_digest));
