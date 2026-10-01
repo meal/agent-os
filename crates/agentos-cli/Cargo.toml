@@ -3,4 +3,23 @@ name = "agentos-cli"
 edition.workspace = true
 version.workspace = true
 
+[[bin]]
+name = "agentos"
+path = "src/main.rs"
+
 [dependencies]
+agentos-core = { path = "../agentos-core" }
+agentos-store = { path = "../agentos-store" }
+agentos-engine = { path = "../agentos-engine" }
+clap.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+predicates.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true

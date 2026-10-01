@@ -20,3 +20,6 @@ jsonschema = "0.58.4"
 tempfile = "3.27.0"
 proptest = "1.11.0"
 rustix = { version = "1.1.5", features = ["process"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
