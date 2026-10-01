@@ -632,3 +632,77 @@ async fn run_loop_rejects_a_patch_through_a_live_symlink_and_still_succeeds() {
     let patches = env.effects("ApplyPatch");
     assert_eq!((patches[0].state, patches[1].state), (EffectState::Failed, EffectState::Completed));
 }
+
+/// Runs the fix-and-verify script with `event` appended from a second connection while the
+/// verification effect is in flight (after dispatch, before completion).
+async fn interrupt_verification(env: &Env, event: TaskEvent) -> TaskState {
+    let writer = Mutex::new(env.second_db());
+    let task = env.task.clone();
+    let exec = HookExec {
+        inner: env.fixture_exec(),
+        before: |req: &EffectRequest| {
+            if kind_is(req, "run_verification") {
+                writer.lock().unwrap().append(&task, &event).unwrap();
+            }
+        },
+        after: |_: &EffectRequest| {},
+    };
+    let mut agent = FakeAgent::from_fixture_patch(fix_patch());
+    run_task(&env.db, &env.blobs, &exec, &mut agent, &env.task).await.unwrap()
+}
+
+fn rejected_follow_ups(env: &Env) -> Vec<serde_json::Value> {
+    env.events().into_iter().filter(|e| e.event_type == "TaskEventRejected").map(|e| e.payload).collect()
+}
+
+#[tokio::test]
+async fn cancel_requested_during_verification_completes_the_effect_but_never_succeeds() {
+    let env = Env::new(10);
+
+    assert_eq!(interrupt_verification(&env, TaskEvent::CancelRequested).await, TaskState::Cancelled);
+
+    let verify = env.effects("RunVerification");
+    assert_eq!(verify.len(), 1);
+    assert_eq!(verify[0].state, EffectState::Completed, "the receipt is still recorded");
+    let evidence = env.blob_json(&verify[0].result_digest.unwrap());
+    assert_eq!(evidence["exit_code"], 0, "the check itself passed");
+
+    let rejected = rejected_follow_ups(&env);
+    assert_eq!(rejected.len(), 1);
+    assert_eq!(rejected[0]["event"], serde_json::json!({ "VerifyPassed": { "digest": env.ws_digest().to_string() } }));
+    assert_eq!(rejected[0]["effect_id"], serde_json::json!(verify[0].effect_id));
+    assert_eq!(env.count("VerifyPassed"), 0);
+    assert_eq!(env.count("CancelCompleted"), 1);
+
+    let task = env.db.task(&env.task).unwrap();
+    assert_eq!(task.state, TaskState::Cancelled);
+    assert_eq!(task.verified_digest, None);
+    assert!(env.db.outstanding_effects(&env.task).unwrap().is_empty());
+    // A further call leaves the terminal task alone.
+    let mut again = FakeAgent::from_fixture_patch(fix_patch());
+    assert_eq!(run(&env, &mut again).await, TaskState::Cancelled);
+}
+
+#[tokio::test]
+async fn failure_during_verification_completes_the_effect_but_never_succeeds() {
+    let env = Env::new(10);
+
+    let event = TaskEvent::Failed { reason: "operator abort".into() };
+    assert_eq!(interrupt_verification(&env, event).await, TaskState::Failed);
+
+    let verify = env.effects("RunVerification");
+    assert_eq!(verify[0].state, EffectState::Completed);
+    let rejected = rejected_follow_ups(&env);
+    assert_eq!(rejected.len(), 1);
+    assert!(rejected[0]["event"].get("VerifyPassed").is_some(), "{}", rejected[0]);
+    assert!(rejected[0]["reason"].as_str().unwrap().contains("terminal"), "{}", rejected[0]);
+    assert_eq!(env.count("VerifyPassed"), 0);
+    let failed: Vec<_> = env.events().into_iter().filter(|e| e.event_type == "Failed").collect();
+    assert_eq!(failed.len(), 1, "only the operator's failure");
+    assert_eq!(failed[0].payload["Failed"]["reason"], "operator abort");
+
+    let task = env.db.task(&env.task).unwrap();
+    assert_eq!(task.state, TaskState::Failed);
+    assert_eq!(task.verified_digest, None);
+    assert!(env.db.outstanding_effects(&env.task).unwrap().is_empty());
+}
