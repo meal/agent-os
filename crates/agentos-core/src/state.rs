@@ -22,6 +22,20 @@ impl TaskState {
             TaskState::Succeeded | TaskState::Failed | TaskState::Cancelled
         )
     }
+
+    /// The upper-case name shown to owners (CLI output, export manifests).
+    pub fn label(self) -> &'static str {
+        match self {
+            TaskState::Ready => "READY",
+            TaskState::Running => "RUNNING",
+            TaskState::Waiting => "WAITING",
+            TaskState::Paused => "PAUSED",
+            TaskState::Verifying => "VERIFYING",
+            TaskState::Succeeded => "SUCCEEDED",
+            TaskState::Failed => "FAILED",
+            TaskState::Cancelled => "CANCELLED",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,6 +236,14 @@ mod tests {
             CancelCompleted,
             Failed { reason: "r".into() },
         ]
+    }
+
+    #[test]
+    fn labels_are_upper_case_variant_names() {
+        for s in [TaskState::Ready, TaskState::Running, TaskState::Waiting, TaskState::Paused,
+                  TaskState::Verifying, TaskState::Succeeded, TaskState::Failed, TaskState::Cancelled] {
+            assert_eq!(s.label(), format!("{s:?}").to_uppercase());
+        }
     }
 
     #[test]

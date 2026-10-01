@@ -43,7 +43,7 @@ use crate::db::{
     digest_from_str, event_name, insert_event, load_task, now_ts, store_task, Db, DbError, Result,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct UsageSummary {
     pub reserved_model_requests: u64,
     pub settled_model_requests: u64,

@@ -2,6 +2,7 @@ pub mod agent;
 pub mod crash;
 pub mod durable;
 pub mod executor;
+pub mod export;
 pub mod fixture;
 mod journal;
 pub mod patch;
