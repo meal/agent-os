@@ -1,3 +1,4 @@
+pub mod budget;
 pub mod contract;
 pub mod effect;
 pub mod ids;

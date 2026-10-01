@@ -1,7 +1,9 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agentos_core::contract::{Contract, Limits};
+use agentos_core::budget::BudgetError;
+use agentos_core::contract::{Capability, Contract};
+use agentos_core::effect::{EffectId, EffectState};
 use agentos_core::ids::{Digest, TaskId};
 use agentos_core::state::{reduce, Task, TaskEvent, TaskState, TransitionError};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -65,11 +67,13 @@ CREATE TABLE IF NOT EXISTS artifacts(
 CREATE TABLE IF NOT EXISTS usage(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id TEXT NOT NULL REFERENCES tasks(id),
-    effect_id TEXT,
+    effect_id TEXT UNIQUE REFERENCES effects(effect_id),
     kind TEXT NOT NULL,
-    reserved INTEGER NOT NULL,
-    settled INTEGER,
-    status TEXT NOT NULL
+    reserved_model_requests INTEGER NOT NULL,
+    reserved_tool_actions INTEGER NOT NULL,
+    settled_model_requests INTEGER,
+    settled_tool_actions INTEGER,
+    status TEXT NOT NULL CHECK(status IN ('Reserved', 'Settled', 'Uncertain'))
 );
 CREATE TABLE IF NOT EXISTS capabilities(
     id TEXT PRIMARY KEY,
@@ -101,6 +105,24 @@ pub enum DbError {
     NotFound(TaskId),
     #[error("corrupt stored value: {0}")]
     Corrupt(String),
+    #[error("capability {0:?} is not granted by the task contract")]
+    CapabilityDenied(Capability),
+    #[error("workspace version conflict: expected {expected}, actual {actual}")]
+    VersionConflict { expected: Digest, actual: Digest },
+    #[error("budget exceeded: {0}")]
+    BudgetExceeded(BudgetError),
+    #[error("task may not dispatch effects (state {state:?}, cancel_requested {cancel_requested})")]
+    NotDispatchable { state: TaskState, cancel_requested: bool },
+    #[error("reservation of {got} tool actions does not match the {expected} this effect kind consumes")]
+    InvalidReservation { expected: u32, got: u32 },
+    #[error("effect not found: {0}")]
+    EffectNotFound(EffectId),
+    #[error("effect {effect} cannot move from {from:?} to {to:?}")]
+    InvalidEffectTransition { effect: EffectId, from: EffectState, to: EffectState },
+    #[error("lease generation {got} is not newer than stored generation {stored}")]
+    StaleLease { stored: u64, got: u64 },
+    #[error("artifact {0} is not registered; publish and register it before completing the effect")]
+    ArtifactNotPublished(Digest),
 }
 
 pub type Result<T> = std::result::Result<T, DbError>;
@@ -119,14 +141,14 @@ pub struct Db {
     conn: Connection,
 }
 
-fn now_ts() -> i64 {
+pub(crate) fn now_ts() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
 
-fn state_to_str(s: TaskState) -> Result<String> {
+pub(crate) fn state_to_str(s: TaskState) -> Result<String> {
     match serde_json::to_value(s)? {
         serde_json::Value::String(s) => Ok(s),
         other => Err(DbError::Corrupt(format!("state serialized as {other}"))),
@@ -137,11 +159,11 @@ fn state_from_str(s: String) -> Result<TaskState> {
     Ok(serde_json::from_value(serde_json::Value::String(s))?)
 }
 
-fn digest_from_str(s: &str) -> Result<Digest> {
+pub(crate) fn digest_from_str(s: &str) -> Result<Digest> {
     Digest::from_hex(s).map_err(|e| DbError::Corrupt(e.to_string()))
 }
 
-fn event_name(ev: &TaskEvent) -> Result<String> {
+pub(crate) fn event_name(ev: &TaskEvent) -> Result<String> {
     // Externally tagged: unit variants serialize as a string, others as {"Name": ...}.
     match serde_json::to_value(ev)? {
         serde_json::Value::String(s) => Ok(s),
@@ -150,7 +172,7 @@ fn event_name(ev: &TaskEvent) -> Result<String> {
     }
 }
 
-fn load_task(tx: &Transaction, id: &TaskId) -> Result<(Task, Limits)> {
+pub(crate) fn load_task(tx: &Transaction, id: &TaskId) -> Result<(Task, Contract)> {
     let row = tx
         .query_row(
             "SELECT state, cancel_requested, workspace_digest, verified_digest, actions_used, step, contract_json
@@ -180,10 +202,10 @@ fn load_task(tx: &Transaction, id: &TaskId) -> Result<(Task, Limits)> {
         actions_used: row.4,
         step: row.5,
     };
-    Ok((task, contract.limits))
+    Ok((task, contract))
 }
 
-fn insert_event(
+pub(crate) fn insert_event(
     tx: &Transaction,
     id: &TaskId,
     event_type: &str,
@@ -199,6 +221,23 @@ fn insert_event(
         params![id.as_str(), seq, event_type, serde_json::to_string(payload)?, now_ts()],
     )?;
     Ok(seq as u64)
+}
+
+pub(crate) fn store_task(tx: &Transaction, t: &Task) -> Result<()> {
+    tx.execute(
+        "UPDATE tasks SET state = ?2, cancel_requested = ?3, workspace_digest = ?4,
+            verified_digest = ?5, actions_used = ?6, step = ?7 WHERE id = ?1",
+        params![
+            t.id.as_str(),
+            state_to_str(t.state)?,
+            t.cancel_requested,
+            t.workspace_digest.to_string(),
+            t.verified_digest.map(|d| d.to_string()),
+            t.actions_used,
+            t.step
+        ],
+    )?;
+    Ok(())
 }
 
 impl Db {
@@ -229,12 +268,12 @@ impl Db {
         })
     }
 
-    fn immediate(&self) -> Result<Transaction<'_>> {
+    pub(crate) fn immediate(&self) -> Result<Transaction<'_>> {
         Ok(Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?)
     }
 
     /// Snapshot read: deferred, so it never takes the write lock and does not block writers under WAL.
-    fn read(&self) -> Result<Transaction<'_>> {
+    pub(crate) fn read(&self) -> Result<Transaction<'_>> {
         Ok(Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?)
     }
 
@@ -268,22 +307,10 @@ impl Db {
 
     pub fn append(&self, id: &TaskId, ev: &TaskEvent) -> Result<Task> {
         let tx = self.immediate()?;
-        let (task, limits) = load_task(&tx, id)?;
+        let (task, contract) = load_task(&tx, id)?;
         // On error `tx` is dropped, which rolls back; nothing has been written yet anyway.
-        let next = reduce(&task, ev, &limits)?;
-        tx.execute(
-            "UPDATE tasks SET state = ?2, cancel_requested = ?3, workspace_digest = ?4,
-                verified_digest = ?5, actions_used = ?6, step = ?7 WHERE id = ?1",
-            params![
-                id.as_str(),
-                state_to_str(next.state)?,
-                next.cancel_requested,
-                next.workspace_digest.to_string(),
-                next.verified_digest.map(|d| d.to_string()),
-                next.actions_used,
-                next.step
-            ],
-        )?;
+        let next = reduce(&task, ev, &contract.limits)?;
+        store_task(&tx, &next)?;
         insert_event(&tx, id, &event_name(ev)?, &serde_json::to_value(ev)?)?;
         tx.commit()?;
         Ok(next)

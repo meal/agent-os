@@ -46,7 +46,8 @@ impl EffectKind {
         }
     }
 
-    fn tag(&self) -> &'static str {
+    /// Stable short name, used in id derivation and storage.
+    pub fn tag(&self) -> &'static str {
         match self {
             EffectKind::ReadSnapshot => "read_snapshot",
             EffectKind::ApplyPatch { .. } => "apply_patch",
@@ -146,12 +147,14 @@ pub struct Receipt {
     pub result_digest: Option<Digest>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReceiptVerdict {
     Apply,
     DuplicateIgnored,
     StaleLeaseIgnored,
     WrongEffect,
+    /// The effect was never dispatched, so no worker can legitimately hold a receipt for it.
+    NotDispatched,
 }
 
 pub fn accept_receipt(effect: &EffectRecord, r: &Receipt) -> ReceiptVerdict {
@@ -160,6 +163,9 @@ pub fn accept_receipt(effect: &EffectRecord, r: &Receipt) -> ReceiptVerdict {
     }
     if matches!(effect.state, EffectState::Completed | EffectState::Failed) {
         return ReceiptVerdict::DuplicateIgnored;
+    }
+    if effect.state == EffectState::Intended {
+        return ReceiptVerdict::NotDispatched;
     }
     if r.lease_generation < effect.lease_generation {
         return ReceiptVerdict::StaleLeaseIgnored;
@@ -332,6 +338,38 @@ mod tests {
         assert_eq!(
             accept_receipt(&e, &receipt(e.effect_id.clone(), 1)),
             ReceiptVerdict::DuplicateIgnored
+        );
+    }
+
+    #[test]
+    fn receipt_for_never_dispatched_effect_is_rejected() {
+        let e = record(EffectState::Intended, 0);
+        for lease in [0, 1, 7] {
+            assert_eq!(
+                accept_receipt(&e, &receipt(e.effect_id.clone(), lease)),
+                ReceiptVerdict::NotDispatched
+            );
+        }
+        // wrong id still wins
+        let other = id_of("t", 9, &EffectKind::ReadSnapshot, b"r");
+        assert_eq!(accept_receipt(&e, &receipt(other, 0)), ReceiptVerdict::WrongEffect);
+    }
+
+    #[test]
+    fn late_receipt_for_unknown_effect_applies() {
+        let e = record(EffectState::Unknown, 2);
+        assert_eq!(accept_receipt(&e, &receipt(e.effect_id.clone(), 2)), ReceiptVerdict::Apply);
+        assert_eq!(
+            accept_receipt(&e, &receipt(e.effect_id.clone(), 1)),
+            ReceiptVerdict::StaleLeaseIgnored
+        );
+    }
+
+    #[test]
+    fn verdict_serializes_as_its_name() {
+        assert_eq!(
+            serde_json::to_value(ReceiptVerdict::StaleLeaseIgnored).unwrap(),
+            serde_json::json!("StaleLeaseIgnored")
         );
     }
 
