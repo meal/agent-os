@@ -11,7 +11,8 @@
 //! ```
 
 use std::fs::{self, File, TryLockError};
-use std::path::{Path, PathBuf};
+use std::io::Write;
+use std::path::{Component, Path, PathBuf};
 
 use agentos_core::ids::TaskId;
 use agentos_engine::durable::{DurableExecutor, ExecCounts};
@@ -35,7 +36,20 @@ pub struct Store {
 ///
 /// Recovery collects unreferenced blobs, which is only safe while nothing else writes to the
 /// blob store, so every run, resume and recovery holds this lock.
-pub struct DriverLock(#[allow(dead_code)] File);
+///
+/// The holder writes the id of the task it drives into the lock file ([`DriverLock::driving`]),
+/// so `cancel` can tell whether the live driver will see its request.
+pub struct DriverLock(File);
+
+impl DriverLock {
+    /// Records that the holder now drives `task`.
+    pub fn driving(&self, task: &TaskId) -> std::io::Result<()> {
+        let mut f = &self.0;
+        f.set_len(0)?;
+        std::io::Seek::rewind(&mut f)?;
+        f.write_all(task.as_str().as_bytes())
+    }
+}
 
 impl Home {
     pub fn new(home: Option<PathBuf>, profiles: Option<PathBuf>) -> Result<Home, CliError> {
@@ -50,8 +64,21 @@ impl Home {
         Ok(Home { root, profiles })
     }
 
-    pub fn profile_dir(&self, id: &str) -> PathBuf {
-        self.profiles.join(id)
+    /// The registry directory of profile `id`, which must be one plain name naming a
+    /// directory really inside the registry (a symlink leading out of it is refused).
+    /// `Ok(None)` when there is no such profile.
+    pub fn profile_dir(&self, id: &str) -> Result<Option<PathBuf>, CliError> {
+        let mut parts = Path::new(id).components();
+        if !matches!((parts.next(), parts.next()), (Some(Component::Normal(_)), None)) || id.contains(['/', '\\', '\0']) {
+            return Err(CliError::usage(format!("verification profile id {id:?} is not a single plain name")));
+        }
+        let dir = self.profiles.join(id);
+        let Ok(real) = dir.canonicalize() else { return Ok(None) };
+        let root = self.profiles.canonicalize()?;
+        if real.parent() != Some(root.as_path()) {
+            return Err(CliError::usage(format!("verification profile {id} resolves to {}, outside the profile registry {}", real.display(), root.display())));
+        }
+        Ok(real.join("profile.json").is_file().then_some(real))
     }
 
     pub fn tasks_dir(&self) -> PathBuf {
@@ -72,10 +99,18 @@ impl Home {
     pub fn try_lock(&self) -> Result<Option<DriverLock>, CliError> {
         let file = File::options().create(true).truncate(false).write(true).open(self.root.join("driver.lock"))?;
         match file.try_lock() {
-            Ok(()) => Ok(Some(DriverLock(file))),
+            Ok(()) => {
+                file.set_len(0)?;
+                Ok(Some(DriverLock(file)))
+            }
             Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Error(e)) => Err(e.into()),
         }
+    }
+
+    /// The task the current lock holder said it drives, if any.
+    pub fn driven_task(&self) -> Option<String> {
+        fs::read_to_string(self.root.join("driver.lock")).ok().filter(|s| !s.is_empty())
     }
 
     pub fn lock(&self) -> Result<DriverLock, CliError> {

@@ -13,7 +13,8 @@ use agentos_engine::agent::{AgentAction, FakeAgent};
 use agentos_engine::export::{export_bundle, ExportError, Manifest};
 use agentos_engine::runner::run_task;
 use agentos_engine::workspace::{copy_tree, workspace_digest};
-use common::{comment_patch, fix_patch, Env};
+use agentos_engine::executor::EffectRequest;
+use common::{comment_patch, fix_patch, Env, HookExec};
 use serde_json::json;
 
 async fn run(env: &Env, task: &TaskId, agent: &mut FakeAgent) -> TaskState {
@@ -96,7 +97,13 @@ async fn succeeded_task_bundle_carries_verified_digests_that_match_the_bytes() {
     assert_eq!(created.event_type, "TaskCreated");
     assert_eq!(json!(manifest.contract_digest), created.payload["contract_digest"]);
     assert_eq!(manifest.model, None, "no model was recorded at submission");
-    assert_eq!(manifest.generated_events, env.events().len());
+    let events = env.events();
+    assert_eq!(manifest.generated_events, events.len() - 1, "counted before the export journaled itself");
+    let exported = events.last().unwrap();
+    assert_eq!(exported.event_type, "Exported");
+    assert_eq!(exported.payload["manifest_digest"], json!(Digest::of(&fs::read(bundle.join("manifest.json")).unwrap())));
+    assert_eq!(exported.payload["dir"], bundle.to_str().unwrap());
+    assert_eq!(exported.payload["files"], 5);
 
     // patch.diff and the per-patch files.
     let diff = fs::read(bundle.join("patch.diff")).unwrap();
@@ -115,7 +122,7 @@ async fn succeeded_task_bundle_carries_verified_digests_that_match_the_bytes() {
     assert_eq!(manifest.verification_results.len(), 1);
     let result = &manifest.verification_results[0];
     assert_eq!(result.effect_id, verifications[0].effect_id);
-    assert!(result.completed && result.passed);
+    assert!(result.completed && result.passed && result.accepted_for_final_workspace);
     assert_eq!(result.exit_code, Some(0));
     assert_eq!(Some(result.evidence_digest), verifications[0].result_digest);
     assert_eq!(result.workspace_digest, task.verified_digest);
@@ -164,8 +171,10 @@ async fn unfinished_tasks_are_refused_and_nothing_is_written() {
     let env = Env::new(10);
     let out_root = tempfile::tempdir().unwrap();
     let bundle = out_root.path().join("bundle");
+    let journaled = env.events().len();
 
     assert!(matches!(export(&env, &env.task, &bundle), Err(ExportError::NotTerminal(TaskState::Ready))));
+    assert_eq!(env.events().len(), journaled, "a refused export journals nothing");
     env.db.append(&env.task, &TaskEvent::Started).unwrap();
     assert!(matches!(export(&env, &env.task, &bundle), Err(ExportError::NotTerminal(TaskState::Running))));
     env.db.append(&env.task, &TaskEvent::Paused).unwrap();
@@ -241,7 +250,7 @@ async fn a_failed_task_is_exported_honestly() {
     assert_eq!(manifest.state, "FAILED");
     assert_eq!(manifest.verified_digest, None, "no success claim");
     assert_eq!(manifest.verification_results.len(), 1);
-    assert!(manifest.verification_results.iter().all(|r| !r.passed));
+    assert!(manifest.verification_results.iter().all(|r| !r.passed && !r.accepted_for_final_workspace));
     assert_ne!(manifest.verification_results[0].exit_code, Some(0));
     assert_eq!(fs::read_to_string(bundle.join("patch.diff")).unwrap(), comment_patch(), "the applied patch, as it was");
     assert_eq!(Some(replay(&env, &bundle)), manifest.final_workspace_digest);
@@ -313,4 +322,33 @@ async fn submitted_inputs_are_reported_and_cross_checked() {
     assert_eq!(run(&env, &raw, &mut agent).await, TaskState::Succeeded);
     let err = export(&env, &raw, &out_root.path().join("raw")).unwrap_err();
     assert!(matches!(&err, ExportError::Inconsistent(m) if m.contains("contract")), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_passing_check_the_task_did_not_accept_is_not_reported_as_accepted() {
+    // A cancel lands while the (passing) verification runs: the evidence says passed, but the
+    // task is CANCELLED and never verified anything.
+    let env = Env::new(10);
+    let writer = std::sync::Mutex::new(env.second_db());
+    let exec = HookExec {
+        inner: env.fixture_exec(),
+        before: |req: &EffectRequest| {
+            if req.kind.tag() == "run_verification" {
+                writer.lock().unwrap().append(&env.task, &TaskEvent::CancelRequested).unwrap();
+            }
+        },
+        after: |_: &EffectRequest| {},
+    };
+    let mut agent = FakeAgent::from_fixture_patch(fix_patch());
+    assert_eq!(run_task(&env.db, &env.blobs, &exec, &mut agent, &env.task).await.unwrap(), TaskState::Cancelled);
+    let out_root = tempfile::tempdir().unwrap();
+
+    let manifest = export(&env, &env.task, &out_root.path().join("bundle")).unwrap();
+
+    assert_eq!(manifest.state, "CANCELLED");
+    assert_eq!(manifest.verified_digest, None);
+    let result = &manifest.verification_results[0];
+    assert!(result.passed, "the evidence's own verdict is reported as it is");
+    assert_eq!(result.workspace_digest, manifest.final_workspace_digest);
+    assert!(!result.accepted_for_final_workspace, "but the task never accepted it");
 }

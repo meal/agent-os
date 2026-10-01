@@ -48,8 +48,9 @@ pub async fn resume(home: &Home, task: &TaskId, patch: Option<&Path>, crash: Opt
     Ok(())
 }
 
-/// Requests cancellation and, unless another process is driving tasks (its runner honours
-/// the request at its next step), completes it here after reconciling in-flight effects.
+/// Requests cancellation and completes it here after reconciling in-flight effects, unless
+/// another process holds the driver lock: then the request stays pending until that process
+/// (if it is driving this task) reaches its next step, or the next `resume`/`cancel` of it.
 pub async fn cancel(home: &Home, task: &TaskId) -> Result<(), CliError> {
     let store = home.open()?;
     let t = store.db.task(task)?;
@@ -60,12 +61,19 @@ pub async fn cancel(home: &Home, task: &TaskId) -> Result<(), CliError> {
     if !t.cancel_requested {
         store.db.append(task, &TaskEvent::CancelRequested)?;
     }
-    let Some(_lock) = home.try_lock()? else {
+    let Some(lock) = home.try_lock()? else {
         let state = store.db.task(task)?.state;
-        let note = "another agentos process is driving tasks; it completes the cancel at its next step";
+        let note = if home.driven_task().as_deref() == Some(task.as_str()) {
+            "another agentos process is driving this task; it completes the cancel at its next step".to_string()
+        } else {
+            format!(
+                "another agentos process is driving tasks; the cancel completes on the next `agentos resume {task}` or `agentos cancel {task}`"
+            )
+        };
         print(&json!({ "task_id": task, "state": state.label(), "cancel_requested": true, "note": note }));
         return Ok(());
     };
+    lock.driving(task)?;
     let t = store.db.task(task)?;
     if !t.state.is_terminal() {
         if store.db.outstanding_effects(task)?.is_empty() {

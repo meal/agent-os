@@ -50,6 +50,23 @@ pub struct Contract {
     pub limits: Limits,
 }
 
+/// A registry id (`profile`, `verification_profile`) must be exactly one plain file name, so
+/// joining it onto a registry directory can never leave that directory.
+fn check_plain_name(field: &str, v: &str) -> Result<(), ContractError> {
+    let plain = !v.is_empty()
+        && v != "."
+        && v != ".."
+        && !v.starts_with('-')
+        && !v.contains(['/', '\\', '\0']);
+    if plain {
+        Ok(())
+    } else {
+        Err(ContractError::Invalid(format!(
+            "{field} {v:?} must be a single plain name (no '/', '\\', '.', '..', NUL or leading '-')"
+        )))
+    }
+}
+
 fn has_parent_component(p: &str) -> bool {
     p.split('/').any(|c| c == "..")
 }
@@ -76,6 +93,8 @@ impl Contract {
                 return Err(ContractError::Invalid(format!("limit {name} must be > 0")));
             }
         }
+        check_plain_name("profile", &self.profile)?;
+        check_plain_name("verification_profile", &self.verification_profile)?;
         if self.editable_paths.is_empty() {
             return Err(ContractError::Invalid("editable_paths must not be empty".into()));
         }
@@ -125,6 +144,22 @@ mod tests {
     #[test] fn rejects_escaping_glob() {
         assert!(Contract::parse(&OK.replace("src/**", "../x/**")).is_err());
         assert!(Contract::parse(&OK.replace("src/**", "/etc/**")).is_err());
+    }
+    #[test] fn rejects_profile_ids_that_are_not_one_plain_name() {
+        for bad in ["../../tmp/x", "/abs/path", "a/b", "..", "", ".", "-rf", "a\\b", "a\u{0}b", "x/", "./x"] {
+            let id = serde_json::to_string(bad).unwrap();
+            let vp = OK.replace("\"verification_profile\":\"parser-checks-v1\"", &format!("\"verification_profile\":{id}"));
+            assert_ne!(vp, OK);
+            let err = Contract::parse(&vp).unwrap_err().to_string();
+            assert!(err.contains("verification_profile"), "{bad:?}: {err}");
+            let p = OK.replace("\"profile\":\"python-stdlib-v1\"", &format!("\"profile\":{id}"));
+            assert_ne!(p, OK);
+            assert!(Contract::parse(&p).unwrap_err().to_string().contains("profile"), "{bad:?}");
+        }
+        for good in ["parser-checks-v1", "p", "a.b_c-2"] {
+            let id = serde_json::to_string(good).unwrap();
+            assert!(Contract::parse(&OK.replace("\"parser-checks-v1\"", &id)).is_ok(), "{good:?}");
+        }
     }
     #[test] fn path_allowed_matches_glob_and_blocks_traversal() {
         let c = Contract::parse(OK).unwrap();

@@ -39,14 +39,9 @@ fn validate(home: &Home, task: &Path, yes: bool, patch: Option<&Path>) -> Result
         .ok()
         .filter(|p| p.is_dir())
         .ok_or_else(|| CliError::usage(format!("repository source {} is not a directory", contract.repository.source)))?;
-    let profile = home.profile_dir(&contract.verification_profile);
-    if !profile.join("profile.json").is_file() {
-        return Err(CliError::usage(format!(
-            "verification profile {} not found in {}",
-            contract.verification_profile,
-            home.profiles.display()
-        )));
-    }
+    let profile = home.profile_dir(&contract.verification_profile)?.ok_or_else(|| {
+        CliError::usage(format!("verification profile {} not found in {}", contract.verification_profile, home.profiles.display()))
+    })?;
     let expected_revision = match contract.repository.revision.as_str() {
         RECORDED_AT_SUBMISSION => None,
         rev => {

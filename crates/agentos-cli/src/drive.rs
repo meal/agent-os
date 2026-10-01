@@ -71,7 +71,8 @@ fn check_inputs(home: &Home, store: &Store, task: &TaskId) -> Result<Option<Task
 }
 
 /// Recovers `task` and runs it with a fresh fake agent. The caller holds the driver lock.
-pub async fn drive(home: &Home, store: &Store, _lock: &DriverLock, task: &TaskId, patch: String, crash: Option<&CrashSpec>) -> Result<TaskState, CliError> {
+pub async fn drive(home: &Home, store: &Store, lock: &DriverLock, task: &TaskId, patch: String, crash: Option<&CrashSpec>) -> Result<TaskState, CliError> {
+    lock.driving(task)?;
     if let Some(state) = check_inputs(home, store, task)? {
         return Ok(state);
     }

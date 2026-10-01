@@ -9,6 +9,11 @@
 //! - `patches/NNNN-<digest>.patch`: each applied patch on its own;
 //! - `evidence/<digest>.json`: the snapshot manifest and every verification result.
 //!
+//! Each verification result reports `passed`, the check's own verdict from its evidence,
+//! and `accepted_for_final_workspace`, the engine's decision: only the result whose
+//! completion made the task SUCCEEDED is accepted. A check that passed but was not accepted
+//! (e.g. a cancel landed while it ran) is evidence, not a success claim.
+//!
 //! The bundle is written into a temp directory beside the destination and renamed into
 //! place, so a failure at any point leaves no partial bundle.
 
@@ -78,6 +83,10 @@ pub struct VerificationResult {
     pub evidence_digest: Digest,
     pub profile_digest: Option<Digest>,
     pub exit_code: Option<i64>,
+    /// The engine's decision, as opposed to `passed`, the check's own verdict: true only for
+    /// the result whose completion committed `VerifyPassed`, so it is the evidence behind
+    /// the task's `verified_digest` (it then passed, for the final workspace).
+    pub accepted_for_final_workspace: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,6 +245,7 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
                     evidence_digest: d,
                     profile_digest: if completed { Some(digest_field(&v, "profile_digest", &what)?) } else { None },
                     exit_code: if completed { v["exit_code"].as_i64() } else { None },
+                    accepted_for_final_workspace: false,
                 });
                 evidence.insert(d, bytes);
             }
@@ -255,9 +265,23 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
             r.effect_id, r.profile_digest
         )));
     }
+    // The verification whose completion committed VerifyPassed (same transaction, so its
+    // EffectCompleted is the event right before).
+    let accepting = events.windows(2).find(|w| w[1].event_type == "VerifyPassed" && w[0].event_type == "EffectCompleted");
+    let accepting: Option<EffectId> = accepting
+        .map(|w| serde_json::from_value(w[0].payload["effect_id"].clone()).map_err(DbError::from))
+        .transpose()?;
+    for r in &mut results {
+        r.accepted_for_final_workspace = t.state == TaskState::Succeeded
+            && accepting.as_ref() == Some(&r.effect_id)
+            && r.passed
+            && r.workspace_digest.is_some()
+            && r.workspace_digest == t.verified_digest
+            && r.workspace_digest == last;
+    }
     let verified = if t.state == TaskState::Succeeded {
         let v = t.verified_digest.ok_or_else(|| inconsistent("SUCCEEDED without a verified digest"))?;
-        let evidenced = results.iter().any(|r| r.passed && r.workspace_digest == Some(v));
+        let evidenced = results.iter().any(|r| r.accepted_for_final_workspace);
         if last != Some(v) || t.workspace_digest != v || !evidenced {
             return Err(inconsistent(format!("verified digest {v} is not the final workspace {last:?} with passing evidence")));
         }
@@ -323,11 +347,29 @@ fn ensure_free(out_dir: &Path) -> Result<()> {
 
 /// Writes the bundle of the finished `task` to `out_dir` (which must not exist, or be an
 /// empty directory) and returns its manifest. See the module docs.
+///
+/// A successful export is journaled as an `Exported` audit event `{manifest_digest, dir,
+/// files}` (`dir` as given); a refused or failed one journals nothing. If that journal write
+/// itself fails, the error is returned although the bundle is in place.
 pub fn export_bundle(db: &Db, blobs: &BlobStore, task: &TaskId, out_dir: &Path) -> Result<Manifest> {
-    write_bundle(collect(db, blobs, task)?, out_dir, &|_| Ok(()))
+    let written = write_bundle(collect(db, blobs, task)?, out_dir, &|_| Ok(()))?;
+    let payload = serde_json::json!({
+        "manifest_digest": written.manifest_digest,
+        "dir": out_dir.display().to_string(),
+        "files": written.files,
+    });
+    db.append_audit(task, "Exported", &payload)?;
+    Ok(written.manifest)
 }
 
-fn write_bundle(contents: Contents, out_dir: &Path, before: BeforeWrite) -> Result<Manifest> {
+#[derive(Debug)]
+struct Written {
+    manifest: Manifest,
+    manifest_digest: Digest,
+    files: usize,
+}
+
+fn write_bundle(contents: Contents, out_dir: &Path, before: BeforeWrite) -> Result<Written> {
     let parent = match out_dir.parent() {
         Some(p) if p.as_os_str().is_empty() => Path::new("."),
         Some(p) => p,
@@ -345,6 +387,7 @@ fn write_bundle(contents: Contents, out_dir: &Path, before: BeforeWrite) -> Resu
     let manifest_json = serde_json::to_vec_pretty(&contents.manifest).map_err(DbError::from)?;
     files.push(("manifest.json".into(), &manifest_json));
     write_checked(root, &files, before)?;
+    let files = files.len();
     for dir in ["patches", "evidence", ""] {
         sync_dir(&root.join(dir))?;
     }
@@ -366,7 +409,7 @@ fn write_bundle(contents: Contents, out_dir: &Path, before: BeforeWrite) -> Resu
     }
     sync_dir(parent)?;
     tracing::info!(task_id = %contents.manifest.task_id, dir = %out_dir.display(), "bundle exported");
-    Ok(contents.manifest)
+    Ok(Written { manifest: contents.manifest, manifest_digest: Digest::of(&manifest_json), files })
 }
 
 #[cfg(test)]
@@ -422,7 +465,10 @@ mod tests {
     fn the_bundle_appears_whole() {
         let root = tempfile::tempdir().unwrap();
         let out = root.path().join("bundle");
-        let manifest = write_bundle(contents(), &out, &|_| Ok(())).unwrap();
+        let written = write_bundle(contents(), &out, &|_| Ok(())).unwrap();
+        assert_eq!(written.files, 5);
+        assert_eq!(written.manifest_digest, Digest::of(&fs::read(out.join("manifest.json")).unwrap()));
+        let manifest = written.manifest;
         let mut got = names(&out);
         got.sort();
         assert_eq!(got, vec!["evidence", "manifest.json", "patch.diff", "patches"]);

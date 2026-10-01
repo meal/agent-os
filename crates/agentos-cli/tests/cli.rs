@@ -48,8 +48,12 @@ impl Cli {
     }
 
     fn cmd(&self, args: &[&str]) -> Command {
+        self.cmd_with_profiles(&fixtures().join("profiles"), args)
+    }
+
+    fn cmd_with_profiles(&self, profiles: &Path, args: &[&str]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_agentos"));
-        cmd.arg("--home").arg(self.home()).arg("--profiles").arg(fixtures().join("profiles")).args(args);
+        cmd.arg("--home").arg(self.home()).arg("--profiles").arg(profiles).args(args);
         cmd
     }
 
@@ -184,6 +188,17 @@ fn invalid_contract_exits_2_with_the_validation_message_and_writes_nothing() {
     cli.cmd(&["submit", &garbage]).assert().code(2).stderr(predicate::str::contains("invalid contract json"));
     let missing_profile = cli.write("p.json", &fs::read_to_string(cli.contract(&repo)).unwrap().replace("parser-checks-v1", "nope-v1"));
     cli.cmd(&["submit", &missing_profile]).assert().code(2).stderr(predicate::str::contains("verification profile nope-v1"));
+    // A profile id is one plain registry name: it can never reach outside the registry.
+    let valid = fs::read_to_string(cli.contract(&repo)).unwrap();
+    for (i, bad) in ["../../tmp/x", "/abs/path", "a/b", "..", "", ".", "-x"].into_iter().enumerate() {
+        let id = serde_json::to_string(bad).unwrap();
+        let file = cli.write(&format!("bad-profile-{i}.json"), &valid.replace("\"parser-checks-v1\"", &id));
+        cli.cmd(&["submit", &file, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()])
+            .assert()
+            .code(2)
+            .stdout("")
+            .stderr(predicate::str::contains("verification_profile"));
+    }
     let wrong_rev = cli.contract_with(&repo, 10, &Digest::of(b"another tree").to_string());
     cli.cmd(&["submit", &wrong_rev]).assert().code(2).stderr(predicate::str::contains("revision"));
     let contract = cli.contract(&repo);
@@ -350,6 +365,7 @@ fn crash_restart_recover_export(spec: &str) {
     let id = cli.crash(&contract, spec);
     let stuck = cli.status(&id);
     assert!(!TERMINAL.contains(&stuck["state"].as_str().unwrap()), "{spec}: crashed task is unfinished: {stuck}");
+    assert_crashed_on_kind(&cli, &id, spec, &stuck);
 
     let resumed = cli.json(&["resume", &id]);
     assert_eq!(resumed, json!({ "task_id": id, "state": "SUCCEEDED" }), "{spec}");
@@ -359,6 +375,42 @@ fn crash_restart_recover_export(spec: &str) {
     let (_, manifest) = cli.export(&id, "recovered");
     assert_eq!(manifest["task_id"], id.as_str());
     assert_eq!(normalized(&manifest), normalized(&expected), "{spec}: recovered bundle equals the uncrashed one");
+}
+
+/// The crash happened on an effect of the spec's KIND: the last intended effect (or, for a
+/// crash right after the agent turn, the journaled action) is of that kind, and an effect
+/// crashed mid-flight is the one outstanding.
+fn assert_crashed_on_kind(cli: &Cli, id: &str, spec: &str, status: &Value) {
+    let mut parts = spec.split(':');
+    let (point, kind) = (parts.next().unwrap(), parts.next().unwrap());
+    let variant = match kind {
+        "read_snapshot" => "ReadSnapshot",
+        "apply_patch" => "ApplyPatch",
+        "run_verification" => "RunVerification",
+        other => panic!("table row without a kind: {other}"),
+    };
+    let events = cli.events(id);
+    let outstanding: Vec<&str> =
+        status["outstanding_effects"].as_array().unwrap().iter().map(|e| e["kind"].as_str().unwrap()).collect();
+    if point == "after-agent-turn-journaled" {
+        let last = events.last().unwrap();
+        assert_eq!(last["type"], "AgentTurn", "{spec}");
+        let action = &last["payload"]["action"];
+        assert!(action == variant || action.get(variant).is_some() || (kind == "run_verification" && action == "Verify"), "{spec}: {action}");
+        assert!(outstanding.is_empty(), "{spec}: {outstanding:?}");
+        return;
+    }
+    let intended = events.iter().rev().find(|e| e["type"] == "EffectIntended").expect("an effect was intended");
+    let k = &intended["payload"]["kind"];
+    assert!(k == variant || k.get(variant).is_some(), "{spec}: last intended effect is {k}");
+    if point == "after-complete" {
+        assert!(outstanding.is_empty(), "{spec}: {outstanding:?}");
+    } else {
+        assert_eq!(outstanding, vec![kind], "{spec}");
+    }
+    if kind == "run_verification" {
+        assert_eq!(status["state"], "VERIFYING", "{spec}");
+    }
 }
 
 /// Crash specs of the demo table; together they cover every crash point.
@@ -434,6 +486,12 @@ fn pause_then_resume() {
     assert_eq!(cli.json(&["resume", &id])["state"], "SUCCEEDED");
     assert_subsequence(&cli.event_types(&id), &["Started", "Paused", "Resumed", "RecoveryDecision", "VerifyPassed"]);
     assert_eq!(cli.status(&id)["outstanding_effects"], json!([]));
+    // The new session's agent re-sent its patch, which no longer applied (a FAILED effect):
+    // only the patch that really applied is in the bundle.
+    assert!(cli.event_types(&id).contains(&"EffectFailed".to_string()));
+    let (bundle, manifest) = cli.export(&id, "bundle");
+    assert_eq!(fs::read(bundle.join("patch.diff")).unwrap(), fs::read(fix_patch()).unwrap());
+    assert_eq!(manifest["patches"].as_array().unwrap().len(), 1);
 }
 
 #[test]
@@ -517,11 +575,19 @@ fn while_another_process_drives_cancel_only_requests_and_resume_waits() {
     // Stand in for a live driver: hold the home's driver lock in this process.
     let lock = fs::File::options().write(true).open(cli.home().join("driver.lock")).unwrap();
     lock.lock().unwrap();
+    // As every real holder does on acquiring it: forget what a previous (dead) holder drove.
+    lock.set_len(0).unwrap();
 
     let out = cli.json(&["cancel", &id]);
     assert_eq!(out["state"], "RUNNING");
     assert_eq!(out["cancel_requested"], true);
-    assert!(out["note"].as_str().unwrap().contains("another agentos process"));
+    let note = out["note"].as_str().unwrap();
+    assert!(note.contains(&format!("next `agentos resume {id}` or `agentos cancel {id}`")), "{note}");
+    // When the lock holder says it drives this very task, its runner completes the cancel.
+    fs::write(cli.home().join("driver.lock"), &id).unwrap();
+    let note = cli.json(&["cancel", &id])["note"].as_str().unwrap().to_string();
+    assert!(note.contains("is driving this task; it completes the cancel at its next step"), "{note}");
+    fs::write(cli.home().join("driver.lock"), "").unwrap();
     cli.cmd(&["resume", &id]).assert().code(1).stderr(predicate::str::contains("another agentos process is driving"));
     let status = cli.status(&id);
     assert_eq!(status["state"], "RUNNING");
@@ -552,4 +618,45 @@ fn recovery_itself_can_be_killed_and_resumed_again() {
     assert_eq!(decisions.len(), 2, "one decision per restart: {decisions:?}");
     assert!(decisions.iter().all(|d| d["kind"] == "apply_patch" && d["decision"] == "Redispatch"));
     assert_eq!(decisions[1]["lease_generation"], 2, "the second restart found the second lease in flight");
+}
+
+#[test]
+fn a_registry_entry_that_links_outside_the_registry_is_refused() {
+    let cli = Cli::new();
+    let registry = cli.path("profiles");
+    copy_tree(&fixtures().join("profiles/parser-checks-v1"), &registry.join("parser-checks-v1")).unwrap();
+    let outside = cli.path("outside");
+    copy_tree(&fixtures().join("profiles/parser-checks-v1"), &outside).unwrap();
+    std::os::unix::fs::symlink(&outside, registry.join("evil")).unwrap();
+    let contract = cli.contract(&cli.repo_copy());
+    let evil = cli.write("evil.json", &fs::read_to_string(&contract).unwrap().replace("\"parser-checks-v1\"", "\"evil\""));
+
+    cli.cmd_with_profiles(&registry, &["submit", &evil]).assert().code(2).stderr(predicate::str::contains("outside the profile registry"));
+    assert!(!cli.home().exists());
+    // A real registry entry still works.
+    let out = cli.cmd_with_profiles(&registry, &["submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()]).assert().success();
+    let out: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(out["state"], "SUCCEEDED");
+}
+
+#[test]
+fn every_export_is_journaled_and_a_refused_one_is_not() {
+    let cli = Cli::new();
+    let contract = cli.contract(&cli.repo_copy());
+    let id = cli.submit_yes(&contract, &fix_patch())["task_id"].as_str().unwrap().to_string();
+    let exported = |cli: &Cli| -> Vec<Value> {
+        cli.events(&id).into_iter().filter(|e| e["type"] == "Exported").map(|e| e["payload"].clone()).collect()
+    };
+
+    let (bundle, _) = cli.export(&id, "one");
+    let events = exported(&cli);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["manifest_digest"], digest_of_file(&bundle.join("manifest.json")));
+    assert_eq!(events[0]["dir"], bundle.to_str().unwrap());
+    assert_eq!(events[0]["files"], 5, "manifest, patch.diff, one patch, two evidence files");
+
+    cli.cmd(&["export", &id, bundle.to_str().unwrap()]).assert().code(1);
+    assert_eq!(exported(&cli).len(), 1, "a refused export journals nothing");
+    cli.export(&id, "two");
+    assert_eq!(exported(&cli).len(), 2);
 }

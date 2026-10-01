@@ -28,7 +28,15 @@ pub async fn dispatch(args: Args) -> Result<(), CliError> {
     }
 }
 
+/// Task ids are UUIDs; anything else is refused before it can reach a path.
 fn task_id(id: &str) -> Result<TaskId, CliError> {
+    let uuid_shaped = id.len() == 36 && id.chars().enumerate().all(|(i, c)| match i {
+        8 | 13 | 18 | 23 => c == '-',
+        _ => c.is_ascii_hexdigit(),
+    });
+    if !uuid_shaped {
+        return Err(CliError::usage(format!("invalid task id {id:?}: expected a UUID")));
+    }
     serde_json::from_value(Value::String(id.to_string())).map_err(|e| CliError::usage(format!("invalid task id {id:?}: {e}")))
 }
 
