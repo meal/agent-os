@@ -280,18 +280,21 @@ async fn verification_sees_only_path_from_the_environment() {
     let fx = Fx::new();
     fs::write(
         fx.dir.path().join("profile/profile.json"),
-        r#"{"id": "env", "command": ["python3", "-c", "import json, os; print(json.dumps(sorted(os.environ)))"], "protected": true}"#,
+        r#"{"id": "env", "command": ["python3", "-c", "import json, os; print(json.dumps(dict(os.environ)))"], "protected": true}"#,
     )
     .unwrap();
     fx.snapshot().await;
     assert!(std::env::var_os("CARGO_MANIFEST_DIR").is_some() || std::env::var_os("HOME").is_some());
     let out = fx.run(EffectKind::RunVerification, b"").await;
     let stdout = json(&out)["stdout"].as_str().unwrap().to_string();
-    let keys: Vec<String> = serde_json::from_str(stdout.trim()).unwrap();
+    let env: std::collections::BTreeMap<String, String> = serde_json::from_str(stdout.trim()).unwrap();
     // Python itself may add LC_CTYPE (locale coercion); nothing else leaks in.
-    let allowed = ["LC_CTYPE", "PATH", "PYTHONDONTWRITEBYTECODE"];
-    assert!(keys.iter().all(|k| allowed.contains(&k.as_str())), "{keys:?}");
-    assert!(keys.contains(&"PATH".to_string()) && keys.contains(&"PYTHONDONTWRITEBYTECODE".to_string()));
+    let allowed = ["LC_CTYPE", "PATH", "PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX"];
+    assert!(env.keys().all(|k| allowed.contains(&k.as_str())), "{env:?}");
+    assert!(env.contains_key("PATH") && env.contains_key("PYTHONDONTWRITEBYTECODE"));
+    // Bytecode caches go to the run's scratch dir, never into the workspace.
+    let prefix = Path::new(&env["PYTHONPYCACHEPREFIX"]);
+    assert!(prefix.is_absolute() && !prefix.starts_with(fx.ws()), "{prefix:?}");
 }
 
 #[tokio::test]
@@ -379,4 +382,72 @@ async fn verification_timeout_kills_the_whole_process_group() {
 
     tokio::time::sleep(Duration::from_millis(1800)).await;
     assert!(!marker.exists(), "a background grandchild survived the timeout");
+}
+
+/// Writes an unchecked-hash bytecode cache of the workspace's current `src/parser.py` where
+/// CPython looks for it, as code run by an earlier verification could.
+fn plant_bytecode(ws: &Path) {
+    let script = "import py_compile, sys, os\n\
+                  src = os.path.join(sys.argv[1], 'src', 'parser.py')\n\
+                  tag = sys.implementation.cache_tag\n\
+                  out = os.path.join(sys.argv[1], 'src', '__pycache__', f'parser.{tag}.pyc')\n\
+                  py_compile.compile(src, cfile=out, doraise=True, invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)\n";
+    let status = std::process::Command::new("python3").args(["-c", script]).arg(ws).status().unwrap();
+    assert!(status.success());
+    assert!(ws.join("src/__pycache__").is_dir());
+}
+
+#[tokio::test]
+async fn planted_bytecode_cannot_decide_a_later_verification() {
+    let fx = Fx::new();
+    let base = fx.snapshot().await;
+    fx.apply(base, &fix_patch()).await;
+    // Bytecode of the FIXED parser, then the source goes back to the buggy one.
+    plant_bytecode(&fx.ws());
+    fs::copy(fx.dir.path().join("snapshot/src/parser.py"), fx.ws().join("src/parser.py")).unwrap();
+    assert_eq!(workspace_digest(&fx.ws()).unwrap(), base, "the digest cannot see the planted bytecode");
+
+    let out = fx.run(EffectKind::RunVerification, b"").await;
+
+    let passed = out.verification.as_ref().is_some_and(|r| r.passed);
+    assert!(!passed, "the buggy source must not pass: {}", String::from_utf8_lossy(&out.output));
+    assert!(!fx.ws().join("src/__pycache__").exists(), "excluded entries are purged before the run");
+}
+
+#[tokio::test]
+async fn a_check_that_leaves_excluded_entries_behind_voids_its_evidence() {
+    let fx = Fx::new();
+    let base = fx.snapshot().await;
+    fx.apply(base, &fix_patch()).await;
+    // Passes, but plants bytecode for the next run on its way out.
+    script_profile(
+        &fx,
+        "import os, sys\nd = os.path.join(sys.argv[1], 'src', '__pycache__')\nos.makedirs(d, exist_ok=True)\nopen(os.path.join(d, 'parser.x.pyc'), 'wb').write(b'x')\nprint('all good')\n",
+    );
+
+    let out = fx.run(EffectKind::RunVerification, b"").await;
+
+    assert!(out.verification.is_none());
+    assert!(reason(&out).contains("workspace polluted by excluded entries"), "{}", reason(&out));
+    assert!(reason(&out).contains("src/__pycache__"), "{}", reason(&out));
+}
+
+#[tokio::test]
+async fn a_planted_git_directory_does_not_influence_git_apply() {
+    let fx = Fx::new();
+    let base = fx.snapshot().await;
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git").args(args).current_dir(fx.ws()).env("GIT_CONFIG_GLOBAL", "/dev/null").status().unwrap();
+        assert!(ok.success(), "{args:?}");
+    };
+    // A repository whose config would reject the patch's trailing whitespace.
+    git(&["init", "-q"]);
+    git(&["config", "apply.whitespace", "error"]);
+    assert_eq!(workspace_digest(&fx.ws()).unwrap(), base);
+    let trailing = "--- a/src/parser.py\n+++ b/src/parser.py\n@@ -1,2 +1,2 @@\n-def parse_kv(text: str) -> dict:\n+def parse_kv(text: str) -> dict:   \n     \"\"\"Parse 'key = value' lines into a dict, skipping blanks and '#' comments.\"\"\"\n".to_string();
+
+    let out = fx.apply(base, &trailing).await;
+
+    assert_eq!(out.receipt.outcome, Outcome::Success, "{}", String::from_utf8_lossy(&out.output));
+    assert!(!fx.ws().join(".git").exists(), "the planted repository is gone");
 }

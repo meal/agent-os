@@ -17,6 +17,44 @@ pub fn has_excluded_component(rel: &str) -> bool {
     Path::new(rel).components().any(|c| is_excluded(c.as_os_str()))
 }
 
+/// Repo-relative paths of the excluded entries (`.git`, `__pycache__`, `*.pyc`) anywhere
+/// under `root`, without descending into them or following symlinks.
+pub fn excluded_entries(root: &Path) -> io::Result<Vec<String>> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> io::Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if is_excluded(&entry.file_name()) {
+                out.push(path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned());
+            } else if entry.file_type()?.is_dir() {
+                walk(root, &path, out)?;
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
+/// Removes every excluded entry under `root`; returns what was removed. The digest cannot
+/// see these entries, so none may survive into an effect whose result it vouches for: a
+/// bytecode cache could stand in for changed source, a `.git` could configure `git apply`.
+pub fn purge_excluded(root: &Path) -> io::Result<Vec<String>> {
+    let found = excluded_entries(root)?;
+    for rel in &found {
+        let path = root.join(rel);
+        // A symlink named `.git` is removed as a link, never followed.
+        if fs::symlink_metadata(&path)?.is_dir() {
+            fs::remove_dir_all(&path)?;
+        } else {
+            fs::remove_file(&path)?;
+        }
+    }
+    Ok(found)
+}
+
 fn invalid(msg: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }

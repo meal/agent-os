@@ -706,3 +706,56 @@ async fn failure_during_verification_completes_the_effect_but_never_succeeds() {
     assert_eq!(task.verified_digest, None);
     assert!(env.db.outstanding_effects(&env.task).unwrap().is_empty());
 }
+
+/// The fix patch reversed: puts the buggy parser back.
+fn unfix_patch() -> String {
+    let mut out = String::new();
+    for line in fix_patch().lines() {
+        let swapped = if line.starts_with("---") || line.starts_with("+++") {
+            line.to_string()
+        } else if line.starts_with("@@") {
+            "@@ -2,9 +2,8 @@".to_string()
+        } else if let Some(rest) = line.strip_prefix('+') {
+            format!("-{rest}")
+        } else if let Some(rest) = line.strip_prefix('-') {
+            format!("+{rest}")
+        } else {
+            line.to_string()
+        };
+        out.push_str(&swapped);
+        out.push('\n');
+    }
+    out
+}
+
+// A verification whose code plants bytecode cannot make a later, buggy revision pass.
+#[tokio::test]
+async fn bytecode_planted_by_one_verification_cannot_pass_a_later_one() {
+    let env = Env::new(10);
+    // The check plants an unchecked-hash .pyc of the current parser (and fails) while
+    // src/plant exists; otherwise it checks normally.
+    let check = env.profile_dir().join("check_parser.py");
+    let original = std::fs::read_to_string(&check).unwrap();
+    let planting = original.replace(
+        "    sys.dont_write_bytecode = True\n",
+        "    sys.dont_write_bytecode = True\n    src = Path(sys.argv[1]) / \"src\"\n    if (src / \"plant\").exists():\n        import py_compile\n        out = src / \"__pycache__\" / f\"parser.{sys.implementation.cache_tag}.pyc\"\n        py_compile.compile(str(src / \"parser.py\"), cfile=str(out), doraise=True, invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)\n        print(\"planted\")\n        return 1\n",
+    );
+    assert_ne!(planting, original);
+    std::fs::write(&check, planting).unwrap();
+    let delete_plant = "diff --git a/src/plant b/src/plant\ndeleted file mode 100644\n--- a/src/plant\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n";
+    let mut agent = FakeAgent::scripted(vec![
+        AgentAction::ApplyPatch(format!("{}{}", fix_patch(), create_patch("src/plant", "x"))),
+        AgentAction::Verify,
+        AgentAction::ApplyPatch(format!("{}{delete_plant}", unfix_patch())),
+        AgentAction::Verify,
+        AgentAction::Finish,
+    ]);
+
+    assert_eq!(run(&env, &mut agent).await, TaskState::Failed);
+
+    assert_eq!(env.count("VerifyPassed"), 0);
+    assert_eq!(env.effects("ApplyPatch").len(), 2);
+    assert!(env.effects("ApplyPatch").iter().all(|e| e.state == EffectState::Completed));
+    assert_eq!(env.ws_digest(), workspace_digest(&env.snapshot_dir()).unwrap(), "back to the buggy source");
+    assert_eq!(env.db.task(&env.task).unwrap().verified_digest, None);
+}

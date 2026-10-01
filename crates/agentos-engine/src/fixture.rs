@@ -13,7 +13,7 @@ use serde_json::json;
 use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor, Reconciliation, VerificationReport};
 use crate::patch::{git, paths_of_file};
 use crate::process::{run_in_group, GroupError};
-use crate::workspace::{copy_tree, has_excluded_component, workspace_digest};
+use crate::workspace::{copy_tree, excluded_entries, has_excluded_component, purge_excluded, workspace_digest};
 
 const OUTPUT_LIMIT: usize = 64 * 1024;
 
@@ -181,6 +181,8 @@ impl FixtureExecutor {
         if actual != expected_base {
             return Err(format!("version conflict: expected {expected_base}, actual {actual}"));
         }
+        // A planted `.git` would make `git apply` honour its repo-local configuration.
+        purge_excluded(&ws).map_err(|e| format!("cannot clean workspace: {e}"))?;
 
         for args in [&["apply", "--check"][..], &["apply"][..]] {
             let out = git(&ws)
@@ -233,6 +235,9 @@ impl FixtureExecutor {
         }
 
         let profile_digest = workspace_digest(&self.profile_dir).map_err(|e| format!("cannot digest profile: {e}"))?;
+        // Entries the digest ignores must not decide the check: a bytecode cache planted by
+        // an earlier run could stand in for the source the evidence names.
+        purge_excluded(&ws).map_err(|e| format!("cannot clean workspace: {e}"))?;
         let run_dir = tempfile::tempdir_in(self.task_dir(&req.task_id)).map_err(|e| format!("scratch dir: {e}"))?;
         let run_profile = run_dir.path().join("profile");
         copy_tree(&self.profile_dir, &run_profile).map_err(|e| format!("cannot stage profile: {e}"))?;
@@ -243,7 +248,9 @@ impl FixtureExecutor {
             .arg(&ws)
             .current_dir(&run_profile)
             .env_clear()
-            .env("PYTHONDONTWRITEBYTECODE", "1");
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            // Bytecode caches live (and are looked up) in this run's scratch dir only.
+            .env("PYTHONPYCACHEPREFIX", run_dir.path().join("pycache"));
         if let Some(path) = std::env::var_os("PATH") {
             cmd.env("PATH", path);
         }
@@ -259,6 +266,11 @@ impl FixtureExecutor {
         }
         if !unchanged(&ws, workspace) {
             return Err("workspace changed during verification".into());
+        }
+        // Whatever the check left behind outside the digest voids its evidence.
+        let polluted = excluded_entries(&ws).map_err(|e| format!("cannot inspect workspace: {e}"))?;
+        if !polluted.is_empty() {
+            return Err(format!("workspace polluted by excluded entries: {}", polluted.join(", ")));
         }
 
         let exit_code = output.status.code();
