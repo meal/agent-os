@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -14,6 +15,8 @@ use agentos_store::db::{Db, DbError, StoredEvent};
 use agentos_store::effects::UsageSummary;
 use rusqlite::Connection;
 use serde_json::json;
+
+const SAME_OUTPUT: &[u8] = b"ok\n";
 
 const ALL_CAPS: &[&str] = &["snapshot.read", "workspace.apply_patch", "verification.run", "artifact.export"];
 
@@ -106,7 +109,9 @@ impl Fx {
         lease: u64,
         follow_up: Option<TaskEvent>,
     ) -> Result<ReceiptVerdict, DbError> {
-        let art = self.publish(e, e.effect_id.as_str().as_bytes());
+        // Deliberately the same bytes for every effect: content addressing must not tie a
+        // blob to the first effect that produced it.
+        let art = self.publish(e, SAME_OUTPUT);
         let r = Receipt { result_digest: Some(art), ..receipt(e, a, lease, Outcome::Success) };
         self.db.complete_effect(&e.effect_id, &r, Some(&art), follow_up)
     }
@@ -510,8 +515,9 @@ fn unknown_effect_redispatches_only_under_a_strictly_newer_lease() {
     assert_eq!(fx.usage().uncertain_model_requests, 1);
     // It can go unknown again and still settles exactly once.
     fx.db.mark_unknown(&e.effect_id).unwrap();
-    fx.db.mark_dispatched(&e.effect_id, &AttemptId::new(), "w3", 5).unwrap();
-    fx.succeed(&e, &a2, 5, None).unwrap();
+    let a3 = AttemptId::new();
+    fx.db.mark_dispatched(&e.effect_id, &a3, "w3", 5).unwrap();
+    fx.succeed(&e, &a3, 5, None).unwrap();
     let u = fx.usage();
     assert_eq!((u.reserved_model_requests, u.uncertain_model_requests, u.settled_model_requests), (0, 0, 1));
     assert_eq!(fx.count("SELECT count(*) FROM usage"), 1);
@@ -660,14 +666,91 @@ fn artifact_registered_for_another_effect_or_none_is_refused() {
     let r = receipt(&e, &a, 1, Outcome::Success);
     let err = fx.db.complete_effect(&e.effect_id, &r, Some(&foreign), None).unwrap_err();
     assert!(
-        matches!(&err, DbError::ArtifactEffectMismatch { artifact, expected, actual }
-            if *artifact == foreign && *expected == e.effect_id && *actual == Some(other.effect_id.clone())),
+        matches!(&err, DbError::ArtifactEffectMismatch { artifact, effect }
+            if *artifact == foreign && *effect == e.effect_id),
         "{err:?}"
     );
     let err = fx.db.complete_effect(&e.effect_id, &r, Some(&loose), None).unwrap_err();
-    assert!(matches!(&err, DbError::ArtifactEffectMismatch { actual: None, .. }), "{err:?}");
+    assert!(matches!(&err, DbError::ArtifactEffectMismatch { artifact, .. } if *artifact == loose), "{err:?}");
     assert_eq!(fx.snapshot(&e.effect_id), before);
     assert_eq!(fx.events(), events);
+}
+
+#[test]
+fn two_effects_with_byte_identical_artifacts_both_complete() {
+    let fx = setup();
+    let (e1, a1) = fx.dispatched(b"1", 1);
+    let (e2, a2) = fx.dispatched(b"2", 1);
+    assert_eq!(fx.succeed(&e1, &a1, 1, None).unwrap(), ReceiptVerdict::Apply);
+    assert_eq!(fx.succeed(&e2, &a2, 1, None).unwrap(), ReceiptVerdict::Apply);
+    let d = Digest::of(SAME_OUTPUT);
+    for e in [&e1, &e2] {
+        let done = fx.db.effect(&e.effect_id).unwrap();
+        assert_eq!((done.state, done.result_digest), (EffectState::Completed, Some(d)));
+    }
+    assert_eq!(fx.count("SELECT count(*) FROM artifacts"), 1);
+    assert_eq!(fx.count("SELECT count(*) FROM artifact_links"), 2);
+    assert_eq!(fx.count_events("ArtifactRegistered"), 2);
+}
+
+#[test]
+fn loose_registration_then_an_effect_claiming_the_same_bytes_completes() {
+    let fx = setup();
+    let (e, a) = fx.dispatched(b"r", 1);
+    let d = fx.blobs().put(b"shared").unwrap();
+    fx.db.register_artifact(&d, 6, "log", None, "import").unwrap();
+    assert_eq!(fx.count("SELECT count(*) FROM artifact_links"), 0);
+    let r = Receipt { result_digest: Some(d), ..receipt(&e, &a, 1, Outcome::Success) };
+    assert!(matches!(
+        fx.db.complete_effect(&e.effect_id, &r, Some(&d), None),
+        Err(DbError::ArtifactEffectMismatch { .. })
+    ));
+    fx.db.register_artifact(&d, 6, "log", Some(&e.effect_id), "worker-1").unwrap();
+    assert_eq!(fx.count("SELECT count(*) FROM artifacts"), 1);
+    assert_eq!(fx.count("SELECT count(*) FROM artifact_links"), 1);
+    assert_eq!(fx.count_events("ArtifactRegistered"), 1);
+    assert_eq!(fx.db.complete_effect(&e.effect_id, &r, Some(&d), None).unwrap(), ReceiptVerdict::Apply);
+    assert_eq!(fx.db.effect(&e.effect_id).unwrap().result_digest, Some(d));
+}
+
+#[test]
+fn effect_not_linked_to_identical_existing_content_is_refused() {
+    let fx = setup();
+    let (e1, a1) = fx.dispatched(b"1", 1);
+    let (e2, a2) = fx.dispatched(b"2", 1);
+    fx.succeed(&e1, &a1, 1, None).unwrap();
+    // e2 produced the same bytes but never registered them for itself.
+    let d = Digest::of(SAME_OUTPUT);
+    let before = fx.snapshot(&e2.effect_id);
+    let events = fx.events();
+    let r = Receipt { result_digest: Some(d), ..receipt(&e2, &a2, 1, Outcome::Success) };
+    let err = fx.db.complete_effect(&e2.effect_id, &r, Some(&d), None).unwrap_err();
+    assert!(
+        matches!(&err, DbError::ArtifactEffectMismatch { artifact, effect } if *artifact == d && *effect == e2.effect_id),
+        "{err:?}"
+    );
+    assert_eq!(fx.snapshot(&e2.effect_id), before);
+    assert_eq!(fx.events(), events);
+}
+
+#[test]
+fn referenced_blobs_are_all_registered_artifacts() {
+    let fx = setup();
+    assert!(fx.db.referenced_blobs().unwrap().is_empty());
+    let (e1, a1) = fx.dispatched(b"1", 1);
+    let (e2, a2) = fx.dispatched(b"2", 1);
+    fx.succeed(&e1, &a1, 1, None).unwrap();
+    fx.succeed(&e2, &a2, 1, None).unwrap();
+    let loose = fx.blobs().put(b"loose").unwrap();
+    fx.db.register_artifact(&loose, 5, "log", None, "import").unwrap();
+    let orphan = fx.blobs().put(b"never registered").unwrap();
+    let refs = fx.reopen().referenced_blobs().unwrap();
+    assert_eq!(refs, HashSet::from([Digest::of(SAME_OUTPUT), loose]));
+    // Feeding it to gc keeps every registered blob and removes only the orphan.
+    let blobs = fx.blobs();
+    assert_eq!(blobs.gc(&refs).unwrap(), 1);
+    assert!(blobs.exists(&loose) && blobs.exists(&Digest::of(SAME_OUTPUT)));
+    assert!(!blobs.exists(&orphan));
 }
 
 #[test]

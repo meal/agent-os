@@ -5,8 +5,10 @@
 //!
 //! Publish ordering (engine contract): write result bytes with `BlobStore::put` FIRST, then
 //! `register_artifact(digest, size, type, Some(effect), provenance)`, then `complete_effect`.
-//! A successful completion must name its artifact, and the artifact must be registered for
-//! that same effect; `effects.result_digest` is set only from that artifact (a failure may
+//! Blobs are content-addressed, so several effects may produce the same bytes: `artifacts`
+//! holds one content row per digest and `artifact_links` records which effects produced it.
+//! A successful completion must name its artifact, and the artifact must be linked to that
+//! same effect; `effects.result_digest` is set only from that artifact (a failure may
 //! name an error artifact under the same rules, or none). So a committed effect never
 //! references a blob that was not published. New workspace digests travel in the follow-up
 //! `TaskEvent`, not in `result_digest`.
@@ -23,6 +25,8 @@
 //! `Uncertain` when the effect becomes unknown; an uncertain reservation is never released
 //! because the effect may have run. It stays `Uncertain` across a re-dispatch and settles
 //! when a receipt finally arrives.
+
+use std::collections::HashSet;
 
 use agentos_core::budget::{check_model_budget, tool_actions_for, BudgetError, Reservation, UsageTotals};
 use agentos_core::effect::{
@@ -409,20 +413,17 @@ impl Db {
             }
             None => {}
             Some(artifact) => {
-                let owner: Option<Option<String>> = tx
-                    .query_row(
-                        "SELECT effect_id FROM artifacts WHERE digest = ?1",
-                        [artifact.to_string()],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
-                let owner = owner.ok_or(DbError::ArtifactNotPublished(*artifact))?;
-                if owner.as_deref() != Some(effect.as_str()) {
-                    return Err(DbError::ArtifactEffectMismatch {
-                        artifact: *artifact,
-                        expected: effect.clone(),
-                        actual: owner.map(|o| serde_json::from_value(serde_json::Value::String(o))).transpose()?,
-                    });
+                let (published, linked): (bool, bool) = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM artifacts WHERE digest = ?1),
+                            EXISTS(SELECT 1 FROM artifact_links WHERE digest = ?1 AND effect_id = ?2)",
+                    [artifact.to_string(), effect.to_string()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                if !published {
+                    return Err(DbError::ArtifactNotPublished(*artifact));
+                }
+                if !linked {
+                    return Err(DbError::ArtifactEffectMismatch { artifact: *artifact, effect: effect.clone() });
                 }
                 if let Some(d) = receipt.result_digest.filter(|d| d != artifact) {
                     return Err(DbError::ReceiptArtifactMismatch { artifact: *artifact, receipt: d });
@@ -492,8 +493,9 @@ impl Db {
         Ok(verdict)
     }
 
-    /// Records a published blob. Idempotent (INSERT OR IGNORE). When linked to an effect, the
-    /// first registration also journals `ArtifactRegistered` on that effect's task.
+    /// Records a published blob (content row) and, when `effect` is given, links it to that
+    /// effect. Both inserts are idempotent; each new link journals `ArtifactRegistered` on the
+    /// effect's task.
     pub fn register_artifact(
         &self,
         digest: &Digest,
@@ -504,19 +506,20 @@ impl Db {
     ) -> Result<()> {
         let tx = self.immediate()?;
         let owner = effect.map(|e| load_effect(&tx, e)).transpose()?;
-        let inserted = tx.execute(
-            "INSERT OR IGNORE INTO artifacts(digest, size, type, effect_id, provenance, created_ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                digest.to_string(),
-                to_sql_int(size)?,
-                artifact_type,
-                effect.map(|e| e.as_str()),
-                provenance,
-                now_ts()
-            ],
+        tx.execute(
+            "INSERT OR IGNORE INTO artifacts(digest, size, type, provenance, created_ts)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![digest.to_string(), to_sql_int(size)?, artifact_type, provenance, now_ts()],
         )?;
-        if let (1, Some(rec)) = (inserted, owner) {
+        let Some(rec) = owner else {
+            tx.commit()?;
+            return Ok(());
+        };
+        let linked = tx.execute(
+            "INSERT OR IGNORE INTO artifact_links(digest, effect_id) VALUES (?1, ?2)",
+            [digest.to_string(), rec.effect_id.to_string()],
+        )?;
+        if linked == 1 {
             insert_event(
                 &tx,
                 &rec.task_id,
@@ -562,6 +565,14 @@ impl Db {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Every registered artifact digest: the `referenced` set for `BlobStore::gc`.
+    pub fn referenced_blobs(&self) -> Result<HashSet<Digest>> {
+        let tx = self.read()?;
+        let mut stmt = tx.prepare("SELECT digest FROM artifacts")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.map(|r| digest_from_str(&r?)).collect()
     }
 
     pub fn effect(&self, id: &EffectId) -> Result<EffectRecord> {

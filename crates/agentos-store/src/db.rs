@@ -60,9 +60,13 @@ CREATE TABLE IF NOT EXISTS artifacts(
     digest TEXT PRIMARY KEY,
     size INTEGER NOT NULL,
     type TEXT NOT NULL,
-    effect_id TEXT,
     provenance TEXT,
     created_ts INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS artifact_links(
+    digest TEXT NOT NULL REFERENCES artifacts(digest),
+    effect_id TEXT NOT NULL REFERENCES effects(effect_id),
+    PRIMARY KEY(digest, effect_id)
 );
 CREATE TABLE IF NOT EXISTS usage(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -125,8 +129,8 @@ pub enum DbError {
     ArtifactNotPublished(Digest),
     #[error("a successful completion of effect {0} must reference a published artifact")]
     ArtifactRequired(EffectId),
-    #[error("artifact {artifact} is registered for effect {actual:?}, not {expected}")]
-    ArtifactEffectMismatch { artifact: Digest, expected: EffectId, actual: Option<EffectId> },
+    #[error("artifact {artifact} is not linked to effect {effect}; register it for that effect first")]
+    ArtifactEffectMismatch { artifact: Digest, effect: EffectId },
     #[error("receipt result digest {receipt} does not match artifact {artifact}")]
     ReceiptArtifactMismatch { artifact: Digest, receipt: Digest },
 }
