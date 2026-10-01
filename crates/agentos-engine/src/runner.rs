@@ -7,7 +7,7 @@
 use agentos_core::contract::{Capability, Contract};
 use agentos_core::effect::{EffectId, EffectKind, EffectRecord, EffectState, ReceiptVerdict};
 use agentos_core::ids::{Digest, TaskId};
-use agentos_core::state::{TaskEvent, TaskState};
+use agentos_core::state::{TaskEvent, TaskState, TransitionError};
 use agentos_store::blob::BlobStore;
 use agentos_store::db::{Db, DbError};
 use serde_json::json;
@@ -80,6 +80,40 @@ fn interrupted(db: &Db, task: &TaskId) -> Result<Option<TaskState>> {
         return Ok(Some(t.state));
     }
     Ok(None)
+}
+
+/// A pause or cancel can land between the runner's [`interrupted`] check and its next write;
+/// the write is then refused (not dispatchable, or the reducer rejects `VerifyStarted`).
+/// Such a refusal stops the run as the interrupt says; any other error propagates. Nothing
+/// is lost: an intent left behind is dispatched on resume or abandoned once cancelled.
+fn or_interrupted<T>(db: &Db, task: &TaskId, r: Result<T>) -> Result<std::result::Result<T, TaskState>> {
+    let refused = matches!(
+        &r,
+        Err(EngineError::Db(
+            DbError::NotDispatchable { .. }
+                | DbError::Transition(
+                    TransitionError::CancelRequested { .. }
+                        | TransitionError::Terminal(_)
+                        | TransitionError::InvalidTransition { .. }
+                )
+        ))
+    );
+    match r {
+        Ok(v) => Ok(Ok(v)),
+        Err(e) if refused => match interrupted(db, task)? {
+            Some(state) => {
+                tracing::info!(task_id = %task, error = %e, ?state, "interrupted before the next write");
+                Ok(Err(state))
+            }
+            None => Err(e),
+        },
+        Err(e) => Err(e),
+    }
+}
+
+/// A step's result, with an interrupt-refused write turned into a stop.
+fn interruptible(db: &Db, task: &TaskId, r: Result<Next>) -> Result<Next> {
+    Ok(or_interrupted(db, task, r)?.unwrap_or_else(Next::Stop))
 }
 
 /// Runs a freshly intended effect, or takes an already finished one as it is (an idempotent
@@ -345,7 +379,9 @@ pub async fn run_task_with<E: Executor, A: Agent>(
 async fn drive<E: Executor, A: Agent>(cx: &Cx<'_, E>, agent: &mut A) -> Result<TaskState> {
     let (db, task) = (cx.db, &cx.task);
     // In-flight effects are reconciled before anything else, a pending cancel included,
-    // so the journal and the workspace agree before the cancel is honoured.
+    // so every effect is decided before the cancel is honoured. (The journal's workspace
+    // digest can still lag the disk: a patch completing under a pending cancel has its
+    // WorkspaceUpdated journaled as TaskEventRejected; its effect result holds the truth.)
     if !db.outstanding_effects(task)?.is_empty() {
         recover::reconcile(cx).await?;
     }
@@ -356,9 +392,9 @@ async fn drive<E: Executor, A: Agent>(cx: &Cx<'_, E>, agent: &mut A) -> Result<T
         db.append(task, &TaskEvent::Started)?;
         tracing::info!(task_id = %task, "task started");
     }
-    let (files, resumed) = match ensure_snapshot(cx).await? {
-        Ok(found) => found,
-        Err(state) => return Ok(state),
+    let (files, resumed) = match or_interrupted(db, task, ensure_snapshot(cx).await)? {
+        Ok(Ok(found)) => found,
+        Ok(Err(state)) | Err(state) => return Ok(state),
     };
     if resumed {
         if let Some(state) = workspace_lost(cx)? {
@@ -385,9 +421,9 @@ async fn drive<E: Executor, A: Agent>(cx: &Cx<'_, E>, agent: &mut A) -> Result<T
         // The last journaled action may be unfinished: perform it, idempotently.
         Some(last) => match interrupted(db, task)? {
             Some(state) => return Ok(state),
-            None => act(cx, last.seq, base, last.action.clone()).await?,
+            None => interruptible(db, task, act(cx, last.seq, base, last.action.clone()).await)?,
         },
-        None if t.state == TaskState::Verifying => verify(cx, None).await?,
+        None if t.state == TaskState::Verifying => interruptible(db, task, verify(cx, None).await)?,
         None => Next::Observe(Observation::Start { files, workspace: base }),
     };
     let mut turn = turns.len() as u32;
@@ -411,6 +447,6 @@ async fn drive<E: Executor, A: Agent>(cx: &Cx<'_, E>, agent: &mut A) -> Result<T
         }
         let since = journal::append_turn(db, task, turn, &obs, &action)?;
         cx.crash(CrashPoint::AfterAgentTurnJournaled, action_kind(&action))?;
-        next = act(cx, since, base, action).await?;
+        next = interruptible(db, task, act(cx, since, base, action).await)?;
     }
 }

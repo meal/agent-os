@@ -730,3 +730,94 @@ async fn the_executor_retains_the_highest_lease_outcome() {
     let receipt: Receipt = retained(&ctl, &verify.effect_id).receipt;
     assert_eq!(receipt, newer.receipt);
 }
+
+/// A hook that never crashes but has an operator append `event` (from its own connection)
+/// the first time the run passes `point` for `kind`: the interrupt lands after the runner's
+/// own interrupt check and before its next write.
+fn interrupt_at(w: &World, point: CrashPoint, kind: &'static str, event: TaskEvent) -> RunOptions {
+    let operator = std::sync::Mutex::new(Db::open(&w.path("agentos.db")).unwrap());
+    let task = w.task.clone();
+    RunOptions::crash_with(CrashHook::new(move |p, ctx| {
+        if p == point && ctx.kind == Some(kind) && ctx.occurrence == 0 {
+            operator.lock().unwrap().append(&task, &event).unwrap();
+        }
+        false
+    }))
+}
+
+/// Runs the fixture solution with an operator interrupt injected; it must end cleanly.
+async fn interrupted_run(point: CrashPoint, kind: &'static str, event: TaskEvent) -> (World, Ctl, TaskState) {
+    let w = World::new();
+    let ctl = w.open(None);
+    let opts = interrupt_at(&w, point, kind, event);
+    let state = w.run(&ctl, &opts).await.unwrap_or_else(|e| panic!("{point} {kind}: the run must end cleanly, got {e:?}"));
+    assert_journal_sound(&w, &ctl);
+    (w, ctl, state)
+}
+
+async fn resume_with(w: &World, ctl: &Ctl, actions: Vec<AgentAction>) -> TaskState {
+    ctl.db.append(&w.task, &TaskEvent::Resumed).unwrap();
+    let mut agent = FakeAgent::scripted(actions);
+    run_task(&ctl.db, &ctl.blobs, &ctl.exec, &mut agent, &w.task).await.unwrap()
+}
+
+#[tokio::test]
+async fn a_pause_landing_after_the_intent_stops_the_run_and_resume_completes_it() {
+    let (w, ctl, state) = interrupted_run(CrashPoint::AfterIntent, "apply_patch", TaskEvent::Paused).await;
+    assert_eq!(state, TaskState::Paused);
+    assert_eq!(ctl.effect(&w, "apply_patch").state, EffectState::Intended, "not dispatched while paused");
+    assert_eq!(w.counts.get("apply_patch"), 0);
+
+    // Resume: recovery dispatches the intended patch, a new session verifies it.
+    assert_eq!(resume_with(&w, &ctl, vec![AgentAction::Verify, AgentAction::Finish]).await, TaskState::Succeeded);
+    assert_eq!(ctl.effect(&w, "apply_patch").state, EffectState::Completed);
+    assert_eq!(w.counts.get("apply_patch"), 1);
+    assert_journal_sound(&w, &ctl);
+}
+
+#[tokio::test]
+async fn a_cancel_landing_after_the_intent_cancels_and_releases_the_intent() {
+    let (w, ctl, state) = interrupted_run(CrashPoint::AfterIntent, "apply_patch", TaskEvent::CancelRequested).await;
+    assert_eq!(state, TaskState::Cancelled);
+    assert_eq!(ctl.effect(&w, "apply_patch").state, EffectState::Abandoned);
+    assert!(ctl.db.outstanding_effects(&w.task).unwrap().is_empty());
+    let usage = ctl.db.usage_summary(&w.task).unwrap();
+    assert_eq!((usage.reserved_tool_actions, usage.settled_tool_actions), (0, 1));
+    assert_eq!(workspace_digest(&w.ws()).unwrap(), w.base());
+    assert!(ctl.recover(&w).await.decisions.is_empty());
+}
+
+#[tokio::test]
+async fn a_pause_landing_after_a_journaled_patch_turn_stops_before_the_intent() {
+    let baseline = baseline().await;
+    let (w, ctl, state) = interrupted_run(CrashPoint::AfterAgentTurnJournaled, "apply_patch", TaskEvent::Paused).await;
+    assert_eq!(state, TaskState::Paused);
+    assert!(ctl.effects(&w).iter().all(|e| e.kind.tag() == "read_snapshot"), "no patch effect");
+
+    // The resumed session starts over from Start and runs the whole solution once.
+    ctl.db.append(&w.task, &TaskEvent::Resumed).unwrap();
+    assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Succeeded);
+    assert_eq!(summarize(&w, &ctl), baseline);
+    assert_eq!(w.counts(), KINDS.iter().map(|k| (*k, 1)).collect());
+}
+
+#[tokio::test]
+async fn a_cancel_landing_after_a_journaled_verify_turn_cancels_without_verifying() {
+    let (w, ctl, state) = interrupted_run(CrashPoint::AfterAgentTurnJournaled, "run_verification", TaskEvent::CancelRequested).await;
+    assert_eq!(state, TaskState::Cancelled);
+    assert_eq!(ctl.of_type(&w, "VerifyStarted").len(), 0);
+    assert!(ctl.effects(&w).iter().all(|e| e.kind.tag() != "run_verification"));
+    assert_eq!(ctl.effect(&w, "apply_patch").state, EffectState::Completed);
+}
+
+#[tokio::test]
+async fn a_pause_landing_after_a_journaled_verify_turn_pauses_and_resume_verifies() {
+    let (w, ctl, state) = interrupted_run(CrashPoint::AfterAgentTurnJournaled, "run_verification", TaskEvent::Paused).await;
+    assert_eq!(state, TaskState::Paused);
+    assert_eq!(ctl.of_type(&w, "VerifyStarted").len(), 0);
+
+    assert_eq!(resume_with(&w, &ctl, vec![AgentAction::Verify]).await, TaskState::Succeeded);
+    let task = ctl.db.task(&w.task).unwrap();
+    assert_eq!(task.verified_digest, Some(workspace_digest(&w.ws()).unwrap()));
+    assert_eq!(w.counts(), KINDS.iter().map(|k| (*k, 1)).collect());
+}
