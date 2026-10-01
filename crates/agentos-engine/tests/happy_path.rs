@@ -10,6 +10,9 @@ use agentos_engine::workspace::workspace_digest;
 use agentos_store::db::DbError;
 use common::{comment_patch, create_patch, edit_patch, fix_patch, Env, FnAgent};
 
+const NO_VERIFY: &[&str] = &["snapshot.read", "workspace.apply_patch"];
+const NO_SNAPSHOT: &[&str] = &["workspace.apply_patch", "verification.run"];
+
 async fn run(env: &Env, agent: &mut impl agentos_engine::agent::Agent) -> TaskState {
     run_task(&env.db, &env.blobs, &env.exec, agent, &env.task).await.unwrap()
 }
@@ -459,4 +462,44 @@ async fn effect_failure_receipts_are_published() {
     let outcome: Outcome = serde_json::from_value(completed.payload["outcome"].clone()).unwrap();
     assert!(matches!(outcome, Outcome::Failure(_)));
     assert!(env.blobs.get(&patch.result_digest.unwrap()).is_ok());
+}
+
+#[tokio::test]
+async fn missing_snapshot_capability_fails_the_task() {
+    let env = Env::with_caps(10, NO_SNAPSHOT);
+    let mut agent = FakeAgent::from_fixture_patch(fix_patch());
+
+    assert_eq!(run(&env, &mut agent).await, TaskState::Failed);
+
+    let failed = env.events().into_iter().find(|e| e.event_type == "Failed").unwrap();
+    assert_eq!(failed.payload["Failed"]["reason"], "capability snapshot.read not granted");
+    assert!(env.effects("ReadSnapshot").is_empty());
+    assert!(agent.observations().is_empty());
+    assert!(!env.ws().exists());
+    // Calling again is a no-op on the terminal task.
+    assert_eq!(run(&env, &mut agent).await, TaskState::Failed);
+}
+
+#[tokio::test]
+async fn missing_verification_capability_is_denied_without_entering_verifying() {
+    let env = Env::with_caps(10, NO_VERIFY);
+    let mut agent = FakeAgent::scripted(vec![
+        AgentAction::ApplyPatch(fix_patch()),
+        AgentAction::Verify,
+        AgentAction::Finish,
+    ]);
+
+    assert_eq!(run(&env, &mut agent).await, TaskState::Failed);
+
+    assert_eq!(env.count("VerifyStarted"), 0);
+    assert!(env.effects("RunVerification").is_empty());
+    let denials = env.denials("CapabilityDenied");
+    assert_eq!(denials.len(), 1);
+    assert_eq!(denials[0]["action"], "Verify");
+    assert_eq!(denials[0]["capability"], "verification.run");
+    assert!(matches!(
+        &agent.observations()[2],
+        Observation::Verification { passed: false, summary } if summary.contains("verification.run")
+    ));
+    assert!(env.db.outstanding_effects(&env.task).unwrap().is_empty());
 }

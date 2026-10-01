@@ -3,7 +3,7 @@
 //! [`intend`] -> [`dispatch`] -> [`execute`] -> [`publish`] -> [`complete`].
 
 use agentos_core::budget::Reservation;
-use agentos_core::contract::Contract;
+use agentos_core::contract::{Capability, Contract};
 use agentos_core::effect::{AttemptId, EffectId, EffectKind, EffectRecord, EffectState, Outcome, ReceiptVerdict};
 use agentos_core::ids::{Digest, TaskId};
 use agentos_core::state::{Task, TaskEvent, TaskState};
@@ -185,6 +185,11 @@ fn workspace_update(out: &ExecOutcome, task: &Task) -> Option<TaskEvent> {
     }
 }
 
+/// The capability's contract name, e.g. `verification.run`.
+fn capability_name(cap: Capability) -> String {
+    serde_json::to_value(cap).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()
+}
+
 fn fail(db: &Db, task: &TaskId, reason: &str) -> Result<TaskState> {
     tracing::info!(task_id = %task, reason, "task failed");
     Ok(db.append(task, &TaskEvent::Failed { reason: reason.into() })?.state)
@@ -229,6 +234,10 @@ async fn ensure_snapshot<E: Executor>(
 ) -> Result<std::result::Result<Vec<String>, TaskState>> {
     let rec = match snapshot_effect(db, task)? {
         Some(rec) => rec,
+        None if !contract.capabilities.contains(&Capability::SnapshotRead) => {
+            let reason = format!("capability {} not granted", capability_name(Capability::SnapshotRead));
+            return Ok(Err(fail(db, task, &reason)?));
+        }
         None => {
             let t = db.task(task)?;
             let request = Digest::of(contract.repository.revision.as_bytes());
@@ -318,6 +327,15 @@ async fn verify<E: Executor>(
     task: &TaskId,
     started: bool,
 ) -> Result<Next> {
+    // Checked before VERIFYING is entered, so a missing grant cannot strand the task there.
+    if !contract.capabilities.contains(&Capability::VerificationRun) {
+        let capability = capability_name(Capability::VerificationRun);
+        let audit = json!({ "action": "Verify", "reason": "CapabilityDenied", "capability": capability });
+        db.append_audit(task, "Denied", &audit)?;
+        tracing::info!(task_id = %task, %audit, "verification denied");
+        let summary = format!("capability {capability} not granted");
+        return Ok(Next::Observe(Observation::Verification { passed: false, summary }));
+    }
     let t = if started { db.task(task)? } else { db.append(task, &TaskEvent::VerifyStarted)? };
     tracing::info!(task_id = %task, step = t.step, "verification started");
     let workspace = t.workspace_digest;

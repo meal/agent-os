@@ -51,7 +51,14 @@ pub fn edit_patch(path: &str, old: &str, new: &str) -> String {
     format!("--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-{old}\n+{new}\n")
 }
 
+pub const ALL_CAPS: &[&str] = &["snapshot.read", "workspace.apply_patch", "verification.run", "artifact.export"];
+
 pub fn contract(tool_actions: u32) -> (Contract, Digest) {
+    contract_with(tool_actions, ALL_CAPS)
+}
+
+pub fn contract_with(tool_actions: u32, caps: &[&str]) -> (Contract, Digest) {
+    let caps = serde_json::to_string(caps).unwrap();
     let json = format!(
         r#"{{
         "goal": "fix the parser",
@@ -59,7 +66,7 @@ pub fn contract(tool_actions: u32) -> (Contract, Digest) {
         "profile": "python-stdlib-v1",
         "editable_paths": ["src/**"],
         "verification_profile": "parser-checks-v1",
-        "capabilities": ["snapshot.read", "workspace.apply_patch", "verification.run", "artifact.export"],
+        "capabilities": {caps},
         "limits": {{
             "model_requests": 1,
             "max_output_tokens_per_request": 1000,
@@ -84,6 +91,10 @@ pub struct Env {
 
 impl Env {
     pub fn new(tool_actions: u32) -> Env {
+        Env::with_caps(tool_actions, ALL_CAPS)
+    }
+
+    pub fn with_caps(tool_actions: u32, caps: &[&str]) -> Env {
         let dir = tempfile::tempdir().unwrap();
         copy_dir(&fixtures().join("parser-repo"), &dir.path().join("snapshot"));
         copy_dir(&fixtures().join("profiles/parser-checks-v1"), &dir.path().join("profile"));
@@ -94,7 +105,7 @@ impl Env {
             dir.path().join("profile"),
             dir.path().join("work"),
         );
-        let (contract, digest) = contract(tool_actions);
+        let (contract, digest) = contract_with(tool_actions, caps);
         let task = db.create_task(&contract, &digest).unwrap();
         Env { dir, db, blobs, exec, task, contract }
     }
