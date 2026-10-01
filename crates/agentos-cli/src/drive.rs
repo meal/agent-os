@@ -73,12 +73,17 @@ fn check_inputs(home: &Home, store: &Store, task: &TaskId) -> Result<Option<Task
 /// Recovers `task` and runs it with a fresh fake agent. The caller holds the driver lock.
 pub async fn drive(home: &Home, store: &Store, lock: &DriverLock, task: &TaskId, patch: String, crash: Option<&CrashSpec>) -> Result<TaskState, CliError> {
     lock.driving(task)?;
-    if let Some(state) = check_inputs(home, store, task)? {
-        return Ok(state);
-    }
     let hook = crash.map(CrashSpec::hook);
     let exec = home.executor(task)?.with_crash(hook.clone());
     let opts = RunOptions { crash: hook };
+    if let Some(state) = check_inputs(home, store, task)? {
+        // The task is failed before anything runs on the changed inputs, but what the dead
+        // process left in flight must still be decided: on a terminal task recovery
+        // dispatches nothing, it only publishes retained receipts, reconciles, and marks the
+        // rest unknown or abandoned, so no reservation is stranded as Reserved.
+        survive(task, recover_with(&store.db, &store.blobs, &exec, task, &opts).await)?;
+        return Ok(state);
+    }
     tracing::info!(task_id = %task, agent_patch = %Digest::of(patch.as_bytes()), "driving task");
     survive(task, recover_with(&store.db, &store.blobs, &exec, task, &opts).await)?;
     let mut agent = FakeAgent::from_fixture_patch(patch);

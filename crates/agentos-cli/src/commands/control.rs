@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use agentos_core::effect::EffectState;
 use agentos_core::ids::TaskId;
 use agentos_core::state::{TaskEvent, TaskState};
 use agentos_engine::recover::recover;
@@ -33,6 +34,14 @@ pub async fn resume(home: &Home, task: &TaskId, patch: Option<&Path>, crash: Opt
     let store = home.open()?;
     let t = store.db.task(task)?;
     if t.state.is_terminal() {
+        // A task that ended with effects still in flight (left by an older build or a
+        // failure path) gets them decided; otherwise this only reports.
+        let in_flight = store.db.outstanding_effects(task)?.iter().any(|e| matches!(e.state, EffectState::Intended | EffectState::Dispatched));
+        if in_flight {
+            let lock = home.lock()?;
+            lock.driving(task)?;
+            recover(&store.db, &store.blobs, &home.executor(task)?, task).await?;
+        }
         print_state(task, t.state);
         return Ok(());
     }

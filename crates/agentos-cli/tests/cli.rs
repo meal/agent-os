@@ -660,3 +660,31 @@ fn every_export_is_journaled_and_a_refused_one_is_not() {
     cli.export(&id, "two");
     assert_eq!(exported(&cli).len(), 2);
 }
+
+#[test]
+fn tampered_inputs_after_a_crash_fail_the_task_without_stranding_its_in_flight_effect() {
+    let cli = Cli::new();
+    let contract = cli.contract(&cli.repo_copy());
+    let id = cli.crash(&contract, "after-dispatch:read_snapshot");
+    let stuck = cli.status(&id);
+    assert_eq!(stuck["outstanding_effects"][0]["state"], "Dispatched");
+    assert_eq!(stuck["usage"]["reserved_tool_actions"], 1);
+    fs::write(cli.home().join("tasks").join(&id).join("snapshot/src/parser.py"), "tampered = True\n").unwrap();
+
+    let resumed = cli.json(&["resume", &id]);
+
+    assert_eq!(resumed["state"], "FAILED");
+    let status = cli.status(&id);
+    let failed = cli.events(&id).into_iter().find(|e| e["type"] == "Failed").unwrap();
+    assert!(failed["payload"]["Failed"]["reason"].as_str().unwrap().contains("recorded snapshot changed"), "{failed}");
+    // The in-flight snapshot was reconciled, not left DISPATCHED with a live reservation.
+    let outstanding = status["outstanding_effects"].as_array().unwrap();
+    assert!(outstanding.iter().all(|e| e["state"] != "Dispatched" && e["state"] != "Intended"), "{status}");
+    assert_eq!(status["usage"]["reserved_tool_actions"], 0, "{status}");
+    assert_eq!(status["usage"]["uncertain_tool_actions"], 1, "it may have run: the reservation stays visible");
+    assert!(cli.events(&id).iter().any(|e| e["type"] == "RecoveryDecision"));
+    // Nothing changes on a further resume.
+    let n = cli.events(&id).len();
+    assert_eq!(cli.json(&["resume", &id])["state"], "FAILED");
+    assert_eq!(cli.events(&id).len(), n);
+}
