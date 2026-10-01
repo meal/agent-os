@@ -1,0 +1,1 @@
+{ "id": "parser-checks-v1", "command": ["python3", "check_parser.py"], "protected": true }
