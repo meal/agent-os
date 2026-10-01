@@ -4,3 +4,8 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
+agentos-core = { path = "../agentos-core" }
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

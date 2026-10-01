@@ -29,6 +29,11 @@ dependencies = [
 [[package]]
 name = "agentos-store"
 version = "0.1.0"
+dependencies = [
+ "agentos-core",
+ "tempfile",
+ "uuid",
+]
 
 [[package]]
 name = "arrayvec"
