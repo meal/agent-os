@@ -8,7 +8,10 @@ use agentos_engine::agent::{AgentAction, FakeAgent, Observation};
 use agentos_engine::runner::run_task;
 use agentos_engine::workspace::workspace_digest;
 use agentos_store::db::DbError;
-use common::{comment_patch, create_patch, edit_patch, fix_patch, Env, FnAgent};
+use std::sync::Mutex;
+
+use agentos_engine::executor::EffectRequest;
+use common::{comment_patch, create_patch, edit_patch, fix_patch, Env, FnAgent, HookExec};
 
 const NO_VERIFY: &[&str] = &["snapshot.read", "workspace.apply_patch"];
 const NO_SNAPSHOT: &[&str] = &["workspace.apply_patch", "verification.run"];
@@ -502,4 +505,130 @@ async fn missing_verification_capability_is_denied_without_entering_verifying() 
         Observation::Verification { passed: false, summary } if summary.contains("verification.run")
     ));
     assert!(env.db.outstanding_effects(&env.task).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn patch_writing_digest_ignored_paths_is_denied_by_the_broker() {
+    let env = Env::new(10);
+    let sneaky = create_patch("src/__pycache__/helper.py", "RESULT = True");
+    let mut agent = FakeAgent::scripted(vec![
+        AgentAction::ApplyPatch(sneaky.clone()),
+        AgentAction::ApplyPatch(create_patch("src/stale.pyc", "x")),
+        AgentAction::ApplyPatch(fix_patch()),
+        AgentAction::Verify,
+    ]);
+
+    assert_eq!(run(&env, &mut agent).await, TaskState::Succeeded);
+
+    let denials = env.denials("DigestExcludedPath");
+    assert_eq!(denials.len(), 2);
+    assert_eq!(denials[0]["action"], "ApplyPatch");
+    assert_eq!(denials[0]["paths"], serde_json::json!(["src/__pycache__/helper.py"]));
+    assert_eq!(denials[0]["request_digest"], Digest::of(sneaky.as_bytes()).to_string());
+    assert_eq!(env.effects("ApplyPatch").len(), 1, "no effect for the denied patches");
+    assert_eq!(env.db.task(&env.task).unwrap().actions_used, 2);
+    assert!(!env.ws().join("src/__pycache__").exists());
+}
+
+fn kind_is(req: &EffectRequest, tag: &str) -> bool {
+    req.kind.tag() == tag
+}
+
+#[tokio::test]
+async fn pause_while_a_patch_is_in_flight_keeps_the_workspace_digest_current() {
+    let env = Env::new(10);
+    let writer = Mutex::new(env.second_db());
+    let task = env.task.clone();
+    let exec = HookExec {
+        inner: env.fixture_exec(),
+        before: |req: &EffectRequest| {
+            if kind_is(req, "apply_patch") {
+                writer.lock().unwrap().append(&task, &TaskEvent::Paused).unwrap();
+            }
+        },
+        after: |_: &EffectRequest| {},
+    };
+    let mut agent = FakeAgent::from_fixture_patch(fix_patch());
+
+    let state = run_task(&env.db, &env.blobs, &exec, &mut agent, &env.task).await.unwrap();
+
+    assert_eq!(state, TaskState::Paused);
+    let paused = env.db.task(&env.task).unwrap();
+    assert_eq!(paused.state, TaskState::Paused);
+    assert_eq!(paused.workspace_digest, env.ws_digest(), "the completed patch updated the digest while paused");
+    assert_eq!(env.effects("ApplyPatch")[0].state, EffectState::Completed);
+    assert_eq!(env.count("TaskEventRejected"), 0);
+
+    env.db.append(&env.task, &TaskEvent::Resumed).unwrap();
+    let mut resumed = FakeAgent::scripted(vec![AgentAction::Verify, AgentAction::Finish]);
+    assert_eq!(run(&env, &mut resumed).await, TaskState::Succeeded);
+    assert!(matches!(&resumed.observations()[0], Observation::Start { workspace, .. } if *workspace == env.ws_digest()));
+    let done = env.db.task(&env.task).unwrap();
+    assert_eq!(done.verified_digest, Some(env.ws_digest()));
+}
+
+#[tokio::test]
+async fn pause_while_the_snapshot_is_in_flight_records_the_real_base() {
+    let env = Env::new(10);
+    let writer = Mutex::new(env.second_db());
+    let task = env.task.clone();
+    let exec = HookExec {
+        inner: env.fixture_exec(),
+        before: |req: &EffectRequest| {
+            if kind_is(req, "read_snapshot") {
+                writer.lock().unwrap().append(&task, &TaskEvent::Paused).unwrap();
+            }
+        },
+        after: |_: &EffectRequest| {},
+    };
+    let mut agent = FakeAgent::from_fixture_patch(fix_patch());
+
+    let state = run_task(&env.db, &env.blobs, &exec, &mut agent, &env.task).await.unwrap();
+
+    assert_eq!(state, TaskState::Paused);
+    assert!(agent.observations().is_empty());
+    let base = workspace_digest(&env.snapshot_dir()).unwrap();
+    assert_eq!(env.db.task(&env.task).unwrap().workspace_digest, base);
+
+    env.db.append(&env.task, &TaskEvent::Resumed).unwrap();
+    assert_eq!(run(&env, &mut agent).await, TaskState::Succeeded);
+    assert_eq!(env.effects("ReadSnapshot").len(), 1);
+    assert_eq!(env.db.task(&env.task).unwrap().verified_digest, Some(env.ws_digest()));
+}
+
+// (f) through the run loop: a symlink appears in the live workspace while the patch runs.
+#[tokio::test]
+async fn run_loop_rejects_a_patch_through_a_live_symlink_and_still_succeeds() {
+    let env = Env::new(10);
+    let outside = env.dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let ws = env.ws();
+    let escape = create_patch("src/escape/pwned.py", "owned");
+    let link = ws.join("src/escape");
+    let exec = HookExec {
+        inner: env.fixture_exec(),
+        before: |req: &EffectRequest| {
+            if req.payload == escape.as_bytes() {
+                std::os::unix::fs::symlink(&outside, &link).unwrap();
+            }
+        },
+        after: |req: &EffectRequest| {
+            if req.payload == escape.as_bytes() {
+                std::fs::remove_file(&link).unwrap();
+            }
+        },
+    };
+    let mut agent = FakeAgent::scripted(vec![
+        AgentAction::ApplyPatch(escape.clone()),
+        AgentAction::ApplyPatch(fix_patch()),
+        AgentAction::Verify,
+    ]);
+
+    let state = run_task(&env.db, &env.blobs, &exec, &mut agent, &env.task).await.unwrap();
+
+    assert_eq!(state, TaskState::Succeeded);
+    assert!(matches!(&agent.observations()[1], Observation::PatchRejected { reason } if reason.contains("symlink")));
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0, "nothing written outside the workspace");
+    let patches = env.effects("ApplyPatch");
+    assert_eq!((patches[0].state, patches[1].state), (EffectState::Failed, EffectState::Completed));
 }

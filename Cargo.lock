@@ -24,6 +24,7 @@ version = "0.1.0"
 dependencies = [
  "agentos-core",
  "agentos-store",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

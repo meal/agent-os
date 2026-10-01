@@ -3,7 +3,6 @@
 
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
 use agentos_core::effect::EffectKind;
@@ -13,7 +12,8 @@ use serde_json::json;
 
 use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor, VerificationReport};
 use crate::patch::{git, paths_of_file};
-use crate::workspace::{copy_tree, workspace_digest};
+use crate::process::{run_in_group, GroupError};
+use crate::workspace::{copy_tree, has_excluded_component, workspace_digest};
 
 const OUTPUT_LIMIT: usize = 64 * 1024;
 
@@ -132,6 +132,9 @@ impl FixtureExecutor {
         if let Some(p) = paths.iter().find(|p| !req.contract.path_allowed(p)) {
             return Err(format!("path not editable: {p}"));
         }
+        if let Some(p) = paths.iter().find(|p| has_excluded_component(p)) {
+            return Err(format!("path excluded from the workspace digest: {p}"));
+        }
         for p in &paths {
             match symlink_on_path(&ws, p) {
                 Ok(None) => {}
@@ -205,16 +208,14 @@ impl FixtureExecutor {
             .arg(&ws)
             .current_dir(&run_profile)
             .env_clear()
-            .env("PYTHONDONTWRITEBYTECODE", "1")
-            .stdin(Stdio::null())
-            .kill_on_drop(true);
+            .env("PYTHONDONTWRITEBYTECODE", "1");
         if let Some(path) = std::env::var_os("PATH") {
             cmd.env("PATH", path);
         }
-        let output = match tokio::time::timeout(self.verify_timeout, cmd.output()).await {
-            Err(_) => return Err("timeout".into()),
-            Ok(Err(e)) => return Err(format!("cannot run profile command: {e}")),
-            Ok(Ok(o)) => o,
+        let output = match run_in_group(cmd, self.verify_timeout, OUTPUT_LIMIT).await {
+            Err(GroupError::Timeout) => return Err("timeout".into()),
+            Err(GroupError::Io(e)) => return Err(format!("cannot run profile command: {e}")),
+            Ok(o) => o,
         };
 
         let unchanged = |dir: &Path, want: Digest| workspace_digest(dir).is_ok_and(|d| d == want);

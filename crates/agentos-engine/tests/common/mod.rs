@@ -7,6 +7,7 @@ use agentos_core::contract::Contract;
 use agentos_core::effect::{EffectId, EffectRecord};
 use agentos_core::ids::{Digest, TaskId};
 use agentos_engine::agent::{Agent, AgentAction, Observation};
+use agentos_engine::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor};
 use agentos_engine::fixture::FixtureExecutor;
 use agentos_engine::workspace::workspace_digest;
 use agentos_store::blob::BlobStore;
@@ -115,6 +116,11 @@ impl Env {
         Db::open(&self.dir.path().join("agentos.db")).unwrap()
     }
 
+    /// Another executor over the same snapshot, profile and work root.
+    pub fn fixture_exec(&self) -> FixtureExecutor {
+        FixtureExecutor::new(self.snapshot_dir(), self.profile_dir(), self.dir.path().join("work"))
+    }
+
     pub fn profile_dir(&self) -> PathBuf {
         self.dir.path().join("profile")
     }
@@ -176,5 +182,26 @@ pub struct FnAgent<F: FnMut(&Observation) -> AgentAction>(pub F);
 impl<F: FnMut(&Observation) -> AgentAction> Agent for FnAgent<F> {
     fn next(&mut self, obs: &Observation) -> AgentAction {
         (self.0)(obs)
+    }
+}
+
+/// Wraps the fixture executor with hooks that run around each attempt, so a test can act
+/// on the world while an effect is in flight (after dispatch, before completion).
+pub struct HookExec<B, A> {
+    pub inner: FixtureExecutor,
+    pub before: B,
+    pub after: A,
+}
+
+impl<B, A> Executor for HookExec<B, A>
+where
+    B: Fn(&EffectRequest) + Send + Sync,
+    A: Fn(&EffectRequest) + Send + Sync,
+{
+    async fn run(&self, req: &EffectRequest, ctx: &AttemptCtx) -> ExecOutcome {
+        (self.before)(req);
+        let out = self.inner.run(req, ctx).await;
+        (self.after)(req);
+        out
     }
 }

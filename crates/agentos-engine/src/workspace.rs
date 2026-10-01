@@ -5,9 +5,16 @@ use std::path::Path;
 
 use agentos_core::ids::Digest;
 
-/// Entries never part of a workspace: VCS metadata and Python bytecode caches.
+/// Entries never part of a workspace: VCS metadata and Python bytecode caches. This one rule
+/// drives both the digest and the patch denial in [`has_excluded_component`], so a patch can
+/// never write a file the digest (and so the verified evidence) does not cover.
 fn is_excluded(name: &OsStr) -> bool {
-    name == ".git" || name == "__pycache__" || Path::new(name).extension().is_some_and(|e| e == "pyc")
+    name == ".git" || name == "__pycache__" || name.as_encoded_bytes().ends_with(b".pyc")
+}
+
+/// True if any component of the repo-relative `rel` is excluded from [`workspace_digest`].
+pub fn has_excluded_component(rel: &str) -> bool {
+    Path::new(rel).components().any(|c| is_excluded(c.as_os_str()))
 }
 
 fn invalid(msg: String) -> io::Error {

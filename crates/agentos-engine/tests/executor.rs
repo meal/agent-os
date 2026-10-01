@@ -309,3 +309,74 @@ async fn apply_without_a_snapshot_fails() {
     assert!(!reason(&out).is_empty());
     assert!(!Path::new(&fx.ws()).exists());
 }
+
+#[tokio::test]
+async fn executor_rejects_paths_the_workspace_digest_ignores() {
+    let fx = Fx::new();
+    let base = fx.snapshot().await;
+    for path in ["src/__pycache__/helper.py", "src/helper.pyc", "src/.git/config"] {
+        let out = fx.apply(base, &create_patch(path, "import os")).await;
+        let r = reason(&out);
+        assert!(r.contains("excluded from the workspace digest") && r.contains(path), "{r}");
+        assert!(!fx.ws().join(path).exists(), "{path}");
+    }
+    assert_eq!(workspace_digest(&fx.ws()).unwrap(), base);
+}
+
+/// Points the fixture profile at a Python one-liner. The real fixture is never touched:
+/// `Fx` works on a copy.
+fn script_profile(fx: &Fx, script: &str) {
+    let profile = serde_json::json!({ "id": "pg-test", "command": ["python3", "-c", script], "protected": true });
+    fs::write(fx.dir.path().join("profile/profile.json"), profile.to_string()).unwrap();
+}
+
+/// A grandchild that outlives the check by `delay` and then writes `marker`.
+fn forking_script(marker: &Path, delay: f64, parent_sleeps: bool) -> String {
+    format!(
+        "import os, sys, time\n\
+         if os.fork() == 0:\n    time.sleep({delay})\n    open({marker:?}, 'w').write('escaped')\n    os._exit(0)\n\
+         print('checks done')\n\
+         if {parent_sleeps}:\n    time.sleep(30)\n",
+        marker = marker.to_str().unwrap(),
+        parent_sleeps = if parent_sleeps { "True" } else { "False" },
+    )
+}
+
+#[tokio::test]
+async fn verification_kills_the_whole_process_group_after_the_check_exits() {
+    let fx = Fx::new();
+    let marker = fx.dir.path().join("marker");
+    script_profile(&fx, &forking_script(&marker, 1.0, false));
+    fx.snapshot().await;
+
+    let started = std::time::Instant::now();
+    let out = fx.run(EffectKind::RunVerification, b"").await;
+    assert_eq!(out.receipt.outcome, Outcome::Success, "{}", String::from_utf8_lossy(&out.output));
+    assert!(out.verification.as_ref().unwrap().passed);
+    assert!(json(&out)["stdout"].as_str().unwrap().contains("checks done"));
+    assert!(started.elapsed() < Duration::from_millis(900), "did not wait for the grandchild");
+
+    tokio::time::sleep(Duration::from_millis(1800)).await;
+    assert!(!marker.exists(), "a background grandchild survived the verification run");
+}
+
+#[tokio::test]
+async fn verification_timeout_kills_the_whole_process_group() {
+    let fx = Fx::new();
+    let marker = fx.dir.path().join("marker");
+    script_profile(&fx, &forking_script(&marker, 1.0, true));
+    let exec = FixtureExecutor::new(
+        fx.dir.path().join("snapshot"),
+        fx.dir.path().join("profile"),
+        fx.dir.path().join("work"),
+    )
+    .with_verify_timeout(Duration::from_millis(400));
+    let fx = Fx { exec, ..fx };
+    fx.snapshot().await;
+
+    let out = fx.run(EffectKind::RunVerification, b"").await;
+    assert_eq!(reason(&out), "timeout");
+
+    tokio::time::sleep(Duration::from_millis(1800)).await;
+    assert!(!marker.exists(), "a background grandchild survived the timeout");
+}

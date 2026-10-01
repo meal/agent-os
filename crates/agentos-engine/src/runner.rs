@@ -14,6 +14,7 @@ use serde_json::json;
 use crate::agent::{Agent, AgentAction, Observation};
 use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor};
 use crate::patch::patch_paths;
+use crate::workspace::has_excluded_component;
 
 pub const WORKER: &str = "fixture-executor";
 
@@ -152,8 +153,8 @@ pub fn complete(
     Ok(())
 }
 
-/// Runs steps 2-5 for a freshly intended effect. `follow_up` picks the task event from the
-/// outcome and the task as it is right before completion.
+/// Runs steps 2-5 for a freshly intended effect. Returns the outcome and the task as it was
+/// when [`follow_up_event`] chose the completion's follow-up.
 async fn run_effect<E: Executor>(
     db: &Db,
     blobs: &BlobStore,
@@ -161,8 +162,7 @@ async fn run_effect<E: Executor>(
     contract: &Contract,
     rec: &EffectRecord,
     payload: Vec<u8>,
-    follow_up: impl FnOnce(&ExecOutcome, &Task) -> Option<TaskEvent>,
-) -> Result<ExecOutcome> {
+) -> Result<(ExecOutcome, Task)> {
     if rec.state != EffectState::Intended {
         return Err(EngineError::UnexpectedEffectState { effect: rec.effect_id.clone(), state: rec.state });
     }
@@ -170,18 +170,45 @@ async fn run_effect<E: Executor>(
     let out = execute(executor, rec, payload, contract, &ctx).await?;
     let artifact = publish(db, blobs, rec, &ctx, &out)?;
     let task = db.task(&rec.task_id)?;
-    let event = follow_up(&out, &task);
+    let event = follow_up_event(&rec.kind, &out, &task);
     complete(db, rec, &out, &artifact, event)?;
-    Ok(out)
+    Ok((out, task))
 }
 
-/// A `WorkspaceUpdated` follow-up for a successful workspace change, if the task can take it.
-fn workspace_update(out: &ExecOutcome, task: &Task) -> Option<TaskEvent> {
-    match (&out.receipt.outcome, out.new_workspace) {
-        (Outcome::Success, Some(digest)) if task.state == TaskState::Running && !task.cancel_requested => {
-            Some(TaskEvent::WorkspaceUpdated { digest })
+/// The task event that completes an effect of `kind` with outcome `out`, given `task` as
+/// it is right before completion. Recovery reuses this to finish effects after a crash.
+///
+/// - ReadSnapshot / ApplyPatch: `WorkspaceUpdated` with the new digest on success, else none.
+///   It is not filtered by task state: the store applies it (Running or Paused), journals it
+///   as rejected when a cancel is pending or the task is terminal, and errors otherwise.
+/// - RunVerification: `VerifyPassed` for the task's current digest only when the check ran,
+///   passed, and its evidence is for exactly that digest; otherwise `VerifyFailed`.
+/// - ExportBundle: none.
+pub fn follow_up_event(kind: &EffectKind, out: &ExecOutcome, task: &Task) -> Option<TaskEvent> {
+    match kind {
+        EffectKind::ReadSnapshot | EffectKind::ApplyPatch { .. } => match (&out.receipt.outcome, out.new_workspace) {
+            (Outcome::Success, Some(digest)) => Some(TaskEvent::WorkspaceUpdated { digest }),
+            _ => None,
+        },
+        EffectKind::RunVerification => Some(if verification_verdict(out, task).0 {
+            TaskEvent::VerifyPassed { digest: task.workspace_digest }
+        } else {
+            TaskEvent::VerifyFailed
+        }),
+        EffectKind::ExportBundle => None,
+    }
+}
+
+/// Whether a verification outcome proves `task`'s current workspace, and a summary for the
+/// agent. Evidence counts only for the digest the task holds right now.
+pub fn verification_verdict(out: &ExecOutcome, task: &Task) -> (bool, String) {
+    match (&out.receipt.outcome, &out.verification) {
+        (Outcome::Success, Some(r)) if r.workspace == task.workspace_digest => (r.passed, r.summary.clone()),
+        (Outcome::Success, Some(r)) => {
+            (false, format!("evidence is for workspace {}, task has {}", r.workspace, task.workspace_digest))
         }
-        _ => None,
+        (Outcome::Success, None) => (false, "executor returned no verification report".into()),
+        (Outcome::Failure(reason), _) => (false, format!("verification did not complete: {reason}")),
     }
 }
 
@@ -242,7 +269,7 @@ async fn ensure_snapshot<E: Executor>(
             let t = db.task(task)?;
             let request = Digest::of(contract.repository.revision.as_bytes());
             let rec = intend(db, task, EffectKind::ReadSnapshot, request, &t.workspace_digest)?;
-            run_effect(db, blobs, executor, contract, &rec, Vec::new(), workspace_update).await?;
+            run_effect(db, blobs, executor, contract, &rec, Vec::new()).await?;
             db.effect(&rec.effect_id)?
         }
     };
@@ -271,11 +298,13 @@ async fn apply_patch<E: Executor>(
             "action": "ApplyPatch", "reason": "InvalidPatch", "detail": detail, "request_digest": request,
         })),
         Ok(paths) => {
-            let refused: Vec<&String> = paths.iter().filter(|p| !contract.path_allowed(p)).collect();
-            (!refused.is_empty()).then(|| {
-                json!({
-                    "action": "ApplyPatch", "reason": "PathNotEditable", "paths": refused, "request_digest": request,
+            let refused = |reason: &str, bad: Vec<&String>| {
+                (!bad.is_empty()).then(|| {
+                    json!({ "action": "ApplyPatch", "reason": reason, "paths": bad, "request_digest": request })
                 })
+            };
+            refused("PathNotEditable", paths.iter().filter(|p| !contract.path_allowed(p)).collect()).or_else(|| {
+                refused("DigestExcludedPath", paths.iter().filter(|p| has_excluded_component(p)).collect())
             })
         }
     };
@@ -307,7 +336,7 @@ async fn apply_patch<E: Executor>(
         // Same patch on the same base already failed; the store returned that record.
         return Ok(Next::Observe(Observation::PatchRejected { reason: "this patch already failed to apply".into() }));
     }
-    let out = run_effect(db, blobs, executor, contract, &rec, patch.into_bytes(), workspace_update).await?;
+    let (out, _) = run_effect(db, blobs, executor, contract, &rec, patch.into_bytes()).await?;
     Ok(Next::Observe(match (&out.receipt.outcome, out.new_workspace) {
         (Outcome::Success, Some(workspace)) => Observation::PatchApplied { workspace },
         (Outcome::Success, None) => {
@@ -340,28 +369,8 @@ async fn verify<E: Executor>(
     tracing::info!(task_id = %task, step = t.step, "verification started");
     let workspace = t.workspace_digest;
     let rec = intend(db, task, EffectKind::RunVerification, Digest::of(workspace.as_bytes()), &workspace)?;
-    let mut verdict = (false, String::new());
-    let decide = |out: &ExecOutcome, now: &Task| {
-        verdict = match (&out.receipt.outcome, &out.verification) {
-            // Evidence counts only for the digest the task holds right now.
-            (Outcome::Success, Some(r)) if r.workspace == now.workspace_digest => (r.passed, r.summary.clone()),
-            (Outcome::Success, Some(r)) => {
-                (false, format!("evidence is for workspace {}, task has {}", r.workspace, now.workspace_digest))
-            }
-            (Outcome::Success, None) => (false, "executor returned no verification report".into()),
-            (Outcome::Failure(reason), _) => (false, format!("verification did not complete: {reason}")),
-        };
-        if now.state != TaskState::Verifying || now.cancel_requested {
-            return None;
-        }
-        Some(if verdict.0 {
-            TaskEvent::VerifyPassed { digest: now.workspace_digest }
-        } else {
-            TaskEvent::VerifyFailed
-        })
-    };
-    run_effect(db, blobs, executor, contract, &rec, Vec::new(), decide).await?;
-    let (passed, summary) = verdict;
+    let (out, at_completion) = run_effect(db, blobs, executor, contract, &rec, Vec::new()).await?;
+    let (passed, summary) = verification_verdict(&out, &at_completion);
     tracing::info!(task_id = %task, passed, "verification finished");
     Ok(Next::Observe(Observation::Verification { passed, summary }))
 }
@@ -442,5 +451,88 @@ pub async fn run_task<E: Executor, A: Agent>(
             AgentAction::Verify => verify(db, blobs, executor, &contract, task, false).await?,
             AgentAction::Finish => Next::Stop(finish(db, task)?),
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use agentos_core::effect::AttemptId;
+
+    use super::*;
+    use crate::executor::VerificationReport;
+
+    fn task(state: TaskState, workspace: Digest) -> Task {
+        Task { state, ..Task::new(TaskId::new(), workspace) }
+    }
+
+    fn outcome(kind: &EffectKind, ok: bool) -> ExecOutcome {
+        let req = EffectRequest {
+            effect_id: EffectId::derive(&TaskId::new(), 0, kind, &Digest::of(b"r")),
+            task_id: TaskId::new(),
+            kind: kind.clone(),
+            payload: Vec::new(),
+            contract: serde_json::from_value(json!({
+                "goal": "g", "repository": {"source": "s", "revision": "r"}, "profile": "p",
+                "editable_paths": ["src/**"], "verification_profile": "v", "capabilities": [],
+                "limits": {"model_requests": 1, "max_output_tokens_per_request": 1, "tool_actions": 1,
+                           "deadline_seconds": 1, "worker_vcpus": 1, "worker_memory_mib": 1}
+            }))
+            .unwrap(),
+        };
+        let ctx = AttemptCtx { attempt_id: AttemptId::new(), lease_generation: 1, worker: "w".into() };
+        if ok {
+            ExecOutcome::success(&req, &ctx, b"{}".to_vec())
+        } else {
+            ExecOutcome::failure(&req, &ctx, "timeout")
+        }
+    }
+
+    fn d(s: &str) -> Digest {
+        Digest::of(s.as_bytes())
+    }
+
+    #[test]
+    fn workspace_changing_effects_follow_up_with_the_new_digest() {
+        for kind in [EffectKind::ReadSnapshot, EffectKind::ApplyPatch { expected_base: d("w0") }] {
+            let mut out = outcome(&kind, true);
+            out.new_workspace = Some(d("w1"));
+            // Applied whatever the state: the store decides (Paused accepts it too).
+            for state in [TaskState::Running, TaskState::Paused] {
+                assert_eq!(
+                    follow_up_event(&kind, &out, &task(state, d("w0"))),
+                    Some(TaskEvent::WorkspaceUpdated { digest: d("w1") }),
+                    "{kind:?} {state:?}"
+                );
+            }
+            assert_eq!(follow_up_event(&kind, &outcome(&kind, false), &task(TaskState::Running, d("w0"))), None);
+        }
+    }
+
+    #[test]
+    fn verification_follow_up_depends_on_the_report_and_the_current_digest() {
+        let kind = EffectKind::RunVerification;
+        let now = task(TaskState::Verifying, d("w1"));
+        let report = |passed: bool, workspace: Digest| {
+            let mut out = outcome(&kind, true);
+            out.verification = Some(VerificationReport { passed, workspace, summary: "s".into() });
+            out
+        };
+        assert_eq!(follow_up_event(&kind, &report(true, d("w1")), &now), Some(TaskEvent::VerifyPassed { digest: d("w1") }));
+        assert_eq!(follow_up_event(&kind, &report(false, d("w1")), &now), Some(TaskEvent::VerifyFailed));
+        // Passing evidence for another workspace version is not success.
+        assert_eq!(follow_up_event(&kind, &report(true, d("w0")), &now), Some(TaskEvent::VerifyFailed));
+        // Timeout (effect failure) and a missing report both fail verification.
+        assert_eq!(follow_up_event(&kind, &outcome(&kind, false), &now), Some(TaskEvent::VerifyFailed));
+        assert_eq!(follow_up_event(&kind, &outcome(&kind, true), &now), Some(TaskEvent::VerifyFailed));
+        let (passed, summary) = verification_verdict(&outcome(&kind, false), &now);
+        assert!(!passed && summary.contains("timeout"), "{summary}");
+    }
+
+    #[test]
+    fn export_has_no_follow_up() {
+        let kind = EffectKind::ExportBundle;
+        let now = task(TaskState::Running, d("w"));
+        assert_eq!(follow_up_event(&kind, &outcome(&kind, false), &now), None);
+        assert_eq!(follow_up_event(&kind, &outcome(&kind, true), &now), None);
     }
 }

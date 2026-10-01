@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use agentos_engine::workspace::{copy_tree, workspace_digest};
+use agentos_engine::workspace::{copy_tree, has_excluded_component, workspace_digest};
 
 fn write(root: &Path, rel: &str, content: &str) {
     let p = root.join(rel);
@@ -94,4 +94,33 @@ fn copy_tree_refuses_symlinks() {
     write(from.path(), "src/x.py", "x");
     std::os::unix::fs::symlink("/etc/passwd", from.path().join("src/p")).unwrap();
     assert!(copy_tree(from.path(), &to.path().join("ws")).is_err());
+}
+
+/// The patch-denial predicate and the digest's exclusion rule are one function: every path
+/// the predicate flags is invisible to the digest, and every other path changes it.
+#[test]
+fn patch_denial_predicate_matches_digest_exclusions() {
+    let table: &[(&str, bool)] = &[
+        ("src/__pycache__/helper.py", true),
+        ("__pycache__/x.py", true),
+        ("src/.git/config", true),
+        (".git/hooks/pre-commit", true),
+        ("src/helper.pyc", true),
+        ("src/pkg/.pyc", true),
+        ("src/helper.py", false),
+        ("src/pycache/x.py", false),
+        ("src/git/x.py", false),
+        ("src/.gitignore", false),
+        ("src/x.pyc.txt", false),
+        ("src/__pycache__x/y.py", false),
+    ];
+    for (rel, excluded) in table {
+        assert_eq!(has_excluded_component(rel), *excluded, "{rel}");
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), "src/base.py", "b");
+        let base = workspace_digest(d.path()).unwrap();
+        write(d.path(), rel, "payload");
+        let after = workspace_digest(d.path()).unwrap();
+        assert_eq!(after == base, *excluded, "digest exclusion disagrees for {rel}");
+    }
 }

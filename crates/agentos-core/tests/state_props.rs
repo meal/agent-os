@@ -51,6 +51,21 @@ proptest! {
                     if before.cancel_requested {
                         prop_assert!(next.cancel_requested);
                     }
+                    match &ev {
+                        TaskEvent::WorkspaceUpdated { digest } => {
+                            let live = matches!(before.state, TaskState::Running | TaskState::Paused);
+                            prop_assert!(live, "WorkspaceUpdated accepted in {:?}", before.state);
+                            prop_assert_eq!(next.state, before.state);
+                            prop_assert_eq!(next.workspace_digest, *digest);
+                            prop_assert_eq!(next.verified_digest, None);
+                        }
+                        TaskEvent::ActionUsed => prop_assert_eq!(before.state, TaskState::Running),
+                        _ => {}
+                    }
+                    let is_update = matches!(ev, TaskEvent::WorkspaceUpdated { .. });
+                    if next.workspace_digest != before.workspace_digest {
+                        prop_assert!(is_update, "only WorkspaceUpdated changes the digest");
+                    }
                     task = next;
                 }
                 Err(_) => {}

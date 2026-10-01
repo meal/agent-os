@@ -19,3 +19,4 @@ uuid = { version = "1.26.1", features = ["v4", "v7", "serde"] }
 jsonschema = "0.58.4"
 tempfile = "3.27.0"
 proptest = "1.11.0"
+rustix = { version = "1.1.5", features = ["process"] }

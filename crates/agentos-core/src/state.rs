@@ -161,7 +161,9 @@ pub fn reduce(task: &Task, ev: &TaskEvent, limits: &Limits) -> Result<Task, Tran
                 Failed
             };
         }
-        (Running, TaskEvent::WorkspaceUpdated { digest }) => {
+        // Also accepted while Paused: an effect that was in flight when the pause landed
+        // still changed the workspace, and the digest must stay true for the resume.
+        (Running | Paused, TaskEvent::WorkspaceUpdated { digest }) => {
             next.workspace_digest = *digest;
             next.verified_digest = None;
         }
@@ -277,15 +279,67 @@ mod tests {
     }
 
     #[test]
-    fn workspace_updated_only_in_running() {
+    fn workspace_updated_only_in_running_or_paused() {
         let l = limits();
-        for s in [
-            TaskState::Ready,
-            TaskState::Waiting,
-            TaskState::Paused,
-            TaskState::Verifying,
-        ] {
+        for s in [TaskState::Ready, TaskState::Waiting, TaskState::Verifying] {
             assert!(reduce(&at(s), &WorkspaceUpdated { digest: d("w") }, &l).is_err(), "{s:?}");
+        }
+        for s in [TaskState::Running, TaskState::Paused] {
+            let t = Task { verified_digest: Some(d("base")), ..at(s) };
+            let n = reduce(&t, &WorkspaceUpdated { digest: d("w") }, &l).unwrap();
+            assert_eq!(n.state, s, "the update never changes the lifecycle state");
+            assert_eq!(n.workspace_digest, d("w"));
+            assert_eq!(n.verified_digest, None);
+            assert_eq!(n.step, t.step + 1);
+        }
+    }
+
+    #[test]
+    fn effect_finishing_while_paused_keeps_the_digest_current_for_resume() {
+        let l = limits();
+        let t = reduce(&running(), &Paused, &l).unwrap();
+        let t = reduce(&t, &WorkspaceUpdated { digest: d("w1") }, &l).unwrap();
+        let t = reduce(&t, &Resumed, &l).unwrap();
+        let t = reduce(&t, &VerifyStarted, &l).unwrap();
+        assert_eq!(reduce(&t, &VerifyPassed { digest: d("w1") }, &l).unwrap().state, TaskState::Succeeded);
+    }
+
+    #[test]
+    fn workspace_updated_rejected_while_cancel_pending_even_when_paused() {
+        let l = limits();
+        let t = Task { cancel_requested: true, ..at(TaskState::Paused) };
+        assert!(matches!(
+            reduce(&t, &WorkspaceUpdated { digest: d("w") }, &l),
+            Err(TransitionError::CancelRequested { .. })
+        ));
+    }
+
+    /// Which (state, event) pairs the reducer accepts, with no cancel pending.
+    #[test]
+    fn valid_from_state_table() {
+        use TaskState as S;
+        let l = limits();
+        let table: [(&str, &[S]); 13] = [
+            ("Started", &[S::Ready]),
+            ("Waiting", &[S::Running]),
+            ("Woken", &[S::Waiting]),
+            ("Paused", &[S::Running, S::Waiting]),
+            ("Resumed", &[S::Paused]),
+            ("VerifyStarted", &[S::Running]),
+            ("VerifyPassed", &[S::Verifying]),
+            ("VerifyFailed", &[S::Verifying]),
+            ("WorkspaceUpdated", &[S::Running, S::Paused]),
+            ("ActionUsed", &[S::Running]),
+            ("CancelRequested", &[S::Ready, S::Running, S::Waiting, S::Paused, S::Verifying]),
+            ("CancelCompleted", &[]),
+            ("Failed", &[S::Ready, S::Running, S::Waiting, S::Paused, S::Verifying]),
+        ];
+        // all_events() uses the base digest for VerifyPassed, so it is acceptable from Verifying.
+        for ev in all_events() {
+            let (_, valid) = table.iter().find(|(n, _)| *n == ev.name()).unwrap();
+            for s in [S::Ready, S::Running, S::Waiting, S::Paused, S::Verifying] {
+                assert_eq!(reduce(&at(s), &ev, &l).is_ok(), valid.contains(&s), "{s:?} {ev:?}");
+            }
         }
     }
 
