@@ -328,3 +328,15 @@ fn failed_create_task_leaves_no_task_row() {
     let n: i64 = raw.query_row("SELECT count(*) FROM tasks", [], |r| r.get(0)).unwrap();
     assert_eq!(n, 0);
 }
+
+#[test]
+fn contract_returns_the_stored_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+    let (c, d) = contract();
+    let id = db.create_task(&c, &d).unwrap();
+    assert_eq!(db.contract(&id).unwrap(), c);
+    let reopened = open(&dir);
+    assert_eq!(reopened.contract(&id).unwrap(), c);
+    assert!(matches!(db.contract(&TaskId::new()), Err(DbError::NotFound(_))));
+}

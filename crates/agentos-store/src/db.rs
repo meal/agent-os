@@ -340,6 +340,12 @@ impl Db {
         Ok(load_task(&tx, id)?.0)
     }
 
+    /// The contract the task was created with.
+    pub fn contract(&self, id: &TaskId) -> Result<Contract> {
+        let tx = self.read()?;
+        Ok(load_task(&tx, id)?.1)
+    }
+
     pub fn events(&self, id: &TaskId) -> Result<Vec<StoredEvent>> {
         let tx = self.read()?;
         load_task(&tx, id)?;
