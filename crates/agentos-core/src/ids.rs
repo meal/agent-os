@@ -39,6 +39,10 @@ impl Digest {
         Digest(*blake3::hash(bytes).as_bytes())
     }
 
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
     pub fn from_hex(s: &str) -> Result<Digest, DigestError> {
         let h = blake3::Hash::from_hex(s).map_err(|e| DigestError(e.to_string()))?;
         Ok(Digest(*h.as_bytes()))
