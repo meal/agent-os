@@ -969,7 +969,7 @@ fn invalid_follow_up_rolls_back_the_whole_completion() {
 fn digest_mismatched_verify_follow_up_rolls_back_the_whole_completion() {
     let fx = setup();
     fx.db.append(&fx.id, &TaskEvent::VerifyStarted).unwrap();
-    let e = fx.verify(b"v", 1).unwrap();
+    let e = fx.verify(fx.base().as_bytes(), 1).unwrap();
     let a = AttemptId::new();
     fx.db.mark_dispatched(&e.effect_id, &a, "worker-1", 1).unwrap();
     let art = fx.publish(&e, b"evidence");
@@ -1243,4 +1243,49 @@ fn a_dispatched_effect_proven_not_applied_may_be_abandoned_once_cancel_is_pendin
     assert!(matches!(err, DbError::InvalidEffectTransition { from: EffectState::Abandoned, .. }), "{err:?}");
     // Survives a reopen.
     assert_eq!(fx.reopen().effect(&e.effect_id).unwrap().state, EffectState::Abandoned);
+}
+
+/// A verification effect intended, dispatched and published, ready to complete.
+fn verification_ready(fx: &Fx, request: &[u8]) -> (EffectRecord, Receipt, Digest) {
+    let e = fx.verify(request, 0).unwrap();
+    let a = AttemptId::new();
+    fx.db.mark_dispatched(&e.effect_id, &a, "worker-1", 1).unwrap();
+    let art = fx.publish(&e, b"evidence");
+    (e.clone(), Receipt { result_digest: Some(art), ..receipt(&e, &a, 1, Outcome::Success) }, art)
+}
+
+#[test]
+fn verify_passed_follow_up_needs_a_successful_verification_of_this_workspace() {
+    let fx = setup();
+    let ws = fx.base();
+    let passed = || Some(TaskEvent::VerifyPassed { digest: ws });
+
+    // Not a verification at all.
+    let (snap, a) = fx.dispatched(b"s", 1);
+    let art = fx.publish(&snap, b"manifest");
+    let r = Receipt { result_digest: Some(art), ..receipt(&snap, &a, 1, Outcome::Success) };
+    let before = (fx.snapshot(&snap.effect_id), fx.events());
+    let err = fx.db.complete_effect(&snap.effect_id, &r, Some(&art), passed()).unwrap_err();
+    assert!(matches!(err, DbError::UnprovenVerification(_)), "{err:?}");
+    assert_eq!((fx.snapshot(&snap.effect_id), fx.events()), before, "nothing written");
+
+    fx.db.append(&fx.id, &TaskEvent::VerifyStarted).unwrap();
+    // A verification whose request is not bound to the current workspace.
+    let (unbound, r, art) = verification_ready(&fx, b"some other request");
+    let before = (fx.snapshot(&unbound.effect_id), fx.events());
+    let err = fx.db.complete_effect(&unbound.effect_id, &r, Some(&art), passed()).unwrap_err();
+    assert!(matches!(err, DbError::UnprovenVerification(_)), "{err:?}");
+    assert_eq!((fx.snapshot(&unbound.effect_id), fx.events()), before);
+
+    // A bound verification that failed.
+    let (bound, r, art) = verification_ready(&fx, ws.as_bytes());
+    let failed = Receipt { outcome: Outcome::Failure("timeout".into()), ..r.clone() };
+    let err = fx.db.complete_effect(&bound.effect_id, &failed, Some(&art), passed()).unwrap_err();
+    assert!(matches!(err, DbError::UnprovenVerification(_)), "{err:?}");
+    assert_eq!(fx.task().state, TaskState::Verifying);
+
+    // The bound, successful verification is accepted.
+    assert_eq!(fx.db.complete_effect(&bound.effect_id, &r, Some(&art), passed()).unwrap(), ReceiptVerdict::Apply);
+    assert_eq!(fx.task().state, TaskState::Succeeded);
+    assert_eq!(fx.task().verified_digest, Some(ws));
 }

@@ -141,7 +141,7 @@ pub(crate) fn receipt_audited(db: &Db, task: &TaskId, attempt: &Value) -> Result
     Ok(db
         .events(task)?
         .iter()
-        .any(|e| matches!(e.event_type.as_str(), "ReceiptIgnored" | "ReceiptRejected") && e.payload["receipt"]["attempt_id"] == *attempt))
+        .any(|e| matches!(e.event_type.as_str(), "ReceiptIgnored" | "ReceiptRejected" | "RetainedReceiptRejected") && e.payload["receipt"]["attempt_id"] == *attempt))
 }
 
 fn protocol(rec: &EffectRecord, what: &str) -> EngineError {

@@ -2,7 +2,9 @@ use std::collections::HashSet;
 use std::sync::{Arc, Barrier};
 use std::thread;
 
+use agentos_core::budget::Reservation;
 use agentos_core::contract::Contract;
+use agentos_core::effect::{AttemptId, EffectKind, Outcome, Receipt, ReceiptVerdict};
 use agentos_core::ids::{Digest, TaskId};
 use agentos_core::state::{TaskEvent, TaskState, TransitionError};
 use agentos_store::db::{Db, DbError};
@@ -15,7 +17,7 @@ fn contract() -> (Contract, Digest) {
         "profile": "protected",
         "editable_paths": ["src/"],
         "verification_profile": "parser-checks-v1",
-        "capabilities": ["snapshot.read", "workspace.apply_patch"],
+        "capabilities": ["snapshot.read", "workspace.apply_patch", "verification.run"],
         "limits": {
             "model_requests": 10,
             "max_output_tokens_per_request": 1000,
@@ -32,6 +34,26 @@ fn contract() -> (Contract, Digest) {
 
 fn open(dir: &tempfile::TempDir) -> Db {
     Db::open(&dir.path().join("agentos.db")).unwrap()
+}
+
+/// Completes a RunVerification of `workspace` with a passing follow-up (the only way in).
+fn verify_passed(db: &Db, id: &TaskId, workspace: Digest) {
+    let kind = EffectKind::RunVerification;
+    let reserve = Reservation::for_kind(&kind, 0);
+    let rec = db.record_intent(id, kind, Digest::of(workspace.as_bytes()), &workspace, reserve).unwrap();
+    let attempt = AttemptId::new();
+    db.mark_dispatched(&rec.effect_id, &attempt, "w", 1).unwrap();
+    let evidence = Digest::of(b"evidence");
+    db.register_artifact(&evidence, 8, "verification-evidence", Some(&rec.effect_id), "w").unwrap();
+    let receipt = Receipt {
+        effect_id: rec.effect_id.clone(),
+        attempt_id: attempt,
+        lease_generation: 1,
+        outcome: Outcome::Success,
+        result_digest: Some(evidence),
+    };
+    let follow_up = Some(TaskEvent::VerifyPassed { digest: workspace });
+    assert_eq!(db.complete_effect(&rec.effect_id, &receipt, Some(&evidence), follow_up).unwrap(), ReceiptVerdict::Apply);
 }
 
 fn running(db: &Db) -> TaskId {
@@ -153,7 +175,8 @@ fn reopening_the_file_yields_identical_task_and_events() {
         db.append(&id, &TaskEvent::ActionUsed).unwrap();
         db.append(&id, &TaskEvent::WorkspaceUpdated { digest: Digest::of(b"w2") }).unwrap();
         db.append(&id, &TaskEvent::VerifyStarted).unwrap();
-        db.append(&id, &TaskEvent::VerifyPassed { digest: Digest::of(b"w2") }).unwrap();
+        // Success only arrives as the follow-up of a verification of exactly this workspace.
+        verify_passed(&db, &id, Digest::of(b"w2"));
         (db.task(&id).unwrap(), db.events(&id).unwrap(), id)
     };
     let db = Db::open(&path).unwrap();
@@ -214,7 +237,7 @@ fn audit_events_keep_seq_gapless_and_leave_task_untouched() {
     assert_eq!(s1, 3);
     assert_eq!(db.task(&id).unwrap(), before);
     db.append(&id, &TaskEvent::ActionUsed).unwrap();
-    let s2 = db.append_audit(&id, "ReceiptIgnored", &serde_json::json!({})).unwrap();
+    let s2 = db.append_audit(&id, "OperatorNote", &serde_json::json!({})).unwrap();
     assert_eq!(s2, 5);
     let seqs: Vec<u64> = db.events(&id).unwrap().iter().map(|e| e.seq).collect();
     assert_eq!(seqs, vec![1, 2, 3, 4, 5]);
@@ -339,4 +362,52 @@ fn contract_returns_the_stored_contract() {
     let reopened = open(&dir);
     assert_eq!(reopened.contract(&id).unwrap(), c);
     assert!(matches!(db.contract(&TaskId::new()), Err(DbError::NotFound(_))));
+}
+
+#[test]
+fn verify_passed_cannot_be_appended_directly() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+    let id = running(&db);
+    db.append(&id, &TaskEvent::VerifyStarted).unwrap();
+    let before = (db.task(&id).unwrap(), db.events(&id).unwrap());
+    let ws = before.0.workspace_digest;
+    let err = db.append(&id, &TaskEvent::VerifyPassed { digest: ws }).unwrap_err();
+    assert!(matches!(err, DbError::UnprovenVerification(_)), "{err:?}");
+    assert!(err.to_string().contains("RunVerification"), "{err}");
+    assert_eq!((db.task(&id).unwrap(), db.events(&id).unwrap()), before);
+}
+
+#[test]
+fn audit_rows_cannot_forge_engine_or_store_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+    let id = running(&db);
+    let n = db.events(&id).unwrap().len();
+    for name in [
+        "TaskCreated", "Started", "Waiting", "Woken", "Paused", "Resumed", "VerifyStarted", "VerifyPassed",
+        "VerifyFailed", "WorkspaceUpdated", "ActionUsed", "CancelRequested", "CancelCompleted", "Failed",
+        "EffectIntended", "EffectDispatched", "EffectCompleted", "EffectFailed", "EffectUnknown", "EffectAbandoned",
+        "ArtifactRegistered", "TaskEventRejected", "ReceiptIgnored", "ReceiptRejected",
+    ] {
+        let err = db.append_audit(&id, name, &serde_json::json!({})).unwrap_err();
+        assert!(matches!(err, DbError::ReservedEventType(ref t) if t == name), "{name}: {err:?}");
+    }
+    assert_eq!(db.events(&id).unwrap().len(), n);
+}
+
+#[test]
+fn a_new_database_records_its_schema_version_and_a_newer_one_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("agentos.db");
+    let db = Db::open(&path).unwrap();
+    assert_eq!(db.pragma_string("user_version").unwrap(), agentos_store::db::SCHEMA_VERSION.to_string());
+    drop(db);
+    // Reopening a current database is fine.
+    drop(Db::open(&path).unwrap());
+    let future = agentos_store::db::SCHEMA_VERSION + 1;
+    Connection::open(&path).unwrap().pragma_update(None, "user_version", future).unwrap();
+    let err = Db::open(&path).err().expect("a newer schema is refused");
+    assert!(matches!(err, DbError::SchemaVersion { found, supported } if found == future && supported == agentos_store::db::SCHEMA_VERSION), "{err:?}");
+    assert!(err.to_string().contains("newer"), "{err}");
 }

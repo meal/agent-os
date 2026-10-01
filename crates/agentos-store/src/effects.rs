@@ -469,6 +469,25 @@ impl Db {
             }
         }
         let (task, contract) = load_task(&tx, &rec.task_id)?;
+        if let Some(TaskEvent::VerifyPassed { .. }) = &follow_up {
+            // Success is bound to evidence: a successful verification effect intended for
+            // exactly the task's current workspace (the engine's request digest is the
+            // digest of that workspace digest). The reducer then requires the follow-up's
+            // digest to be that workspace too.
+            let bound = Digest::of(task.workspace_digest.as_bytes());
+            let why = if rec.kind != EffectKind::RunVerification {
+                Some(format!("effect {effect} is {}, not a verification", rec.kind.tag()))
+            } else if receipt.outcome != Outcome::Success {
+                Some(format!("verification {effect} did not succeed"))
+            } else if rec.request_digest != bound {
+                Some(format!("verification {effect} was not intended for the current workspace {}", task.workspace_digest))
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                return Err(DbError::UnprovenVerification(format!("VerifyPassed refused: {why}")));
+            }
+        }
         let (state, event_type) = match receipt.outcome {
             Outcome::Success => (EffectState::Completed, "EffectCompleted"),
             Outcome::Failure(_) => (EffectState::Failed, "EffectFailed"),

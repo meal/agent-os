@@ -1,5 +1,9 @@
-//! Crash recovery: bring every outstanding effect of a task to a decided state, so the
-//! journal, the usage ledger and the workspace agree again, before the run loop resumes.
+//! Crash recovery: bring every outstanding effect of a task to a decided state before the
+//! run loop resumes. On a task that can still dispatch, the journal, the usage ledger and
+//! the workspace then agree again. Two exceptions: a patch that completes while a cancel is
+//! pending has its `WorkspaceUpdated` journaled as `TaskEventRejected`, so the task's
+//! workspace digest lags the disk (the effect's published result holds the true digest);
+//! and an unreconcilable effect stays UNKNOWN, so whether it took effect is not known.
 //!
 //! Order of work:
 //! 1. `BlobStore::gc` against the registered artifacts. It is only safe with no concurrent
@@ -171,7 +175,7 @@ async fn use_retained<E: Executor>(cx: &Cx<'_, E>, rec: &EffectRecord, report: &
         if verdict == ReceiptVerdict::Apply {
             // Applicable by lease, but it does not describe its own output.
             let audit = json!({ "reason": "ResultDigestMismatch", "effect_id": rec.effect_id, "receipt": out.receipt });
-            cx.db.append_audit(&cx.task, "ReceiptIgnored", &audit)?;
+            cx.db.append_audit(&cx.task, "RetainedReceiptRejected", &audit)?;
         } else {
             // The store re-derives the same verdict and journals the receipt as ignored.
             cx.db.complete_effect(&rec.effect_id, &out.receipt, None, None)?;

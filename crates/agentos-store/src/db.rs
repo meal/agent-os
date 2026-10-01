@@ -10,6 +10,22 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 
 const OWNER: &str = "local-owner";
 
+/// Stored in `PRAGMA user_version`. Bump it on every change to [`SCHEMA`] an older build
+/// could misread, and teach [`Db::open`] to migrate from the previous version; a database
+/// newer than this build is refused rather than misread. 0 is a database created before
+/// versioning (identical to version 1) or a brand-new file.
+pub const SCHEMA_VERSION: i64 = 1;
+
+/// Event types the store and the engine's state machine own. An audit row may not use
+/// them, so it can never forge a lifecycle event, an effect transition, or a receipt verdict
+/// that readers of the journal (replay, export) rely on.
+const RESERVED_EVENT_TYPES: &[&str] = &[
+    "TaskCreated", "Started", "Waiting", "Woken", "Paused", "Resumed", "VerifyStarted", "VerifyPassed",
+    "VerifyFailed", "WorkspaceUpdated", "ActionUsed", "CancelRequested", "CancelCompleted", "Failed",
+    "EffectIntended", "EffectDispatched", "EffectCompleted", "EffectFailed", "EffectUnknown", "EffectAbandoned",
+    "ArtifactRegistered", "TaskEventRejected", "ReceiptIgnored", "ReceiptRejected",
+];
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS tasks(
     id TEXT PRIMARY KEY,
@@ -79,6 +95,7 @@ CREATE TABLE IF NOT EXISTS usage(
     settled_tool_actions INTEGER,
     status TEXT NOT NULL CHECK(status IN ('Reserved', 'Settled', 'Uncertain', 'Released'))
 );
+-- Reserved for Phase 3 (capability leases and observed revisions); unused in Phases 1-2.
 CREATE TABLE IF NOT EXISTS capabilities(
     id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL REFERENCES tasks(id),
@@ -121,6 +138,12 @@ pub enum DbError {
     InvalidReservation { expected: u32, got: u32 },
     #[error("effects of this task may not be abandoned (state {state:?}, cancel_requested {cancel_requested}): it could still dispatch them")]
     NotAbandonable { state: TaskState, cancel_requested: bool },
+    #[error("{0}")]
+    UnprovenVerification(String),
+    #[error("event type {0:?} is reserved for the store and the engine; an audit row may not use it")]
+    ReservedEventType(String),
+    #[error("database schema version {found} is newer than the {supported} this build supports; upgrade agentos")]
+    SchemaVersion { found: i64, supported: i64 },
     #[error("effect not found: {0}")]
     EffectNotFound(EffectId),
     #[error("effect {effect} cannot move from {from:?} to {to:?}")]
@@ -264,7 +287,14 @@ impl Db {
         }
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version > SCHEMA_VERSION {
+            return Err(DbError::SchemaVersion { found: version, supported: SCHEMA_VERSION });
+        }
         conn.execute_batch(SCHEMA)?;
+        if version < SCHEMA_VERSION {
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        }
         Ok(Db { conn })
     }
 
@@ -291,7 +321,9 @@ impl Db {
 
     pub fn create_task(&self, contract: &Contract, contract_digest: &Digest) -> Result<TaskId> {
         let id = TaskId::new();
-        // Placeholder base workspace digest until real workspace digests exist (Task 9).
+        // A placeholder base digest by design: the task's ReadSnapshot effect replaces it with
+        // the real workspace digest (WorkspaceUpdated) before any other work. `checkpoint`
+        // stays NULL: journal replay is the checkpoint mechanism.
         let base = Digest::of(contract.repository.revision.as_bytes());
         let task = Task::new(id.clone(), base);
         let now = now_ts();
@@ -317,7 +349,14 @@ impl Db {
         Ok(id)
     }
 
+    /// Applies a lifecycle event. `VerifyPassed` is refused: success may only arrive as the
+    /// follow-up of a completed verification effect (see `complete_effect`).
     pub fn append(&self, id: &TaskId, ev: &TaskEvent) -> Result<Task> {
+        if matches!(ev, TaskEvent::VerifyPassed { .. }) {
+            return Err(DbError::UnprovenVerification(
+                "VerifyPassed may only arrive as the follow-up of a completed, successful RunVerification effect".into(),
+            ));
+        }
         let tx = self.immediate()?;
         let (task, contract) = load_task(&tx, id)?;
         // On error `tx` is dropped, which rolls back; nothing has been written yet anyway.
@@ -328,8 +367,12 @@ impl Db {
         Ok(next)
     }
 
-    /// Append an event row without touching task state (denials, ignored receipts).
+    /// Append an event row without touching task state (denials, agent turns, recovery
+    /// decisions). Reserved event types are refused.
     pub fn append_audit(&self, id: &TaskId, event_type: &str, payload: &serde_json::Value) -> Result<u64> {
+        if RESERVED_EVENT_TYPES.contains(&event_type) {
+            return Err(DbError::ReservedEventType(event_type.to_string()));
+        }
         let tx = self.immediate()?;
         load_task(&tx, id)?;
         let seq = insert_event(&tx, id, event_type, payload)?;
