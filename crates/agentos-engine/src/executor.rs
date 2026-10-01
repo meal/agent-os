@@ -6,6 +6,7 @@ use std::future::Future;
 use agentos_core::contract::Contract;
 use agentos_core::effect::{AttemptId, EffectId, EffectKind, Outcome, Receipt};
 use agentos_core::ids::{Digest, TaskId};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
 pub struct EffectRequest {
@@ -24,7 +25,7 @@ pub struct AttemptCtx {
     pub worker: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerificationReport {
     pub passed: bool,
     /// The workspace digest the check ran against.
@@ -32,7 +33,7 @@ pub struct VerificationReport {
     pub summary: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecOutcome {
     pub receipt: Receipt,
     /// Bytes of the result artifact; failures carry a JSON description.
@@ -76,8 +77,38 @@ impl ExecOutcome {
     }
 }
 
+/// What an executor can tell about a dispatched effect it holds no receipt for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reconciliation {
+    /// The effect provably did not take effect; a new attempt is safe.
+    NotApplied,
+    /// The effect provably took effect; this is the outcome it had.
+    Applied(ExecOutcome),
+    /// Cannot tell. The effect must be treated as possibly applied.
+    Unknown,
+}
+
 pub trait Executor {
     /// Runs one attempt of an effect. Never panics on effect failure: every failure is an
     /// `Outcome::Failure` receipt with a JSON description in `output`.
     fn run(&self, req: &EffectRequest, ctx: &AttemptCtx) -> impl Future<Output = ExecOutcome> + Send;
+
+    /// The latest outcome the executor durably retained for `effect` (highest lease
+    /// generation), independent of the controller's database. Recovery publishes it instead
+    /// of running the effect again.
+    fn retained_outcome(&self, _effect: &EffectId) -> Option<ExecOutcome> {
+        None
+    }
+
+    /// Inspects the world to decide whether a dispatched effect without a receipt took
+    /// effect. `ctx` is the attempt an `Applied` outcome's receipt is issued under.
+    fn reconcile(&self, _req: &EffectRequest, _ctx: &AttemptCtx) -> impl Future<Output = Reconciliation> + Send {
+        async { Reconciliation::Unknown }
+    }
+
+    /// The current digest of `task`'s workspace, `Err` when it cannot be read (e.g. it is
+    /// gone), or `None` when this executor cannot tell.
+    fn current_workspace(&self, _task: &TaskId) -> Option<Result<Digest, String>> {
+        None
+    }
 }

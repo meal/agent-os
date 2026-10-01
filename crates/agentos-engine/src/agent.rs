@@ -1,9 +1,10 @@
 use std::collections::VecDeque;
 
 use agentos_core::ids::Digest;
+use serde::{Deserialize, Serialize};
 
 /// What the agent asks the runner to do next.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentAction {
     /// Apply a unified diff to the workspace.
     ApplyPatch(String),
@@ -14,7 +15,7 @@ pub enum AgentAction {
 }
 
 /// What the runner tells the agent after each step.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Observation {
     Start { files: Vec<String>, workspace: Digest },
     PatchApplied { workspace: Digest },

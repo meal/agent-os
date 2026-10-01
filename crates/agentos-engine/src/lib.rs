@@ -1,7 +1,12 @@
 pub mod agent;
+pub mod crash;
+pub mod durable;
 pub mod executor;
 pub mod fixture;
+mod journal;
 pub mod patch;
 mod process;
+pub mod recover;
 pub mod runner;
+pub mod steps;
 pub mod workspace;

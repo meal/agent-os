@@ -10,7 +10,7 @@ use agentos_core::ids::{Digest, TaskId};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor, VerificationReport};
+use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor, Reconciliation, VerificationReport};
 use crate::patch::{git, paths_of_file};
 use crate::process::{run_in_group, GroupError};
 use crate::workspace::{copy_tree, has_excluded_component, workspace_digest};
@@ -100,16 +100,51 @@ impl FixtureExecutor {
         }
     }
 
+    /// The success outcome of an applied patch; reconciliation rebuilds the same bytes.
+    fn patch_applied(req: &EffectRequest, ctx: &AttemptCtx, paths: Vec<String>, digest: Digest) -> ExecOutcome {
+        let output = json!({ "applied": true, "paths": paths, "workspace_digest": digest });
+        let mut out = ExecOutcome::success(req, ctx, output.to_string().into_bytes());
+        out.new_workspace = Some(digest);
+        out
+    }
+
     async fn apply_patch(&self, req: &EffectRequest, ctx: &AttemptCtx, expected_base: Digest) -> ExecOutcome {
         match self.try_apply_patch(req, expected_base).await {
-            Ok((paths, digest)) => {
-                let output = json!({ "applied": true, "paths": paths, "workspace_digest": digest });
-                let mut out = ExecOutcome::success(req, ctx, output.to_string().into_bytes());
-                out.new_workspace = Some(digest);
-                out
-            }
+            Ok((paths, digest)) => FixtureExecutor::patch_applied(req, ctx, paths, digest),
             Err(reason) => ExecOutcome::failure(req, ctx, reason),
         }
+    }
+
+    /// Whether the patch in `req` was applied to the workspace: `Ok(None)` if the workspace
+    /// is still exactly the expected base, `Ok(Some(..))` if it is exactly the base plus
+    /// this patch (reverting the patch on a scratch copy gives the base back), else `Err`.
+    async fn patch_state(&self, req: &EffectRequest, expected_base: Digest) -> Result<Option<(Vec<String>, Digest)>, String> {
+        let ws = self.workspace(&req.task_id);
+        if !ws.is_dir() {
+            return Err("workspace missing".into());
+        }
+        let actual = workspace_digest(&ws).map_err(|e| format!("cannot digest workspace: {e}"))?;
+        if actual == expected_base {
+            return Ok(None);
+        }
+        let scratch =
+            tempfile::tempdir_in(self.task_dir(&req.task_id)).map_err(|e| format!("scratch dir: {e}"))?;
+        let patch_file = scratch.path().join("change.patch");
+        std::fs::write(&patch_file, &req.payload).map_err(|e| format!("cannot write patch: {e}"))?;
+        let paths = paths_of_file(&patch_file, scratch.path()).await?;
+        let copy = scratch.path().join("ws");
+        copy_tree(&ws, &copy).map_err(|e| format!("cannot copy workspace: {e}"))?;
+        let reverted = git(&copy)
+            .args(["apply", "--reverse"])
+            .arg(&patch_file)
+            .output()
+            .await
+            .map_err(|e| format!("cannot run git: {e}"))?;
+        let reverted = reverted.status.success() && workspace_digest(&copy).is_ok_and(|d| d == expected_base);
+        if !reverted {
+            return Err(format!("workspace {actual} is neither the base {expected_base} nor the base with this patch"));
+        }
+        Ok(Some((paths, actual)))
     }
 
     /// Validation order: parse, editable paths, symlinks, expected base; only then git.
@@ -237,6 +272,7 @@ impl FixtureExecutor {
             .map(str::to_string)
             .unwrap_or_else(|| format!("exit code {exit_code:?}"));
         let evidence = json!({
+            "summary": summary,
             "profile_id": profile.id,
             "profile_digest": profile_digest,
             "workspace_digest": workspace,
@@ -260,5 +296,29 @@ impl Executor for FixtureExecutor {
             EffectKind::RunVerification => self.run_verification(req, ctx).await,
             EffectKind::ExportBundle => ExecOutcome::failure(req, ctx, "not implemented in this milestone"),
         }
+    }
+
+    /// Only a patch can be reconciled; the other kinds are retried or left unknown.
+    async fn reconcile(&self, req: &EffectRequest, ctx: &AttemptCtx) -> Reconciliation {
+        let EffectKind::ApplyPatch { expected_base } = req.kind else {
+            return Reconciliation::Unknown;
+        };
+        match self.patch_state(req, expected_base).await {
+            Ok(None) => Reconciliation::NotApplied,
+            Ok(Some((paths, digest))) => Reconciliation::Applied(FixtureExecutor::patch_applied(req, ctx, paths, digest)),
+            Err(reason) => {
+                tracing::warn!(effect_id = %req.effect_id, reason, "patch cannot be reconciled");
+                Reconciliation::Unknown
+            }
+        }
+    }
+
+    fn current_workspace(&self, task: &TaskId) -> Option<Result<Digest, String>> {
+        let ws = self.workspace(task);
+        Some(if ws.is_dir() {
+            workspace_digest(&ws).map_err(|e| e.to_string())
+        } else {
+            Err(format!("workspace directory {} is missing", ws.display()))
+        })
     }
 }

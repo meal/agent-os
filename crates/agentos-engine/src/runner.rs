@@ -1,22 +1,27 @@
-//! The run loop. Each effect goes through separate steps, in this order, so recovery can
-//! resume between any two of them:
-//! [`intend`] -> [`dispatch`] -> [`execute`] -> [`publish`] -> [`complete`].
+//! The run loop. The agent chooses an action, the runner journals it as an `AgentTurn`, then
+//! performs it through the effect steps in [`crate::steps`]. Every action is idempotent
+//! against the journal (see [`crate::journal`]), so after a crash `run_task` recovers the
+//! outstanding effects ([`crate::recover`]), replays the open session into a fresh agent
+//! and carries on exactly where the killed controller stopped.
 
-use agentos_core::budget::Reservation;
 use agentos_core::contract::{Capability, Contract};
-use agentos_core::effect::{AttemptId, EffectId, EffectKind, EffectRecord, EffectState, Outcome, ReceiptVerdict};
+use agentos_core::effect::{EffectId, EffectKind, EffectRecord, EffectState, ReceiptVerdict};
 use agentos_core::ids::{Digest, TaskId};
-use agentos_core::state::{Task, TaskEvent, TaskState};
+use agentos_core::state::{TaskEvent, TaskState};
 use agentos_store::blob::BlobStore;
 use agentos_store::db::{Db, DbError};
 use serde_json::json;
 
 use crate::agent::{Agent, AgentAction, Observation};
-use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor};
+use crate::crash::{CrashPoint, RunOptions};
+use crate::executor::Executor;
+use crate::journal;
 use crate::patch::patch_paths;
+use crate::recover;
+use crate::steps::{intend, run_attempt, Cx};
 use crate::workspace::has_excluded_component;
 
-pub const WORKER: &str = "fixture-executor";
+pub use crate::steps::{follow_up_event, verification_verdict, WORKER};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -24,17 +29,19 @@ pub enum EngineError {
     Db(#[from] DbError),
     #[error("blob store: {0}")]
     Blob(#[from] std::io::Error),
-    #[error("task {task} has outstanding effects {effects:?}; recover them before running")]
-    OutstandingEffects { task: TaskId, effects: Vec<EffectId> },
-    #[error("effect {effect} is {state:?}, expected it to be freshly intended")]
+    #[error("effect {effect} is {state:?}, expected it to be freshly intended or finished")]
     UnexpectedEffectState { effect: EffectId, state: EffectState },
     #[error("receipt for effect {effect} was not applied: {verdict:?}")]
     ReceiptNotApplied { effect: EffectId, verdict: ReceiptVerdict },
     #[error("executor protocol violation: {0}")]
     Protocol(String),
+    #[error("injected crash at {0}")]
+    Crashed(CrashPoint),
+    #[error("agent replay diverged at turn {turn}: journaled {journaled}, agent chose {emitted}")]
+    NondeterministicAgent { turn: u32, journaled: String, emitted: String },
 }
 
-type Result<T> = std::result::Result<T, EngineError>;
+pub(crate) type Result<T> = std::result::Result<T, EngineError>;
 
 /// Where the loop goes after a step: give the agent an observation, or stop.
 enum Next {
@@ -42,174 +49,10 @@ enum Next {
     Stop(TaskState),
 }
 
-/// Ceiling on agent turns per `run_task` call. Denied patches and repeated verifications
-/// consume no tool action, so without it a confused agent could loop forever.
+/// Ceiling on agent turns per session. Denied patches and repeated verifications consume
+/// no tool action, so without it a confused agent could loop forever.
 fn turn_limit(contract: &Contract) -> u32 {
     contract.limits.tool_actions.saturating_mul(4).saturating_add(8)
-}
-
-/// Step 1: durably record the intent (and its reservation) before anything runs.
-pub fn intend(
-    db: &Db,
-    task: &TaskId,
-    kind: EffectKind,
-    request: Digest,
-    expected_workspace: &Digest,
-) -> Result<EffectRecord> {
-    let reserve = Reservation::for_kind(&kind, 0);
-    let rec = db.record_intent(task, kind, request, expected_workspace, reserve)?;
-    tracing::info!(
-        task_id = %task, step = rec.step, effect_id = %rec.effect_id, kind = rec.kind.tag(),
-        "effect intended"
-    );
-    Ok(rec)
-}
-
-/// Step 2: mark the effect dispatched under a fresh attempt and the next lease generation.
-pub fn dispatch(db: &Db, rec: &EffectRecord) -> Result<AttemptCtx> {
-    let ctx = AttemptCtx {
-        attempt_id: AttemptId::new(),
-        lease_generation: rec.lease_generation + 1,
-        worker: WORKER.to_string(),
-    };
-    db.mark_dispatched(&rec.effect_id, &ctx.attempt_id, &ctx.worker, ctx.lease_generation)?;
-    tracing::info!(
-        task_id = %rec.task_id, effect_id = %rec.effect_id, lease = ctx.lease_generation,
-        "effect dispatched"
-    );
-    Ok(ctx)
-}
-
-/// Step 3: run the attempt on the executor.
-pub async fn execute<E: Executor>(
-    executor: &E,
-    rec: &EffectRecord,
-    payload: Vec<u8>,
-    contract: &Contract,
-    ctx: &AttemptCtx,
-) -> Result<ExecOutcome> {
-    let req = EffectRequest {
-        effect_id: rec.effect_id.clone(),
-        task_id: rec.task_id.clone(),
-        kind: rec.kind.clone(),
-        payload,
-        contract: contract.clone(),
-    };
-    let out = executor.run(&req, ctx).await;
-    if out.receipt.result_digest != Some(Digest::of(&out.output)) {
-        let msg = format!("receipt for {} does not describe its output", rec.effect_id);
-        return Err(EngineError::Protocol(msg));
-    }
-    tracing::info!(
-        task_id = %rec.task_id, effect_id = %rec.effect_id, outcome = ?out.receipt.outcome,
-        "effect executed"
-    );
-    Ok(out)
-}
-
-fn artifact_type(kind: &EffectKind, outcome: &Outcome) -> &'static str {
-    match (kind, outcome) {
-        (_, Outcome::Failure(_)) => "effect-failure",
-        (EffectKind::ReadSnapshot, _) => "snapshot-manifest",
-        (EffectKind::ApplyPatch { .. }, _) => "patch-result",
-        (EffectKind::RunVerification, _) => "verification-evidence",
-        (EffectKind::ExportBundle, _) => "export-bundle",
-    }
-}
-
-/// Step 4: write the result bytes to the blob store, then register them for the effect.
-pub fn publish(
-    db: &Db,
-    blobs: &BlobStore,
-    rec: &EffectRecord,
-    ctx: &AttemptCtx,
-    out: &ExecOutcome,
-) -> Result<Digest> {
-    let digest = blobs.put(&out.output)?;
-    let provenance = json!({ "worker": ctx.worker, "attempt_id": ctx.attempt_id, "effect_id": rec.effect_id });
-    db.register_artifact(
-        &digest,
-        out.output.len() as u64,
-        artifact_type(&rec.kind, &out.receipt.outcome),
-        Some(&rec.effect_id),
-        &provenance.to_string(),
-    )?;
-    Ok(digest)
-}
-
-/// Step 5: apply the receipt together with the follow-up task event.
-pub fn complete(
-    db: &Db,
-    rec: &EffectRecord,
-    out: &ExecOutcome,
-    artifact: &Digest,
-    follow_up: Option<TaskEvent>,
-) -> Result<()> {
-    let verdict = db.complete_effect(&rec.effect_id, &out.receipt, Some(artifact), follow_up)?;
-    if verdict != ReceiptVerdict::Apply {
-        return Err(EngineError::ReceiptNotApplied { effect: rec.effect_id.clone(), verdict });
-    }
-    tracing::info!(task_id = %rec.task_id, effect_id = %rec.effect_id, "effect completed");
-    Ok(())
-}
-
-/// Runs steps 2-5 for a freshly intended effect. Returns the outcome and the task as it was
-/// when [`follow_up_event`] chose the completion's follow-up.
-async fn run_effect<E: Executor>(
-    db: &Db,
-    blobs: &BlobStore,
-    executor: &E,
-    contract: &Contract,
-    rec: &EffectRecord,
-    payload: Vec<u8>,
-) -> Result<(ExecOutcome, Task)> {
-    if rec.state != EffectState::Intended {
-        return Err(EngineError::UnexpectedEffectState { effect: rec.effect_id.clone(), state: rec.state });
-    }
-    let ctx = dispatch(db, rec)?;
-    let out = execute(executor, rec, payload, contract, &ctx).await?;
-    let artifact = publish(db, blobs, rec, &ctx, &out)?;
-    let task = db.task(&rec.task_id)?;
-    let event = follow_up_event(&rec.kind, &out, &task);
-    complete(db, rec, &out, &artifact, event)?;
-    Ok((out, task))
-}
-
-/// The task event that completes an effect of `kind` with outcome `out`, given `task` as
-/// it is right before completion. Recovery reuses this to finish effects after a crash.
-///
-/// - ReadSnapshot / ApplyPatch: `WorkspaceUpdated` with the new digest on success, else none.
-///   It is not filtered by task state: the store applies it (Running or Paused), journals it
-///   as rejected when a cancel is pending or the task is terminal, and errors otherwise.
-/// - RunVerification: `VerifyPassed` for the task's current digest only when the check ran,
-///   passed, and its evidence is for exactly that digest; otherwise `VerifyFailed`.
-/// - ExportBundle: none.
-pub fn follow_up_event(kind: &EffectKind, out: &ExecOutcome, task: &Task) -> Option<TaskEvent> {
-    match kind {
-        EffectKind::ReadSnapshot | EffectKind::ApplyPatch { .. } => match (&out.receipt.outcome, out.new_workspace) {
-            (Outcome::Success, Some(digest)) => Some(TaskEvent::WorkspaceUpdated { digest }),
-            _ => None,
-        },
-        EffectKind::RunVerification => Some(if verification_verdict(out, task).0 {
-            TaskEvent::VerifyPassed { digest: task.workspace_digest }
-        } else {
-            TaskEvent::VerifyFailed
-        }),
-        EffectKind::ExportBundle => None,
-    }
-}
-
-/// Whether a verification outcome proves `task`'s current workspace, and a summary for the
-/// agent. Evidence counts only for the digest the task holds right now.
-pub fn verification_verdict(out: &ExecOutcome, task: &Task) -> (bool, String) {
-    match (&out.receipt.outcome, &out.verification) {
-        (Outcome::Success, Some(r)) if r.workspace == task.workspace_digest => (r.passed, r.summary.clone()),
-        (Outcome::Success, Some(r)) => {
-            (false, format!("evidence is for workspace {}, task has {}", r.workspace, task.workspace_digest))
-        }
-        (Outcome::Success, None) => (false, "executor returned no verification report".into()),
-        (Outcome::Failure(reason), _) => (false, format!("verification did not complete: {reason}")),
-    }
 }
 
 /// The capability's contract name, e.g. `verification.run`.
@@ -217,7 +60,7 @@ fn capability_name(cap: Capability) -> String {
     serde_json::to_value(cap).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()
 }
 
-fn fail(db: &Db, task: &TaskId, reason: &str) -> Result<TaskState> {
+pub(crate) fn fail(db: &Db, task: &TaskId, reason: &str) -> Result<TaskState> {
     tracing::info!(task_id = %task, reason, "task failed");
     Ok(db.append(task, &TaskEvent::Failed { reason: reason.into() })?.state)
 }
@@ -239,61 +82,95 @@ fn interrupted(db: &Db, task: &TaskId) -> Result<Option<TaskState>> {
     Ok(None)
 }
 
-/// The task's ReadSnapshot effect, found through its `EffectIntended` journal entry.
-fn snapshot_effect(db: &Db, task: &TaskId) -> Result<Option<EffectRecord>> {
-    for ev in db.events(task)? {
-        if ev.event_type == "EffectIntended" && ev.payload["kind"] == "ReadSnapshot" {
-            let id: EffectId =
-                serde_json::from_value(ev.payload["effect_id"].clone()).map_err(DbError::from)?;
-            return Ok(Some(db.effect(&id)?));
+/// Runs a freshly intended effect, or takes an already finished one as it is (an idempotent
+/// intent may return it), and gives the agent its observation.
+async fn effect_turn<E: Executor>(cx: &Cx<'_, E>, rec: EffectRecord, payload: Vec<u8>) -> Result<Next> {
+    let rec = match rec.state {
+        EffectState::Intended => {
+            let verdict = run_attempt(cx, &rec, payload).await?;
+            if verdict != ReceiptVerdict::Apply {
+                return Err(EngineError::ReceiptNotApplied { effect: rec.effect_id, verdict });
+            }
+            cx.db.effect(&rec.effect_id)?
         }
-    }
-    Ok(None)
+        EffectState::Completed | EffectState::Failed => rec,
+        state => return Err(EngineError::UnexpectedEffectState { effect: rec.effect_id, state }),
+    };
+    Ok(Next::Observe(journal::effect_observation(cx.blobs, &rec)?))
 }
 
-/// Ensures the workspace exists; returns the snapshot's file list, or the state to stop in.
-async fn ensure_snapshot<E: Executor>(
-    db: &Db,
-    blobs: &BlobStore,
-    executor: &E,
-    contract: &Contract,
-    task: &TaskId,
-) -> Result<std::result::Result<Vec<String>, TaskState>> {
-    let rec = match snapshot_effect(db, task)? {
-        Some(rec) => rec,
-        None if !contract.capabilities.contains(&Capability::SnapshotRead) => {
+/// Ensures the workspace exists; returns the snapshot's file list and whether the snapshot
+/// predates this call, or the state to stop in.
+async fn ensure_snapshot<E: Executor>(cx: &Cx<'_, E>) -> Result<std::result::Result<(Vec<String>, bool), TaskState>> {
+    let (db, task) = (cx.db, &cx.task);
+    let events = db.events(task)?;
+    let (rec, resumed) = match journal::intended(&events, "ReadSnapshot", None)? {
+        Some(id) => (db.effect(&id)?, true),
+        None if !cx.contract.capabilities.contains(&Capability::SnapshotRead) => {
             let reason = format!("capability {} not granted", capability_name(Capability::SnapshotRead));
             return Ok(Err(fail(db, task, &reason)?));
         }
         None => {
             let t = db.task(task)?;
-            let request = Digest::of(contract.repository.revision.as_bytes());
+            let request = Digest::of(cx.contract.repository.revision.as_bytes());
             let rec = intend(db, task, EffectKind::ReadSnapshot, request, &t.workspace_digest)?;
-            run_effect(db, blobs, executor, contract, &rec, Vec::new()).await?;
-            db.effect(&rec.effect_id)?
+            cx.crash(CrashPoint::AfterIntent, Some(rec.kind.tag()))?;
+            let verdict = run_attempt(cx, &rec, Vec::new()).await?;
+            if verdict != ReceiptVerdict::Apply {
+                return Err(EngineError::ReceiptNotApplied { effect: rec.effect_id, verdict });
+            }
+            (db.effect(&rec.effect_id)?, false)
         }
     };
     if rec.state != EffectState::Completed {
         return Ok(Err(fail(db, task, "snapshot failed")?));
     }
     let digest = rec.result_digest.ok_or_else(|| EngineError::Protocol("snapshot without manifest".into()))?;
-    let manifest: serde_json::Value = serde_json::from_slice(&blobs.get(&digest)?).map_err(DbError::from)?;
+    let manifest: serde_json::Value = serde_json::from_slice(&cx.blobs.get(&digest)?).map_err(DbError::from)?;
     let files = serde_json::from_value(manifest["files"].clone()).map_err(DbError::from)?;
-    Ok(Ok(files))
+    Ok(Ok((files, resumed)))
 }
 
-async fn apply_patch<E: Executor>(
-    db: &Db,
-    blobs: &BlobStore,
-    executor: &E,
-    contract: &Contract,
-    task: &TaskId,
-    base: Digest,
-    patch: String,
-) -> Result<Next> {
-    let request = Digest::of(patch.as_bytes());
-    // Broker pre-check: refused patches create no effect and consume no tool action.
-    let denied = match patch_paths(&patch).await {
+/// On resume the workspace must still be the one the journal describes. After a host
+/// restart it may be gone; nothing can be reconciled then, so the task fails once, cleanly.
+fn workspace_lost<E: Executor>(cx: &Cx<'_, E>) -> Result<Option<TaskState>> {
+    let expected = cx.db.task(&cx.task)?.workspace_digest;
+    let reason = match cx.exec.current_workspace(&cx.task) {
+        None => return Ok(None),
+        Some(Ok(actual)) if actual == expected => return Ok(None),
+        Some(Ok(actual)) => format!("workspace lost: expected {expected}, found {actual}"),
+        Some(Err(e)) => format!("workspace lost: {e}"),
+    };
+    Ok(Some(fail(cx.db, &cx.task, &reason)?))
+}
+
+/// Publishes the patch text and links it to its effect, once.
+fn ensure_patch_artifact<E>(cx: &Cx<'_, E>, rec: &EffectRecord, patch: &str) -> Result<()> {
+    if !cx.blobs.exists(&rec.request_digest) {
+        cx.blobs.put(patch.as_bytes())?;
+    }
+    let provenance = json!({ "source": "agent" }).to_string();
+    cx.db.register_artifact(&rec.request_digest, patch.len() as u64, "patch", Some(&rec.effect_id), &provenance)?;
+    Ok(())
+}
+
+/// Recovery's view of [`ensure_patch_artifact`]: the patch text for an ApplyPatch effect,
+/// from the agent turn that chose it (or its blob), published again if it was collected.
+pub(crate) fn recovered_patch<E>(cx: &Cx<'_, E>, rec: &EffectRecord) -> Result<Option<String>> {
+    let text = match journal::journaled_patch(cx.db, &cx.task, &rec.request_digest)? {
+        Some(text) => text,
+        None if cx.blobs.exists(&rec.request_digest) => {
+            String::from_utf8(cx.blobs.get(&rec.request_digest)?).map_err(|e| EngineError::Protocol(e.to_string()))?
+        }
+        None => return Ok(None),
+    };
+    ensure_patch_artifact(cx, rec, &text)?;
+    Ok(Some(text))
+}
+
+/// The broker pre-check: refused patches create no effect and consume no tool action.
+async fn patch_denial(contract: &Contract, patch: &str, request: Digest) -> Option<serde_json::Value> {
+    match patch_paths(patch).await {
         Err(detail) => Some(json!({
             "action": "ApplyPatch", "reason": "InvalidPatch", "detail": detail, "request_digest": request,
         })),
@@ -307,15 +184,31 @@ async fn apply_patch<E: Executor>(
                 refused("DigestExcludedPath", paths.iter().filter(|p| has_excluded_component(p)).collect())
             })
         }
-    };
-    if let Some(audit) = denied {
+    }
+}
+
+/// Applies `patch` for the turn journaled at `since`. Idempotent: an effect or denial the
+/// turn already produced is reused (see [`crate::journal`]).
+async fn apply_patch<E: Executor>(cx: &Cx<'_, E>, since: u64, base: Digest, patch: String) -> Result<Next> {
+    let (db, task) = (cx.db, &cx.task);
+    let request = Digest::of(patch.as_bytes());
+    let after = journal::events_after(db, task, since)?;
+    if let Some(id) = journal::intended(&after, "ApplyPatch", Some(&request))? {
+        let rec = db.effect(&id)?;
+        ensure_patch_artifact(cx, &rec, &patch)?;
+        return effect_turn(cx, rec, patch.into_bytes()).await;
+    }
+    if let Some(denied) = journal::denial(&after) {
+        return Ok(Next::Observe(journal::denial_observation(denied)?));
+    }
+    if let Some(audit) = patch_denial(&cx.contract, &patch, request).await {
         db.append_audit(task, "Denied", &audit)?;
         tracing::info!(task_id = %task, %audit, "patch denied");
         return Ok(Next::Observe(Observation::PatchRejected { reason: audit.to_string() }));
     }
 
     // Publish the patch itself first so the intent's request digest names a stored blob.
-    blobs.put(patch.as_bytes())?;
+    cx.blobs.put(patch.as_bytes())?;
     let kind = EffectKind::ApplyPatch { expected_base: base };
     let rec = match intend(db, task, kind, request, &base) {
         Ok(rec) => rec,
@@ -330,49 +223,49 @@ async fn apply_patch<E: Executor>(
         }
         Err(e) => return Err(e),
     };
-    let provenance = json!({ "source": "agent" }).to_string();
-    db.register_artifact(&request, patch.len() as u64, "patch", Some(&rec.effect_id), &provenance)?;
+    if rec.state == EffectState::Intended {
+        cx.crash(CrashPoint::AfterIntent, Some(rec.kind.tag()))?;
+    }
+    ensure_patch_artifact(cx, &rec, &patch)?;
     if rec.state == EffectState::Failed {
         // Same patch on the same base already failed; the store returned that record.
         return Ok(Next::Observe(Observation::PatchRejected { reason: "this patch already failed to apply".into() }));
     }
-    let (out, _) = run_effect(db, blobs, executor, contract, &rec, patch.into_bytes()).await?;
-    Ok(Next::Observe(match (&out.receipt.outcome, out.new_workspace) {
-        (Outcome::Success, Some(workspace)) => Observation::PatchApplied { workspace },
-        (Outcome::Success, None) => {
-            return Err(EngineError::Protocol("patch applied without a workspace digest".into()));
-        }
-        (Outcome::Failure(reason), _) => Observation::PatchRejected { reason: reason.clone() },
-    }))
+    effect_turn(cx, rec, patch.into_bytes()).await
 }
 
-/// Verifies the current workspace. `started` is true when resuming a task already in
-/// VERIFYING, so `VerifyStarted` is not appended twice.
-async fn verify<E: Executor>(
-    db: &Db,
-    blobs: &BlobStore,
-    executor: &E,
-    contract: &Contract,
-    task: &TaskId,
-    started: bool,
-) -> Result<Next> {
+/// Verifies the current workspace for the turn journaled at `since` (none when resuming a
+/// task found VERIFYING without a journaled turn). `VerifyStarted` is appended only if the
+/// task is not VERIFYING yet; an effect or denial the turn already produced is reused.
+async fn verify<E: Executor>(cx: &Cx<'_, E>, since: Option<u64>) -> Result<Next> {
+    let (db, task) = (cx.db, &cx.task);
+    let after = match since {
+        Some(since) => journal::events_after(db, task, since)?,
+        None => Vec::new(),
+    };
+    if let Some(id) = journal::intended(&after, "RunVerification", None)? {
+        return effect_turn(cx, db.effect(&id)?, Vec::new()).await;
+    }
     // Checked before VERIFYING is entered, so a missing grant cannot strand the task there.
-    if !contract.capabilities.contains(&Capability::VerificationRun) {
+    if !cx.contract.capabilities.contains(&Capability::VerificationRun) {
         let capability = capability_name(Capability::VerificationRun);
-        let audit = json!({ "action": "Verify", "reason": "CapabilityDenied", "capability": capability });
-        db.append_audit(task, "Denied", &audit)?;
-        tracing::info!(task_id = %task, %audit, "verification denied");
+        if journal::denial(&after).is_none() {
+            let audit = json!({ "action": "Verify", "reason": "CapabilityDenied", "capability": capability });
+            db.append_audit(task, "Denied", &audit)?;
+            tracing::info!(task_id = %task, %audit, "verification denied");
+        }
         let summary = format!("capability {capability} not granted");
         return Ok(Next::Observe(Observation::Verification { passed: false, summary }));
     }
-    let t = if started { db.task(task)? } else { db.append(task, &TaskEvent::VerifyStarted)? };
+    let t = db.task(task)?;
+    let t = if t.state == TaskState::Verifying { t } else { db.append(task, &TaskEvent::VerifyStarted)? };
     tracing::info!(task_id = %task, step = t.step, "verification started");
     let workspace = t.workspace_digest;
     let rec = intend(db, task, EffectKind::RunVerification, Digest::of(workspace.as_bytes()), &workspace)?;
-    let (out, at_completion) = run_effect(db, blobs, executor, contract, &rec, Vec::new()).await?;
-    let (passed, summary) = verification_verdict(&out, &at_completion);
-    tracing::info!(task_id = %task, passed, "verification finished");
-    Ok(Next::Observe(Observation::Verification { passed, summary }))
+    if rec.state == EffectState::Intended {
+        cx.crash(CrashPoint::AfterIntent, Some(rec.kind.tag()))?;
+    }
+    effect_turn(cx, rec, Vec::new()).await
 }
 
 fn finish(db: &Db, task: &TaskId) -> Result<TaskState> {
@@ -383,6 +276,30 @@ fn finish(db: &Db, task: &TaskId) -> Result<TaskState> {
     fail(db, task, "agent finished without verified success")
 }
 
+async fn act<E: Executor>(cx: &Cx<'_, E>, since: u64, base: Digest, action: AgentAction) -> Result<Next> {
+    match action {
+        AgentAction::ApplyPatch(patch) => apply_patch(cx, since, base, patch).await,
+        AgentAction::Verify => verify(cx, Some(since)).await,
+        AgentAction::Finish => Ok(Next::Stop(finish(cx.db, &cx.task)?)),
+    }
+}
+
+/// The effect kind an action will intend, for the crash hook.
+fn action_kind(action: &AgentAction) -> Option<&'static str> {
+    match action {
+        AgentAction::ApplyPatch(_) => Some("apply_patch"),
+        AgentAction::Verify => Some("run_verification"),
+        AgentAction::Finish => None,
+    }
+}
+
+fn describe(action: &AgentAction) -> String {
+    match action {
+        AgentAction::ApplyPatch(patch) => format!("ApplyPatch({})", Digest::of(patch.as_bytes())),
+        other => format!("{other:?}"),
+    }
+}
+
 fn observed_workspace(obs: &Observation) -> Option<Digest> {
     match obs {
         Observation::Start { workspace, .. } | Observation::PatchApplied { workspace } => Some(*workspace),
@@ -391,10 +308,11 @@ fn observed_workspace(obs: &Observation) -> Option<Digest> {
     }
 }
 
-/// Drives `task` until it is terminal, paused or waiting. Resumable: a RUNNING or VERIFYING
-/// task continues from the journal (the snapshot is not taken twice); a terminal task is
+/// Drives `task` until it is terminal, paused or waiting. Resumable: outstanding effects
+/// of a crashed run are recovered first ([`crate::recover`]); the open session's journaled
+/// turns are replayed into `agent` (which must be deterministic: a divergence fails the task
+/// with `NondeterministicAgent`); the snapshot is not taken twice. A terminal task is
 /// returned untouched; a PAUSED one is left for the caller to resume with `Resumed`.
-/// Outstanding effects from a crashed run are an error until recovery handles them.
 pub async fn run_task<E: Executor, A: Agent>(
     db: &Db,
     blobs: &BlobStore,
@@ -402,32 +320,77 @@ pub async fn run_task<E: Executor, A: Agent>(
     agent: &mut A,
     task: &TaskId,
 ) -> std::result::Result<TaskState, EngineError> {
-    let contract = db.contract(task)?;
+    run_task_with(db, blobs, executor, agent, task, &RunOptions::default()).await
+}
+
+/// [`run_task`] with options (crash injection).
+pub async fn run_task_with<E: Executor, A: Agent>(
+    db: &Db,
+    blobs: &BlobStore,
+    executor: &E,
+    agent: &mut A,
+    task: &TaskId,
+    opts: &RunOptions,
+) -> std::result::Result<TaskState, EngineError> {
+    let cx = Cx::new(db, blobs, executor, task, opts)?;
+    let state = drive(&cx, agent).await?;
+    if state.is_terminal() {
+        // An intent left behind (e.g. a cancel landed between intent and dispatch) can
+        // never run now; release its reservation.
+        db.abandon_outstanding(task)?;
+    }
+    Ok(state)
+}
+
+async fn drive<E: Executor, A: Agent>(cx: &Cx<'_, E>, agent: &mut A) -> Result<TaskState> {
+    let (db, task) = (cx.db, &cx.task);
+    // In-flight effects are reconciled before anything else, a pending cancel included,
+    // so the journal and the workspace agree before the cancel is honoured.
+    if !db.outstanding_effects(task)?.is_empty() {
+        recover::reconcile(cx).await?;
+    }
     if let Some(state) = interrupted(db, task)? {
         return Ok(state);
-    }
-    let outstanding = db.outstanding_effects(task)?;
-    if !outstanding.is_empty() {
-        let effects = outstanding.into_iter().map(|e| e.effect_id).collect();
-        return Err(EngineError::OutstandingEffects { task: task.clone(), effects });
     }
     if db.task(task)?.state == TaskState::Ready {
         db.append(task, &TaskEvent::Started)?;
         tracing::info!(task_id = %task, "task started");
     }
-    let files = match ensure_snapshot(db, blobs, executor, &contract, task).await? {
-        Ok(files) => files,
+    let (files, resumed) = match ensure_snapshot(cx).await? {
+        Ok(found) => found,
         Err(state) => return Ok(state),
     };
+    if resumed {
+        if let Some(state) = workspace_lost(cx)? {
+            return Ok(state);
+        }
+    }
 
+    let turns = journal::session_turns(&db.events(task)?)?;
     let t = db.task(task)?;
     let mut base = t.workspace_digest;
-    let mut next = if t.state == TaskState::Verifying {
-        verify(db, blobs, executor, &contract, task, true).await?
-    } else {
-        Next::Observe(Observation::Start { files, workspace: base })
+    for turn in &turns {
+        base = observed_workspace(&turn.observation).unwrap_or(base);
+        let emitted = agent.next(&turn.observation);
+        if emitted != turn.action {
+            fail(db, task, &format!("agent replay diverged at turn {}", turn.turn))?;
+            return Err(EngineError::NondeterministicAgent {
+                turn: turn.turn,
+                journaled: describe(&turn.action),
+                emitted: describe(&emitted),
+            });
+        }
+    }
+    let mut next = match turns.last() {
+        // The last journaled action may be unfinished: perform it, idempotently.
+        Some(last) => match interrupted(db, task)? {
+            Some(state) => return Ok(state),
+            None => act(cx, last.seq, base, last.action.clone()).await?,
+        },
+        None if t.state == TaskState::Verifying => verify(cx, None).await?,
+        None => Next::Observe(Observation::Start { files, workspace: base }),
     };
-    let mut turns = 0;
+    let mut turn = turns.len() as u32;
     loop {
         let obs = match next {
             Next::Observe(obs) => obs,
@@ -436,103 +399,18 @@ pub async fn run_task<E: Executor, A: Agent>(
         if let Some(state) = interrupted(db, task)? {
             return Ok(state);
         }
-        if turns >= turn_limit(&contract) {
+        if turn >= turn_limit(&cx.contract) {
             return fail(db, task, "agent turn limit exceeded");
         }
-        turns += 1;
+        turn += 1;
         base = observed_workspace(&obs).unwrap_or(base);
         let action = agent.next(&obs);
         // A pause or cancel that arrived while the agent was deciding wins over its action.
         if let Some(state) = interrupted(db, task)? {
             return Ok(state);
         }
-        next = match action {
-            AgentAction::ApplyPatch(patch) => apply_patch(db, blobs, executor, &contract, task, base, patch).await?,
-            AgentAction::Verify => verify(db, blobs, executor, &contract, task, false).await?,
-            AgentAction::Finish => Next::Stop(finish(db, task)?),
-        };
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use agentos_core::effect::AttemptId;
-
-    use super::*;
-    use crate::executor::VerificationReport;
-
-    fn task(state: TaskState, workspace: Digest) -> Task {
-        Task { state, ..Task::new(TaskId::new(), workspace) }
-    }
-
-    fn outcome(kind: &EffectKind, ok: bool) -> ExecOutcome {
-        let req = EffectRequest {
-            effect_id: EffectId::derive(&TaskId::new(), 0, kind, &Digest::of(b"r")),
-            task_id: TaskId::new(),
-            kind: kind.clone(),
-            payload: Vec::new(),
-            contract: serde_json::from_value(json!({
-                "goal": "g", "repository": {"source": "s", "revision": "r"}, "profile": "p",
-                "editable_paths": ["src/**"], "verification_profile": "v", "capabilities": [],
-                "limits": {"model_requests": 1, "max_output_tokens_per_request": 1, "tool_actions": 1,
-                           "deadline_seconds": 1, "worker_vcpus": 1, "worker_memory_mib": 1}
-            }))
-            .unwrap(),
-        };
-        let ctx = AttemptCtx { attempt_id: AttemptId::new(), lease_generation: 1, worker: "w".into() };
-        if ok {
-            ExecOutcome::success(&req, &ctx, b"{}".to_vec())
-        } else {
-            ExecOutcome::failure(&req, &ctx, "timeout")
-        }
-    }
-
-    fn d(s: &str) -> Digest {
-        Digest::of(s.as_bytes())
-    }
-
-    #[test]
-    fn workspace_changing_effects_follow_up_with_the_new_digest() {
-        for kind in [EffectKind::ReadSnapshot, EffectKind::ApplyPatch { expected_base: d("w0") }] {
-            let mut out = outcome(&kind, true);
-            out.new_workspace = Some(d("w1"));
-            // Applied whatever the state: the store decides (Paused accepts it too).
-            for state in [TaskState::Running, TaskState::Paused] {
-                assert_eq!(
-                    follow_up_event(&kind, &out, &task(state, d("w0"))),
-                    Some(TaskEvent::WorkspaceUpdated { digest: d("w1") }),
-                    "{kind:?} {state:?}"
-                );
-            }
-            assert_eq!(follow_up_event(&kind, &outcome(&kind, false), &task(TaskState::Running, d("w0"))), None);
-        }
-    }
-
-    #[test]
-    fn verification_follow_up_depends_on_the_report_and_the_current_digest() {
-        let kind = EffectKind::RunVerification;
-        let now = task(TaskState::Verifying, d("w1"));
-        let report = |passed: bool, workspace: Digest| {
-            let mut out = outcome(&kind, true);
-            out.verification = Some(VerificationReport { passed, workspace, summary: "s".into() });
-            out
-        };
-        assert_eq!(follow_up_event(&kind, &report(true, d("w1")), &now), Some(TaskEvent::VerifyPassed { digest: d("w1") }));
-        assert_eq!(follow_up_event(&kind, &report(false, d("w1")), &now), Some(TaskEvent::VerifyFailed));
-        // Passing evidence for another workspace version is not success.
-        assert_eq!(follow_up_event(&kind, &report(true, d("w0")), &now), Some(TaskEvent::VerifyFailed));
-        // Timeout (effect failure) and a missing report both fail verification.
-        assert_eq!(follow_up_event(&kind, &outcome(&kind, false), &now), Some(TaskEvent::VerifyFailed));
-        assert_eq!(follow_up_event(&kind, &outcome(&kind, true), &now), Some(TaskEvent::VerifyFailed));
-        let (passed, summary) = verification_verdict(&outcome(&kind, false), &now);
-        assert!(!passed && summary.contains("timeout"), "{summary}");
-    }
-
-    #[test]
-    fn export_has_no_follow_up() {
-        let kind = EffectKind::ExportBundle;
-        let now = task(TaskState::Running, d("w"));
-        assert_eq!(follow_up_event(&kind, &outcome(&kind, false), &now), None);
-        assert_eq!(follow_up_event(&kind, &outcome(&kind, true), &now), None);
+        let since = journal::append_turn(db, task, turn, &obs, &action)?;
+        cx.crash(CrashPoint::AfterAgentTurnJournaled, action_kind(&action))?;
+        next = act(cx, since, base, action).await?;
     }
 }
