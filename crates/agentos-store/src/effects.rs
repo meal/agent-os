@@ -24,7 +24,8 @@
 //! Usage: one row per effect. Status `Reserved` -> `Settled` on a receipt, or `Reserved` ->
 //! `Uncertain` when the effect becomes unknown; an uncertain reservation is never released
 //! because the effect may have run. It stays `Uncertain` across a re-dispatch and settles
-//! when a receipt finally arrives.
+//! when a receipt finally arrives. `Released` is reached only by abandoning an effect the
+//! task can no longer dispatch, which the caller knows never took effect; it counts nowhere.
 
 use std::collections::HashSet;
 
@@ -34,7 +35,7 @@ use agentos_core::effect::{
     ReceiptVerdict,
 };
 use agentos_core::ids::{Digest, TaskId};
-use agentos_core::state::{reduce, TaskEvent, TransitionError};
+use agentos_core::state::{reduce, Task, TaskEvent, TransitionError};
 use rusqlite::{params, OptionalExtension, Transaction};
 use serde_json::json;
 
@@ -72,6 +73,7 @@ fn effect_state_str(s: EffectState) -> &'static str {
         EffectState::Completed => "COMPLETED",
         EffectState::Failed => "FAILED",
         EffectState::Unknown => "UNKNOWN",
+        EffectState::Abandoned => "ABANDONED",
     }
 }
 
@@ -82,6 +84,7 @@ fn effect_state_from(s: &str) -> Result<EffectState> {
         "COMPLETED" => EffectState::Completed,
         "FAILED" => EffectState::Failed,
         "UNKNOWN" => EffectState::Unknown,
+        "ABANDONED" => EffectState::Abandoned,
         other => return Err(DbError::Corrupt(format!("effect state {other:?}"))),
     })
 }
@@ -158,10 +161,45 @@ fn usage_totals(tx: &Transaction, task: &TaskId) -> Result<UsageSummary> {
             "Reserved" => (s.reserved_model_requests, s.reserved_tool_actions) = (model, tools),
             "Settled" => (s.settled_model_requests, s.settled_tool_actions) = (model, tools),
             "Uncertain" => (s.uncertain_model_requests, s.uncertain_tool_actions) = (model, tools),
+            // Abandoned effects never ran: their reservations count nowhere.
+            "Released" => {}
             other => return Err(DbError::Corrupt(format!("usage status {other:?}"))),
         }
     }
     Ok(s)
+}
+
+/// Abandoning is only sound once the task can never dispatch again.
+fn ensure_abandonable(task: &Task) -> Result<()> {
+    if task.state.is_terminal() || task.cancel_requested {
+        Ok(())
+    } else {
+        Err(DbError::NotAbandonable { state: task.state, cancel_requested: task.cancel_requested })
+    }
+}
+
+fn abandon(tx: &Transaction, rec: &EffectRecord, reason: &str) -> Result<()> {
+    let now = now_ts();
+    tx.execute(
+        "UPDATE effects SET state = ?2, updated_ts = ?3 WHERE effect_id = ?1",
+        params![rec.effect_id.as_str(), effect_state_str(EffectState::Abandoned), now],
+    )?;
+    tx.execute(
+        "UPDATE attempts SET finished_ts = ?2 WHERE effect_id = ?1 AND finished_ts IS NULL",
+        params![rec.effect_id.as_str(), now],
+    )?;
+    let n = tx.execute(
+        "UPDATE usage SET status = 'Released' WHERE effect_id = ?1 AND status IN ('Reserved', 'Uncertain')",
+        [rec.effect_id.as_str()],
+    )?;
+    expect_one(n, "usage release", &rec.effect_id)?;
+    insert_event(
+        tx,
+        &rec.task_id,
+        "EffectAbandoned",
+        &json!({ "effect_id": rec.effect_id, "previous_state": rec.state, "reason": reason }),
+    )?;
+    Ok(())
 }
 
 fn expect_one(n: usize, what: &str, effect: &EffectId) -> Result<()> {
@@ -591,6 +629,49 @@ impl Db {
         ))?;
         let rows = stmt.query_map([task.as_str()], effect_row)?;
         rows.map(|r| effect_from_row(r?)).collect()
+    }
+
+    /// Closes `effect` as ABANDONED and releases its reservation. Only allowed while the task
+    /// can never dispatch it again (terminal, or cancellation pending: cancel always wins);
+    /// a paused or waiting task may still resume and run it. From INTENDED it is always
+    /// sound (never dispatched). From DISPATCHED or UNKNOWN the caller asserts it has proof
+    /// the effect did not take effect (e.g. reconciliation found it not applied).
+    pub fn abandon_effect(&self, effect: &EffectId, reason: &str) -> Result<()> {
+        let tx = self.immediate()?;
+        let rec = load_effect(&tx, effect)?;
+        if !matches!(rec.state, EffectState::Intended | EffectState::Dispatched | EffectState::Unknown) {
+            return Err(DbError::InvalidEffectTransition {
+                effect: effect.clone(),
+                from: rec.state,
+                to: EffectState::Abandoned,
+            });
+        }
+        let (task, _) = load_task(&tx, &rec.task_id)?;
+        ensure_abandonable(&task)?;
+        abandon(&tx, &rec, reason)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Abandons every INTENDED (never dispatched) effect of a task that can no longer
+    /// dispatch them, in one transaction; returns them in creation order. Journals nothing
+    /// when there are none.
+    pub fn abandon_outstanding(&self, task_id: &TaskId) -> Result<Vec<EffectId>> {
+        let tx = self.immediate()?;
+        let (task, _) = load_task(&tx, task_id)?;
+        ensure_abandonable(&task)?;
+        let intended = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT {EFFECT_COLUMNS} FROM effects WHERE task_id = ?1 AND state = 'INTENDED' ORDER BY rowid"
+            ))?;
+            let rows = stmt.query_map([task_id.as_str()], effect_row)?;
+            rows.map(|r| effect_from_row(r?)).collect::<Result<Vec<_>>>()?
+        };
+        for rec in &intended {
+            abandon(&tx, rec, "task can no longer dispatch it")?;
+        }
+        tx.commit()?;
+        Ok(intended.into_iter().map(|r| r.effect_id).collect())
     }
 
     pub fn usage_summary(&self, task: &TaskId) -> Result<UsageSummary> {

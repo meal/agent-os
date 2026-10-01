@@ -1165,3 +1165,82 @@ fn reopened_database_shows_identical_effects_and_usage() {
     );
     assert_eq!(effects[1].lease_generation, 3);
 }
+
+#[test]
+fn abandoning_is_refused_while_the_task_could_still_dispatch() {
+    let fx = setup();
+    let e = fx.read(b"r", 1).unwrap();
+    let before = fx.snapshot(&e.effect_id);
+    let err = fx.db.abandon_effect(&e.effect_id, "test").unwrap_err();
+    assert!(matches!(err, DbError::NotAbandonable { state: TaskState::Running, cancel_requested: false }), "{err:?}");
+    assert!(fx.db.abandon_outstanding(&fx.id).is_err());
+    fx.db.append(&fx.id, &TaskEvent::Paused).unwrap();
+    // A paused task may resume and dispatch the effect after all.
+    assert!(matches!(fx.db.abandon_effect(&e.effect_id, "test"), Err(DbError::NotAbandonable { .. })));
+    assert_eq!(fx.db.effect(&e.effect_id).unwrap(), before.1);
+    assert_eq!(fx.usage(), before.2);
+    assert_eq!(fx.count_events("EffectAbandoned"), 0);
+}
+
+#[test]
+fn abandoning_intended_effects_of_a_cancelled_task_releases_their_reservations() {
+    let fx = setup();
+    let (done, a) = fx.dispatched(b"done", 1);
+    fx.succeed(&done, &a, 1, None).unwrap();
+    let e1 = fx.read(b"1", 2).unwrap();
+    let e2 = fx.verify(b"2", 3).unwrap();
+    let (in_flight, _) = fx.dispatched(b"3", 1);
+    let before = fx.usage();
+    assert_eq!((before.reserved_model_requests, before.reserved_tool_actions), (2 + 3 + 1, 2));
+
+    fx.db.append(&fx.id, &TaskEvent::CancelRequested).unwrap();
+    fx.db.append(&fx.id, &TaskEvent::CancelCompleted).unwrap();
+    let abandoned = fx.db.abandon_outstanding(&fx.id).unwrap();
+
+    assert_eq!(abandoned, vec![e1.effect_id.clone(), e2.effect_id.clone()], "only never-dispatched effects");
+    for e in [&e1, &e2] {
+        assert_eq!(fx.db.effect(&e.effect_id).unwrap().state, EffectState::Abandoned);
+    }
+    assert_eq!(fx.db.effect(&in_flight.effect_id).unwrap().state, EffectState::Dispatched);
+    let usage = fx.usage();
+    assert_eq!((usage.reserved_model_requests, usage.reserved_tool_actions), (1, 1), "only the in-flight one");
+    assert_eq!((usage.settled_model_requests, usage.settled_tool_actions), (before.settled_model_requests, 1));
+    assert_eq!((usage.uncertain_model_requests, usage.uncertain_tool_actions), (0, 0));
+    let events: Vec<_> = fx.events().into_iter().filter(|e| e.event_type == "EffectAbandoned").collect();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].payload["previous_state"], "Intended");
+    assert_eq!(fx.db.outstanding_effects(&fx.id).unwrap().len(), 1);
+
+    // Idempotent: nothing left to abandon, nothing journaled.
+    let n = fx.events().len();
+    assert!(fx.db.abandon_outstanding(&fx.id).unwrap().is_empty());
+    assert_eq!(fx.events().len(), n);
+    // A receipt for an abandoned effect is rejected and changes nothing.
+    let r = receipt(&e1, &AttemptId::new(), 1, Outcome::Success);
+    assert_eq!(fx.db.complete_effect(&e1.effect_id, &r, None, None).unwrap(), ReceiptVerdict::NotDispatched);
+    assert_eq!(fx.db.effect(&e1.effect_id).unwrap().state, EffectState::Abandoned);
+    assert_eq!(fx.usage(), usage);
+}
+
+#[test]
+fn a_dispatched_effect_proven_not_applied_may_be_abandoned_once_cancel_is_pending() {
+    let fx = setup();
+    let (e, _) = fx.dispatched(b"r", 1);
+    fx.db.mark_unknown(&e.effect_id).unwrap();
+    assert_eq!(fx.usage().uncertain_tool_actions, 1);
+    fx.db.append(&fx.id, &TaskEvent::CancelRequested).unwrap();
+
+    fx.db.abandon_effect(&e.effect_id, "reconciled: not applied").unwrap();
+
+    assert_eq!(fx.db.effect(&e.effect_id).unwrap().state, EffectState::Abandoned);
+    assert_eq!(fx.usage(), UsageSummary::default());
+    assert_eq!(fx.count("SELECT count(*) FROM attempts WHERE finished_ts IS NULL"), 0);
+    let ev = fx.events().into_iter().find(|e| e.event_type == "EffectAbandoned").unwrap();
+    assert_eq!(ev.payload["previous_state"], "Unknown");
+    assert_eq!(ev.payload["reason"], "reconciled: not applied");
+    // Finished effects cannot be abandoned.
+    let err = fx.db.abandon_effect(&e.effect_id, "again").unwrap_err();
+    assert!(matches!(err, DbError::InvalidEffectTransition { from: EffectState::Abandoned, .. }), "{err:?}");
+    // Survives a reopen.
+    assert_eq!(fx.reopen().effect(&e.effect_id).unwrap().state, EffectState::Abandoned);
+}

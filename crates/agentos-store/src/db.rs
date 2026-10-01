@@ -77,7 +77,7 @@ CREATE TABLE IF NOT EXISTS usage(
     reserved_tool_actions INTEGER NOT NULL,
     settled_model_requests INTEGER,
     settled_tool_actions INTEGER,
-    status TEXT NOT NULL CHECK(status IN ('Reserved', 'Settled', 'Uncertain'))
+    status TEXT NOT NULL CHECK(status IN ('Reserved', 'Settled', 'Uncertain', 'Released'))
 );
 CREATE TABLE IF NOT EXISTS capabilities(
     id TEXT PRIMARY KEY,
@@ -119,6 +119,8 @@ pub enum DbError {
     NotDispatchable { state: TaskState, cancel_requested: bool },
     #[error("reservation of {got} tool actions does not match the {expected} this effect kind consumes")]
     InvalidReservation { expected: u32, got: u32 },
+    #[error("effects of this task may not be abandoned (state {state:?}, cancel_requested {cancel_requested}): it could still dispatch them")]
+    NotAbandonable { state: TaskState, cancel_requested: bool },
     #[error("effect not found: {0}")]
     EffectNotFound(EffectId),
     #[error("effect {effect} cannot move from {from:?} to {to:?}")]

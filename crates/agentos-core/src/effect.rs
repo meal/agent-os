@@ -64,6 +64,9 @@ pub enum EffectState {
     Completed,
     Failed,
     Unknown,
+    /// Never took effect and never will: the task can no longer dispatch it. Its
+    /// reservation is released.
+    Abandoned,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -164,7 +167,9 @@ pub fn accept_receipt(effect: &EffectRecord, r: &Receipt) -> ReceiptVerdict {
     if matches!(effect.state, EffectState::Completed | EffectState::Failed) {
         return ReceiptVerdict::DuplicateIgnored;
     }
-    if effect.state == EffectState::Intended {
+    // An abandoned effect is closed without ever having taken effect; no attempt of it may
+    // complete it.
+    if matches!(effect.state, EffectState::Intended | EffectState::Abandoned) {
         return ReceiptVerdict::NotDispatched;
     }
     if r.lease_generation < effect.lease_generation {
@@ -353,6 +358,17 @@ mod tests {
         // wrong id still wins
         let other = id_of("t", 9, &EffectKind::ReadSnapshot, b"r");
         assert_eq!(accept_receipt(&e, &receipt(other, 0)), ReceiptVerdict::WrongEffect);
+    }
+
+    #[test]
+    fn receipt_for_abandoned_effect_is_rejected_as_never_dispatched() {
+        let e = record(EffectState::Abandoned, 1);
+        for lease in [0, 1, 2] {
+            assert_eq!(
+                accept_receipt(&e, &receipt(e.effect_id.clone(), lease)),
+                ReceiptVerdict::NotDispatched
+            );
+        }
     }
 
     #[test]
