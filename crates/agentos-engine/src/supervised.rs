@@ -11,9 +11,12 @@
 //! plus a grace period; past it the job is fenced, and a job that survives the fence is
 //! `unresolved` too: no outcome is ever invented for a job that may still be running.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -22,13 +25,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use agentos_core::effect::{EffectId, EffectKind, RetryPolicy};
 use agentos_core::ids::{Digest, TaskId};
 use agentos_core::lease::{lease_expiry_ms, EffectTimeouts};
-use rustix::process::{getpgrp, getpid, getsid, kill_process, kill_process_group, Pid, Signal};
+use rustix::process::{getpgrp, getpid, getsid, kill_process_group, pidfd_open, pidfd_send_signal, Pid, PidfdFlags, Signal};
 
 use crate::crash::{CrashHook, CrashPoint};
 use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor, Reconciliation};
 use crate::fixture::FixtureExecutor;
 use crate::job::{JobDir, JobRequest, WorkerConfig};
-use crate::supervisor::SupervisorCmd;
+use crate::supervisor::{group_in_session, SupervisorCmd};
 
 /// How often a job directory is looked at while waiting.
 const POLL: Duration = Duration::from_millis(25);
@@ -134,40 +137,72 @@ fn signalable(id: i32) -> Option<Pid> {
     Pid::from_raw(id)
 }
 
-/// The recorded supervisor pid, if it still names a supervisor: `status.json` is file
-/// content, so the pid must lead its own session (a real supervisor calls `setsid` and
-/// refuses to run otherwise) and that session must not be ours.
-fn trusted_supervisor(pid: u32) -> Option<Pid> {
-    let p = signalable(i32::try_from(pid).ok()?)?;
-    let own_session = getsid(None).ok()?;
-    (getsid(Some(p)).ok()? == p && p != own_session).then_some(p)
+/// Whether `pid` is the supervisor of `job`: its stdin is this job's very `lock` file (the
+/// supervisor holds the lock through fd 0 for its whole life) and its command line ends with
+/// `run <job_dir>`. `status.json` is worker-writable, so the pid it names proves nothing.
+fn is_job_supervisor(pid: Pid, job: &JobDir) -> bool {
+    let proc = PathBuf::from(format!("/proc/{}", pid.as_raw_nonzero()));
+    let same_lock = match (fs::metadata(proc.join("fd/0")), fs::metadata(job.path.join("lock"))) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    };
+    if !same_lock {
+        return false;
+    }
+    let Ok(cmdline) = fs::read(proc.join("cmdline")) else { return false };
+    let args: Vec<&[u8]> = cmdline.strip_suffix(b"\0").unwrap_or(&cmdline).split(|b| *b == 0).collect();
+    let [.., verb, dir] = args.as_slice() else { return false };
+    if *verb != b"run" {
+        return false;
+    }
+    // Relative to the supervisor's working directory, if it was launched with a relative path.
+    let dir = Path::new(OsStr::from_bytes(dir));
+    let dir = match fs::read_link(proc.join("cwd")) {
+        Ok(cwd) => cwd.join(dir),
+        Err(_) if dir.is_absolute() => dir.to_path_buf(),
+        Err(_) => return false,
+    };
+    matches!((fs::canonicalize(dir), fs::canonicalize(&job.path)), (Ok(a), Ok(b)) if a == b)
 }
 
-/// SIGKILLs what `job` recorded: its worker groups and `groups` entries that live in the
-/// supervisor's session (`groups` is worker-writable; a forged entry must not reach any
-/// other process), then the supervisor itself, which a stopped supervisor cannot do for us.
+/// SIGKILLs what `job` recorded, once the recorded supervisor pid is proven to be the job's
+/// own supervisor: its worker group and the `groups` entries that live in the supervisor's
+/// session (`groups` is worker-writable; a forged entry must not reach any other process),
+/// then the supervisor itself, which a stopped supervisor cannot do for us. The supervisor
+/// is signalled through a pidfd opened before the check, so a reused pid is never hit.
 fn kill_job(job: &JobDir) {
     let Some(status) = job.read_status() else {
         tracing::warn!(job = %job.path.display(), "no status: no recorded process to kill");
         return;
     };
-    let Some(supervisor) = status.supervisor_pid.and_then(trusted_supervisor) else {
-        tracing::warn!(job = %job.path.display(), pid = ?status.supervisor_pid, "recorded supervisor pid is not a supervisor");
+    let Some(supervisor) = status.supervisor_pid.and_then(|p| i32::try_from(p).ok()).and_then(signalable) else {
+        tracing::warn!(job = %job.path.display(), pid = ?status.supervisor_pid, "no usable supervisor pid");
         return;
     };
+    let pidfd = match pidfd_open(supervisor, PidfdFlags::empty()) {
+        Ok(fd) => fd,
+        Err(e) => {
+            tracing::warn!(job = %job.path.display(), error = %e, "the recorded supervisor is gone");
+            return;
+        }
+    };
+    if !is_job_supervisor(supervisor, job) || getsid(Some(supervisor)).ok() != Some(supervisor) {
+        tracing::warn!(job = %job.path.display(), pid = supervisor.as_raw_nonzero().get(), "the recorded pid is not this job's supervisor; not signalling");
+        return;
+    }
     let groups = status.worker_pgid.into_iter().chain(job.groups());
     for pgid in groups {
         let Some(group) = signalable(pgid) else { continue };
-        match getsid(Some(group)) {
-            Ok(sid) if sid == supervisor => {
+        match group_in_session(group, supervisor) {
+            Some(true) => {
                 let _ = kill_process_group(group, Signal::KILL);
             }
-            Ok(_) => tracing::warn!(job = %job.path.display(), pgid, "not killing a group outside the job's session"),
-            Err(_) => {} // the group's leader is gone
+            Some(false) => tracing::warn!(job = %job.path.display(), pgid, "not killing a group outside the job's session"),
+            None => {} // nothing of the group is left
         }
     }
     tracing::warn!(job = %job.path.display(), pid = supervisor.as_raw_nonzero().get(), "killing the supervisor");
-    let _ = kill_process(supervisor, Signal::KILL);
+    let _ = pidfd_send_signal(&pidfd, Signal::KILL);
 }
 
 impl SupervisedExecutor {
@@ -327,7 +362,6 @@ impl SupervisedExecutor {
 
 impl Executor for SupervisedExecutor {
     async fn run(&self, req: &EffectRequest, ctx: &AttemptCtx) -> ExecOutcome {
-        self.counts.record(&req.kind);
         let now = now_ms();
         let task_deadline_ms = req.deadline_ts.saturating_mul(1000);
         let lease = lease_expiry_ms(now, millis(self.timeout(&req.kind)), task_deadline_ms);
@@ -357,6 +391,8 @@ impl Executor for SupervisedExecutor {
             }
             return ExecOutcome::failure(req, ctx, format!("supervisor launch failed: {e}"));
         }
+        // Counted only now: a refused or failed launch executed nothing.
+        self.counts.record(&req.kind);
         if self.crash.as_ref().is_some_and(|h| h.check(CrashPoint::DuringExecute, Some(req.kind.tag()))) {
             // The controller "dies" with the job running; the runner discards this outcome.
             return ExecOutcome::failure(req, ctx, "injected crash after the launch");

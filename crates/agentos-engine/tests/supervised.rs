@@ -15,7 +15,7 @@ use agentos_core::state::TaskState;
 use agentos_engine::agent::{AgentAction, Observation};
 use agentos_engine::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor, Reconciliation};
 use agentos_engine::fixture::FixtureExecutor;
-use agentos_engine::job::{HostConfig, JobDir, JobRequest, JobState, KillReason, ScriptedConfig, WorkerConfig};
+use agentos_engine::job::{HostConfig, JobDir, JobRequest, JobState, JobStatus, KillReason, ScriptedConfig, WorkerConfig};
 use agentos_engine::runner::run_task;
 use agentos_engine::supervised::{ExecCounts, JobWait, SupervisedExecutor};
 use agentos_engine::supervisor::SupervisorCmd;
@@ -158,6 +158,62 @@ fn assert_for(out: &ExecOutcome, req: &EffectRequest, ctx: &AttemptCtx) {
     assert_eq!(out.receipt.attempt_id, ctx.attempt_id);
     assert_eq!(out.receipt.lease_generation, ctx.lease_generation);
     assert_eq!(out.receipt.result_digest, Some(Digest::of(&out.output)));
+}
+
+/// SIGSTOPs a process and SIGKILLs it when dropped, so a failing test never leaves a
+/// stopped supervisor behind.
+struct Stopped(Pid);
+
+impl Stopped {
+    fn stop(pid: i32) -> Stopped {
+        let pid = Pid::from_raw(pid).unwrap();
+        kill_process(pid, Signal::STOP).unwrap();
+        Stopped(pid)
+    }
+}
+
+impl Drop for Stopped {
+    fn drop(&mut self) {
+        let _ = kill_process(self.0, Signal::KILL);
+    }
+}
+
+/// Kills and reaps a helper process when dropped.
+struct Helper(std::process::Child);
+
+impl Drop for Helper {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A job whose lock the test holds, with a `status.json` naming `supervisor_pid` and
+/// `worker_pgid`: what a worker that forged its job's status would leave.
+fn forged_job(fx: &Fx, kind: EffectKind, supervisor_pid: u32, worker_pgid: i32) -> (JobDir, fs::File, EffectId) {
+    let req = fx.request(kind, b"forged");
+    let job_req = JobRequest {
+        effect_id: req.effect_id.clone(),
+        task_id: req.task_id.clone(),
+        kind: req.kind.clone(),
+        payload: Vec::new(),
+        contract: req.contract.clone(),
+        attempt_id: AttemptId::new(),
+        lease_generation: 1,
+        lease_expiry_ms: now_ms() + 3_600_000,
+        task_deadline_ms: 0,
+        worker: WorkerConfig::Scripted(ScriptedConfig { script: "true".into() }),
+    };
+    let (job, lock) = JobDir::create(&fx.path("jobs"), &job_req).unwrap();
+    job.write_status(&JobStatus {
+        state: JobState::Running,
+        reason: None,
+        supervisor_pid: Some(supervisor_pid),
+        worker_pgid: Some(worker_pgid),
+        updated_ms: now_ms(),
+    })
+    .unwrap();
+    (job, lock, req.effect_id)
 }
 
 async fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
@@ -415,13 +471,15 @@ async fn fence_job_kills_a_sigstopped_supervisor_and_its_worker_groups() {
     };
     wait_for("the script's processes", || fs::read_to_string(&pids).is_ok_and(|s| s.lines().count() == 2)).await;
     let job = fx.job(&req.effect_id);
+    // The supervisor writes Running only after the spawn returned, which can be after the script started.
+    wait_for("Running status", || job.read_status().is_some_and(|s| s.state == JobState::Running)).await;
     let status = job.read_status().unwrap();
     assert_eq!(status.state, JobState::Running);
     let supervisor = status.supervisor_pid.unwrap() as i32;
     let worker = status.worker_pgid.unwrap();
     let script_pids: Vec<i32> = fs::read_to_string(&pids).unwrap().split_whitespace().map(|p| p.parse().unwrap()).collect();
     assert_eq!(job.groups(), vec![script_pids[0]], "the script's group is recorded");
-    kill_process(Pid::from_raw(supervisor).unwrap(), Signal::STOP).unwrap();
+    let _stopped = Stopped::stop(supervisor);
 
     let started = Instant::now();
     assert!(exec.fence_job(&req.effect_id).await, "the job is dead after the fence");
@@ -475,6 +533,13 @@ async fn counts_record_each_launch() {
     let fx = Fx::new();
     let exec = fx.scripted("true");
     let snapshot = fx.request(EffectKind::ReadSnapshot, b"");
+    // Neither a refused launch nor a failed spawn launches anything.
+    let expired = EffectRequest { deadline_ts: 1, ..snapshot.clone() };
+    assert_eq!(failure_reason(&exec.run(&expired, &ctx(1)).await), "deadline exceeded");
+    let cmd = SupervisorCmd { program: fx.path("no-such-supervisor"), prefix_args: Vec::new() };
+    let broken = SupervisedExecutor::new(fx.path("jobs"), cmd, WorkerConfig::Scripted(ScriptedConfig { script: "true".into() }), fx.counts.clone()).unwrap();
+    assert!(failure_reason(&broken.run(&snapshot, &ctx(1)).await).starts_with("supervisor launch failed"));
+    assert_eq!(fx.counts.get("read_snapshot"), 0);
     exec.run(&snapshot, &ctx(1)).await;
     exec.run(&snapshot, &ctx(2)).await;
     // Another executor sharing the counts (a restarted controller) adds to them.
@@ -525,4 +590,106 @@ async fn a_job_with_only_request_json_is_waited_for_not_redispatched() {
     let started = Instant::now();
     assert_eq!(exec.wait_for_job(&req.effect_id, PATIENCE).await, JobWait::StillAlive);
     assert!(started.elapsed() < Duration::from_secs(1), "waited {:?}", started.elapsed());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fence_never_signals_a_foreign_session_leader_named_in_status_json() {
+    let fx = Fx::new();
+    // A process that leads its own session, like a supervisor, but is not one.
+    let helper = Helper(std::process::Command::new("setsid").args(["sleep", "30"]).spawn().unwrap());
+    let pid = helper.0.id();
+    wait_for("the helper to lead its session", || {
+        rustix::process::getsid(Pid::from_raw(pid as i32)).is_ok_and(|s| s.as_raw_nonzero().get() == pid as i32)
+    })
+    .await;
+    let (job, _lock, effect) = forged_job(&fx, EffectKind::ReadSnapshot, pid, pid as i32);
+    let exec = fx.scripted("true");
+    assert!(!exec.fence_job(&effect).await, "the job (its lock held by the test) is still alive");
+    assert!(!job.is_dead());
+    assert!(!gone(pid as i32), "the foreign session leader was signalled");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fence_never_signals_another_jobs_supervisor_named_in_status_json() {
+    let fx = Fx::new();
+    let exec = Arc::new(fx.scripted("sleep 30"));
+    let req = fx.request(EffectKind::RunVerification, b"");
+    let running = {
+        let (exec, req) = (exec.clone(), req.clone());
+        tokio::spawn(async move { exec.run(&req, &ctx(1)).await })
+    };
+    wait_for("a running job", || {
+        fx.jobs(&req.effect_id).first().and_then(JobDir::read_status).is_some_and(|s| s.state == JobState::Running)
+    })
+    .await;
+    let real = fx.job(&req.effect_id);
+    let status = real.read_status().unwrap();
+    let (supervisor, worker) = (status.supervisor_pid.unwrap(), status.worker_pgid.unwrap());
+    // Stopped, so it cannot react to anything; only a signal from the fence could kill it.
+    let stopped = Stopped::stop(supervisor as i32);
+    let (forged, _lock, effect) = forged_job(&fx, EffectKind::ReadSnapshot, supervisor, worker);
+    assert!(!exec.fence_job(&effect).await);
+    assert!(!forged.is_dead());
+    assert!(!gone(supervisor as i32), "another job's supervisor was signalled");
+    assert!(!gone(worker), "another job's worker was signalled");
+    assert!(!real.is_dead());
+    // The real job is still its own: fencing it does kill it.
+    assert!(exec.fence_job(&req.effect_id).await);
+    drop(stopped);
+    assert_eq!(failure_reason(&running.await.unwrap()), "supervisor died without a receipt");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fence_kills_a_recorded_group_whose_leader_is_gone() {
+    let fx = Fx::new();
+    let (req, attempt) = (fx.request(EffectKind::RunVerification, b""), ctx(1));
+    let groups = fx.path("jobs").join(format!("{}-{}", req.effect_id, attempt.attempt_id)).join("groups");
+    let (member, marker) = (fx.path("member"), fx.path("marker"));
+    // The check starts a group whose leader exits (and is reaped) while a member lives on
+    // and would write `marker` after 4 s; the group is recorded like any check group.
+    let python = format!(
+        r#"import os, time
+leader = os.fork()
+if leader == 0:
+    os.setpgid(0, 0)
+    if os.fork() == 0:
+        open("{member}", "w").write(str(os.getpid()))
+        time.sleep(4)
+        open("{marker}", "w").close()
+    os._exit(0)
+with open("{groups}", "a") as f:
+    f.write(f"{{leader}}\n")
+os.waitpid(leader, 0)
+time.sleep(60)
+"#,
+        member = member.display(),
+        marker = marker.display(),
+        groups = groups.display(),
+    );
+    let exec = Arc::new(fx.scripted(&format!("python3 -c '{python}'")));
+    let started = Instant::now();
+    let running = {
+        let (exec, req, attempt) = (exec.clone(), req.clone(), attempt.clone());
+        tokio::spawn(async move { exec.run(&req, &attempt).await })
+    };
+    wait_for("the group member and its recorded group", || {
+        fs::read_to_string(&member).is_ok_and(|s| !s.is_empty()) && fs::read_to_string(&groups).is_ok_and(|s| s.lines().count() == 2)
+    })
+    .await;
+    let member_pid: i32 = fs::read_to_string(&member).unwrap().parse().unwrap();
+    let job = fx.job(&req.effect_id);
+    let leader = *job.groups().last().unwrap();
+    assert_ne!(leader, member_pid);
+    wait_for("the leader to be reaped", || fs::metadata(format!("/proc/{leader}")).is_err()).await;
+    let status = job.read_status().unwrap();
+    let _stopped = Stopped::stop(status.supervisor_pid.unwrap() as i32);
+
+    assert!(exec.fence_job(&req.effect_id).await);
+    wait_for("the leaderless group's member to die", || gone(member_pid)).await;
+    assert_eq!(failure_reason(&running.await.unwrap()), "supervisor died without a receipt");
+    let until = Duration::from_millis(4_500);
+    if let Some(left) = until.checked_sub(started.elapsed()) {
+        tokio::time::sleep(left).await;
+    }
+    assert!(!marker.exists(), "the member outlived the fence and wrote its marker");
 }

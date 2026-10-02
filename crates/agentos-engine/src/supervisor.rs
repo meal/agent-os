@@ -177,17 +177,16 @@ fn proc_stats() -> io::Result<Vec<(i32, [String; 4])>> {
     Ok(found)
 }
 
-/// Whether group `pgid` belongs to our session. Its leader answers directly; a group whose
+/// Whether group `pgid` belongs to session `sid`. Its leader answers directly; a group whose
 /// leader is gone answers through any member (a group never spans sessions). Unknown means
 /// no: `groups` is written by the worker, and a forged entry must never reach a process
-/// outside the job, such as the controller's.
-fn in_our_session(pgid: Pid, sid: Pid) -> Option<bool> {
+/// outside the job, such as the controller's. `None`: the group has no process left.
+pub(crate) fn group_in_session(pgid: Pid, sid: Pid) -> Option<bool> {
     if let Ok(leader_sid) = getsid(Some(pgid)) {
         return Some(leader_sid == sid);
     }
     let (pgid, sid) = (pgid.as_raw_nonzero().get().to_string(), sid.as_raw_nonzero().get().to_string());
     let Ok(stats) = proc_stats() else { return Some(false) };
-    // `None`: no member is left, so there is nothing to kill.
     stats.iter().find(|(_, [_, _, pgrp, _])| *pgrp == pgid).map(|(_, [.., session])| *session == sid)
 }
 
@@ -198,7 +197,7 @@ fn kill_recorded_group(pgid: i32, sid: Pid) {
         && pgid != getpgrp().as_raw_nonzero().get()
         && let Some(p) = Pid::from_raw(pgid)
     {
-        match in_our_session(p, sid) {
+        match group_in_session(p, sid) {
             Some(true) => {
                 let _ = kill_process_group(p, Signal::KILL);
             }
