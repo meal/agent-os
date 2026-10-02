@@ -22,6 +22,7 @@ const TEST_WORKERS: &str = "AGENTOS_TEST_WORKERS";
 const EXIT_BEFORE_RECEIPT: &str = "AGENTOS_TEST_SUPERVISOR_EXIT_BEFORE_RECEIPT";
 const POLL: &str = "AGENTOS_SUPERVISOR_POLL_MS";
 const PANIC_AFTER_SPAWN: &str = "AGENTOS_TEST_SUPERVISOR_PANIC_AFTER_SPAWN";
+const PROC_SCAN_FAILS: &str = "AGENTOS_TEST_SUPERVISOR_PROC_SCAN_FAILS";
 /// Upper bound for anything a test waits on; every test should finish well inside it.
 const PATIENCE: Duration = Duration::from_secs(5);
 
@@ -119,7 +120,7 @@ fn parts(req: &JobRequest) -> (EffectRequest, AttemptCtx) {
 fn spawn_with(job: &JobDir, lock: File, env: &[(&str, &str)]) -> Child {
     let mut cmd = Command::new(BIN);
     cmd.arg("run").arg(&job.path).stdin(Stdio::from(lock)).stdout(Stdio::null()).stderr(Stdio::null());
-    cmd.env_remove(TEST_WORKERS).env_remove(EXIT_BEFORE_RECEIPT).env_remove(POLL).env_remove(PANIC_AFTER_SPAWN);
+    cmd.env_remove(TEST_WORKERS).env_remove(EXIT_BEFORE_RECEIPT).env_remove(POLL).env_remove(PANIC_AFTER_SPAWN).env_remove(PROC_SCAN_FAILS);
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -733,4 +734,69 @@ fn a_panic_after_the_spawn_kills_the_job_before_the_lock_is_released() {
     assert!(trigger.exists());
     sleep(Duration::from_millis(1500));
     assert!(!m.exists(), "a process of the job outlived the panicking supervisor");
+}
+
+#[test]
+fn a_supervisor_launched_as_a_group_leader_refuses_to_run() {
+    let fx = Fx::new();
+    let marker = fx.path("marker");
+    let req = fx.scripted(EffectKind::ReadSnapshot, &format!("touch {}", marker.display()), 5000);
+    let (job, lock) = fx.create(&req);
+    // As a group leader it cannot `setsid`, so it would stay in its launcher's session.
+    let mut child = Command::new(BIN)
+        .arg("run")
+        .arg(&job.path)
+        .process_group(0)
+        .env(TEST_WORKERS, "1")
+        .stdin(Stdio::from(lock))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    assert_eq!(wait_exit(&mut child).code(), Some(1));
+
+    assert!(job.read_status().is_none_or(|s| s.state != JobState::Running), "{:?}", job.read_status());
+    assert!(!job.path.join("groups").exists() && job.read_outcome().is_none(), "a worker ran");
+    assert!(job.read_receipt().is_none());
+    assert!(job.is_dead() && !job.lock_held());
+    let log = fs::read_to_string(job.path.join("supervisor.log")).unwrap();
+    assert!(log.contains("not a session leader"), "{log}");
+    sleep(Duration::from_millis(200));
+    assert!(!marker.exists());
+}
+
+#[test]
+fn a_failing_proc_scan_is_retried_until_the_orphans_are_dead() {
+    let fx = Fx::new();
+    let (p, m) = (fx.path("pid"), fx.path("marker"));
+    // As in `normal_exit_reaps_a_background_child`: only the child scan can reach it.
+    let script = format!(
+        "setsid sh -c 'echo $$ > {p}; sleep 1; touch {m}' </dev/null >/dev/null 2>&1 &\n\
+         while [ ! -s {p} ]; do sleep 0.01; done; echo ok",
+        p = p.display(),
+        m = m.display(),
+    );
+    let req = fx.scripted(EffectKind::ReadSnapshot, &script, 5000);
+    let (job, lock) = fx.create(&req);
+    let mut child = spawn_with(&job, lock, &[(TEST_WORKERS, "1"), (PROC_SCAN_FAILS, "1")]);
+    let mut orphan = None;
+    while child.try_wait().unwrap().is_none() {
+        if orphan.is_none() && p.exists() {
+            orphan = pids(&p).first().copied();
+        }
+        if let Some(pid) = orphan
+            && !job.lock_held()
+        {
+            assert!(gone(pid), "the lock was released while the orphan lived");
+        }
+        sleep(Duration::from_millis(2));
+    }
+    assert!(child.wait().unwrap().success());
+
+    assert_eq!(status(&job).state, JobState::Exited);
+    let log = fs::read_to_string(job.path.join("supervisor.log")).unwrap();
+    assert!(log.contains("cannot scan /proc"), "{log}");
+    assert_all_gone(&pids(&p));
+    sleep(Duration::from_millis(1500));
+    assert!(!m.exists(), "the orphan outlived the job");
 }

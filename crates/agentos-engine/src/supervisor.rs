@@ -20,6 +20,7 @@ use std::os::unix::process::CommandExt;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentos_core::effect::RetryPolicy;
@@ -40,6 +41,11 @@ pub const POLL_ENV: &str = "AGENTOS_SUPERVISOR_POLL_MS";
 /// receipt is written (the Phase 2 "executed but not durable" case).
 pub const EXIT_BEFORE_RECEIPT_ENV: &str = "AGENTOS_TEST_SUPERVISOR_EXIT_BEFORE_RECEIPT";
 pub const EXIT_BEFORE_RECEIPT_CODE: i32 = 3;
+/// Test-only hook, honoured only together with `AGENTOS_TEST_WORKERS=1`: the first
+/// `TEST_FAILED_SCANS` scans for children fail, as if `/proc` were unreadable.
+pub const PROC_SCAN_FAILS_ENV: &str = "AGENTOS_TEST_SUPERVISOR_PROC_SCAN_FAILS";
+const TEST_FAILED_SCANS: u32 = 3;
+static FAILED_SCANS: AtomicU32 = AtomicU32::new(0);
 /// Test-only hook, honoured only together with `AGENTOS_TEST_WORKERS=1`: panic in the poll
 /// loop once `<job>/panic-now` exists (the test's script creates it when its processes are
 /// up), to prove a panic never frees the lock while the job lives.
@@ -204,6 +210,9 @@ fn kill_recorded_group(pgid: i32, sid: Pid) {
 /// SIGKILLs every live child of this process. A child's pid cannot be reused before we
 /// reap it, so nothing else can be hit.
 fn kill_children() -> io::Result<()> {
+    if test_hook(PROC_SCAN_FAILS_ENV) && FAILED_SCANS.fetch_add(1, Ordering::Relaxed) < TEST_FAILED_SCANS {
+        return Err(io::Error::other("test hook: /proc scan fails"));
+    }
     let me = std::process::id().to_string();
     for (pid, [state, ppid, ..]) in proc_stats()? {
         if ppid == me
@@ -216,32 +225,27 @@ fn kill_children() -> io::Result<()> {
     Ok(())
 }
 
-/// Reaps children until none is left, killing any that still live. If `/proc` cannot be
-/// read it falls back to waiting for them: the lock stays held for as long as any lives.
+/// Reaps children until none is left, killing any that still live. A failed `/proc` scan
+/// is retried with the same backoff: we never return while a child exists, so the lock
+/// stays held for as long as any process of the job lives.
 fn reap_all() -> io::Result<()> {
-    let mut pause = REAP_PAUSE;
+    let (mut pause, mut scan_failing) = (REAP_PAUSE, false);
     loop {
         match wait(WaitOptions::NOHANG) {
             Ok(Some(_)) => pause = REAP_PAUSE,
             Err(Errno::INTR) => {}
             Ok(None) => {
-                if let Err(e) = kill_children() {
-                    log(format_args!("cannot scan /proc ({e}); waiting for the remaining children"));
-                    return reap_blocking();
+                match kill_children() {
+                    Err(e) if !scan_failing => {
+                        log(format_args!("cannot scan /proc ({e}); retrying"));
+                        scan_failing = true;
+                    }
+                    Err(_) => {}
+                    Ok(()) => scan_failing = false,
                 }
                 std::thread::sleep(pause);
                 pause = (pause * 2).min(REAP_PAUSE_MAX);
             }
-            Err(Errno::CHILD) => return Ok(()),
-            Err(e) => return Err(e.into()),
-        }
-    }
-}
-
-fn reap_blocking() -> io::Result<()> {
-    loop {
-        match wait(WaitOptions::empty()) {
-            Ok(_) | Err(Errno::INTR) => {}
             Err(Errno::CHILD) => return Ok(()),
             Err(e) => return Err(e.into()),
         }
@@ -350,10 +354,18 @@ pub fn run_supervisor(job: &JobDir, worker_cmd: &SupervisorCmd) -> io::Result<Jo
     let req = job
         .request()
         .map_err(|e| io::Error::new(e.kind(), format!("cannot read {}: {e}", job.path.join("request.json").display())))?;
-    // Already a group leader (EPERM) is fine: we only need to leave the launcher's session.
+    // EPERM: `main_run` already made us a session leader, or the launcher made us a group
+    // leader. The second case is refused below.
     match setsid() {
         Ok(_) | Err(Errno::PERM) => {}
         Err(e) => return Err(e.into()),
+    }
+    // The session guard trusts our session to hold only the job: staying in the launcher's
+    // session would let a forged `groups` entry reach the controller's own groups.
+    if getsid(None)? != getpid() {
+        return Err(io::Error::other(
+            "not a session leader: launch the supervisor with a plain spawn (no process_group/setsid by the parent)",
+        ));
     }
     set_child_subreaper(Some(getpid()))?;
     if !job.lock_held() {
@@ -396,14 +408,14 @@ pub fn run_supervisor(job: &JobDir, worker_cmd: &SupervisorCmd) -> io::Result<Jo
     Err(failed)
 }
 
-/// When the orderly stop failed: kill what we can name and wait (blocking) for every
-/// child, so the lock outlives the job's processes.
+/// When the orderly stop failed: kill what we can name and reap every child, so the lock
+/// outlives the job's processes.
 fn last_resort(sup: &Supervisor, worker: Pid) {
     if !sup.worker_reaped.get() {
         let _ = kill_process_group(worker, Signal::KILL);
         let _ = kill_process(worker, Signal::KILL);
     }
-    let _ = reap_blocking();
+    let _ = reap_all();
 }
 
 /// `run <job_dir>`: supervises the job with this process's stdout and stderr appended to
