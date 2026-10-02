@@ -16,7 +16,7 @@ use agentos_core::effect::{AttemptId, EffectId, EffectKind, Outcome};
 use agentos_core::guest::{Message, Mode, SCRATCH_IMAGE_BYTES};
 use agentos_core::ids::{Digest, TaskId};
 use agentos_engine::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor};
-use agentos_engine::firecracker::{render_vm_json, FirecrackerConfig, FirecrackerWorker, WorkerResult};
+use agentos_engine::firecracker::{render_vm_json, Answer, FirecrackerConfig, FirecrackerWorker, Inspector, Query, WorkerResult};
 use agentos_engine::fixture::FixtureExecutor;
 use agentos_engine::guestlink::GuestLink;
 use agentos_engine::jail::{self, JailConfig, JailMode, StageSources};
@@ -570,6 +570,14 @@ async fn staged_ws_img_is_owned_by_the_jail_uid_and_still_inspectable() {
     assert!(status.success(), "{status}");
     let collected = jail::collect(&dir, &jc.cgroup_root).unwrap();
     assert_eq!((collected.cgroup_removed, collected.jail_removed), (true, true));
+
+    // The inspector itself (Task 7) reads the jail-owned image through the same jailer, and
+    // collects the hand-made inspection above as a dead one first.
+    let answer = Inspector::new(fx.cfg.clone(), fx.path("inspect")).with_env(test_env()).query(&fx.task, Query::Digest).unwrap();
+    assert_eq!(answer, Answer::Digest(digest));
+    assert!(!dir.exists(), "the earlier inspect directory is collected");
+    let ws = fs::metadata(fx.task_dir().join("ws.img")).unwrap();
+    assert_eq!((ws.uid(), ws.gid()), (jc.uid, jc.gid), "still the jail's");
 }
 
 fn wait_or_kill(child: &mut std::process::Child, within: Duration) -> std::process::ExitStatus {

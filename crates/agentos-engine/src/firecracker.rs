@@ -9,15 +9,15 @@
 use std::fs::{self, File, TryLockError};
 use std::io;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agentos_core::effect::EffectKind;
+use agentos_core::effect::{AttemptId, EffectKind};
 use agentos_core::guest::{
-    unb64, Message, Mode, FILE_LIMIT, GUEST_CID, GUEST_MIN_MEMORY_MIB, GUEST_PROTOCOL, MAX_VCPUS, OUTPUT_LIMIT, PATCH_LIMIT,
+    mint_attempt_token, unb64, Message, Mode, FILE_LIMIT, GUEST_CID, GUEST_MIN_MEMORY_MIB, GUEST_PROTOCOL, MAX_VCPUS, OUTPUT_LIMIT, PATCH_LIMIT,
     PROFILE_LIMIT, SCRATCH_IMAGE_BYTES, SNAPSHOT_BYTES_LIMIT, SNAPSHOT_FILES_LIMIT, WS_IMAGE_BYTES,
 };
 use agentos_core::ids::{Digest, TaskId};
@@ -26,11 +26,13 @@ use rustix::process::{kill_process, kill_process_group, Pid, Signal};
 use serde::{Deserialize, Serialize};
 
 use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Reconciliation};
-use crate::guestlink::{guest_text, spawn_fake, type_name, GuestLauncher, GuestLink, LinkError};
+use crate::guestlink::{fake_command, guest_text, type_name, GuestLauncher, GuestLink, LinkError};
 use crate::jail::{self, JailMode, StageSources};
 use crate::job::JobDir;
 use crate::outcomes::{self, Check};
 use crate::worker::{Worker, TEST_WORKERS_ENV};
+
+pub use agentos_guest::handlers::PatchStateIs;
 
 /// From spawn to `Ready`.
 pub const BOOT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -418,8 +420,9 @@ impl Drop for ScratchGuard {
     }
 }
 
-/// The spawned Firecracker (or fake guest). It runs in the worker's process group, so it is
-/// never killed by group from here; dropping an unreaped VM kills it.
+/// The spawned Firecracker (or jailer, or fake guest). A job's VM runs in the worker's
+/// process group, so the group kill here misses (the pid leads no group); an inspector's VM
+/// leads its own group, which the kill reaches whole. Dropping an unreaped VM kills it.
 struct Vm {
     child: Child,
     status: Option<ExitStatus>,
@@ -434,7 +437,7 @@ impl Vm {
         self.status.as_ref().map(exit_code_text)
     }
 
-    /// SIGKILLs the process (and a group it may lead; never the worker's own) and reaps it.
+    /// SIGKILLs the process (and the group it may lead; never the worker's own) and reaps it.
     fn kill(&mut self) -> ExitStatus {
         if let Some(status) = self.status {
             return status;
@@ -502,8 +505,136 @@ fn capped(mut bytes: Vec<u8>, truncated: bool) -> (Vec<u8>, bool) {
     (bytes, truncated || over)
 }
 
+/// How long a busy `ws.lock` is retried before it counts as held. A descriptor of it lives
+/// on for a moment in a child that another thread of this process forked (until that
+/// child's `exec` closes it), which must not read as "attached to another VM"; a VM that
+/// really has the image holds it for the whole boot.
+const LOCK_PATIENCE: Duration = Duration::from_millis(500);
+
+/// `try_lock` on `ws.lock`, retried for up to `LOCK_PATIENCE` while it is busy.
+fn lock_ws(lock: &File) -> Result<(), TryLockError> {
+    let until = Instant::now() + LOCK_PATIENCE;
+    loop {
+        match lock.try_lock() {
+            Err(TryLockError::WouldBlock) if Instant::now() < until => thread::sleep(EXIT_POLL),
+            other => return other,
+        }
+    }
+}
+
 fn sparse(path: &Path, len: u64) -> io::Result<()> {
     File::create(path)?.set_len(len)
+}
+
+/// `name` from `extra` (a test seam's environment, last entry wins) or else the process's.
+fn env_value(extra: &[(String, String)], name: &str) -> Option<String> {
+    extra.iter().rev().find(|(k, _)| k == name).map(|(_, v)| v.clone()).or_else(|| std::env::var(name).ok())
+}
+
+/// A test hook: `name=1` together with `AGENTOS_TEST_WORKERS=1`.
+fn test_hook(extra: &[(String, String)], name: &str) -> bool {
+    env_value(extra, TEST_WORKERS_ENV).as_deref() == Some("1") && env_value(extra, name).as_deref() == Some("1")
+}
+
+/// The environment of a spawned VM process: the test switches of this process
+/// (`AGENTOS_TEST_WORKERS`, `AGENTOS_TEST_FAKE_GUEST_*`) and the `extra` entries.
+fn guest_env(extra: &[(String, String)]) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .filter(|(k, _)| k == TEST_WORKERS_ENV || k.starts_with("AGENTOS_TEST_FAKE_GUEST_"))
+        .collect();
+    env.extend(extra.iter().cloned());
+    env
+}
+
+/// The fake launcher runs only in tests.
+fn fake_gate(cfg: &FirecrackerConfig, extra: &[(String, String)]) -> Result<(), String> {
+    if matches!(cfg.launcher, GuestLauncher::Fake { .. }) && env_value(extra, TEST_WORKERS_ENV).as_deref() != Some("1") {
+        return Err(format!("firecracker worker unavailable: the fake guest launcher needs {TEST_WORKERS_ENV}=1"));
+    }
+    Ok(())
+}
+
+/// The VM's files in `paths.dir` before the launch: `scratch.img` (sparse), empty
+/// `console.log` and `stderr.log`, and, unjailed, `firecracker.log` and `vm.json` (jailed,
+/// `jail::stage` makes `firecracker.log` as a link to the chroot's, and the chroot's
+/// `vm.json`).
+fn prepare_vm_files(cfg: &FirecrackerConfig, paths: &VmPaths) -> io::Result<()> {
+    sparse(&paths.scratch_img, SCRATCH_IMAGE_BYTES)?;
+    File::create(&paths.console_log)?;
+    File::create(&paths.stderr_log)?;
+    if matches!(cfg.jail, JailMode::Unjailed) {
+        File::create(&paths.firecracker_log)?;
+        write_vm_json(&paths.vm_json, cfg, &paths.host_view(&cfg.image_dir))?;
+    }
+    Ok(())
+}
+
+/// Which process group a VM is spawned in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Group {
+    /// The caller's: the worker's, so every 3a kill path (`worker_pgid`) reaches the VM.
+    Caller,
+    /// A new one the VM leads: the inspector's VM, a child of the controller, is killed as
+    /// a group (it never shares the controller's group).
+    Own,
+}
+
+/// Spawns the VM `id` for `paths` and says which socket reaches it: Firecracker against
+/// `<dir>/vm.json` (unjailed), the fake guest (unjailed, test tier), or, jailed (whatever
+/// the launcher), the jailer after `jail::plan` and `jail::stage`, reached through the
+/// chroot's socket. The jailer `exec`s Firecracker in place, so the child is Firecracker
+/// either way. Errors are effect failure reasons. Used by the worker (`Group::Caller`) and
+/// the inspector (`Group::Own`).
+fn launch(
+    cfg: &FirecrackerConfig,
+    paths: &VmPaths,
+    task_dir: &Path,
+    id: &str,
+    extra_env: &[(String, String)],
+    group: Group,
+) -> Result<(Child, PathBuf), String> {
+    let start = |e: io::Error| format!("cannot start firecracker: {e}");
+    let stdio = || -> io::Result<(File, File)> {
+        Ok((File::options().append(true).open(&paths.console_log)?, File::options().append(true).open(&paths.stderr_log)?))
+    };
+    let env = guest_env(extra_env);
+    let (mut cmd, uds) = match (&cfg.jail, &cfg.launcher) {
+        (JailMode::Jailed(jc), _) => {
+            let plan = jail::plan(jc, &cfg.firecracker_bin, &paths.dir, id).map_err(|e| format!("cannot prepare the jail: {e}"))?;
+            let vm_json = render_vm_json(cfg, &jail::chroot_view(&plan));
+            let sources = StageSources {
+                kernel: &cfg.image_dir.join(KERNEL_FILE),
+                rootfs: &cfg.image_dir.join(ROOTFS_FILE),
+                ws_img: &paths.ws_img,
+                scratch_img: &paths.scratch_img,
+                vm_json: &vm_json,
+            };
+            jail::stage(jc, &plan, &paths.dir, sources)?;
+            let mut cmd = Command::new(&jc.jailer_bin);
+            cmd.args(jail::jailer_args(jc, &plan, &cfg.firecracker_bin, cfg.vcpus, cfg.memory_mib));
+            (cmd, jail::host_uds(&plan))
+        }
+        (JailMode::Unjailed, GuestLauncher::Real { .. }) => {
+            let mut cmd = Command::new(&cfg.firecracker_bin);
+            cmd.args(["--no-api", "--config-file"]).arg(&paths.vm_json).arg("--id").arg(id);
+            (cmd, paths.uds.clone())
+        }
+        (JailMode::Unjailed, fake @ GuestLauncher::Fake { .. }) => {
+            let mut cmd = fake_command(fake, &paths.uds, task_dir, &env).map_err(start)?;
+            if group == Group::Own {
+                cmd.process_group(0);
+            }
+            return Ok((cmd.spawn().map_err(start)?, paths.uds.clone()));
+        }
+    };
+    let (console, stderr) = stdio().map_err(start)?;
+    cmd.env_clear().envs(env).current_dir(&paths.dir).stdin(Stdio::null()).stdout(console).stderr(stderr);
+    if group == Group::Own {
+        cmd.process_group(0);
+    }
+    let child = cmd.spawn().map_err(start)?;
+    Ok((child, uds))
 }
 
 impl FirecrackerWorker {
@@ -525,23 +656,8 @@ impl FirecrackerWorker {
         self
     }
 
-    fn env_value(&self, name: &str) -> Option<String> {
-        self.env.iter().rev().find(|(k, _)| k == name).map(|(_, v)| v.clone()).or_else(|| std::env::var(name).ok())
-    }
-
     fn test_hook(&self, name: &str) -> bool {
-        self.env_value(TEST_WORKERS_ENV).as_deref() == Some("1") && self.env_value(name).as_deref() == Some("1")
-    }
-
-    /// The environment of the spawned process: the test switches of this process
-    /// (`AGENTOS_TEST_WORKERS`, `AGENTOS_TEST_FAKE_GUEST_*`) and the `with_env` entries.
-    fn guest_env(&self) -> Vec<(String, String)> {
-        let mut env: Vec<(String, String)> = std::env::vars_os()
-            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
-            .filter(|(k, _)| k == TEST_WORKERS_ENV || k.starts_with("AGENTOS_TEST_FAKE_GUEST_"))
-            .collect();
-        env.extend(self.env.iter().cloned());
-        env
+        test_hook(&self.env, name)
     }
 
     /// Runs the job (blocking work on a blocking thread). What `run_worker` calls.
@@ -581,57 +697,6 @@ impl FirecrackerWorker {
         }
     }
 
-    /// Spawns the VM `id` for `paths` and says which socket reaches it: Firecracker against
-    /// `<dir>/vm.json` (unjailed), the fake guest (unjailed, test tier), or, jailed (whatever
-    /// the launcher), the jailer after `jail::plan` and `jail::stage`, reached through the
-    /// chroot's socket. The jailer `exec`s Firecracker in place, so the child is Firecracker
-    /// either way. Errors are effect failure reasons.
-    fn launch(&self, paths: &VmPaths, task_dir: &Path, id: &str) -> Result<(Child, PathBuf), String> {
-        let start = |e: io::Error| format!("cannot start firecracker: {e}");
-        let stdio = || -> io::Result<(File, File)> {
-            Ok((File::options().append(true).open(&paths.console_log)?, File::options().append(true).open(&paths.stderr_log)?))
-        };
-        // Either binary runs in the worker's process group (no process_group(0)): every 3a
-        // kill path reaches it.
-        let (mut cmd, uds) = match (&self.cfg.jail, &self.cfg.launcher) {
-            (JailMode::Jailed(jc), _) => {
-                let plan = jail::plan(jc, &self.cfg.firecracker_bin, &paths.dir, id).map_err(|e| format!("cannot prepare the jail: {e}"))?;
-                let vm_json = render_vm_json(&self.cfg, &jail::chroot_view(&plan));
-                let sources = StageSources {
-                    kernel: &self.cfg.image_dir.join(KERNEL_FILE),
-                    rootfs: &self.cfg.image_dir.join(ROOTFS_FILE),
-                    ws_img: &paths.ws_img,
-                    scratch_img: &paths.scratch_img,
-                    vm_json: &vm_json,
-                };
-                jail::stage(jc, &plan, &paths.dir, sources)?;
-                let mut cmd = Command::new(&jc.jailer_bin);
-                cmd.args(jail::jailer_args(jc, &plan, &self.cfg.firecracker_bin, self.cfg.vcpus, self.cfg.memory_mib));
-                (cmd, jail::host_uds(&plan))
-            }
-            (JailMode::Unjailed, GuestLauncher::Real { .. }) => {
-                let mut cmd = Command::new(&self.cfg.firecracker_bin);
-                cmd.args(["--no-api", "--config-file"]).arg(&paths.vm_json).arg("--id").arg(id);
-                (cmd, paths.uds.clone())
-            }
-            (JailMode::Unjailed, fake @ GuestLauncher::Fake { .. }) => {
-                let child = spawn_fake(fake, &paths.uds, task_dir, &self.guest_env()).map_err(start)?;
-                return Ok((child, paths.uds.clone()));
-            }
-        };
-        let (console, stderr) = stdio().map_err(start)?;
-        let child = cmd
-            .env_clear()
-            .envs(self.guest_env())
-            .current_dir(&paths.dir)
-            .stdin(Stdio::null())
-            .stdout(console)
-            .stderr(stderr)
-            .spawn()
-            .map_err(start)?;
-        Ok((child, uds))
-    }
-
     /// `run_vm`, then, jailed and with an outcome (the VM is reaped by then), the jail's
     /// collection. Without an outcome (a request was sent and the VM was lost) the jail is
     /// left for the controller, which collects once the job is settled.
@@ -655,8 +720,8 @@ impl FirecrackerWorker {
         }
 
         // Preflight, before every launch.
-        if matches!(self.cfg.launcher, GuestLauncher::Fake { .. }) && self.env_value(TEST_WORKERS_ENV).as_deref() != Some("1") {
-            return fail(format!("firecracker worker unavailable: the fake guest launcher needs {TEST_WORKERS_ENV}=1"));
+        if let Err(e) = fake_gate(&self.cfg, &self.env) {
+            return fail(e);
         }
         if let Err(e) = preflight(&self.cfg) {
             return fail(format!("firecracker worker unavailable: {e}"));
@@ -669,7 +734,7 @@ impl FirecrackerWorker {
             Ok(f) => f,
             Err(e) => return fail(format!("cannot prepare the VM: {e}")),
         };
-        match lock.try_lock() {
+        match lock_ws(&lock) {
             Ok(()) => {}
             // Another VM has the image: for a patch it may be applying it right now.
             Err(TryLockError::WouldBlock) if is_patch => return WorkerResult::Outcome(ExecOutcome::unresolved(req, ctx, WS_BUSY)),
@@ -693,25 +758,13 @@ impl FirecrackerWorker {
             return fail(format!("cannot prepare the VM: {}: {e}", paths.ws_img.display()));
         }
         let _scratch = ScratchGuard(paths.scratch_img.clone());
-        // Jailed, `jail::stage` makes firecracker.log (a link to the chroot's) and the
-        // chroot's vm.json.
-        let jailed = matches!(self.cfg.jail, JailMode::Jailed(_));
-        let prepared = sparse(&paths.scratch_img, SCRATCH_IMAGE_BYTES)
-            .and_then(|()| File::create(&paths.console_log).map(drop))
-            .and_then(|()| File::create(&paths.stderr_log).map(drop))
-            .and_then(|()| match jailed {
-                true => Ok(()),
-                false => File::create(&paths.firecracker_log)
-                    .map(drop)
-                    .and_then(|()| write_vm_json(&paths.vm_json, &self.cfg, &paths.host_view(&self.cfg.image_dir))),
-            });
-        if let Err(e) = prepared {
+        if let Err(e) = prepare_vm_files(&self.cfg, &paths) {
             return fail(format!("cannot prepare the VM: {e}"));
         }
 
         // Spawn and boot.
         let attempt = ctx.attempt_id.to_string();
-        let (mut vm, uds) = match self.launch(&paths, &task_dir, &attempt) {
+        let (mut vm, uds) = match launch(&self.cfg, &paths, &task_dir, &attempt, &self.env, Group::Caller) {
             Ok((child, uds)) => (Vm { child, status: None }, uds),
             Err(reason) => return fail(reason),
         };
@@ -872,6 +925,251 @@ impl FirecrackerWorker {
             }
             (_, other) => Err(violation(format!("expected {expected}, got {}", type_name(&other)))),
         }
+    }
+}
+
+/// What an inspection boot asks the guest (inspect mode).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Query {
+    /// The workspace digest (`current_workspace`).
+    Digest,
+    /// Whether `patch` was applied on top of `expected_base` (`reconcile`).
+    PatchState { expected_base: Digest, patch: Vec<u8> },
+}
+
+/// The guest's answer to a `Query`. Guest-controlled: `PatchStateIs.reason` must be
+/// escaped (`guest_text`) before it reaches a log, and `paths` only ever goes into JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answer {
+    Digest(Digest),
+    PatchState(PatchStateIs),
+}
+
+/// The controller's inspection boots: the task's guest image booted in inspect mode over
+/// the task's `ws.img`, one query, then shut down. Runs in the controller process, in a
+/// process group of its own; bounded by `INSPECT_TIMEOUT`; jailed like a job VM.
+#[derive(Debug, Clone)]
+pub struct Inspector {
+    cfg: FirecrackerConfig,
+    /// `<home>/inspect`: inspections of a task live in `<inspect_root>/<task>/<uuid>/`.
+    inspect_root: PathBuf,
+    inspect_timeout: Duration,
+    boot_timeout: Duration,
+    env: Vec<(String, String)>,
+}
+
+fn inspect_failed(why: impl std::fmt::Display) -> String {
+    format!("workspace inspection failed: {why}")
+}
+
+/// `60s`, or `1500ms` for a duration that is not whole seconds.
+fn duration_text(d: Duration) -> String {
+    if d.subsec_nanos() == 0 {
+        format!("{}s", d.as_secs())
+    } else {
+        format!("{}ms", d.as_millis())
+    }
+}
+
+/// The cgroup root `jail::collect` checks markers against: the jail's, or (unjailed, where
+/// no marker is ever written) a root no marker can name.
+pub(crate) fn collect_root(cfg: &FirecrackerConfig) -> &Path {
+    match &cfg.jail {
+        JailMode::Jailed(jc) => &jc.cgroup_root,
+        JailMode::Unjailed => Path::new("/nonexistent"),
+    }
+}
+
+impl Inspector {
+    /// `inspect_root` is `<home>/inspect`; the engine takes it explicitly.
+    pub fn new(cfg: FirecrackerConfig, inspect_root: PathBuf) -> Inspector {
+        Inspector { cfg, inspect_root, inspect_timeout: INSPECT_TIMEOUT, boot_timeout: BOOT_TIMEOUT, env: Vec::new() }
+    }
+
+    /// Test seam: replaces `INSPECT_TIMEOUT`.
+    pub fn with_inspect_timeout(mut self, timeout: Duration) -> Inspector {
+        self.inspect_timeout = timeout;
+        self
+    }
+
+    /// Test seam: replaces `BOOT_TIMEOUT`.
+    pub fn with_boot_timeout(mut self, timeout: Duration) -> Inspector {
+        self.boot_timeout = timeout;
+        self
+    }
+
+    /// Test seam: environment treated as this process's own (test hooks) and passed to the
+    /// spawned guest, as `FirecrackerWorker::with_env`.
+    pub fn with_env(mut self, env: Vec<(String, String)>) -> Inspector {
+        self.env = env;
+        self
+    }
+
+    pub(crate) fn push_env(&mut self, key: String, value: String) {
+        self.env.push((key, value));
+    }
+
+    pub fn config(&self) -> &FirecrackerConfig {
+        &self.cfg
+    }
+
+    /// Collects every inspect directory of the task: one controller runs per home, so any
+    /// found is a dead inspector's. Its jail is collected first; a directory whose jail
+    /// cannot be collected is kept (a chroot is never removed under a cgroup that still
+    /// has processes) and the next inspection tries again. Failures are warnings.
+    fn collect_dead(&self, task_root: &Path) {
+        let entries = match fs::read_dir(task_root) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return,
+            Err(e) => {
+                tracing::warn!(dir = %task_root.display(), error = %e, "cannot list dead inspections");
+                return;
+            }
+        };
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                tracing::warn!(path = %dir.display(), "not an inspect directory; left alone");
+                continue;
+            }
+            match jail::collect(&dir, collect_root(&self.cfg)) {
+                Ok(_) => {
+                    if let Err(e) = fs::remove_dir_all(&dir) {
+                        tracing::warn!(dir = %dir.display(), error = %e, "cannot remove a dead inspection");
+                    }
+                }
+                Err(e) => tracing::warn!(dir = %dir.display(), error = %e, "a dead inspection's jail was not collected; kept"),
+            }
+        }
+    }
+
+    /// One inspection boot (blocking): `ws.img` must exist; preflight; dead inspections of
+    /// the task collected; `ws.lock` taken; `<inspect_root>/<task>/<uuid>/` prepared; the
+    /// VM (`inspect-<uuid>`) spawned in a new process group, asked `query` in inspect mode,
+    /// shut down; its jail collected; the directory removed on success and kept (without
+    /// its jail and scratch image) on failure. Bounded by the inspect timeout.
+    pub fn query(&self, task: &TaskId, query: Query) -> Result<Answer, String> {
+        let task_dir = self.cfg.work_root.join(task.as_str());
+        let ws_img = task_dir.join("ws.img");
+        if !ws_img.is_file() {
+            return Err(format!("workspace image {} is missing", ws_img.display()));
+        }
+        let deadline = Instant::now() + self.inspect_timeout;
+        fake_gate(&self.cfg, &self.env).map_err(inspect_failed)?;
+        preflight(&self.cfg).map_err(|e| inspect_failed(format!("firecracker worker unavailable: {e}")))?;
+        let task_root = self.inspect_root.join(task.as_str());
+        self.collect_dead(&task_root);
+
+        let lock_path = task_dir.join("ws.lock");
+        let lock = File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| inspect_failed(format!("cannot lock {}: {e}", lock_path.display())))?;
+        match lock_ws(&lock) {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => return Err(WS_BUSY.into()),
+            Err(TryLockError::Error(e)) => return Err(inspect_failed(format!("cannot lock {}: {e}", lock_path.display()))),
+        }
+
+        let uuid = AttemptId::new().to_string();
+        let id = format!("inspect-{uuid}");
+        let dir = task_root.join(&uuid);
+        let paths = VmPaths::new(&dir, &self.cfg.work_root, task);
+        let result = self.boot(&paths, &task_dir, &id, task, &query, deadline).map_err(|why| {
+            if Instant::now() >= deadline {
+                inspect_failed(format!("timeout after {}", duration_text(self.inspect_timeout)))
+            } else {
+                inspect_failed(why)
+            }
+        });
+
+        // The VM is reaped by now.
+        let collected = match jail::collect(&dir, collect_root(&self.cfg)) {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(dir = %dir.display(), error = %e, "the inspection's jail was not collected");
+                false
+            }
+        };
+        let _ = fs::remove_file(&paths.scratch_img);
+        match &result {
+            Ok(_) if collected => {
+                if let Err(e) = fs::remove_dir_all(&dir) {
+                    tracing::warn!(dir = %dir.display(), error = %e, "cannot remove the inspect directory");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(task = %task, dir = %dir.display(), error = %e, "inspection failed; its directory is kept"),
+        }
+        drop(lock);
+        result
+    }
+
+    /// Prepare, spawn, connect, `Hello{mode: inspect}`, the query, `Shutdown`. The VM is
+    /// reaped (`Vm` kills its group and waits when dropped) before this returns. Errors are
+    /// the reasons after `workspace inspection failed: `.
+    fn boot(&self, paths: &VmPaths, task_dir: &Path, id: &str, task: &TaskId, query: &Query, deadline: Instant) -> Result<Answer, String> {
+        fs::create_dir_all(&paths.dir).map_err(|e| format!("cannot prepare the VM: {}: {e}", paths.dir.display()))?;
+        if [&self.cfg.image_dir, &paths.dir, &paths.ws_img].iter().any(|p| p.to_str().is_none()) {
+            return Err("cannot prepare the VM: a VM path is not valid UTF-8".into());
+        }
+        prepare_vm_files(&self.cfg, paths).map_err(|e| format!("cannot prepare the VM: {e}"))?;
+        let (child, uds) = launch(&self.cfg, paths, task_dir, id, &self.env, Group::Own)?;
+        let mut vm = Vm { child, status: None };
+
+        let boot_deadline = deadline.min(Instant::now() + self.boot_timeout);
+        let mut link = GuestLink::connect_until(&uds, boot_deadline, || vm.exited()).map_err(|e| not_up(&e))?;
+        let hello = Message::Hello {
+            protocol: GUEST_PROTOCOL,
+            // Fresh per inspection: identity of this boot, never a job's token.
+            attempt_token: mint_attempt_token(),
+            task_id: task.as_str().to_string(),
+            effect_id: String::new(),
+            attempt_id: id.to_string(),
+            lease_generation: 0,
+            mode: Mode::Inspect,
+        };
+        match link.hello(hello, boot_deadline) {
+            Ok(Message::Ready { mode: Mode::Inspect, .. }) => {}
+            Ok(_) => return Err(not_up(&LinkError::Protocol("guest is not in inspect mode".into()))),
+            Err(e) => return Err(not_up(&e)),
+        }
+        let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
+        link.set_write_timeout(Some(left)).map_err(|e| e.to_string())?;
+
+        let violation = |why: String| LinkError::Protocol(why).to_string();
+        let answer = match query {
+            Query::Digest => {
+                link.send(&Message::Digest).map_err(|e| e.to_string())?;
+                match link.recv(deadline).map_err(|e| e.to_string())? {
+                    Message::DigestIs { workspace_digest } => Answer::Digest(workspace_digest),
+                    Message::Refused { reason } => return Err(guest_text(&reason)),
+                    other => return Err(violation(format!("expected DigestIs, got {}", type_name(&other)))),
+                }
+            }
+            Query::PatchState { expected_base, patch } => {
+                link.send(&Message::PatchState { expected_base: *expected_base }).map_err(|e| e.to_string())?;
+                link.send_patch(patch).map_err(|e| e.to_string())?;
+                match link.recv(deadline).map_err(|e| e.to_string())? {
+                    Message::PatchStateIs { state, paths, workspace_digest, reason } => {
+                        Answer::PatchState(PatchStateIs { state, paths, workspace_digest, reason })
+                    }
+                    Message::Refused { reason } => return Err(guest_text(&reason)),
+                    other => return Err(violation(format!("expected PatchStateIs, got {}", type_name(&other)))),
+                }
+            }
+        };
+
+        // The answer is in hand: shut down, bounded by what is left of the inspection.
+        let wait = SHUTDOWN_WAIT.min(deadline.saturating_duration_since(Instant::now()));
+        if link.send(&Message::Shutdown).is_ok() {
+            let _ = link.recv(Instant::now() + wait);
+        }
+        drop(link);
+        vm.wait_or_kill(wait);
+        Ok(answer)
     }
 }
 

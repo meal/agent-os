@@ -30,6 +30,11 @@ pub trait Backend: Send {
     fn check_command(&self, program: &str, args: &[String], workspace: &Path, cwd: &Path, pycache: &Path) -> Command;
     fn vcpus(&self) -> u32;
     fn memory_mib(&self) -> u32;
+    /// Test hook (fake guest only, with `AGENTOS_TEST_WORKERS=1`): `PatchState` is never
+    /// answered; the session ends when the host closes the connection.
+    fn hang_inspect(&self) -> bool {
+        false
+    }
 }
 
 /// The scrubbed `git` both backends start from (the VM backend adds the uid drop).
@@ -137,6 +142,10 @@ impl Backend for FakeBackend {
 
     fn vcpus(&self) -> u32 {
         visible_vcpus()
+    }
+
+    fn hang_inspect(&self) -> bool {
+        crate::fake::test_hook("AGENTOS_TEST_FAKE_GUEST_HANG_INSPECT")
     }
 
     fn memory_mib(&self) -> u32 {

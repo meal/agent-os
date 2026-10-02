@@ -163,6 +163,14 @@ impl Session {
                         Ok(Frame::Json(_)) => return lost("JSON frame where the patch was expected"),
                         Err(e) => return lost(e),
                     };
+                    if backend.hang_inspect() {
+                        // Test hook: never answer, but still end with the connection.
+                        loop {
+                            if let Err(e) = read_frame(&mut stream, 0) {
+                                return lost(e);
+                            }
+                        }
+                    }
                     handlers::patch_state(backend, expected_base, &patch).into_message()
                 }
                 Message::Shutdown => {

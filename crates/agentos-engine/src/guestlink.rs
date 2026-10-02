@@ -350,6 +350,12 @@ pub(crate) fn type_name(m: &Message) -> String {
 /// never exceeds the socket address limit). The environment is cleared apart from `PATH`
 /// and `env`. The caller kills and reaps the child explicitly.
 pub fn spawn_fake(launcher: &GuestLauncher, uds: &Path, root: &Path, env: &[(String, String)]) -> io::Result<Child> {
+    fake_command(launcher, uds, root, env)?.spawn()
+}
+
+/// The command `spawn_fake` spawns, for a caller that adds to it (the inspector puts the
+/// fake guest in a process group of its own).
+pub fn fake_command(launcher: &GuestLauncher, uds: &Path, root: &Path, env: &[(String, String)]) -> io::Result<Command> {
     let GuestLauncher::Fake { program, prefix_args } = launcher else {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "spawn_fake needs a Fake launcher"));
     };
@@ -365,5 +371,6 @@ pub fn spawn_fake(launcher: &GuestLauncher, uds: &Path, root: &Path, env: &[(Str
     for (k, v) in env {
         cmd.env(k, v);
     }
-    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    Ok(cmd)
 }

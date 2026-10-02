@@ -18,7 +18,8 @@ use crate::backend::FakeBackend;
 /// The longest handshake line accepted (`CONNECT 5200\n` is 13 bytes).
 const MAX_CONNECT_LINE: usize = 32;
 
-fn test_hook(name: &str) -> bool {
+/// A test hook: `name=1` together with `AGENTOS_TEST_WORKERS=1`.
+pub(crate) fn test_hook(name: &str) -> bool {
     std::env::var_os("AGENTOS_TEST_WORKERS").is_some_and(|v| v == "1") && std::env::var_os(name).is_some_and(|v| v == "1")
 }
 

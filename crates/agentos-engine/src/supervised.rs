@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentos_core::effect::{EffectId, EffectKind, RetryPolicy};
+use agentos_core::guest::{mint_attempt_token, PatchStateKind};
 use agentos_core::ids::{Digest, TaskId};
 use agentos_core::lease::{lease_expiry_ms, EffectTimeouts};
 use rustix::process::{getpgrp, getpid, getsid, kill_process_group, pidfd_open, pidfd_send_signal, Pid, PidfdFlags, Signal};
@@ -35,8 +36,12 @@ use rustix::process::{getpgrp, getpid, getsid, kill_process_group, pidfd_open, p
 use crate::crash::{CrashHook, CrashPoint};
 use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor, Reconciliation};
 pub use crate::executor::JobWait;
+use crate::firecracker::{collect_root, Answer, Inspector, Query};
 use crate::fixture::FixtureExecutor;
+use crate::guestlink::guest_text;
+use crate::jail;
 use crate::job::{JobDir, JobRequest, JobState, WorkerConfig};
+use crate::outcomes;
 use crate::supervisor::{group_in_session, proc_stats, SupervisorCmd};
 
 /// How often a job directory is looked at while waiting.
@@ -79,6 +84,70 @@ impl ExecCounts {
     }
 }
 
+/// How the controller looks at a task's workspace without running a job.
+#[allow(clippy::large_enum_variant, reason = "one per executor, built once")]
+pub enum Reconciler {
+    /// The workspace is a host directory the controller reads directly.
+    Host(FixtureExecutor),
+    /// The workspace is a block image only the guest mounts: an inspection boot.
+    Firecracker(Inspector),
+}
+
+impl Reconciler {
+    /// Whether `req` (a patch) took effect. Firecracker: `NotApplied` only when the guest
+    /// reports the base digest, `Applied` only with a digest other than the base (the
+    /// guest reverted the patch on a copy and got the base back); anything else, and any
+    /// inspection failure, is `Unknown`, never `NotApplied`.
+    pub async fn reconcile(&self, req: &EffectRequest, ctx: &AttemptCtx) -> Reconciliation {
+        let inspector = match self {
+            Reconciler::Host(fixture) => return fixture.reconcile(req, ctx).await,
+            Reconciler::Firecracker(inspector) => inspector,
+        };
+        let EffectKind::ApplyPatch { expected_base } = req.kind else {
+            return Reconciliation::Unknown;
+        };
+        let (inspector, task, patch) = (inspector.clone(), req.task_id.clone(), req.payload.clone());
+        let answer = tokio::task::spawn_blocking(move || inspector.query(&task, Query::PatchState { expected_base, patch }))
+            .await
+            .unwrap_or_else(|e| Err(format!("workspace inspection failed: {e}")));
+        let state = match answer {
+            Ok(Answer::PatchState(state)) => state,
+            Ok(Answer::Digest(_)) => {
+                tracing::warn!(effect_id = %req.effect_id, "inspection answered a digest to a patch-state query");
+                return Reconciliation::Unknown;
+            }
+            Err(e) => {
+                tracing::warn!(effect_id = %req.effect_id, error = %e, "patch cannot be reconciled");
+                return Reconciliation::Unknown;
+            }
+        };
+        match (state.state, state.workspace_digest) {
+            (PatchStateKind::NotApplied, Some(d)) if d == expected_base => Reconciliation::NotApplied,
+            (PatchStateKind::Applied, Some(d)) if d != expected_base => {
+                Reconciliation::Applied(outcomes::patch_applied(req, ctx, state.paths, d))
+            }
+            (kind, digest) => {
+                let reason = guest_text(state.reason.as_deref().unwrap_or(""));
+                tracing::warn!(effect_id = %req.effect_id, ?kind, ?digest, reason, "patch cannot be reconciled");
+                Reconciliation::Unknown
+            }
+        }
+    }
+
+    /// The task's workspace digest, or why it cannot be had. Never `None`: either kind can
+    /// always tell or say why not.
+    pub fn current_workspace(&self, task: &TaskId) -> Option<Result<Digest, String>> {
+        match self {
+            Reconciler::Host(fixture) => fixture.current_workspace(task),
+            Reconciler::Firecracker(inspector) => Some(match inspector.query(task, Query::Digest) {
+                Ok(Answer::Digest(d)) => Ok(d),
+                Ok(Answer::PatchState(_)) => Err("workspace inspection failed: a patch state answered a digest query".into()),
+                Err(e) => Err(e),
+            }),
+        }
+    }
+}
+
 pub struct SupervisedExecutor {
     jobs_root: PathBuf,
     supervisor: SupervisorCmd,
@@ -87,10 +156,9 @@ pub struct SupervisedExecutor {
     counts: ExecCounts,
     crash: Option<CrashHook>,
     extra_env: Vec<(String, String)>,
-    /// Answers `reconcile` and `current_workspace` for host workers, read-only. The 3a
-    /// stand-in: the workspace lives on the host, so the controller can inspect it directly;
-    /// 3b moves it into the guest and this into the worker.
-    reconciler: Option<FixtureExecutor>,
+    /// Answers `reconcile` and `current_workspace`, read-only: the host workspace directly
+    /// (host workers), or an inspection boot (Firecracker); none for scripted workers.
+    reconciler: Option<Reconciler>,
     /// `MAX_EFFECT_TIMEOUT_MS` except in tests.
     max_lease_clamp_ms: i64,
 }
@@ -308,14 +376,17 @@ impl SupervisedExecutor {
     ) -> io::Result<SupervisedExecutor> {
         fs::create_dir_all(&jobs_root)?;
         let reconciler = match &worker {
-            WorkerConfig::Host(h) => Some(
+            WorkerConfig::Host(h) => Some(Reconciler::Host(
                 FixtureExecutor::new(h.snapshot_dir.clone(), h.profile_dir.clone(), h.work_root.clone())
                     .with_verify_timeout(Duration::from_secs(h.verify_timeout_secs))
                     .with_pinned_profile(h.profile_digest),
-            ),
+            )),
             WorkerConfig::Scripted(_) => None,
-            // The inspector (Task 7) answers reconcile/current_workspace for Firecracker.
-            WorkerConfig::Firecracker(_) => None,
+            WorkerConfig::Firecracker(cfg) => {
+                // `<home>/jobs` ⇒ `<home>/inspect`.
+                let inspect_root = jobs_root.parent().unwrap_or(&jobs_root).join("inspect");
+                Some(Reconciler::Firecracker(Inspector::new(cfg.clone(), inspect_root)))
+            }
         };
         Ok(SupervisedExecutor {
             jobs_root,
@@ -349,9 +420,14 @@ impl SupervisedExecutor {
         self
     }
 
-    /// Sets `key` in the supervisor's (and so the worker's) environment.
+    /// Sets `key` in the supervisor's (and so the worker's) environment, and in the
+    /// environment the inspector treats as its own.
     pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> SupervisedExecutor {
-        self.extra_env.push((key.into(), value.into()));
+        let (key, value) = (key.into(), value.into());
+        if let Some(Reconciler::Firecracker(inspector)) = &mut self.reconciler {
+            inspector.push_env(key.clone(), value.clone());
+        }
+        self.extra_env.push((key, value));
         self
     }
 
@@ -415,7 +491,12 @@ impl SupervisedExecutor {
         lease_expiry_ms.min(now.saturating_add(self.max_lease_clamp_ms)).saturating_add(GRACE_MS)
     }
 
+    /// The job's `request.json`. A Firecracker job gets a fresh attempt token of its own.
     fn job_request(&self, req: &EffectRequest, ctx: &AttemptCtx, lease_expiry_ms: i64) -> JobRequest {
+        let mut worker = self.worker.clone();
+        if let WorkerConfig::Firecracker(cfg) = &mut worker {
+            cfg.attempt_token = mint_attempt_token();
+        }
         JobRequest {
             effect_id: req.effect_id.clone(),
             task_id: req.task_id.clone(),
@@ -426,7 +507,19 @@ impl SupervisedExecutor {
             lease_generation: ctx.lease_generation,
             lease_expiry_ms,
             task_deadline_ms: req.deadline_ts.saturating_mul(1000),
-            worker: self.worker.clone(),
+            worker,
+        }
+    }
+
+    /// Collects the jail a settled Firecracker job left (its worker died without collecting
+    /// it: a supervisor SIGKILL, a lease kill). Only ever called once 3a has proven the job
+    /// settled; a failure is a warning.
+    fn collect_jails(&self, jobs: &[JobDir]) {
+        let WorkerConfig::Firecracker(cfg) = &self.worker else { return };
+        for job in jobs {
+            if let Err(e) = jail::collect(&job.path, collect_root(cfg)) {
+                tracing::warn!(job = %job.path.display(), error = %e, "the job's jail was not collected");
+            }
         }
     }
 
@@ -501,6 +594,7 @@ impl SupervisedExecutor {
     pub async fn fence_jobs(&self, jobs: &[JobDir]) -> bool {
         let live: Vec<JobDir> = jobs.iter().filter(|j| !settled(j)).cloned().collect();
         if live.is_empty() {
+            self.collect_jails(jobs);
             return true;
         }
         for job in &live {
@@ -509,14 +603,20 @@ impl SupervisedExecutor {
             }
         }
         if wait_dead(&live, now_ms().saturating_add(FENCE_GRACE_MS)).await {
+            self.collect_jails(jobs);
             return true;
         }
         for job in live.iter().filter(|j| !settled(j)) {
             kill_job(job);
         }
         let dead = wait_dead(&live, now_ms().saturating_add(KILL_SETTLE_MS)).await;
-        if !dead {
+        if dead {
+            self.collect_jails(jobs);
+        } else {
             tracing::warn!(jobs = ?live.iter().map(|j| j.path.display().to_string()).collect::<Vec<_>>(), "jobs survived the fence");
+            // Only the jobs proven settled; the others may still have a VM in their jail.
+            let settled_jobs: Vec<JobDir> = jobs.iter().filter(|j| settled(j)).cloned().collect();
+            self.collect_jails(&settled_jobs);
         }
         dead
     }
@@ -551,6 +651,7 @@ impl SupervisedExecutor {
         if !wait_dead(&jobs, until).await {
             return JobWait::StillAlive;
         }
+        self.collect_jails(&jobs);
         match self.retained_outcome(effect) {
             Some(out) => JobWait::Receipt(Box::new(out)),
             None => JobWait::Dead,
@@ -586,6 +687,9 @@ impl Executor for SupervisedExecutor {
         if !wait_dead(jobs, self.lease_bound(now_ms(), lease)).await && !self.fence_jobs(jobs).await {
             return ExecOutcome::unresolved(req, ctx, "the job outlived its lease and could not be stopped");
         }
+        // Settled: its jail, if its worker could not collect it, goes now, before any
+        // inspection boots on the same image.
+        self.collect_jails(jobs);
         match receipt_for(&job, req, ctx) {
             Some(out) => out,
             None => self.without_receipt(req, ctx).await,
