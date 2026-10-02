@@ -1,12 +1,15 @@
 //! Running a check in its own process group, so nothing it starts outlives it.
 
 use std::io;
+use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use rustix::process::{kill_process_group, Pid, Signal};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
+
+use crate::job::append_group;
 
 pub(crate) struct GroupOutput {
     pub status: ExitStatus,
@@ -46,7 +49,16 @@ fn kill_group(pgid: Option<Pid>) {
 /// in the instant between reaping and killing.)
 /// A descendant that calls `setsid` leaves the group and escapes this; containing that is
 /// the job of the VM/Wasm backends.
-pub(crate) async fn run_in_group(mut cmd: Command, timeout: Duration, limit: usize) -> Result<GroupOutput, GroupError> {
+///
+/// With `groups_file`, the group id is appended to it (durably) before the wait, so a
+/// supervisor that outlives this process can still kill the group. If it cannot be
+/// recorded, the group is killed at once and nothing runs unrecorded.
+pub(crate) async fn run_in_group(
+    mut cmd: Command,
+    timeout: Duration,
+    limit: usize,
+    groups_file: Option<&Path>,
+) -> Result<GroupOutput, GroupError> {
     cmd.process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -54,6 +66,17 @@ pub(crate) async fn run_in_group(mut cmd: Command, timeout: Duration, limit: usi
         .kill_on_drop(true);
     let mut child = cmd.spawn().map_err(GroupError::Io)?;
     let pgid = child.id().and_then(|id| Pid::from_raw(id as i32));
+    if let Some(file) = groups_file {
+        let recorded = match pgid {
+            Some(p) => append_group(file, p.as_raw_nonzero().get()),
+            None => Err(io::Error::other("spawned child has no pid")),
+        };
+        if let Err(e) = recorded {
+            kill_group(pgid);
+            let _ = child.kill().await;
+            return Err(GroupError::Io(io::Error::new(e.kind(), format!("cannot record process group: {e}"))));
+        }
+    }
     let stdout = tokio::spawn(capture(child.stdout.take().expect("stdout is piped"), limit));
     let stderr = tokio::spawn(capture(child.stderr.take().expect("stderr is piped"), limit));
 

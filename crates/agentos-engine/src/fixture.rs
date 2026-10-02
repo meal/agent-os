@@ -28,6 +28,10 @@ pub struct FixtureExecutor {
     profile_dir: PathBuf,
     work_root: PathBuf,
     verify_timeout: Duration,
+    /// Where each verification's process group is recorded; set inside a worker.
+    groups_file: Option<PathBuf>,
+    /// The digest the staged profile must have before anything of it runs.
+    pinned_profile: Option<Digest>,
 }
 
 /// Runs blocking filesystem work off the async runtime.
@@ -62,7 +66,27 @@ fn symlink_on_path(ws: &Path, rel: &str) -> io::Result<Option<String>> {
 
 impl FixtureExecutor {
     pub fn new(snapshot_dir: PathBuf, profile_dir: PathBuf, work_root: PathBuf) -> FixtureExecutor {
-        FixtureExecutor { snapshot_dir, profile_dir, work_root, verify_timeout: Duration::from_secs(60) }
+        FixtureExecutor {
+            snapshot_dir,
+            profile_dir,
+            work_root,
+            verify_timeout: Duration::from_secs(60),
+            groups_file: None,
+            pinned_profile: None,
+        }
+    }
+
+    /// Records every verification's process group in `groups_file`, so the supervisor can
+    /// kill it; the check still runs in a group of its own.
+    pub fn inside_worker(mut self, groups_file: PathBuf) -> FixtureExecutor {
+        self.groups_file = Some(groups_file);
+        self
+    }
+
+    /// Refuses to run a verification whose staged profile does not have digest `pinned`.
+    pub fn with_pinned_profile(mut self, pinned: Option<Digest>) -> FixtureExecutor {
+        self.pinned_profile = pinned;
+        self
     }
 
     pub fn with_verify_timeout(mut self, timeout: Duration) -> FixtureExecutor {
@@ -241,6 +265,12 @@ impl FixtureExecutor {
         let run_dir = tempfile::tempdir_in(self.task_dir(&req.task_id)).map_err(|e| format!("scratch dir: {e}"))?;
         let run_profile = run_dir.path().join("profile");
         copy_tree(&self.profile_dir, &run_profile).map_err(|e| format!("cannot stage profile: {e}"))?;
+        if let Some(pinned) = self.pinned_profile {
+            let staged = workspace_digest(&run_profile).map_err(|e| format!("cannot digest profile: {e}"))?;
+            if staged != pinned {
+                return Err(format!("profile digest mismatch: pinned {pinned}, found {staged}"));
+            }
+        }
         let workspace = workspace_digest(&ws).map_err(|e| format!("cannot digest workspace: {e}"))?;
 
         let mut cmd = tokio::process::Command::new(program);
@@ -254,7 +284,7 @@ impl FixtureExecutor {
         if let Some(path) = std::env::var_os("PATH") {
             cmd.env("PATH", path);
         }
-        let output = match run_in_group(cmd, self.verify_timeout, OUTPUT_LIMIT).await {
+        let output = match run_in_group(cmd, self.verify_timeout, OUTPUT_LIMIT, self.groups_file.as_deref()).await {
             Err(GroupError::Timeout) => return Err("timeout".into()),
             Err(GroupError::Io(e)) => return Err(format!("cannot run profile command: {e}")),
             Ok(o) => o,

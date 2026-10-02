@@ -270,9 +270,7 @@ impl JobDir {
     }
 
     pub fn record_group(&self, pgid: i32) -> io::Result<()> {
-        let mut f = OpenOptions::new().create(true).append(true).open(self.path.join("groups"))?;
-        f.write_all(format!("{pgid}\n").as_bytes())?;
-        f.sync_all()
+        append_group(&self.path.join("groups"), pgid)
     }
 
     pub fn groups(&self) -> Vec<i32> {
@@ -326,6 +324,14 @@ impl JobDir {
         found.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.path.cmp(&b.1.path)));
         found.into_iter().map(|(_, j)| j).collect()
     }
+}
+
+/// Appends `pgid` to a `groups` file and makes it durable before returning, so the
+/// supervisor can kill the group even if this process dies right after.
+pub fn append_group(path: &Path, pgid: i32) -> io::Result<()> {
+    let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+    f.write_all(format!("{pgid}\n").as_bytes())?;
+    f.sync_all()
 }
 
 fn probe_lock(
