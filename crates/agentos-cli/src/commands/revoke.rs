@@ -37,7 +37,7 @@ pub fn cancel_running_jobs(home: &Home, store: &Store, task: &TaskId, only: Opti
         return Ok(0);
     }
     // A task whose inputs were never recorded has no job to stop.
-    Ok(home.executor(task).map_or(0, |exec| exec.cancel_jobs(&effects)))
+    Ok(home.executor(store, task).map_or(0, |exec| exec.cancel_jobs(&effects)))
 }
 
 pub fn revoke(home: &Home, task: &TaskId, capability: Option<&str>) -> Result<(), CliError> {

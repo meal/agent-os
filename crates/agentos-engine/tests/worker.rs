@@ -169,6 +169,21 @@ async fn verification_with_a_wrong_pinned_digest_fails_before_running_the_profil
 }
 
 #[tokio::test]
+async fn profile_bytes_changed_after_hostconfig_is_built_voids_the_evidence() {
+    let fx = Fx::new();
+    let pinned = workspace_digest(&fx.path("profile")).unwrap();
+    let worker = fx.worker(Some(pinned), 60);
+    // The registry copy is swapped for a check that passes everything, after the pin.
+    fx.script_profile("print('always passes')");
+    let changed = workspace_digest(&fx.path("profile")).unwrap();
+    succeeded(&worker.run(&fx.request(EffectKind::ReadSnapshot, b""), &ctx()).await);
+
+    let out = worker.run(&fx.request(EffectKind::RunVerification, b""), &ctx()).await;
+    assert_eq!(reason(&out), format!("profile digest mismatch: pinned {pinned}, found {changed}"));
+    assert!(out.verification.is_none(), "no evidence, so nothing can pass");
+}
+
+#[tokio::test]
 async fn verification_with_the_right_pinned_digest_passes() {
     let fx = Fx::new();
     let pinned = workspace_digest(&fx.path("profile")).unwrap();

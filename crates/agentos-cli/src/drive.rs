@@ -74,7 +74,7 @@ fn check_inputs(home: &Home, store: &Store, task: &TaskId) -> Result<Option<Task
 pub async fn drive(home: &Home, store: &Store, lock: &DriverLock, task: &TaskId, patch: String, crash: Option<&CrashSpec>) -> Result<TaskState, CliError> {
     lock.driving(task)?;
     let hook = crash.map(CrashSpec::hook);
-    let exec = home.executor(task)?.with_crash(hook.clone());
+    let exec = home.executor(store, task)?.with_crash(hook.clone());
     let opts = RunOptions { crash: hook };
     if let Some(state) = check_inputs(home, store, task)? {
         // The task is failed before anything runs on the changed inputs, but what the dead

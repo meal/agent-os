@@ -1,6 +1,7 @@
 mod control;
 mod export;
 mod inspect;
+mod profile;
 mod revoke;
 mod submit;
 pub mod supervise;
@@ -9,7 +10,7 @@ use agentos_core::ids::TaskId;
 use agentos_core::state::TaskState;
 use serde_json::{json, Value};
 
-use crate::args::{Args, Command};
+use crate::args::{Args, Command, ProfileCommand};
 use crate::error::CliError;
 use crate::home::Home;
 
@@ -26,6 +27,8 @@ pub async fn dispatch(args: Args) -> Result<(), CliError> {
             control::resume(&home, &task_id(&id)?, fake_agent_patch.as_deref(), crash_at.as_ref()).await
         }
         Command::Cancel { id } => control::cancel(&home, &task_id(&id)?).await,
+        Command::Profile { command: ProfileCommand::Register { dir } } => profile::register(&home, &dir),
+        Command::Profile { command: ProfileCommand::List } => profile::list(&home),
         Command::Revoke { id, capability } => revoke::revoke(&home, &task_id(&id)?, capability.as_deref()),
         Command::Export { id, dir } => export::export(&home, &task_id(&id)?, &dir),
         Command::Supervise { .. } => unreachable!("handled before the runtime starts"),

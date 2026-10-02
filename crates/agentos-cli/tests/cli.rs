@@ -63,6 +63,11 @@ impl Cli {
         serde_json::from_slice(&out).unwrap_or_else(|e| panic!("stdout of {args:?} is not JSON ({e}): {}", String::from_utf8_lossy(&out)))
     }
 
+    fn json_with_profiles(&self, profiles: &Path, args: &[&str]) -> Value {
+        let out = self.cmd_with_profiles(profiles, args).assert().success().get_output().stdout.clone();
+        serde_json::from_slice(&out).unwrap_or_else(|e| panic!("stdout of {args:?} is not JSON ({e}): {}", String::from_utf8_lossy(&out)))
+    }
+
     fn write(&self, rel: &str, content: &str) -> String {
         let p = self.path(rel);
         fs::write(&p, content).unwrap();
@@ -983,4 +988,159 @@ fn first_task(cli: &Cli) -> String {
     let mut ids: Vec<String> = fs::read_dir(cli.home().join("tasks")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
     assert_eq!(ids.len(), 1, "{ids:?}");
     ids.remove(0)
+}
+
+/// A profile directory in the scratch dir: the fixture's parser check with `check_prefix`
+/// prepended (so its bytes, and digest, differ), registered under `id`.
+fn profile_variant(cli: &Cli, name: &str, id: &str, check_prefix: &str) -> PathBuf {
+    let dir = cli.path(name);
+    copy_tree(&fixtures().join("profiles/parser-checks-v1"), &dir).unwrap();
+    let script = fs::read_to_string(dir.join("check_parser.py")).unwrap();
+    fs::write(dir.join("check_parser.py"), format!("{check_prefix}{script}")).unwrap();
+    fs::write(dir.join("profile.json"), json!({ "id": id, "command": ["python3", "check_parser.py"], "protected": true }).to_string()).unwrap();
+    dir
+}
+
+fn register(cli: &Cli, dir: &Path) -> Value {
+    cli.json(&["profile", "register", dir.to_str().unwrap()])
+}
+
+/// A contract over a repository copy, naming `verification_profile` and optionally pinning it.
+fn contract_for_profile(cli: &Cli, id: &str, pin: Option<&str>) -> String {
+    let mut contract: Value = serde_json::from_str(&fs::read_to_string(cli.contract(&cli.repo_copy())).unwrap()).unwrap();
+    contract["verification_profile"] = json!(id);
+    if let Some(pin) = pin {
+        contract["profile_digest"] = json!(pin);
+    }
+    cli.write(&format!("pinned-{}.json", Digest::of(contract.to_string().as_bytes())), &contract.to_string())
+}
+
+/// `--profiles` pointing at an empty directory: only the registry can supply a profile.
+fn no_legacy(cli: &Cli) -> PathBuf {
+    let dir = cli.path("no-legacy");
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn submitted_profile_digest(cli: &Cli, id: &str) -> String {
+    cli.events(id).iter().find(|e| e["type"] == "Submitted").unwrap()["payload"]["profile_digest"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn register_twice_is_a_noop_and_changed_bytes_are_a_new_entry() {
+    let cli = Cli::new();
+    let dir = profile_variant(&cli, "p1", "reg-v1", "");
+    let first = register(&cli, &dir);
+    assert_eq!(first["id"], "reg-v1");
+    assert_eq!(first["digest"].as_str().unwrap().len(), 64);
+    assert_eq!(register(&cli, &dir), first, "same bytes, same entry");
+    assert_eq!(cli.json(&["profile", "list"]).as_array().unwrap().len(), 1);
+
+    let changed = profile_variant(&cli, "p2", "reg-v1", "# changed\n");
+    let second = register(&cli, &changed);
+    assert_ne!(second["digest"], first["digest"]);
+    let listed = cli.json(&["profile", "list"]);
+    assert_eq!(listed.as_array().unwrap().len(), 2, "{listed}");
+}
+
+#[test]
+fn registered_entries_have_no_write_bits() {
+    use std::os::unix::fs::PermissionsExt;
+    let cli = Cli::new();
+    let digest = register(&cli, &profile_variant(&cli, "p1", "ro-v1", ""))["digest"].as_str().unwrap().to_string();
+    let entry = cli.home().join("registry").join(format!("ro-v1@{digest}"));
+    for path in [entry.clone(), entry.join("profile.json"), entry.join("check_parser.py")] {
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o222, 0, "{} is writable: {mode:o}", path.display());
+    }
+    assert!(cli.home().join("registry").join(format!("ro-v1@{digest}.meta.json")).is_file());
+}
+
+#[test]
+fn ids_with_at_sign_or_traversal_are_rejected_at_register() {
+    let cli = Cli::new();
+    for (i, id) in ["a@b", "../x", "a/b", "..", "", "-x"].into_iter().enumerate() {
+        let dir = profile_variant(&cli, &format!("bad-{i}"), id, "");
+        cli.cmd(&["profile", "register", dir.to_str().unwrap()]).assert().code(2).stderr(predicate::str::contains("plain name"));
+    }
+    assert!(!cli.home().join("registry").exists() || fs::read_dir(cli.home().join("registry")).unwrap().next().is_none());
+    let empty = cli.path("empty-command");
+    fs::create_dir_all(&empty).unwrap();
+    fs::write(empty.join("profile.json"), r#"{"id":"e-v1","command":[]}"#).unwrap();
+    cli.cmd(&["profile", "register", empty.to_str().unwrap()]).assert().code(2).stderr(predicate::str::contains("command"));
+}
+
+#[test]
+fn registered_profile_runs_end_to_end() {
+    let cli = Cli::new();
+    let digest = register(&cli, &fixtures().join("profiles/parser-checks-v1"))["digest"].as_str().unwrap().to_string();
+    let contract = contract_for_profile(&cli, "parser-checks-v1", None);
+    let out = cli.json_with_profiles(&no_legacy(&cli), &["submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()]);
+    assert_eq!(out["state"], "SUCCEEDED");
+    assert_eq!(submitted_profile_digest(&cli, out["task_id"].as_str().unwrap()), digest);
+}
+
+#[test]
+fn submit_with_a_pin_for_a_missing_digest_exits_2() {
+    let cli = Cli::new();
+    register(&cli, &fixtures().join("profiles/parser-checks-v1"));
+    let contract = contract_for_profile(&cli, "parser-checks-v1", Some(&"0".repeat(64)));
+    cli.cmd(&["submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("is not in the registry"));
+}
+
+#[test]
+fn submit_with_the_pin_uses_exactly_that_digest_even_if_a_newer_entry_exists() {
+    let cli = Cli::new();
+    let older = register(&cli, &profile_variant(&cli, "p1", "pin-v1", ""))["digest"].as_str().unwrap().to_string();
+    // Registration times are milliseconds: make sure the second entry is strictly newer.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let newer = register(&cli, &profile_variant(&cli, "p2", "pin-v1", "# newer\n"))["digest"].as_str().unwrap().to_string();
+    assert_ne!(older, newer);
+
+    let pinned = contract_for_profile(&cli, "pin-v1", Some(&older));
+    let out = cli.json_with_profiles(&no_legacy(&cli), &["submit", &pinned, "--fake-agent-patch", fix_patch().to_str().unwrap()]);
+    assert_eq!(submitted_profile_digest(&cli, out["task_id"].as_str().unwrap()), older);
+    let unpinned = contract_for_profile(&cli, "pin-v1", None);
+    let out = cli.json_with_profiles(&no_legacy(&cli), &["submit", &unpinned, "--fake-agent-patch", fix_patch().to_str().unwrap()]);
+    assert_eq!(submitted_profile_digest(&cli, out["task_id"].as_str().unwrap()), newer, "no pin: the newest entry");
+}
+
+#[test]
+fn legacy_profiles_dir_still_works_with_the_profiles_flag() {
+    let cli = Cli::new();
+    let contract = cli.contract(&cli.repo_copy());
+    assert!(!cli.home().join("registry").exists());
+    assert_eq!(cli.submit_yes(&contract, &fix_patch())["state"], "SUCCEEDED");
+}
+
+#[test]
+fn registry_wins_over_legacy_when_both_exist() {
+    let cli = Cli::new();
+    // The registry's parser-checks-v1 rejects everything; the legacy one (the fixture) is right.
+    let strict = profile_variant(&cli, "p1", "parser-checks-v1", "import sys\nsys.exit(1)\n");
+    let digest = register(&cli, &strict)["digest"].as_str().unwrap().to_string();
+    let contract = contract_for_profile(&cli, "parser-checks-v1", None);
+    let out = cli.json(&["submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()]);
+    assert_eq!(out["state"], "FAILED", "the registry entry was used, not the legacy directory");
+    assert_eq!(submitted_profile_digest(&cli, out["task_id"].as_str().unwrap()), digest);
+}
+
+#[test]
+fn cli_tampered_staged_profile_fails_the_task_before_any_verification() {
+    let cli = Cli::new();
+    let contract = cli.contract(&cli.repo_copy());
+    let ready = cli.json(&["submit", &contract, "--fake-agent-patch", fix_patch().to_str().unwrap()]);
+    let id = ready["task_id"].as_str().unwrap();
+    let staged = cli.home().join("tasks").join(id).join("profile/check_parser.py");
+    fs::write(&staged, "import sys\nsys.exit(0)\n").unwrap();
+
+    assert_eq!(cli.json(&["resume", id])["state"], "FAILED");
+    let events = cli.events(id);
+    let reason = events.iter().find(|e| e["type"] == "Failed").unwrap()["payload"].to_string();
+    assert!(reason.contains("recorded profile changed"), "{reason}");
+    assert!(!events.iter().any(|e| e["type"] == "EffectIntended"), "nothing ran on the tampered profile");
+    assert!(job_dirs(&cli).is_empty());
 }

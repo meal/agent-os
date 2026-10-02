@@ -52,6 +52,11 @@ pub enum Command {
     },
     /// Cancel a task; in-flight effects are reconciled first.
     Cancel { id: String },
+    /// Manage the verification profile registry.
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommand,
+    },
     /// Revoke a task's capabilities (all, or one by its contract name, e.g. verification.run);
     /// running jobs that depend on a revoked capability are stopped.
     Revoke {
@@ -67,4 +72,13 @@ pub enum Command {
         verb: String,
         job_dir: PathBuf,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProfileCommand {
+    /// Copy a profile directory (profile.json plus its check files) into the read-only,
+    /// content-addressed registry; the same bytes twice change nothing.
+    Register { dir: PathBuf },
+    /// List registered profiles.
+    List,
 }

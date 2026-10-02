@@ -39,8 +39,13 @@ fn validate(home: &Home, task: &Path, yes: bool, patch: Option<&Path>) -> Result
         .ok()
         .filter(|p| p.is_dir())
         .ok_or_else(|| CliError::usage(format!("repository source {} is not a directory", contract.repository.source)))?;
-    let profile = home.profile_dir(&contract.verification_profile)?.ok_or_else(|| {
-        CliError::usage(format!("verification profile {} not found in {}", contract.verification_profile, home.profiles.display()))
+    let profile = home.resolve_profile(&contract.verification_profile, contract.profile_digest.as_deref())?.ok_or_else(|| {
+        CliError::usage(format!(
+            "verification profile {} not found in the registry {} or in {}",
+            contract.verification_profile,
+            home.registry_dir().display(),
+            home.profiles.display()
+        ))
     })?;
     let expected_revision = match contract.repository.revision.as_str() {
         RECORDED_AT_SUBMISSION => None,
@@ -102,6 +107,11 @@ pub async fn submit(home: &Home, task_file: &Path, yes: bool, patch: Option<&Pat
     copy_tree(&profile, &staging.path().join("profile"))?;
     let repo_digest = workspace_digest(&staging.path().join("snapshot"))?;
     let profile_digest = workspace_digest(&staging.path().join("profile"))?;
+    if let Some(pin) = &contract.profile_digest {
+        if profile_digest.to_string() != *pin {
+            return Err(CliError::usage(format!("verification profile changed while it was recorded: pinned {pin}, found {profile_digest}")));
+        }
+    }
     if expected_revision.is_some_and(|d| d != repo_digest) {
         return Err(CliError::usage(format!("repository source changed while it was recorded (now {repo_digest})")));
     }

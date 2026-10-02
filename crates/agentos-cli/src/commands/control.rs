@@ -40,7 +40,7 @@ pub async fn resume(home: &Home, task: &TaskId, patch: Option<&Path>, crash: Opt
         if in_flight {
             let lock = home.lock()?;
             lock.driving(task)?;
-            recover(&store.db, &store.blobs, &home.executor(task)?, task).await?;
+            recover(&store.db, &store.blobs, &home.executor(&store, task)?, task).await?;
         }
         print_state(task, t.state);
         return Ok(());
@@ -96,7 +96,7 @@ pub async fn cancel(home: &Home, task: &TaskId) -> Result<(), CliError> {
             store.db.append(task, &TaskEvent::CancelCompleted)?;
         } else {
             // Reconciles in-flight effects and completes the cancel once none is in flight.
-            recover(&store.db, &store.blobs, &home.executor(task)?, task).await?;
+            recover(&store.db, &store.blobs, &home.executor(&store, task)?, task).await?;
         }
     }
     print_state(task, store.db.task(task)?.state);
