@@ -13,8 +13,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use agentos_core::guest::{
-    read_frame, write_frame, Frame, FrameError, Message, FILE_LIMIT, GUEST_PROTOCOL, RAW_FRAME_LIMIT, SNAPSHOT_BYTES_LIMIT,
-    SNAPSHOT_FILES_LIMIT, VSOCK_PORT,
+    raw_frames_for, read_frame, write_frame, Frame, FrameError, Message, FILE_LIMIT, GUEST_PROTOCOL, RAW_FRAME_LIMIT,
+    SNAPSHOT_BYTES_LIMIT, SNAPSHOT_FILES_LIMIT, VSOCK_PORT,
 };
 use agentos_core::workspace::list_files;
 use serde::{Deserialize, Serialize};
@@ -64,7 +64,7 @@ fn lost(e: io::Error) -> LinkError {
 /// wrong is a protocol violation.
 fn frame_error(e: FrameError) -> LinkError {
     match e {
-        FrameError::Io(e) => LinkError::Lost(e),
+        FrameError::Io(e) => LinkError::Lost(normalize(e)),
         other => LinkError::Protocol(other.to_string()),
     }
 }
@@ -73,9 +73,36 @@ fn remaining(until: Instant) -> Duration {
     until.saturating_duration_since(Instant::now()).max(Duration::from_millis(1))
 }
 
+/// A stalled read surfaces as `TimedOut` with a plain message, not "Resource temporarily
+/// unavailable".
+fn normalize(e: io::Error) -> io::Error {
+    if is_timeout(&e) {
+        io::Error::new(io::ErrorKind::TimedOut, "timed out waiting for the guest")
+    } else {
+        e
+    }
+}
+
+/// A reader whose total wait is bounded: the socket timeout is re-armed before every read
+/// from the time left until `until`, so a peer dripping bytes cannot stretch the deadline.
+struct DeadlineReader<'a> {
+    stream: &'a UnixStream,
+    until: Instant,
+}
+
+impl Read for DeadlineReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if Instant::now() >= self.until {
+            return Err(normalize(io::ErrorKind::TimedOut.into()));
+        }
+        self.stream.set_read_timeout(Some(remaining(self.until)))?;
+        self.stream.read(buf).map_err(normalize)
+    }
+}
+
 /// Reads the handshake reply a byte at a time (nothing of the first frame is consumed).
 /// `Ok(None)` is a connection closed before a full line.
-fn read_line(stream: &mut UnixStream) -> io::Result<Option<Vec<u8>>> {
+fn read_line(stream: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
     while line.last() != Some(&b'\n') {
@@ -118,7 +145,6 @@ impl GuestLink {
     /// handshake. A connection the proxy closes because the guest is not listening yet is
     /// retried every 50 ms; past `deadline` it is `BootTimeout`.
     pub fn connect(uds: &Path, deadline: Instant) -> Result<GuestLink, LinkError> {
-        let expected = format!("OK {VSOCK_PORT}");
         loop {
             if Instant::now() >= deadline {
                 return Err(LinkError::BootTimeout);
@@ -127,16 +153,15 @@ impl GuestLink {
                 thread::sleep(SOCKET_POLL);
                 continue;
             };
-            let _ = stream.set_read_timeout(Some(remaining(deadline)));
             let reply = match stream.write_all(format!("CONNECT {VSOCK_PORT}\n").as_bytes()) {
-                Ok(()) => read_line(&mut stream),
+                Ok(()) => read_line(&mut DeadlineReader { stream: &stream, until: deadline }),
                 Err(e) => Err(e),
             };
             match reply {
                 Ok(Some(line)) => {
                     let text = String::from_utf8_lossy(&line);
                     let text = text.trim_end();
-                    if !(text == expected || text.starts_with("OK ")) {
+                    if !text.strip_prefix("OK ").is_some_and(|n| n.parse::<u32>().is_ok()) {
                         return Err(LinkError::Protocol(format!("unexpected handshake reply {text:?}")));
                     }
                     stream.set_read_timeout(None).map_err(lost)?;
@@ -154,9 +179,11 @@ impl GuestLink {
         write_frame(&mut self.stream, &Frame::Json(msg.clone())).map_err(lost)
     }
 
-    /// Sends `bytes` as raw frames of at most `RAW_FRAME_LIMIT`; no bytes, no frames.
+    /// Sends `bytes` as `raw_frames_for(len)` raw frames (every one full except the last);
+    /// no bytes, no frames.
     pub fn send_raw(&mut self, bytes: &[u8]) -> Result<(), LinkError> {
-        for chunk in bytes.chunks(RAW_FRAME_LIMIT) {
+        for i in 0..raw_frames_for(bytes.len() as u64) as usize {
+            let chunk = &bytes[i * RAW_FRAME_LIMIT..bytes.len().min((i + 1) * RAW_FRAME_LIMIT)];
             write_frame(&mut self.stream, &Frame::Raw(chunk.to_vec())).map_err(lost)?;
         }
         Ok(())
@@ -165,8 +192,7 @@ impl GuestLink {
     /// The next message, waiting at most until `until`. A timeout is `Lost`; a raw frame
     /// where a message is expected is `Protocol`.
     pub fn recv(&mut self, until: Instant) -> Result<Message, LinkError> {
-        self.stream.set_read_timeout(Some(remaining(until))).map_err(lost)?;
-        match read_frame(&mut self.stream, 0).map_err(frame_error)? {
+        match read_frame(&mut DeadlineReader { stream: &self.stream, until }, 0).map_err(frame_error)? {
             Frame::Json(m) => Ok(m),
             Frame::Raw(_) => Err(LinkError::Protocol("raw frame where a message was expected".into())),
         }
@@ -185,7 +211,12 @@ impl GuestLink {
 
     /// Streams every regular file under `root` as `File{path,len}` + raw frames (sorted),
     /// then `EndFiles`. Returns `(files, bytes)`. The limits are checked before anything
-    /// is written.
+    /// is written. These are the *snapshot* limits (256 MiB, 65 536 files); a profile
+    /// (`RunVerification`) is bounded by `PROFILE_LIMIT` (64 MiB), which the caller checks
+    /// with `count_tree` before sending the request. The caller must have sent the request
+    /// that announces the stream (`ReadSnapshot`/`RunVerification` with the counts from
+    /// `count_tree`) first. Any error from a link means the stream may be desynchronised:
+    /// drop the link, never reuse it.
     pub fn send_tree(&mut self, root: &Path) -> Result<(u64, u64), LinkError> {
         let entries = scan(root).map_err(|e| LinkError::Protocol(format!("cannot read {}: {e}", root.display())))?;
         let files = entries.len() as u64;
@@ -202,19 +233,18 @@ impl GuestLink {
         for e in &entries {
             self.send(&Message::File { path: e.rel.clone(), len: e.len })?;
             let mut file = File::open(&e.path).map_err(|err| LinkError::Protocol(format!("cannot read {}: {err}", e.rel)))?;
-            let mut left = e.len;
-            while left > 0 {
-                let mut chunk = vec![0u8; left.min(RAW_FRAME_LIMIT as u64) as usize];
+            for i in 0..raw_frames_for(e.len) {
+                let size = (e.len - i * RAW_FRAME_LIMIT as u64).min(RAW_FRAME_LIMIT as u64) as usize;
+                let mut chunk = vec![0u8; size];
                 file.read_exact(&mut chunk).map_err(|err| LinkError::Protocol(format!("{} changed while it was sent: {err}", e.rel)))?;
                 write_frame(&mut self.stream, &Frame::Raw(chunk)).map_err(lost)?;
-                left -= left.min(RAW_FRAME_LIMIT as u64);
             }
         }
         self.send(&Message::EndFiles)?;
         Ok((files, bytes))
     }
 
-    /// `(files, bytes)` of the tree, for the `file_count`/`total_bytes` of the request
+    /// `(files, bytes)` of the tree (no limit is enforced here), for the `file_count`/`total_bytes` of the request
     /// that precedes `send_tree`.
     pub fn count_tree(root: &Path) -> io::Result<(u64, u64)> {
         let entries = scan(root)?;
