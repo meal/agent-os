@@ -3,6 +3,7 @@ pub mod crash;
 pub mod executor;
 pub mod export;
 pub mod fixture;
+pub mod guestlink;
 pub mod job;
 mod journal;
 pub mod patch;

@@ -482,8 +482,15 @@ pub fn main_with_args(args: impl IntoIterator<Item = OsString>, worker_cmd: &Sup
     match args.as_slice() {
         [verb, dir] if verb == "run" => main_run(Path::new(dir), worker_cmd),
         [verb, dir] if verb == "worker" => main_worker(Path::new(dir)),
+        [verb, uds, root] if verb == "fake-guest" => match agentos_guest::fake::serve(Path::new(uds), Path::new(root)) {
+            Ok(()) => 0,
+            Err(e) => {
+                let _ = writeln!(io::stderr(), "agentos-supervisor: fake guest: {e}");
+                1
+            }
+        },
         _ => {
-            let _ = writeln!(io::stderr(), "usage: agentos-supervisor run|worker <job_dir>");
+            let _ = writeln!(io::stderr(), "usage: agentos-supervisor run|worker <job_dir> | fake-guest <uds> <root>");
             1
         }
     }
