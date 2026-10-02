@@ -1,0 +1,14 @@
+[package]
+name = "agentos-guest"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+agentos-core = { path = "../agentos-core" }
+serde.workspace = true
+serde_json.workspace = true
+rustix = { workspace = true, features = ["fs", "mount", "process", "system"] }
+vsock.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
