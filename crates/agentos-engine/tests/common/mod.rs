@@ -114,7 +114,9 @@ while [ $# -gt 0 ]; do case "$1" in
 chroot="$base/$(basename "$exec_file")/$id/root"
 printf '%s\n' "$all" > "$base/argv.txt"
 mkdir -p "$CGROUP_ROOT/$parent/$id"
-root=$(dirname "$(find "$WORK_ROOT" -samefile "$chroot/ws.img" -print -quit)")   # the hard link finds the task
+found=$(find "$WORK_ROOT" -samefile "$chroot/ws.img" -print -quit)   # the hard link finds the task
+[ -n "$found" ] || { echo "fake jailer: no task under $WORK_ROOT holds $chroot/ws.img" >&2; exit 1; }
+root=$(dirname "$found")
 cd "$chroot"
 exec "$SUPERVISOR" fake-guest v.sock "$root"
 "#

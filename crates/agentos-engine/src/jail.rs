@@ -165,13 +165,26 @@ fn prepare_err(step: &str, e: io::Error) -> String {
 
 /// Hard-links `src` to `dst`: never a copy (the image would be duplicated and `ws.img` would
 /// no longer be the task's).
+/// Only a regular file is linked: `hard_link` would link a symlink itself, and the chown and
+/// chmod that follow would then reach whatever it points at.
 fn link(src: &Path, dst: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(src) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return Err(format!("cannot prepare the jail: {} is not a regular file", src.display())),
+        Err(e) => return Err(prepare_err(&format!("stat {}", src.display()), e)),
+    }
     fs::hard_link(src, dst).map_err(|e| match e.kind() {
         io::ErrorKind::CrossesDevices => {
             format!("cannot prepare the jail: {} and {} are on different filesystems", src.display(), dst.display())
         }
         _ => prepare_err(&format!("link {} to {}", src.display(), dst.display()), e),
-    })
+    })?;
+    // The link itself, so a source swapped for a symlink after the check is refused too.
+    if !fs::symlink_metadata(dst).is_ok_and(|m| m.is_file()) {
+        let _ = fs::remove_file(dst);
+        return Err(format!("cannot prepare the jail: {} is not a regular file", src.display()));
+    }
+    Ok(())
 }
 
 /// Gives `path` to the jail's uid/gid with `mode`.
@@ -211,6 +224,8 @@ pub fn stage(cfg: &JailConfig, plan: &JailPlan, dir: &Path, src: StageSources) -
     hand_over(cfg, &log, 0o600)?;
     link(&log, &dir.join("firecracker.log"))?;
     let vm_json = plan.chroot.join("vm.json");
+    // A `Value` serializes its keys alphabetically, not in the documented order: harmless,
+    // Firecracker reads the document by key.
     let mut bytes = serde_json::to_vec_pretty(src.vm_json).map_err(|e| prepare_err("vm.json", io::Error::other(e)))?;
     bytes.push(b'\n');
     fs::write(&vm_json, bytes).map_err(|e| prepare_err(&format!("write {}", vm_json.display()), e))?;

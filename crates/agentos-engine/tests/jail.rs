@@ -209,7 +209,12 @@ impl Staging {
     fn new() -> Staging {
         let root = tempfile::tempdir().unwrap();
         let fc = jailed_fake_firecracker_config(root.path());
-        let JailMode::Jailed(cfg) = fc.jail.clone() else { unreachable!() };
+        let JailMode::Jailed(mut cfg) = fc.jail.clone() else { unreachable!() };
+        // As root (the `test` service), stage to the real jail ids, so a chown that reached
+        // a registry inode would show; otherwise only our own ids are possible.
+        if as_root() {
+            (cfg.uid, cfg.gid) = (jail::JAIL_UID, jail::JAIL_GID);
+        }
         let job = root.path().join("jobs/e-a");
         fs::create_dir_all(&job).unwrap();
         let ws_img = root.path().join("work/task-1/ws.img");
@@ -244,6 +249,16 @@ impl Staging {
             },
         )
     }
+}
+
+fn as_root() -> bool {
+    rustix::process::geteuid().is_root()
+}
+
+/// `(uid, gid)` of `path`, not following a final symlink.
+fn owner(path: &Path) -> (u32, u32) {
+    let m = fs::symlink_metadata(path).unwrap();
+    (m.uid(), m.gid())
 }
 
 fn sorted_names(dir: &Path) -> Vec<String> {
@@ -331,6 +346,27 @@ fn stage_links_only_the_documented_files_and_nothing_else() {
     let scratch = fs::metadata(s.plan.chroot.join("scratch.img")).unwrap();
     assert_eq!((scratch.mode() & 0o7777, scratch.uid()), (0o600, s.cfg.uid));
     assert_eq!(fs::read_to_string(s.job().join("jail/cgroup")).unwrap(), format!("{}\n", s.plan.cgroup.display()));
+
+    // What the jail uid owns, at the chroot link and at the original path (one inode).
+    let jail_ids = (s.cfg.uid, s.cfg.gid);
+    let handed = [
+        (s.plan.chroot.join("ws.img"), Some(s.ws_img.clone())),
+        (s.plan.chroot.join("scratch.img"), Some(s.scratch.clone())),
+        (s.plan.chroot.join("firecracker.log"), Some(s.job().join("firecracker.log"))),
+        (s.plan.chroot.join("vm.json"), None),
+    ];
+    if as_root() {
+        println!("ownership branch: root, staged to {}:{}", jail::JAIL_UID, jail::JAIL_GID);
+        assert_eq!(jail_ids, (jail::JAIL_UID, jail::JAIL_GID));
+    } else {
+        println!("ownership branch: not root, staged to the test's own {}:{} (chown cannot be observed)", jail_ids.0, jail_ids.1);
+    }
+    for (link, original) in handed {
+        assert_eq!(owner(&link), jail_ids, "{}", link.display());
+        if let Some(original) = original {
+            assert_eq!(owner(&original), jail_ids, "{}", original.display());
+        }
+    }
 }
 
 #[test]
@@ -340,16 +376,55 @@ fn registry_files_stay_root_owned_and_read_only_after_staging() {
     for f in &files {
         fs::set_permissions(f, fs::Permissions::from_mode(0o444)).unwrap();
     }
-    let before: Vec<(u32, u32)> = files.iter().map(|f| fs::metadata(f).map(|m| (m.uid(), m.gid())).unwrap()).collect();
+    let before: Vec<(u32, u32)> = files.iter().map(|f| owner(f)).collect();
+    if as_root() {
+        println!("ownership branch: root, registry 0:0, staged to {}:{}", s.cfg.uid, s.cfg.gid);
+        assert!(before.iter().all(|o| *o == (0, 0)), "{before:?}");
+        assert_eq!((s.cfg.uid, s.cfg.gid), (jail::JAIL_UID, jail::JAIL_GID));
+    } else {
+        println!("ownership branch: not root, registry owned by {:?}, staged to the same ids (chown cannot be observed)", before[0]);
+    }
     s.stage().unwrap();
-    for (f, owner) in files.iter().zip(before) {
-        let meta = fs::metadata(f).unwrap();
-        assert_eq!(meta.mode() & 0o7777, 0o444, "{}", f.display());
-        assert_eq!((meta.uid(), meta.gid()), owner, "{}", f.display());
-        assert_eq!(meta.nlink(), 2, "{}", f.display());
+    for (f, was) in files.iter().zip(before) {
+        let link = s.plan.chroot.join(f.file_name().unwrap());
+        for path in [f, &link] {
+            let meta = fs::metadata(path).unwrap();
+            assert_eq!(meta.mode() & 0o7777, 0o444, "{}", path.display());
+            assert_eq!((meta.uid(), meta.gid()), was, "{}", path.display());
+            assert_eq!(meta.nlink(), 2, "{}", path.display());
+        }
     }
     // ws.img and scratch.img changed hands; the registry did not.
-    assert_eq!(fs::metadata(&s.ws_img).unwrap().mode() & 0o7777, 0o600);
+    for img in [&s.ws_img, &s.scratch] {
+        let meta = fs::metadata(img).unwrap();
+        assert_eq!((meta.mode() & 0o7777, meta.uid(), meta.gid()), (0o600, s.cfg.uid, s.cfg.gid), "{}", img.display());
+    }
+}
+
+#[test]
+fn stage_refuses_a_symlinked_or_non_regular_source() {
+    let s = Staging::new();
+    // ws.img replaced by a symlink to a file the jail must never own.
+    let target = s.root.path().join("precious");
+    fs::write(&target, b"x").unwrap();
+    let before = (owner(&target), fs::metadata(&target).unwrap().mode());
+    fs::remove_file(&s.ws_img).unwrap();
+    std::os::unix::fs::symlink(&target, &s.ws_img).unwrap();
+    let err = s.stage().unwrap_err();
+    assert_eq!(err, format!("cannot prepare the jail: {} is not a regular file", s.ws_img.display()));
+    assert_eq!((owner(&target), fs::metadata(&target).unwrap().mode()), before, "the symlink target was touched");
+    assert!(!s.plan.chroot.join("ws.img").exists());
+
+    // A directory as scratch.img, and a symlinked registry kernel.
+    let s = Staging::new();
+    fs::remove_file(&s.scratch).unwrap();
+    fs::create_dir(&s.scratch).unwrap();
+    assert_eq!(s.stage().unwrap_err(), format!("cannot prepare the jail: {} is not a regular file", s.scratch.display()));
+    let s = Staging::new();
+    let kernel = s.image.join("vmlinux");
+    fs::rename(&kernel, s.root.path().join("vmlinux.real")).unwrap();
+    std::os::unix::fs::symlink(s.root.path().join("vmlinux.real"), &kernel).unwrap();
+    assert_eq!(s.stage().unwrap_err(), format!("cannot prepare the jail: {} is not a regular file", kernel.display()));
 }
 
 #[test]
