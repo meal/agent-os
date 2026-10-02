@@ -3,11 +3,15 @@ name = "agentos-engine"
 edition.workspace = true
 version.workspace = true
 
+[[bin]]
+name = "agentos-supervisor"
+path = "src/bin/agentos-supervisor.rs"
+
 [dependencies]
 agentos-core = { path = "../agentos-core" }
 agentos-store = { path = "../agentos-store" }
 tokio = { workspace = true, features = ["io-util"] }
-rustix.workspace = true
+rustix = { workspace = true, features = ["stdio"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
