@@ -160,7 +160,7 @@ fn valid_outcome(job: &JobDir, req: &JobRequest) -> Option<ExecOutcome> {
 }
 
 /// `(state, ppid, pgrp, session)` of every process in `/proc`, as raw strings.
-fn proc_stats() -> io::Result<Vec<(i32, [String; 4])>> {
+pub(crate) fn proc_stats() -> io::Result<Vec<(i32, [String; 4])>> {
     let mut found = Vec::new();
     for entry in fs::read_dir("/proc")?.flatten() {
         let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<i32>().ok()) else { continue };

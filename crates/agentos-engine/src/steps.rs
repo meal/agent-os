@@ -182,7 +182,7 @@ pub(crate) async fn run_attempt<E: Executor>(cx: &Cx<'_, E>, rec: &EffectRecord,
     let deadline_ts = cx.db.deadline_ts(&rec.task_id)?;
     let out = execute(cx.exec, rec, payload, &cx.contract, deadline_ts, &ctx).await?;
     if let Some(point) = cx.opts.tripped() {
-        // The executor was killed before its receipt became durable.
+        // The controller "died" inside the executor, right after launching the job.
         return Err(EngineError::Crashed(point));
     }
     if out.unresolved {

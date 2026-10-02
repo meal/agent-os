@@ -15,11 +15,11 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 use agentos_core::ids::TaskId;
-use agentos_engine::durable::{DurableExecutor, ExecCounts};
 use agentos_engine::fixture::FixtureExecutor;
 use agentos_store::blob::BlobStore;
 use agentos_store::db::Db;
 
+use crate::durable::DurableExecutor;
 use crate::error::CliError;
 
 pub struct Home {
@@ -126,6 +126,6 @@ impl Home {
             return Err(CliError::other(format!("task {task} has no recorded inputs in {}; it was not completely submitted", dir.display())));
         }
         let fixture = FixtureExecutor::new(dir.join("snapshot"), dir.join("profile"), self.root.join("work"));
-        Ok(DurableExecutor::new(fixture, self.root.join("receipts"), ExecCounts::default())?)
+        Ok(DurableExecutor::new(fixture, self.root.join("receipts"))?)
     }
 }

@@ -11,16 +11,24 @@
 //!    live run of another task sharing the store would lose a blob it put but has not
 //!    registered yet). Blobs left by a crash between put and register go away here.
 //! 2. Each outstanding effect, in creation order, gets a decision, journaled as a
-//!    `RecoveryDecision` audit event *before* it is acted on (see [`Decision`]):
+//!    `RecoveryDecision` audit event *before* it is acted on (see [`Decision`]). Receipts
+//!    are job directories: every attempt ran as a supervised job, which may still be running
+//!    (the controller's death does not stop it) and writes its receipt there.
 //!    - a usable receipt retained by the executor is published and applied, never
 //!      re-executed; a stale or malformed one goes through `complete_effect`'s verdicts
 //!      (journaled as ignored) and is otherwise disregarded;
 //!    - INTENDED effects are dispatched (lease 1) within their original reservation;
-//!    - DISPATCHED/UNKNOWN ones follow their kind's retry policy: `Retry` re-dispatches
-//!      under the next lease; `ReconcileThenRetry` asks the executor, which either proves
-//!      the effect applied (its outcome is published), proves it not applied (re-dispatch)
-//!      or cannot tell: the effect becomes UNKNOWN, its reservation stays `Uncertain`, and
-//!      the task fails with "unreconcilable effect <id>".
+//!    - for DISPATCHED/UNKNOWN ones, recovery first makes sure no attempt still runs: it
+//!      waits for the effect's live jobs, bounded by their lease plus a grace period, and
+//!      re-reads the receipts (a job that finished while the controller was down is
+//!      published like any retained receipt). It never kills a job inside its lease; one
+//!      still alive past the bound is fenced (`WaitedForJob`), and one that cannot be
+//!      stopped leaves the effect UNKNOWN and fails the task (`FenceFailed`).
+//!    - with every attempt dead and no usable receipt, they follow their kind's retry
+//!      policy: `Retry` re-dispatches under the next lease; `ReconcileThenRetry` asks the
+//!      executor, which either proves the effect applied (its outcome is published),
+//!      proves it not applied (re-dispatch) or cannot tell: the effect becomes UNKNOWN, its
+//!      reservation stays `Uncertain`, and the task fails with "unreconcilable effect <id>".
 //! 3. A pending cancel is honoured once nothing is in flight; a task that can never dispatch
 //!    again (terminal, or cancel pending) dispatches nothing: never-dispatched effects and
 //!    effects proven not applied are abandoned (reservation released), receipt-less ones
@@ -41,7 +49,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::crash::RunOptions;
-use crate::executor::{AttemptCtx, ExecOutcome, Executor, Reconciliation};
+use crate::executor::{AttemptCtx, ExecOutcome, Executor, JobWait, Reconciliation};
 use crate::journal;
 use crate::runner::{recovered_patch, EngineError, Result};
 use crate::steps::{check_outcome, finish_attempt, mark_unreconcilable, request, run_attempt, Attempt, Cx, WORKER};
@@ -64,6 +72,11 @@ pub enum Decision {
     Unreconcilable,
     /// Provably never took effect and the task can no longer dispatch it: abandoned.
     Abandon,
+    /// A job of the effect was still alive past its lease bound and was fenced; the
+    /// decision journaled next acts on what the fence left.
+    WaitedForJob,
+    /// A job of the effect could not be stopped: left UNKNOWN and the task failed.
+    FenceFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,6 +234,18 @@ async fn recover_effect<E: Executor>(cx: &Cx<'_, E>, rec: EffectRecord, report: 
         return Ok(());
     }
 
+    // Dispatched: whatever is decided next, no earlier attempt may still be running.
+    if let JobWait::StillAlive = cx.exec.await_job(&rec.effect_id).await {
+        if !cx.exec.fence_job(&rec.effect_id).await {
+            return fence_failed(cx, report, &rec);
+        }
+        decide(cx, report, &rec, Decision::WaitedForJob, "a job of the effect outlived its lease and was fenced")?;
+    }
+    // Every attempt is dead now: a receipt one left while we waited is used like any other.
+    if use_retained(cx, &rec, report).await? {
+        return Ok(());
+    }
+
     match rec.kind.retry_policy() {
         RetryPolicy::Retry if can_dispatch => {
             let Some(payload) = payload(cx, &rec)? else {
@@ -285,6 +310,17 @@ fn abandon<E>(cx: &Cx<'_, E>, report: &mut RecoveryReport, rec: &EffectRecord, r
     decide(cx, report, rec, Decision::Abandon, reason)?;
     cx.db.abandon_effect(&rec.effect_id, reason)?;
     report.abandoned.push(rec.effect_id.clone());
+    Ok(())
+}
+
+/// A job of the effect survived the fence, so it may still take effect: the effect is left
+/// UNKNOWN and the task failed. A no-op for an effect already UNKNOWN on a terminal task.
+fn fence_failed<E>(cx: &Cx<'_, E>, report: &mut RecoveryReport, rec: &EffectRecord) -> Result<()> {
+    if cx.db.task(&cx.task)?.state.is_terminal() && rec.state == EffectState::Unknown {
+        return Ok(());
+    }
+    decide(cx, report, rec, Decision::FenceFailed, "a job of the effect is still alive and could not be stopped")?;
+    mark_unreconcilable(cx.db, rec)?;
     Ok(())
 }
 

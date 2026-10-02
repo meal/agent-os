@@ -7,8 +7,12 @@ use agentos_core::contract::Contract;
 use agentos_core::effect::{EffectId, EffectRecord};
 use agentos_core::ids::{Digest, TaskId};
 use agentos_engine::agent::{Agent, AgentAction, Observation};
+use agentos_engine::crash::CrashHook;
 use agentos_engine::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor};
 use agentos_engine::fixture::FixtureExecutor;
+use agentos_engine::job::{HostConfig, WorkerConfig};
+use agentos_engine::supervised::{ExecCounts, SupervisedExecutor};
+use agentos_engine::supervisor::SupervisorCmd;
 use agentos_engine::workspace::workspace_digest;
 use agentos_store::blob::BlobStore;
 use agentos_store::db::{Db, StoredEvent};
@@ -29,6 +33,41 @@ pub fn copy_dir(from: &Path, to: &Path) {
             fs::copy(entry.path(), dest).unwrap();
         }
     }
+}
+
+/// The real supervisor binary, built by cargo for the engine's integration tests.
+pub const SUPERVISOR_BIN: &str = env!("CARGO_BIN_EXE_agentos-supervisor");
+pub const TEST_WORKERS_ENV: &str = "AGENTOS_TEST_WORKERS";
+pub const EXIT_BEFORE_RECEIPT_ENV: &str = "AGENTOS_TEST_SUPERVISOR_EXIT_BEFORE_RECEIPT";
+
+/// The fixture worker over `root`'s `snapshot`, `profile` and `work` (absolute paths, as
+/// the supervisor runs in its own working directory).
+pub fn host_config(root: &Path) -> HostConfig {
+    HostConfig {
+        snapshot_dir: root.join("snapshot"),
+        profile_dir: root.join("profile"),
+        work_root: root.join("work"),
+        verify_timeout_secs: 60,
+        profile_digest: None,
+    }
+}
+
+/// A supervised executor running `worker` jobs under `jobs_root` with the real supervisor
+/// binary, counting launches in `counts`, consulting `crash` right after each launch, and
+/// with `env` set in the supervisor's (and worker's) environment.
+pub fn supervised(
+    jobs_root: &Path,
+    worker: WorkerConfig,
+    counts: &ExecCounts,
+    crash: Option<CrashHook>,
+    env: &[(&str, &str)],
+) -> SupervisedExecutor {
+    let cmd = SupervisorCmd { program: SUPERVISOR_BIN.into(), prefix_args: Vec::new() };
+    let mut exec = SupervisedExecutor::new(jobs_root.to_path_buf(), cmd, worker, counts.clone()).unwrap().with_crash(crash);
+    for (k, v) in env {
+        exec = exec.with_env(*k, *v);
+    }
+    exec
 }
 
 pub fn fix_patch() -> String {

@@ -1,33 +1,43 @@
 //! Crash injection and recovery. Every test simulates a controller kill by returning
 //! `EngineError::Crashed` at a boundary and then dropping every in-memory handle (database,
 //! blob store, executor, agent); the restarted controller reopens the same on-disk paths
-//! with fresh objects.
+//! with fresh objects. Effects run as supervised jobs (the real `agentos-supervisor`), which
+//! outlive the "killed" controller exactly as they would a real one.
 
 mod common;
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agentos_core::broker::Resource;
 use agentos_core::budget::Reservation;
 use agentos_core::effect::{AttemptId, EffectId, EffectKind, EffectRecord, EffectState, Outcome, Receipt, ReceiptVerdict};
 use agentos_core::ids::{Digest, TaskId};
+use agentos_core::lease::EffectTimeouts;
 use agentos_core::state::{TaskEvent, TaskState};
 use agentos_engine::agent::{AgentAction, FakeAgent};
 use agentos_engine::crash::{CrashHook, CrashPoint, RunOptions};
-use agentos_engine::durable::{DurableExecutor, ExecCounts};
-use agentos_engine::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor};
-use agentos_engine::fixture::FixtureExecutor;
+use agentos_engine::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor, JobWait, Reconciliation};
+use agentos_engine::job::{JobDir, JobRequest, JobState, ScriptedConfig, WorkerConfig};
 use agentos_engine::recover::{recover, recover_with, Decision, RecoveryReport};
 use agentos_engine::runner::{run_task, run_task_with, EngineError};
+use agentos_engine::supervised::{ExecCounts, SupervisedExecutor};
 use agentos_engine::workspace::workspace_digest;
 use agentos_store::blob::BlobStore;
 use agentos_store::db::{Db, StoredEvent};
 use agentos_store::effects::UsageSummary;
-use common::{comment_patch, contract, copy_dir, fix_patch, fixtures};
+use common::{
+    comment_patch, contract, copy_dir, fix_patch, fixtures, host_config, supervised, EXIT_BEFORE_RECEIPT_ENV,
+    TEST_WORKERS_ENV,
+};
+use rustix::process::{kill_process, Pid, Signal};
 use tempfile::TempDir;
 
 const KINDS: [&str; 3] = ["read_snapshot", "apply_patch", "run_verification"];
+/// Upper bound for anything a test waits on outside the engine.
+const PATIENCE: Duration = Duration::from_secs(20);
 
 /// Everything on disk that survives a controller kill.
 struct World {
@@ -36,11 +46,61 @@ struct World {
     counts: ExecCounts,
 }
 
+/// How a controller's executor is put together.
+#[derive(Debug, Clone, Default)]
+struct ExecOpts {
+    /// Effects of this kind run under a supervisor that exits after the worker's outcome and
+    /// before the receipt (the Phase 2 "executed but not durable" case).
+    exit_before_receipt: Option<&'static str>,
+    /// Verifications run this shell script (a scripted worker) instead of the profile check.
+    scripted_verification: Option<String>,
+    timeouts: Option<EffectTimeouts>,
+    /// `fence_job` fails without stopping anything.
+    fence_fails: bool,
+}
+
+/// The controller's executor: supervised jobs, with one kind optionally routed to a
+/// differently configured supervised executor over the same jobs root and counts.
+struct Exec {
+    plain: SupervisedExecutor,
+    special: Option<(&'static str, SupervisedExecutor)>,
+    fence_fails: bool,
+}
+
+impl Executor for Exec {
+    async fn run(&self, req: &EffectRequest, ctx: &AttemptCtx) -> ExecOutcome {
+        match &self.special {
+            Some((tag, exec)) if *tag == req.kind.tag() => exec.run(req, ctx).await,
+            _ => self.plain.run(req, ctx).await,
+        }
+    }
+
+    fn retained_outcome(&self, effect: &EffectId) -> Option<ExecOutcome> {
+        self.plain.retained_outcome(effect)
+    }
+
+    async fn reconcile(&self, req: &EffectRequest, ctx: &AttemptCtx) -> Reconciliation {
+        self.plain.reconcile(req, ctx).await
+    }
+
+    fn current_workspace(&self, task: &TaskId) -> Option<Result<Digest, String>> {
+        self.plain.current_workspace(task)
+    }
+
+    async fn await_job(&self, effect: &EffectId) -> JobWait {
+        self.plain.await_job(effect).await
+    }
+
+    async fn fence_job(&self, effect: &EffectId) -> bool {
+        !self.fence_fails && self.plain.fence_job(effect).await
+    }
+}
+
 /// The in-memory controller: dropped wholesale to simulate a kill.
 struct Ctl {
     db: Db,
     blobs: BlobStore,
-    exec: DurableExecutor<FixtureExecutor>,
+    exec: Exec,
 }
 
 impl World {
@@ -59,13 +119,36 @@ impl World {
         self.dir.path().join(rel)
     }
 
+    fn exec(&self, hook: Option<CrashHook>, opts: &ExecOpts) -> Exec {
+        let jobs = self.path("jobs");
+        let host = WorkerConfig::Host(host_config(self.dir.path()));
+        let timeouts = opts.timeouts.unwrap_or_default();
+        let plain = supervised(&jobs, host.clone(), &self.counts, hook.clone(), &[]).with_timeouts(timeouts);
+        let special = match (&opts.scripted_verification, opts.exit_before_receipt) {
+            (Some(script), _) => {
+                let worker = WorkerConfig::Scripted(ScriptedConfig { script: script.clone() });
+                let exec = supervised(&jobs, worker, &self.counts, hook, &[(TEST_WORKERS_ENV, "1")]);
+                Some(("run_verification", exec.with_timeouts(timeouts)))
+            }
+            (None, Some(kind)) => {
+                let env = [(TEST_WORKERS_ENV, "1"), (EXIT_BEFORE_RECEIPT_ENV, "1")];
+                Some((kind, supervised(&jobs, host, &self.counts, hook, &env).with_timeouts(timeouts)))
+            }
+            (None, None) => None,
+        };
+        Exec { plain, special, fence_fails: opts.fence_fails }
+    }
+
     /// A freshly restarted controller over this world's files.
     fn open(&self, hook: Option<CrashHook>) -> Ctl {
-        let fixture = FixtureExecutor::new(self.path("snapshot"), self.path("profile"), self.path("work"));
+        self.open_with(hook, &ExecOpts::default())
+    }
+
+    fn open_with(&self, hook: Option<CrashHook>, opts: &ExecOpts) -> Ctl {
         Ctl {
             db: Db::open(&self.path("agentos.db")).unwrap(),
             blobs: BlobStore::open(self.path("blobs")).unwrap(),
-            exec: DurableExecutor::new(fixture, self.path("receipts"), self.counts.clone()).unwrap().with_crash(hook),
+            exec: self.exec(hook, opts),
         }
     }
 
@@ -94,6 +177,17 @@ impl World {
         KINDS.iter().map(|k| (*k, self.counts.get(k))).collect()
     }
 
+    /// Every job directory of `effect`, ascending by lease generation.
+    fn jobs(&self, effect: &EffectId) -> Vec<JobDir> {
+        JobDir::list(&self.path("jobs"), effect)
+    }
+
+    fn only_job(&self, effect: &EffectId) -> JobDir {
+        let mut jobs = self.jobs(effect);
+        assert_eq!(jobs.len(), 1, "one job for {effect}");
+        jobs.remove(0)
+    }
+
     /// Runs the scripted fixture solution with a fresh agent.
     async fn run(&self, ctl: &Ctl, opts: &RunOptions) -> Result<TaskState, EngineError> {
         let mut agent = FakeAgent::from_fixture_patch(fix_patch());
@@ -102,13 +196,116 @@ impl World {
 
     /// Runs until the hook fires, then drops the controller (the kill).
     async fn crash_run(&self, hook: CrashHook) -> CrashPoint {
-        let ctl = self.open(Some(hook.clone()));
+        self.crash_run_with(hook, &ExecOpts::default()).await
+    }
+
+    async fn crash_run_with(&self, hook: CrashHook, opts: &ExecOpts) -> CrashPoint {
+        let ctl = self.open_with(Some(hook.clone()), opts);
         let err = self.run(&ctl, &RunOptions::crash_with(hook)).await.unwrap_err();
         match err {
             EngineError::Crashed(p) => p,
             other => panic!("expected an injected crash, got {other:?}"),
         }
     }
+
+    /// Points the profile (the world's copy) at the real check, run after `secs` seconds.
+    fn slow_profile(&self, secs: f64) {
+        let script = format!("sleep {secs}; exec python3 check_parser.py \"$1\"");
+        let profile = serde_json::json!({ "id": "parser-checks-v1", "command": ["sh", "-c", script, "sh"], "protected": true });
+        fs::write(self.path("profile/profile.json"), profile.to_string()).unwrap();
+    }
+
+    fn restore_profile(&self) {
+        fs::copy(fixtures().join("profiles/parser-checks-v1/profile.json"), self.path("profile/profile.json")).unwrap();
+    }
+
+    /// Live (non-zombie) processes whose command line names anything in this world: the
+    /// supervisors and workers (their job directory) and the checks (the workspace).
+    fn live_processes(&self) -> Vec<i32> {
+        processes_naming(self.dir.path())
+    }
+
+    /// Waits for every process of this world to be gone; panics with the survivors.
+    async fn assert_no_live_process(&self) {
+        let started = Instant::now();
+        loop {
+            let live = self.live_processes();
+            if live.is_empty() {
+                return;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5), "processes outlived recovery: {live:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+}
+
+/// `(state, session)` of `pid`, from `/proc/<pid>/stat`.
+fn proc_state(pid: i32) -> Option<(String, i32)> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let mut fields = stat[stat.rfind(')')? + 1..].split_whitespace();
+    let state = fields.next()?.to_string();
+    let session = fields.nth(2)?.parse().ok()?;
+    Some((state, session))
+}
+
+fn all_pids() -> Vec<i32> {
+    fs::read_dir("/proc").unwrap().flatten().filter_map(|e| e.file_name().to_str()?.parse().ok()).collect()
+}
+
+/// Live (non-zombie) processes whose command line contains `path`.
+fn processes_naming(path: &Path) -> Vec<i32> {
+    let needle = path.as_os_str().as_encoded_bytes();
+    all_pids()
+        .into_iter()
+        .filter(|pid| {
+            let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else { return false };
+            cmdline.windows(needle.len()).any(|w| w == needle) && proc_state(*pid).is_some_and(|(s, _)| s != "Z")
+        })
+        .collect()
+}
+
+/// Live (non-zombie) processes in session `sid`.
+fn session_members(sid: i32) -> Vec<i32> {
+    all_pids().into_iter().filter(|pid| proc_state(*pid).is_some_and(|(s, sess)| sess == sid && s != "Z")).collect()
+}
+
+async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    let started = Instant::now();
+    while !done() {
+        assert!(started.elapsed() < PATIENCE, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// SIGSTOPs a process and SIGKILLs it when dropped, so a failing test never leaves a
+/// stopped supervisor behind.
+struct Stopped(Pid);
+
+impl Stopped {
+    fn stop(pid: i32) -> Stopped {
+        let pid = Pid::from_raw(pid).unwrap();
+        kill_process(pid, Signal::STOP).unwrap();
+        Stopped(pid)
+    }
+}
+
+impl Drop for Stopped {
+    fn drop(&mut self) {
+        let _ = kill_process(self.0, Signal::KILL);
+    }
+}
+
+/// The supervisor pid of a running `job`, once its check (or script) has started.
+async fn running_supervisor(job: &JobDir) -> i32 {
+    wait_until("the job's check to run", || {
+        job.read_status().is_some_and(|s| s.state == JobState::Running) && !job.groups().is_empty()
+    })
+    .await;
+    job.read_status().unwrap().supervisor_pid.unwrap() as i32
 }
 
 impl Ctl {
@@ -205,10 +402,18 @@ fn assert_journal_sound(w: &World, ctl: &Ctl) {
     assert!(completed.values().all(|n| *n == 1), "an effect completed twice: {completed:?}");
 }
 
-fn expected_decision(point: CrashPoint, kind: &str) -> Option<Decision> {
+/// The decision recovery takes after a crash at `point` in `kind`. With `exit_before_receipt`
+/// the job's supervisor also died after the worker finished and before the receipt.
+///
+/// `DuringExecute` now means the controller died with the job running: the job finishes on
+/// its own and recovery waits for it and publishes its receipt (Phase 2 re-ran it, or
+/// reconciled the patch, because its receipt was lost with the controller). The Phase 2
+/// "executed but not durable" case is the exit-before-receipt one.
+fn expected_decision(point: CrashPoint, kind: &str, exit_before_receipt: bool) -> Option<Decision> {
     match point {
         CrashPoint::AfterIntent => Some(Decision::Dispatch),
         CrashPoint::AfterDispatch => Some(Decision::Redispatch),
+        CrashPoint::DuringExecute if !exit_before_receipt => Some(Decision::PublishRetained),
         CrashPoint::DuringExecute if kind == "apply_patch" => Some(Decision::PublishReconciled),
         CrashPoint::DuringExecute => Some(Decision::Redispatch),
         CrashPoint::AfterExecuteBeforePublish | CrashPoint::AfterBlobPut | CrashPoint::AfterRegister => {
@@ -218,17 +423,23 @@ fn expected_decision(point: CrashPoint, kind: &str) -> Option<Decision> {
     }
 }
 
-/// Real executions of `tag` once a crash at `point` in `kind` was recovered. Only an
-/// attempt that ran without leaving a durable receipt may run again, and only when its kind
-/// is safe to retry blindly; the patch is reconciled instead.
-fn expected_executions(point: CrashPoint, kind: &str, tag: &str) -> usize {
-    if point == CrashPoint::DuringExecute && kind == tag && kind != "apply_patch" { 2 } else { 1 }
+/// Real executions (job launches) of `tag` once a crash at `point` in `kind` was recovered.
+/// Only an attempt that ran without leaving a durable receipt may run again, and only when
+/// its kind is safe to retry blindly; the patch is reconciled instead.
+fn expected_executions(point: CrashPoint, kind: &str, tag: &str, exit_before_receipt: bool) -> usize {
+    let rerun = exit_before_receipt && point == CrashPoint::DuringExecute && kind == tag && kind != "apply_patch";
+    if rerun { 2 } else { 1 }
 }
 
 async fn crash_case(point: CrashPoint, kind: &'static str) {
+    crash_case_with(point, kind, false).await;
+}
+
+async fn crash_case_with(point: CrashPoint, kind: &'static str, exit_before_receipt: bool) {
     let baseline = baseline().await;
     let w = World::new();
-    assert_eq!(w.crash_run(CrashHook::at(point, kind)).await, point);
+    let opts = ExecOpts { exit_before_receipt: exit_before_receipt.then_some(kind), ..ExecOpts::default() };
+    assert_eq!(w.crash_run_with(CrashHook::at(point, kind), &opts).await, point);
 
     let ctl = w.open(None);
     let outstanding: Vec<EffectId> =
@@ -250,7 +461,8 @@ async fn crash_case(point: CrashPoint, kind: &'static str) {
     }
     let decided: Vec<_> = report.decisions.iter().map(|d| d.effect_id.clone()).collect();
     assert_eq!(decided, outstanding, "one decision per outstanding effect, in creation order");
-    match expected_decision(point, kind) {
+    let expected = expected_decision(point, kind, exit_before_receipt);
+    match expected {
         Some(decision) => {
             assert_eq!(report.decisions.len(), 1);
             assert_eq!(report.decisions[0].decision, decision, "{report:?}");
@@ -269,9 +481,9 @@ async fn crash_case(point: CrashPoint, kind: &'static str) {
 
     assert_eq!(summarize(&w, &ctl), baseline, "crash at {point} in {kind}");
     for tag in KINDS {
-        assert_eq!(w.counts.get(tag), expected_executions(point, kind, tag), "executions of {tag}");
+        assert_eq!(w.counts.get(tag), expected_executions(point, kind, tag, exit_before_receipt), "executions of {tag}");
     }
-    let lease = if expected_decision(point, kind) == Some(Decision::Redispatch) { 2 } else { 1 };
+    let lease = if expected == Some(Decision::Redispatch) { 2 } else { 1 };
     assert_eq!(ctl.effect(&w, kind).lease_generation, lease);
     assert_journal_sound(&w, &ctl);
     assert_eq!(ctl.of_type(&w, "ReceiptIgnored").len(), 0);
@@ -282,6 +494,7 @@ async fn crash_case(point: CrashPoint, kind: &'static str) {
     assert!(again.decisions.is_empty() && again.gc_removed == 0 && again.abandoned.is_empty(), "{again:?}");
     assert_eq!(ctl.events(&w), events);
     assert_eq!(summarize(&w, &ctl), baseline);
+    w.assert_no_live_process().await;
 }
 
 macro_rules! matrix {
@@ -319,6 +532,20 @@ matrix! {
     verify_after_blob_put: AfterBlobPut, "run_verification";
     verify_after_register: AfterRegister, "run_verification";
     verify_after_complete: AfterComplete, "run_verification";
+}
+
+/// The controller dies with the patch job running, and the job's supervisor dies after the
+/// patch was applied and before its receipt: nothing durable says it happened, so recovery
+/// reconciles it (applied once, never twice).
+#[tokio::test]
+async fn patch_supervisor_exits_before_receipt() {
+    crash_case_with(CrashPoint::DuringExecute, "apply_patch", true).await;
+}
+
+/// As above for a verification: it is safe to run again, so it is (lease 2).
+#[tokio::test]
+async fn verification_supervisor_exits_before_receipt() {
+    crash_case_with(CrashPoint::DuringExecute, "run_verification", true).await;
 }
 
 #[tokio::test]
@@ -364,7 +591,8 @@ async fn recovering_twice_before_resuming_is_idempotent() {
 async fn a_crash_during_recovery_still_converges() {
     let baseline = baseline().await;
     let w = World::new();
-    w.crash_run(CrashHook::at(CrashPoint::DuringExecute, "apply_patch")).await;
+    let hooked = ExecOpts { exit_before_receipt: Some("apply_patch"), ..ExecOpts::default() };
+    w.crash_run_with(CrashHook::at(CrashPoint::DuringExecute, "apply_patch"), &hooked).await;
     {
         // The first recovery reconciles the patch, then dies before completing it.
         let hook = CrashHook::at(CrashPoint::AfterRegister, "apply_patch");
@@ -389,8 +617,10 @@ async fn repeated_crashes_of_a_retried_verification_converge() {
     let w = World::new();
     w.crash_run(CrashHook::at(CrashPoint::AfterDispatch, "run_verification")).await;
     {
+        // The redispatched attempt runs, but its supervisor dies before the receipt.
         let hook = CrashHook::at(CrashPoint::DuringExecute, "run_verification");
-        let ctl = w.open(Some(hook.clone()));
+        let hooked = ExecOpts { exit_before_receipt: Some("run_verification"), ..ExecOpts::default() };
+        let ctl = w.open_with(Some(hook.clone()), &hooked);
         let err = recover_with(&ctl.db, &ctl.blobs, &ctl.exec, &w.task, &RunOptions::crash_with(hook)).await;
         assert!(matches!(err, Err(EngineError::Crashed(CrashPoint::DuringExecute))), "{err:?}");
     }
@@ -425,6 +655,35 @@ fn attempt(lease: u64) -> AttemptCtx {
     AttemptCtx { attempt_id: AttemptId::new(), lease_generation: lease, worker: "zombie".into() }
 }
 
+/// A job request for an attempt of `rec`, as the executor would write it.
+fn job_request(w: &World, ctl: &Ctl, rec: &EffectRecord, ctx: &AttemptCtx, lease_expiry_ms: i64) -> JobRequest {
+    JobRequest {
+        effect_id: rec.effect_id.clone(),
+        task_id: w.task.clone(),
+        kind: rec.kind.clone(),
+        payload: Vec::new(),
+        contract: ctl.db.contract(&w.task).unwrap(),
+        attempt_id: ctx.attempt_id.clone(),
+        lease_generation: ctx.lease_generation,
+        lease_expiry_ms,
+        task_deadline_ms: 0,
+        worker: WorkerConfig::Host(host_config(w.dir.path())),
+    }
+}
+
+/// Leaves `out` as the receipt of a fresh, dead job directory of its effect, the way a job
+/// (or a forger) would.
+fn leave_receipt(w: &World, ctl: &Ctl, rec: &EffectRecord, out: &ExecOutcome) {
+    let ctx = AttemptCtx {
+        attempt_id: out.receipt.attempt_id.clone(),
+        lease_generation: out.receipt.lease_generation,
+        worker: "zombie".into(),
+    };
+    let (job, lock) = JobDir::create(&w.path("jobs"), &job_request(w, ctl, rec, &ctx, 0)).unwrap();
+    drop(lock);
+    job.write_receipt(out).unwrap();
+}
+
 #[tokio::test]
 async fn stale_and_duplicate_receipts_are_ignored_and_audited() {
     let baseline = baseline().await;
@@ -442,15 +701,14 @@ async fn stale_and_duplicate_receipts_are_ignored_and_audited() {
     assert_eq!((verify.state, verify.lease_generation), (EffectState::Dispatched, 2));
 
     // A zombie of the first attempt (lease 1) reports directly, and another left a forged
-    // receipt in the executor's log.
+    // receipt in a (dead) job directory of its own.
     let zombie = ExecOutcome::success(&request(&ctl, &w, &verify), &attempt(1), b"{\"passed\": true}".to_vec());
     let before = (ctl.db.task(&w.task).unwrap(), ctl.db.usage_summary(&w.task).unwrap());
     let verdict = ctl.db.complete_effect(&verify.effect_id, &zombie.receipt, None, None).unwrap();
     assert_eq!(verdict, ReceiptVerdict::StaleLeaseIgnored);
     assert_eq!((ctl.db.task(&w.task).unwrap(), ctl.db.usage_summary(&w.task).unwrap()), before);
     let forged_out = ExecOutcome::success(&request(&ctl, &w, &verify), &attempt(1), b"{\"passed\": true}".to_vec());
-    let forged = w.path("receipts").join(format!("{}-{}.json", verify.effect_id, forged_out.receipt.attempt_id));
-    std::fs::write(&forged, serde_json::to_vec(&forged_out).unwrap()).unwrap();
+    leave_receipt(&w, &ctl, &verify, &forged_out);
 
     let report = ctl.recover(&w).await;
 
@@ -479,8 +737,12 @@ async fn stale_and_duplicate_receipts_are_ignored_and_audited() {
 
 /// Crashes at `point` in `kind`, has an operator request cancellation, then recovers.
 async fn cancel_after_crash(point: CrashPoint, kind: &'static str) -> (World, Ctl, RecoveryReport) {
+    cancel_after_crash_with(point, kind, &ExecOpts::default()).await
+}
+
+async fn cancel_after_crash_with(point: CrashPoint, kind: &'static str, opts: &ExecOpts) -> (World, Ctl, RecoveryReport) {
     let w = World::new();
-    w.crash_run(CrashHook::at(point, kind)).await;
+    w.crash_run_with(CrashHook::at(point, kind), opts).await;
     let ctl = w.open(None);
     ctl.db.append(&w.task, &TaskEvent::CancelRequested).unwrap();
     let report = ctl.recover(&w).await;
@@ -529,7 +791,9 @@ async fn cancel_after_a_crash_completes_a_retained_verification_without_success(
 
 #[tokio::test]
 async fn cancel_after_a_crash_leaves_an_unprovable_verification_unknown() {
-    let (w, ctl, report) = cancel_after_crash(CrashPoint::DuringExecute, "run_verification").await;
+    // The verification ran, but its supervisor died before the receipt.
+    let hooked = ExecOpts { exit_before_receipt: Some("run_verification"), ..ExecOpts::default() };
+    let (w, ctl, report) = cancel_after_crash_with(CrashPoint::DuringExecute, "run_verification", &hooked).await;
     assert_eq!(report.decisions[0].decision, Decision::MarkUnknown);
     let verify = ctl.effect(&w, "run_verification");
     assert_eq!(verify.state, EffectState::Unknown, "it ran and left no receipt: it may have happened");
@@ -544,10 +808,15 @@ async fn cancel_after_a_crash_leaves_an_unprovable_verification_unknown() {
 #[tokio::test]
 async fn an_unreconcilable_patch_fails_the_task_and_keeps_its_reservation_uncertain() {
     let w = World::new();
-    w.crash_run(CrashHook::at(CrashPoint::DuringExecute, "apply_patch")).await;
-    // Someone else touched the workspace too: it is neither the base nor base + patch.
-    std::fs::write(w.ws().join("src/__init__.py"), "# changed by hand\n").unwrap();
+    let hooked = ExecOpts { exit_before_receipt: Some("apply_patch"), ..ExecOpts::default() };
+    w.crash_run_with(CrashHook::at(CrashPoint::DuringExecute, "apply_patch"), &hooked).await;
     let ctl = w.open(None);
+    // The patch job ends without a receipt ...
+    let job = w.only_job(&ctl.effect(&w, "apply_patch").effect_id);
+    wait_until("the patch job to end", || job.is_dead()).await;
+    assert_eq!(job.read_receipt(), None);
+    // ... and someone else touched the workspace too: it is neither the base nor base + patch.
+    std::fs::write(w.ws().join("src/__init__.py"), "# changed by hand\n").unwrap();
 
     let report = ctl.recover(&w).await;
 
@@ -727,8 +996,7 @@ async fn the_executor_retains_the_highest_lease_outcome() {
     let newer = ExecOutcome::success(&request(&ctl, &w, &verify), &attempt(7), b"newer".to_vec());
     let older = ExecOutcome::success(&request(&ctl, &w, &verify), &attempt(0), b"older".to_vec());
     for out in [&newer, &older] {
-        let name = format!("{}-{}.json", verify.effect_id, out.receipt.attempt_id);
-        std::fs::write(w.path("receipts").join(name), serde_json::to_vec(out).unwrap()).unwrap();
+        leave_receipt(&w, &ctl, &verify, out);
     }
     let receipt: Receipt = retained(&ctl, &verify.effect_id).receipt;
     assert_eq!(receipt, newer.receipt);
@@ -823,4 +1091,231 @@ async fn a_pause_landing_after_a_journaled_verify_turn_pauses_and_resume_verifie
     let task = ctl.db.task(&w.task).unwrap();
     assert_eq!(task.verified_digest, Some(workspace_digest(&w.ws()).unwrap()));
     assert_eq!(w.counts(), KINDS.iter().map(|k| (*k, 1)).collect());
+}
+
+/// The controller dies right after launching a verification that takes a while: recovery
+/// waits for the job, publishes its receipt and never starts a second attempt.
+#[tokio::test]
+async fn recovery_waits_for_a_running_job_and_publishes_its_receipt_without_a_second_attempt() {
+    let baseline = baseline().await;
+    let w = World::new();
+    w.slow_profile(2.5);
+    assert_eq!(w.crash_run(CrashHook::at(CrashPoint::DuringExecute, "run_verification")).await, CrashPoint::DuringExecute);
+    let ctl = w.open(None);
+    let verify = ctl.effect(&w, "run_verification");
+    let job = w.only_job(&verify.effect_id);
+    assert!(!job.is_dead(), "the controller died with the job running");
+
+    let report = ctl.recover(&w).await;
+
+    let decisions: Vec<_> = report.decisions.iter().map(|d| d.decision).collect();
+    assert_eq!(decisions, vec![Decision::PublishRetained], "{report:?}");
+    assert_eq!(ctl.of_type(&w, "RecoveryDecision").len(), 1);
+    assert_eq!(w.jobs(&verify.effect_id).len(), 1, "no second attempt");
+    let verify = ctl.effect(&w, "run_verification");
+    assert_eq!((verify.state, verify.lease_generation), (EffectState::Completed, 1));
+    assert_eq!(verify.result_digest, Some(Digest::of(&job.read_receipt().unwrap().output)));
+    assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Succeeded);
+    assert_eq!(ctl.db.usage_summary(&w.task).unwrap(), baseline.usage);
+    let task = ctl.db.task(&w.task).unwrap();
+    assert_eq!(task.verified_digest, Some(workspace_digest(&w.ws()).unwrap()));
+    assert_eq!(w.counts(), KINDS.iter().map(|k| (*k, 1)).collect());
+    assert_journal_sound(&w, &ctl);
+    w.assert_no_live_process().await;
+}
+
+/// The supervisor of a running verification is SIGKILLed while the controller is down: its
+/// lock is free, so the job is dead, but its worker and check live on. Recovery kills them
+/// before it runs the verification again, so the two attempts never overlap.
+#[tokio::test]
+async fn recovery_after_a_supervisor_sigkill_redispatches_a_verification_after_fencing_the_orphan_worker() {
+    let baseline = baseline().await;
+    let w = World::new();
+    w.slow_profile(30.0);
+    w.crash_run(CrashHook::at(CrashPoint::DuringExecute, "run_verification")).await;
+    let ctl = w.open(None);
+    let verify = ctl.effect(&w, "run_verification");
+    let first = w.only_job(&verify.effect_id);
+    let supervisor = running_supervisor(&first).await;
+    kill_process(Pid::from_raw(supervisor).unwrap(), Signal::KILL).unwrap();
+    wait_until("the first job's lock to be free", || first.is_dead()).await;
+    assert!(!session_members(supervisor).is_empty(), "the orphaned worker outlived its supervisor");
+    w.restore_profile();
+
+    let report = ctl.recover(&w).await;
+
+    let decisions: Vec<_> = report.decisions.iter().map(|d| d.decision).collect();
+    assert_eq!(decisions, vec![Decision::Redispatch], "{report:?}");
+    let jobs = w.jobs(&verify.effect_id);
+    assert_eq!(jobs.len(), 2);
+    assert!(jobs[0].is_dead() && jobs[0].read_receipt().is_none());
+    assert_eq!(session_members(supervisor), Vec::<i32>::new(), "a process of the first attempt lives");
+    assert_eq!(processes_naming(&first.path), Vec::<i32>::new());
+    assert_eq!(ctl.effect(&w, "run_verification").lease_generation, 2);
+    assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Succeeded);
+    assert_eq!(summarize(&w, &ctl), baseline);
+    assert_eq!(w.counts.get("run_verification"), 2);
+    assert_journal_sound(&w, &ctl);
+    w.assert_no_live_process().await;
+}
+
+/// A stopped supervisor keeps its lock past its lease: recovery waits out the lease plus the
+/// grace, fences the job (the cancel marker goes unheard, so the controller kills it), and
+/// only then runs the verification again.
+#[tokio::test]
+async fn recovery_with_a_sigstopped_supervisor_fences_then_redispatches() {
+    let baseline = baseline().await;
+    let w = World::new();
+    w.slow_profile(30.0);
+    let short = ExecOpts {
+        timeouts: Some(EffectTimeouts { verification: Duration::from_secs(2), other: Duration::from_secs(30) }),
+        ..ExecOpts::default()
+    };
+    w.crash_run_with(CrashHook::at(CrashPoint::DuringExecute, "run_verification"), &short).await;
+    let ctl = w.open(None);
+    let verify = ctl.effect(&w, "run_verification");
+    let first = w.only_job(&verify.effect_id);
+    let supervisor = running_supervisor(&first).await;
+    let _stopped = Stopped::stop(supervisor);
+    w.restore_profile();
+
+    let started = Instant::now();
+    let report = ctl.recover(&w).await;
+
+    let lease_expiry = first.request().unwrap().lease_expiry_ms;
+    assert!(now_ms() >= lease_expiry + 5_000, "fenced only past the lease plus the grace");
+    assert!(started.elapsed() < PATIENCE);
+    let decisions: Vec<_> = report.decisions.iter().map(|d| d.decision).collect();
+    assert_eq!(decisions, vec![Decision::WaitedForJob, Decision::Redispatch], "{report:?}");
+    let journaled = ctl.of_type(&w, "RecoveryDecision");
+    assert_eq!(journaled.len(), 2);
+    assert_eq!(journaled[0]["decision"], "WaitedForJob");
+    let jobs = w.jobs(&verify.effect_id);
+    assert_eq!(jobs.len(), 2);
+    assert!(jobs[0].is_dead() && jobs[0].read_receipt().is_none(), "killed mid-flight: no receipt");
+    assert!(jobs[0].cancel_requested());
+    assert_eq!(session_members(supervisor), Vec::<i32>::new(), "a process of the first attempt lives");
+    assert_eq!(ctl.effect(&w, "run_verification").lease_generation, 2);
+    assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Succeeded);
+    assert_eq!(summarize(&w, &ctl), baseline);
+    assert_eq!(w.counts.get("run_verification"), 2);
+    assert_journal_sound(&w, &ctl);
+    w.assert_no_live_process().await;
+}
+
+/// A job that cannot be stopped: the effect may still be running, so it is left UNKNOWN,
+/// its reservation stays uncertain, and the task fails.
+#[tokio::test]
+async fn recovery_marks_unknown_when_fencing_cannot_free_the_lock() {
+    let w = World::new();
+    w.crash_run(CrashHook::at(CrashPoint::AfterDispatch, "apply_patch")).await;
+    let ctl = w.open_with(None, &ExecOpts { fence_fails: true, ..ExecOpts::default() });
+    let patch = ctl.effect(&w, "apply_patch");
+    // A job of the dispatched attempt, past its lease, whose lock this test holds.
+    let ctx = AttemptCtx { attempt_id: AttemptId::new(), lease_generation: patch.lease_generation, worker: "w".into() };
+    let (_job, _lock) = JobDir::create(&w.path("jobs"), &job_request(&w, &ctl, &patch, &ctx, now_ms() - 60_000)).unwrap();
+
+    let report = ctl.recover(&w).await;
+
+    let decisions: Vec<_> = report.decisions.iter().map(|d| d.decision).collect();
+    assert_eq!(decisions, vec![Decision::FenceFailed], "{report:?}");
+    assert_eq!(report.state, Some(TaskState::Failed));
+    let journaled = ctl.of_type(&w, "RecoveryDecision");
+    assert_eq!(journaled.len(), 1);
+    assert_eq!(journaled[0]["decision"], "FenceFailed");
+    let patch = ctl.effect(&w, "apply_patch");
+    assert_eq!(patch.state, EffectState::Unknown);
+    let failed = ctl.of_type(&w, "Failed");
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0]["Failed"]["reason"], format!("unreconcilable effect {}", patch.effect_id));
+    let usage = ctl.db.usage_summary(&w.task).unwrap();
+    assert_eq!((usage.uncertain_tool_actions, usage.reserved_tool_actions, usage.settled_tool_actions), (1, 0, 1));
+    assert_eq!(ctl.db.outstanding_effects(&w.task).unwrap(), vec![patch]);
+    assert_eq!(workspace_digest(&w.ws()).unwrap(), w.base(), "nothing was reconciled or run");
+
+    let n = ctl.events(&w).len();
+    assert!(ctl.recover(&w).await.decisions.is_empty());
+    assert_eq!(ctl.events(&w).len(), n);
+    assert_eq!(w.counts.get("apply_patch"), 0);
+    assert_journal_sound(&w, &ctl);
+}
+
+/// Every way a controller can die with a job in flight leaves no process of that world
+/// behind once recovery is done.
+#[tokio::test]
+async fn no_live_process_remains_after_any_recovery_case() {
+    for kind in KINDS {
+        for exit_before_receipt in [false, true] {
+            let w = World::new();
+            let opts = ExecOpts { exit_before_receipt: exit_before_receipt.then_some(kind), ..ExecOpts::default() };
+            w.crash_run_with(CrashHook::at(CrashPoint::DuringExecute, kind), &opts).await;
+            let ctl = w.open(None);
+            ctl.recover(&w).await;
+            w.assert_no_live_process().await;
+            assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Succeeded, "{kind}");
+            w.assert_no_live_process().await;
+        }
+    }
+    // An orphaned check whose supervisor was killed.
+    let w = World::new();
+    w.slow_profile(30.0);
+    w.crash_run(CrashHook::at(CrashPoint::DuringExecute, "run_verification")).await;
+    let ctl = w.open(None);
+    let job = w.only_job(&ctl.effect(&w, "run_verification").effect_id);
+    let supervisor = running_supervisor(&job).await;
+    kill_process(Pid::from_raw(supervisor).unwrap(), Signal::KILL).unwrap();
+    wait_until("the lock to be free", || job.is_dead()).await;
+    assert!(!w.live_processes().is_empty());
+    w.restore_profile();
+    ctl.recover(&w).await;
+    w.assert_no_live_process().await;
+}
+
+/// One attempt's `[start, last sign of life]` in nanoseconds, from the files the script left.
+fn intervals(dir: &Path) -> Vec<(u128, u128)> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "start") {
+            let start: u128 = fs::read_to_string(&path).unwrap().trim().parse().unwrap();
+            let beats = fs::read_to_string(path.with_extension("beats")).unwrap_or_default();
+            let last = beats.lines().filter_map(|l| l.trim().parse().ok()).max().unwrap_or(start);
+            found.push((start, last));
+        }
+    }
+    found.sort();
+    found
+}
+
+#[tokio::test]
+async fn two_attempts_of_the_same_effect_never_run_concurrently() {
+    let w = World::new();
+    let beats = w.path("beats");
+    fs::create_dir(&beats).unwrap();
+    // Each attempt records its start and then a heartbeat every ~25 ms for about a second.
+    let script = format!(
+        "f={}/$$; date +%s%N > $f.tmp && mv $f.tmp $f.start; i=0; while [ $i -lt 40 ]; do date +%s%N >> $f.beats; sleep 0.025; i=$((i+1)); done; echo checked",
+        beats.display()
+    );
+    let opts = ExecOpts { scripted_verification: Some(script), ..ExecOpts::default() };
+    w.crash_run_with(CrashHook::at(CrashPoint::DuringExecute, "run_verification"), &opts).await;
+    let ctl = w.open_with(None, &opts);
+    let verify = ctl.effect(&w, "run_verification");
+    let first = w.only_job(&verify.effect_id);
+    let supervisor = running_supervisor(&first).await;
+    wait_until("the first heartbeat", || intervals(&beats).first().is_some_and(|(s, l)| l > s)).await;
+    kill_process(Pid::from_raw(supervisor).unwrap(), Signal::KILL).unwrap();
+    wait_until("the first job's lock to be free", || first.is_dead()).await;
+
+    let report = ctl.recover(&w).await;
+
+    assert_eq!(report.decisions.iter().map(|d| d.decision).collect::<Vec<_>>(), vec![Decision::Redispatch]);
+    assert_eq!(ctl.effect(&w, "run_verification").state, EffectState::Completed);
+    // Let a surviving first attempt (if any) show itself.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let found = intervals(&beats);
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(found[0].1 < found[1].0, "the attempts overlapped: {found:?}");
+    assert_eq!(w.counts.get("run_verification"), 2);
+    w.assert_no_live_process().await;
 }

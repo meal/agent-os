@@ -6,6 +6,7 @@ mod args;
 mod commands;
 pub mod crash;
 mod drive;
+mod durable;
 mod error;
 mod home;
 

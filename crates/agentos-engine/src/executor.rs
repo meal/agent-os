@@ -92,6 +92,17 @@ impl ExecOutcome {
     }
 }
 
+/// What waiting for an effect's jobs found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobWait {
+    /// Every attempt is dead; this is the receipt of the highest lease generation.
+    Receipt(Box<ExecOutcome>),
+    /// Every attempt is dead and none left a receipt (or there is no attempt at all).
+    Dead,
+    /// Some attempt still holds its lock after the bound.
+    StillAlive,
+}
+
 /// What an executor can tell about a dispatched effect it holds no receipt for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reconciliation {
@@ -125,6 +136,12 @@ pub trait Executor {
     /// gone), or `None` when this executor cannot tell.
     fn current_workspace(&self, _task: &TaskId) -> Option<Result<Digest, String>> {
         None
+    }
+
+    /// Waits, bounded by the executor's own lease bounds, until no attempt of `effect` can
+    /// run any more. An executor without out-of-process jobs has nothing to wait for.
+    fn await_job(&self, _effect: &EffectId) -> impl Future<Output = JobWait> + Send {
+        async { JobWait::Dead }
     }
 
     /// Stops every live attempt of `effect` and returns whether all of them are dead. An

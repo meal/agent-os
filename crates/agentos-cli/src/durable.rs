@@ -1,5 +1,9 @@
-//! Durable executor receipts: a stand-in for the Phase 3 supervisor, which keeps every
+//! Durable executor receipts: the Phase 2 stand-in for the supervisor, which keeps every
 //! outcome it produced on its own disk, independent of the controller's database.
+//!
+//! Temporary: the engine replaced it with `SupervisedExecutor` (job directories); the CLI
+//! keeps this copy only until it launches supervised jobs itself (hidden `supervise`
+//! subcommands), which removes this module and `<home>/receipts/`.
 //!
 //! [`DurableExecutor`] wraps any executor and writes each outcome to
 //! `<receipt_dir>/<effect_id>-<attempt_id>.json` (write temp file, fsync, rename, fsync the
@@ -11,15 +15,12 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use agentos_core::effect::EffectId;
 use agentos_core::ids::{Digest, TaskId};
-
-use crate::crash::{CrashHook, CrashPoint};
-use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor, Reconciliation};
-pub use crate::supervised::ExecCounts;
+use agentos_engine::crash::{CrashHook, CrashPoint};
+use agentos_engine::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor, Reconciliation};
 
 pub struct DurableExecutor<E> {
     inner: E,
     dir: PathBuf,
-    counts: ExecCounts,
     crash: Option<CrashHook>,
 }
 
@@ -28,9 +29,9 @@ fn sync_dir(path: &Path) -> io::Result<()> {
 }
 
 impl<E: Executor> DurableExecutor<E> {
-    pub fn new(inner: E, receipt_dir: PathBuf, counts: ExecCounts) -> io::Result<DurableExecutor<E>> {
+    pub fn new(inner: E, receipt_dir: PathBuf) -> io::Result<DurableExecutor<E>> {
         fs::create_dir_all(&receipt_dir)?;
-        Ok(DurableExecutor { inner, dir: receipt_dir, counts, crash: None })
+        Ok(DurableExecutor { inner, dir: receipt_dir, crash: None })
     }
 
     /// Consults `hook` at `CrashPoint::DuringExecute`: when it fires, the outcome is
@@ -39,14 +40,6 @@ impl<E: Executor> DurableExecutor<E> {
     pub fn with_crash(mut self, hook: Option<CrashHook>) -> DurableExecutor<E> {
         self.crash = hook;
         self
-    }
-
-    pub fn inner(&self) -> &E {
-        &self.inner
-    }
-
-    pub fn counts(&self) -> &ExecCounts {
-        &self.counts
     }
 
     fn persist(&self, out: &ExecOutcome) -> io::Result<()> {
@@ -73,7 +66,6 @@ impl<E: Executor> DurableExecutor<E> {
 
 impl<E: Executor + Sync> Executor for DurableExecutor<E> {
     async fn run(&self, req: &EffectRequest, ctx: &AttemptCtx) -> ExecOutcome {
-        self.counts.record(&req.kind);
         let out = self.inner.run(req, ctx).await;
         if self.crash.as_ref().is_some_and(|h| h.check(CrashPoint::DuringExecute, Some(req.kind.tag()))) {
             // Killed after the side effects, before the receipt became durable.

@@ -19,9 +19,11 @@ pub enum CrashPoint {
     AfterIntent,
     /// The effect is DISPATCHED; the executor has not been called.
     AfterDispatch,
-    /// Inside the executor: the side effects happened, the receipt is not durable yet.
+    /// Inside the executor, right after the job was launched: the controller dies while the
+    /// job runs on (its supervisor is detached), so the job may finish, and leave its
+    /// receipt, before recovery looks.
     DuringExecute,
-    /// The receipt is durable in the executor's own log; nothing is in the blob store.
+    /// The receipt is durable in the job directory; nothing is in the blob store.
     AfterExecuteBeforePublish,
     /// The result bytes are in the blob store but not registered.
     AfterBlobPut,
@@ -63,8 +65,8 @@ pub struct CrashCtx {
 type Decide = dyn Fn(CrashPoint, &CrashCtx) -> bool + Send + Sync;
 
 /// Cheap cloneable crash decision. Clones share their occurrence counters and the
-/// "tripped" latch, so a hook handed both to the runner and to a `DurableExecutor` acts as
-/// one: a crash inside the executor is seen by the runner as soon as the executor returns.
+/// "tripped" latch, so a hook handed both to the runner and to a `SupervisedExecutor` acts
+/// as one: a crash inside the executor is seen by the runner as soon as the executor returns.
 #[derive(Clone)]
 pub struct CrashHook {
     decide: Arc<Decide>,
