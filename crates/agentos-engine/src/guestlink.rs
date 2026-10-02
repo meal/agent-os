@@ -6,6 +6,7 @@
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -13,7 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use agentos_core::guest::{
-    raw_frames_for, read_frame, write_frame, Frame, FrameError, Message, FILE_LIMIT, GUEST_PROTOCOL, RAW_FRAME_LIMIT,
+    raw_frames_for, read_frame, write_frame, Frame, FrameError, Message, FILE_LIMIT, GUEST_PROTOCOL, PATCH_LIMIT, RAW_FRAME_LIMIT,
     SNAPSHOT_BYTES_LIMIT, SNAPSHOT_FILES_LIMIT, VSOCK_PORT,
 };
 use agentos_core::workspace::list_files;
@@ -30,6 +31,8 @@ pub enum GuestLauncher {
 #[derive(Debug)]
 pub enum LinkError {
     BootTimeout,
+    /// The guest's process ended before a connection was made; the text says how.
+    Exited(String),
     Lost(io::Error),
     Protocol(String),
     Refused(String),
@@ -39,6 +42,7 @@ impl fmt::Display for LinkError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LinkError::BootTimeout => f.write_str("guest did not come up: no connection before the boot deadline"),
+            LinkError::Exited(how) => write!(f, "guest did not come up: {how}"),
             LinkError::Lost(e) => write!(f, "guest connection lost: {e}"),
             LinkError::Protocol(why) => write!(f, "guest protocol violation: {why}"),
             LinkError::Refused(reason) => f.write_str(reason),
@@ -51,6 +55,23 @@ impl std::error::Error for LinkError {}
 const SOCKET_POLL: Duration = Duration::from_millis(10);
 const RETRY_PAUSE: Duration = Duration::from_millis(50);
 const MAX_HANDSHAKE_LINE: usize = 64;
+/// The longest path a Unix socket address holds (`sun_path` is 108 bytes with the NUL).
+const SUN_PATH_MAX: usize = 107;
+
+/// A path that reaches the socket `uds` within `SUN_PATH_MAX`: `uds` itself, or, when it is
+/// longer (a job directory is named `<64-hex effect>-<uuid>`), `/proc/self/fd/<n>/<name>`
+/// through a descriptor of its directory, which the returned `File` keeps open.
+pub fn socket_path(uds: &Path) -> io::Result<(PathBuf, Option<File>)> {
+    if uds.as_os_str().len() <= SUN_PATH_MAX {
+        return Ok((uds.to_path_buf(), None));
+    }
+    let (Some(dir), Some(name)) = (uds.parent(), uds.file_name()) else {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{} is not a socket path", uds.display())));
+    };
+    let dir = File::open(dir)?;
+    let alias = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())).join(name);
+    Ok((alias, Some(dir)))
+}
 
 pub struct GuestLink {
     stream: UnixStream,
@@ -145,11 +166,27 @@ impl GuestLink {
     /// handshake. A connection the proxy closes because the guest is not listening yet is
     /// retried every 50 ms; past `deadline` it is `BootTimeout`.
     pub fn connect(uds: &Path, deadline: Instant) -> Result<GuestLink, LinkError> {
+        GuestLink::connect_until(uds, deadline, || None)
+    }
+
+    /// `connect`, asking `gone` whenever the socket cannot be reached whether the guest's
+    /// process has ended (`Some(how)` ends the wait at once as `Exited(how)`). Only then: a
+    /// dead process cannot be listening, while a reachable socket is always given the
+    /// handshake up to `deadline`.
+    pub fn connect_until(
+        uds: &Path,
+        deadline: Instant,
+        mut gone: impl FnMut() -> Option<String>,
+    ) -> Result<GuestLink, LinkError> {
         loop {
             if Instant::now() >= deadline {
                 return Err(LinkError::BootTimeout);
             }
-            let Ok(mut stream) = UnixStream::connect(uds) else {
+            let reached = socket_path(uds).and_then(|(path, _dir)| UnixStream::connect(path));
+            let Ok(mut stream) = reached else {
+                if let Some(how) = gone() {
+                    return Err(LinkError::Exited(how));
+                }
                 thread::sleep(SOCKET_POLL);
                 continue;
             };
@@ -187,6 +224,20 @@ impl GuestLink {
             write_frame(&mut self.stream, &Frame::Raw(chunk.to_vec())).map_err(lost)?;
         }
         Ok(())
+    }
+
+    /// Sends `bytes` as exactly one raw frame, empty included (the patch of `ApplyPatch` and
+    /// `PatchState`, which the guest reads as one frame of at most `PATCH_LIMIT` bytes).
+    pub fn send_patch(&mut self, bytes: &[u8]) -> Result<(), LinkError> {
+        if bytes.len() > PATCH_LIMIT {
+            return Err(LinkError::Protocol(format!("patch of {} bytes, over the {PATCH_LIMIT} limit", bytes.len())));
+        }
+        write_frame(&mut self.stream, &Frame::Raw(bytes.to_vec())).map_err(lost)
+    }
+
+    /// Bounds every single write on the connection (a peer that stops reading).
+    pub fn set_write_timeout(&self, timeout: Option<Duration>) -> Result<(), LinkError> {
+        self.stream.set_write_timeout(timeout).map_err(lost)
     }
 
     /// The next message, waiting at most until `until`. A timeout is `Lost`; a raw frame
@@ -252,22 +303,28 @@ impl GuestLink {
     }
 }
 
-fn type_name(m: &Message) -> String {
+/// The `type` tag of a message, for error texts.
+pub(crate) fn type_name(m: &Message) -> String {
     serde_json::to_value(m)
         .ok()
         .and_then(|v| v.get("type").and_then(|t| t.as_str().map(str::to_string)))
         .unwrap_or_else(|| "?".into())
 }
 
-/// Starts the fake guest as `program prefix_args… fake-guest UDS ROOT` with null stdio, in
-/// the caller's process group (as Firecracker will be). The environment is cleared apart
-/// from `PATH` and `env`. The caller kills and reaps the child explicitly.
+/// Starts the fake guest as `program prefix_args… fake-guest NAME ROOT` with null stdio, in
+/// the caller's process group (as Firecracker will be), in the socket's directory with the
+/// socket's file name (as Firecracker binds its relative `uds_path`, so a long directory
+/// never exceeds the socket address limit). The environment is cleared apart from `PATH`
+/// and `env`. The caller kills and reaps the child explicitly.
 pub fn spawn_fake(launcher: &GuestLauncher, uds: &Path, root: &Path, env: &[(String, String)]) -> io::Result<Child> {
     let GuestLauncher::Fake { program, prefix_args } = launcher else {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "spawn_fake needs a Fake launcher"));
     };
     let mut cmd = Command::new(program);
-    cmd.args(prefix_args).arg("fake-guest").arg(uds).arg(root);
+    match (uds.parent().filter(|d| !d.as_os_str().is_empty()), uds.file_name()) {
+        (Some(dir), Some(name)) => cmd.current_dir(dir).args(prefix_args).arg("fake-guest").arg(name).arg(root),
+        _ => cmd.args(prefix_args).arg("fake-guest").arg(uds).arg(root),
+    };
     cmd.env_clear();
     if let Some(path) = std::env::var_os("PATH") {
         cmd.env("PATH", path);

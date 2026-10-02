@@ -28,7 +28,11 @@ use agentos_core::effect::{AttemptId, EffectId, EffectKind};
 use agentos_core::ids::{Digest, TaskId};
 use serde::{Deserialize, Serialize};
 
+use agentos_core::guest::is_attempt_token;
+
 use crate::executor::ExecOutcome;
+use crate::firecracker::FirecrackerConfig;
+use crate::jail::JailMode;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobRequest {
@@ -45,9 +49,50 @@ pub struct JobRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant, reason = "a handful per process, serialized into request.json")]
 pub enum WorkerConfig {
     Host(HostConfig),
     Scripted(ScriptedConfig),
+    Firecracker(FirecrackerConfig),
+}
+
+impl WorkerConfig {
+    /// Every path must be absolute (the supervisor and the worker run with their own
+    /// working directory) and a Firecracker attempt token must be well formed.
+    pub fn check_paths(&self) -> io::Result<()> {
+        let mut paths: Vec<(&str, &Path)> = Vec::new();
+        match self {
+            WorkerConfig::Host(h) => {
+                paths.extend([
+                    ("snapshot_dir", h.snapshot_dir.as_path()),
+                    ("profile_dir", h.profile_dir.as_path()),
+                    ("work_root", h.work_root.as_path()),
+                ]);
+            }
+            WorkerConfig::Scripted(_) => {}
+            WorkerConfig::Firecracker(f) => {
+                paths.extend([
+                    ("firecracker_bin", f.firecracker_bin.as_path()),
+                    ("image_dir", f.image_dir.as_path()),
+                    ("snapshot_dir", f.snapshot_dir.as_path()),
+                    ("profile_dir", f.profile_dir.as_path()),
+                    ("work_root", f.work_root.as_path()),
+                ]);
+                if let JailMode::Jailed(j) = &f.jail {
+                    paths.extend([("jailer_bin", j.jailer_bin.as_path()), ("cgroup_root", j.cgroup_root.as_path())]);
+                }
+                if !is_attempt_token(&f.attempt_token) {
+                    return Err(invalid("attempt_token must be 32 lowercase hex characters".into()));
+                }
+            }
+        }
+        for (name, p) in paths {
+            if !p.is_absolute() {
+                return Err(invalid(format!("{name} {} must be absolute", p.display())));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// All paths must be absolute: the supervisor runs with its own working directory.
@@ -146,17 +191,7 @@ impl JobDir {
         check_plain_name("effect id", req.effect_id.as_str())?;
         let attempt = req.attempt_id.to_string();
         check_plain_name("attempt id", &attempt)?;
-        if let WorkerConfig::Host(h) = &req.worker {
-            for (name, p) in [
-                ("snapshot_dir", &h.snapshot_dir),
-                ("profile_dir", &h.profile_dir),
-                ("work_root", &h.work_root),
-            ] {
-                if !p.is_absolute() {
-                    return Err(invalid(format!("{name} {} must be absolute", p.display())));
-                }
-            }
-        }
+        req.worker.check_paths()?;
         JobDir::create_with(jobs_root, req, |_| Ok(()))
     }
 

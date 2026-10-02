@@ -314,6 +314,8 @@ impl SupervisedExecutor {
                     .with_pinned_profile(h.profile_digest),
             ),
             WorkerConfig::Scripted(_) => None,
+            // The inspector (Task 7) answers reconcile/current_workspace for Firecracker.
+            WorkerConfig::Firecracker(_) => None,
         };
         Ok(SupervisedExecutor {
             jobs_root,

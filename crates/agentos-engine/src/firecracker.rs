@@ -1,0 +1,967 @@
+//! The Firecracker worker: one microVM per job, booted fresh from a pinned guest image,
+//! driven over the guest control protocol, destroyed when the job ends. Every outcome byte
+//! is built here, on the host, from the guest's structured reply (`outcomes`), so the
+//! artifacts equal the host worker's.
+//!
+//! Also: the worker configuration, the `vm.json` renderer, exit-code naming, the guest image
+//! manifest and the preflight the controller and the worker both run.
+
+use std::fs::{self, File, TryLockError};
+use std::io;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::ExitStatusExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use agentos_core::effect::EffectKind;
+use agentos_core::guest::{
+    unb64, Message, Mode, FILE_LIMIT, GUEST_CID, GUEST_MIN_MEMORY_MIB, GUEST_PROTOCOL, MAX_VCPUS, OUTPUT_LIMIT, PATCH_LIMIT,
+    PROFILE_LIMIT, SCRATCH_IMAGE_BYTES, SNAPSHOT_BYTES_LIMIT, SNAPSHOT_FILES_LIMIT, WS_IMAGE_BYTES,
+};
+use agentos_core::ids::{Digest, TaskId};
+use agentos_core::workspace::{list_files, workspace_digest};
+use rustix::process::{kill_process, kill_process_group, Pid, Signal};
+use serde::{Deserialize, Serialize};
+
+use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Reconciliation};
+use crate::guestlink::{spawn_fake, type_name, GuestLauncher, GuestLink, LinkError};
+use crate::jail::JailMode;
+use crate::job::JobDir;
+use crate::outcomes::{self, Check};
+use crate::worker::{Worker, TEST_WORKERS_ENV};
+
+/// From spawn to `Ready`.
+pub const BOOT_TIMEOUT: Duration = Duration::from_secs(15);
+/// The whole of one inspection boot.
+pub const INSPECT_TIMEOUT: Duration = Duration::from_secs(60);
+/// From `Shutdown` (or a lost connection) to Firecracker's exit, before it is SIGKILLed.
+pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
+/// The guest kernel command line; Firecracker appends `root=/dev/vda ro` and the
+/// `virtio_mmio.device=` entries. It carries nothing secret.
+pub const BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off nomodule quiet loglevel=4 init=/sbin/agentos-guest";
+/// Test hook (with `AGENTOS_TEST_WORKERS=1`): SIGKILL the VM right after `ApplyPatch` was sent.
+pub const KILL_VM_AFTER_REQUEST_ENV: &str = "AGENTOS_TEST_KILL_VM_AFTER_REQUEST";
+/// What `firecracker --version` must start with.
+pub const FIRECRACKER_VERSION_PREFIX: &str = "Firecracker v1.17.";
+/// The file names of a registered image (fixed, as the jail stages them under these names).
+pub const KERNEL_FILE: &str = "vmlinux";
+pub const ROOTFS_FILE: &str = "rootfs.squashfs";
+
+/// How long a `ReadSnapshot`/`ApplyPatch` reply may take once the request was sent. The
+/// job's lease (the supervisor's kill) normally ends a stuck guest first.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(120);
+/// A `RunVerification` reply may take the check's own timeout plus this.
+const VERIFY_REPLY_MARGIN: Duration = Duration::from_secs(60);
+/// Bounds each single write to the guest (a peer that stops reading).
+const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+const EXIT_POLL: Duration = Duration::from_millis(10);
+const WS_BUSY: &str = "workspace image is attached to another VM";
+const WORKSPACE_MISSING: &str = "workspace missing: no snapshot was read";
+
+/// The Firecracker worker's part of `request.json`. Every path is absolute.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FirecrackerConfig {
+    pub firecracker_bin: PathBuf,
+    /// `<registry>/images/<id>@<digest>/`.
+    pub image_dir: PathBuf,
+    /// Pinned; the image is re-digested before every launch.
+    pub image_digest: Digest,
+    pub snapshot_dir: PathBuf,
+    pub profile_dir: PathBuf,
+    pub profile_digest: Option<Digest>,
+    /// `ws.img` lives at `<work_root>/<task>/ws.img`.
+    pub work_root: PathBuf,
+    pub verify_timeout_secs: u64,
+    /// The contract's `worker_vcpus`, 1..=32.
+    pub vcpus: u32,
+    /// The contract's `worker_memory_mib`, at least `GUEST_MIN_MEMORY_MIB`.
+    pub memory_mib: u32,
+    /// 32 lowercase hex, minted per job; identity (sent only in `Hello`), not authority.
+    pub attempt_token: String,
+    pub launcher: GuestLauncher,
+    /// Decided by the controller; the worker only executes it.
+    pub jail: JailMode,
+}
+
+impl FirecrackerConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=MAX_VCPUS).contains(&self.vcpus) {
+            return Err(format!("worker_vcpus must be between 1 and {MAX_VCPUS}"));
+        }
+        if self.memory_mib < GUEST_MIN_MEMORY_MIB {
+            return Err(format!("worker_memory_mib must be at least {GUEST_MIN_MEMORY_MIB}"));
+        }
+        Ok(())
+    }
+}
+
+/// The six strings that go into `vm.json`: host paths (unjailed) or chroot paths (jailed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmView {
+    pub kernel: String,
+    pub rootfs: String,
+    pub ws_img: String,
+    pub scratch_img: String,
+    pub uds: String,
+    pub log: String,
+}
+
+/// Where a job's VM files live on the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmPaths {
+    pub dir: PathBuf,
+    pub ws_img: PathBuf,
+    pub scratch_img: PathBuf,
+    pub vm_json: PathBuf,
+    pub uds: PathBuf,
+    pub console_log: PathBuf,
+    pub firecracker_log: PathBuf,
+    pub stderr_log: PathBuf,
+}
+
+fn text(p: &Path) -> String {
+    p.to_string_lossy().into_owned()
+}
+
+impl VmPaths {
+    /// The files of a VM run from `dir` (a job directory) on `task`'s workspace image.
+    pub fn new(dir: &Path, work_root: &Path, task: &TaskId) -> VmPaths {
+        VmPaths {
+            dir: dir.to_path_buf(),
+            ws_img: work_root.join(task.as_str()).join("ws.img"),
+            scratch_img: dir.join("scratch.img"),
+            vm_json: dir.join("vm.json"),
+            uds: dir.join("v.sock"),
+            console_log: dir.join("console.log"),
+            firecracker_log: dir.join("firecracker.log"),
+            stderr_log: dir.join("stderr.log"),
+        }
+    }
+
+    /// The unjailed view: absolute host paths, except `uds`, which is `v.sock` relative to
+    /// Firecracker's working directory (the job directory): `<job>/v.sock` is longer than a
+    /// Unix socket address can be (`sun_path`, 108 bytes) since a job directory is named
+    /// `<64-hex effect>-<uuid>`.
+    pub fn host_view(&self, image_dir: &Path) -> VmView {
+        VmView {
+            kernel: text(&image_dir.join(KERNEL_FILE)),
+            rootfs: text(&image_dir.join(ROOTFS_FILE)),
+            ws_img: text(&self.ws_img),
+            scratch_img: text(&self.scratch_img),
+            uds: self.uds.file_name().map_or_else(|| text(&self.uds), |n| text(Path::new(n))),
+            log: text(&self.firecracker_log),
+        }
+    }
+}
+
+// `vm.json` as ordered structs, so the file keeps the documented field order (a
+// `serde_json::Value` sorts its keys).
+#[derive(Serialize)]
+struct VmConfig<'a> {
+    #[serde(rename = "boot-source")]
+    boot_source: BootSource<'a>,
+    drives: [Drive<'a>; 3],
+    #[serde(rename = "machine-config")]
+    machine_config: MachineConfig,
+    vsock: Vsock<'a>,
+    #[serde(rename = "network-interfaces")]
+    network_interfaces: [(); 0],
+    logger: Logger<'a>,
+}
+
+#[derive(Serialize)]
+struct BootSource<'a> {
+    kernel_image_path: &'a str,
+    boot_args: &'a str,
+}
+
+#[derive(Serialize)]
+struct Drive<'a> {
+    drive_id: &'a str,
+    is_root_device: bool,
+    is_read_only: bool,
+    path_on_host: &'a str,
+    cache_type: &'a str,
+}
+
+#[derive(Serialize)]
+struct MachineConfig {
+    vcpu_count: u32,
+    mem_size_mib: u32,
+    smt: bool,
+    huge_pages: &'static str,
+}
+
+#[derive(Serialize)]
+struct Vsock<'a> {
+    guest_cid: u32,
+    uds_path: &'a str,
+}
+
+#[derive(Serialize)]
+struct Logger<'a> {
+    log_path: &'a str,
+    level: &'a str,
+}
+
+fn vm_config<'a>(cfg: &FirecrackerConfig, view: &'a VmView) -> VmConfig<'a> {
+    VmConfig {
+        boot_source: BootSource { kernel_image_path: &view.kernel, boot_args: BOOT_ARGS },
+        drives: [
+            Drive { drive_id: "rootfs", is_root_device: true, is_read_only: true, path_on_host: &view.rootfs, cache_type: "Unsafe" },
+            // Writeback: a guest fsync reaches ws.img before the guest reports success.
+            Drive { drive_id: "workspace", is_root_device: false, is_read_only: false, path_on_host: &view.ws_img, cache_type: "Writeback" },
+            Drive { drive_id: "scratch", is_root_device: false, is_read_only: false, path_on_host: &view.scratch_img, cache_type: "Unsafe" },
+        ],
+        machine_config: MachineConfig { vcpu_count: cfg.vcpus, mem_size_mib: cfg.memory_mib, smt: false, huge_pages: "None" },
+        vsock: Vsock { guest_cid: GUEST_CID, uds_path: &view.uds },
+        network_interfaces: [],
+        logger: Logger { log_path: &view.log, level: "Warning" },
+    }
+}
+
+/// The Firecracker configuration for `view`: three drives in the order that fixes the guest
+/// names `vda`, `vdb`, `vdc`; no network interface; no balloon, MMDS or CPU template.
+pub fn render_vm_json(cfg: &FirecrackerConfig, view: &VmView) -> serde_json::Value {
+    serde_json::to_value(vm_config(cfg, view)).expect("vm.json serializes")
+}
+
+/// Writes `vm.json` with the documented field order.
+pub fn write_vm_json(path: &Path, cfg: &FirecrackerConfig, view: &VmView) -> io::Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(&vm_config(cfg, view)).map_err(io::Error::other)?;
+    bytes.push(b'\n');
+    fs::write(path, bytes)
+}
+
+/// `firecracker exit code N` or `firecracker killed by signal N`.
+pub fn exit_code_text(status: &ExitStatus) -> String {
+    match (status.code(), status.signal()) {
+        (Some(code), _) => format!("firecracker exit code {code}"),
+        (None, Some(signal)) => format!("firecracker killed by signal {signal}"),
+        (None, None) => format!("firecracker ended with {status}"),
+    }
+}
+
+/// `image.json` of a registered guest image.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageManifest {
+    pub id: String,
+    pub protocol: u32,
+    pub kernel: String,
+    pub rootfs: String,
+    pub agent_version: String,
+    pub kernel_sha256: String,
+    pub built_from: String,
+}
+
+/// Parses `<image_dir>/image.json` and checks that it speaks `GUEST_PROTOCOL` and names
+/// `vmlinux` and `rootfs.squashfs`, both present as regular files.
+pub fn read_image(image_dir: &Path) -> Result<ImageManifest, String> {
+    let path = image_dir.join("image.json");
+    let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let image: ImageManifest = serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    if image.protocol != GUEST_PROTOCOL {
+        return Err(format!("{}: guest image speaks protocol {}, expected {GUEST_PROTOCOL}", path.display(), image.protocol));
+    }
+    for (field, name, want) in [("kernel", &image.kernel, KERNEL_FILE), ("rootfs", &image.rootfs, ROOTFS_FILE)] {
+        if name != want {
+            return Err(format!("{}: {field} is {name:?}, expected {want:?}", path.display()));
+        }
+        let file = image_dir.join(want);
+        if !file.is_file() {
+            return Err(format!("{}: {field} {} is missing", path.display(), file.display()));
+        }
+    }
+    Ok(image)
+}
+
+fn executable(path: &Path) -> Result<(), String> {
+    let meta = fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
+        return Err(format!("{} is not an executable file", path.display()));
+    }
+    Ok(())
+}
+
+/// The first line of `firecracker --version`, which must start with `Firecracker v1.17.`.
+pub fn firecracker_version(firecracker_bin: &Path) -> Result<String, String> {
+    let out = Command::new(firecracker_bin)
+        .arg("--version")
+        .env_clear()
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| e.to_string())?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let first = stdout.lines().next().unwrap_or("").trim();
+    if !out.status.success() || !first.starts_with(FIRECRACKER_VERSION_PREFIX) {
+        return Err(format!("expected {FIRECRACKER_VERSION_PREFIX}…, got {first:?} ({})", out.status));
+    }
+    Ok(first.to_string())
+}
+
+/// Whether this host can run `cfg`'s VMs: `/dev/kvm` opens read-write, the Firecracker
+/// binary is a v1.17 build (`Real`), or the fake guest's program is executable (`Fake`);
+/// and the image parses, speaks protocol 1 and still has the pinned digest. The caller
+/// prefixes errors with `firecracker worker unavailable: `.
+pub fn preflight(cfg: &FirecrackerConfig) -> Result<(), String> {
+    cfg.validate()?;
+    match &cfg.launcher {
+        GuestLauncher::Real { .. } => {
+            File::options().read(true).write(true).open("/dev/kvm").map_err(|e| format!("/dev/kvm: {e}"))?;
+            executable(&cfg.firecracker_bin)?;
+            firecracker_version(&cfg.firecracker_bin).map_err(|e| format!("firecracker --version: {e}"))?;
+        }
+        GuestLauncher::Fake { program, .. } => executable(program)?,
+    }
+    read_image(&cfg.image_dir)?;
+    let found = workspace_digest(&cfg.image_dir).map_err(|e| format!("cannot digest {}: {e}", cfg.image_dir.display()))?;
+    if found != cfg.image_digest {
+        return Err(format!("guest image digest mismatch: pinned {}, found {found}", cfg.image_digest));
+    }
+    Ok(())
+}
+
+/// What the worker entry point does with a job: write this outcome, or write none and exit
+/// 1 (a request was sent and its effect is unknown: the controller reconciles by inspection).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant, reason = "one value per job, moved once")]
+pub enum WorkerResult {
+    Outcome(ExecOutcome),
+    NoOutcome(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct FirecrackerWorker {
+    cfg: FirecrackerConfig,
+    job_dir: PathBuf,
+    boot_timeout: Duration,
+    env: Vec<(String, String)>,
+}
+
+/// The request to send, prepared (and limit-checked) before anything is launched.
+enum Plan {
+    Snapshot { files: u64, bytes: u64 },
+    Patch { expected_base: Digest, editable_paths: Vec<String> },
+    Verify { files: u64, bytes: u64, source: Option<Digest> },
+}
+
+/// The reply that decides the outcome, held until the VM is down.
+enum Reply {
+    Refused(String),
+    Snapshot(Vec<String>, Digest),
+    Patch(Vec<String>, Digest),
+    Verified(Check),
+}
+
+/// Why serving a request failed after it (or part of it) was sent.
+enum Served {
+    Lost,
+    Violation(String),
+}
+
+/// Removes `scratch.img` however the job ends inside this process.
+struct ScratchGuard(PathBuf);
+
+impl Drop for ScratchGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// The spawned Firecracker (or fake guest). It runs in the worker's process group, so it is
+/// never killed by group from here; dropping an unreaped VM kills it.
+struct Vm {
+    child: Child,
+    status: Option<ExitStatus>,
+}
+
+impl Vm {
+    /// Whether it has exited, and how.
+    fn exited(&mut self) -> Option<String> {
+        if self.status.is_none() {
+            self.status = self.child.try_wait().ok().flatten();
+        }
+        self.status.as_ref().map(exit_code_text)
+    }
+
+    /// SIGKILLs the process (and a group it may lead; never the worker's own) and reaps it.
+    fn kill(&mut self) -> ExitStatus {
+        if let Some(status) = self.status {
+            return status;
+        }
+        if let Some(pid) = i32::try_from(self.child.id()).ok().and_then(Pid::from_raw) {
+            let _ = kill_process(pid, Signal::KILL);
+            let _ = kill_process_group(pid, Signal::KILL);
+        }
+        let status = self.child.wait().unwrap_or_else(|_| ExitStatus::from_raw(9));
+        self.status = Some(status);
+        status
+    }
+
+    /// Waits up to `within` for the exit, then kills.
+    fn wait_or_kill(&mut self, within: Duration) -> ExitStatus {
+        let until = Instant::now() + within;
+        while Instant::now() < until {
+            if self.exited().is_some() {
+                return self.status.expect("set by exited");
+            }
+            thread::sleep(EXIT_POLL);
+        }
+        self.kill()
+    }
+}
+
+impl Drop for Vm {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+fn not_up(e: &LinkError) -> String {
+    match e {
+        LinkError::BootTimeout | LinkError::Exited(_) => e.to_string(),
+        other => format!("guest did not come up: {other}"),
+    }
+}
+
+/// `(files, bytes)` of the regular files under `root`, within the protocol limits.
+fn tree_within(root: &Path, bytes_limit: u64) -> Result<(u64, u64), String> {
+    let entries = list_files(root).map_err(|e| e.to_string())?;
+    let files = entries.len() as u64;
+    if files > SNAPSHOT_FILES_LIMIT {
+        return Err(format!("{files} files, over the {SNAPSHOT_FILES_LIMIT} limit"));
+    }
+    let mut bytes = 0u64;
+    for (rel, path) in &entries {
+        let len = path.metadata().map_err(|e| format!("{rel}: {e}"))?.len();
+        if len > FILE_LIMIT {
+            return Err(format!("file {rel} is {len} bytes, over the {FILE_LIMIT} limit"));
+        }
+        bytes += len;
+    }
+    if bytes > bytes_limit {
+        return Err(format!("{bytes} bytes, over the {bytes_limit} limit"));
+    }
+    Ok((files, bytes))
+}
+
+/// At most `OUTPUT_LIMIT` bytes; cut if the guest says so or sent more.
+fn capped(mut bytes: Vec<u8>, truncated: bool) -> (Vec<u8>, bool) {
+    let over = bytes.len() > OUTPUT_LIMIT;
+    bytes.truncate(OUTPUT_LIMIT);
+    (bytes, truncated || over)
+}
+
+fn sparse(path: &Path, len: u64) -> io::Result<()> {
+    File::create(path)?.set_len(len)
+}
+
+impl FirecrackerWorker {
+    pub fn new(cfg: &FirecrackerConfig, job: &JobDir) -> FirecrackerWorker {
+        FirecrackerWorker { cfg: cfg.clone(), job_dir: job.path.clone(), boot_timeout: BOOT_TIMEOUT, env: Vec::new() }
+    }
+
+    /// Test seam: replaces `BOOT_TIMEOUT`.
+    pub fn with_boot_timeout(mut self, timeout: Duration) -> FirecrackerWorker {
+        self.boot_timeout = timeout;
+        self
+    }
+
+    /// Test seam: environment the worker treats as its own on top of the process's (test
+    /// hooks such as `AGENTOS_TEST_WORKERS`) and passes to the spawned guest, without
+    /// touching the test process's environment.
+    pub fn with_env(mut self, env: Vec<(String, String)>) -> FirecrackerWorker {
+        self.env = env;
+        self
+    }
+
+    fn env_value(&self, name: &str) -> Option<String> {
+        self.env.iter().rev().find(|(k, _)| k == name).map(|(_, v)| v.clone()).or_else(|| std::env::var(name).ok())
+    }
+
+    fn test_hook(&self, name: &str) -> bool {
+        self.env_value(TEST_WORKERS_ENV).as_deref() == Some("1") && self.env_value(name).as_deref() == Some("1")
+    }
+
+    /// The environment of the spawned process: the test switches of this process
+    /// (`AGENTOS_TEST_WORKERS`, `AGENTOS_TEST_FAKE_GUEST_*`) and the `with_env` entries.
+    fn guest_env(&self) -> Vec<(String, String)> {
+        let mut env: Vec<(String, String)> = std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .filter(|(k, _)| k == TEST_WORKERS_ENV || k.starts_with("AGENTOS_TEST_FAKE_GUEST_"))
+            .collect();
+        env.extend(self.env.iter().cloned());
+        env
+    }
+
+    /// Runs the job (blocking work on a blocking thread). What `run_worker` calls.
+    pub async fn run_job(&self, req: &EffectRequest, ctx: &AttemptCtx) -> WorkerResult {
+        let (this, req, ctx) = (self.clone(), req.clone(), ctx.clone());
+        match tokio::task::spawn_blocking(move || this.run_blocking(&req, &ctx)).await {
+            Ok(result) => result,
+            Err(e) => WorkerResult::NoOutcome(format!("firecracker worker failed: {e}")),
+        }
+    }
+
+    /// The pre-launch part of a request: limits, the workspace precondition, the unpinned
+    /// profile's source digest. Errors are effect failures (nothing was sent).
+    fn plan(&self, req: &EffectRequest) -> Result<Plan, String> {
+        match &req.kind {
+            EffectKind::ReadSnapshot => {
+                let (files, bytes) = tree_within(&self.cfg.snapshot_dir, SNAPSHOT_BYTES_LIMIT).map_err(|e| format!("snapshot failed: {e}"))?;
+                Ok(Plan::Snapshot { files, bytes })
+            }
+            EffectKind::ApplyPatch { expected_base } => {
+                if req.payload.len() > PATCH_LIMIT {
+                    return Err(format!("invalid patch: {} bytes, over the {PATCH_LIMIT} limit", req.payload.len()));
+                }
+                Ok(Plan::Patch { expected_base: *expected_base, editable_paths: req.contract.editable_paths.clone() })
+            }
+            EffectKind::RunVerification => {
+                let (files, bytes) = tree_within(&self.cfg.profile_dir, PROFILE_LIMIT).map_err(|e| format!("cannot stage profile: {e}"))?;
+                // Unpinned, the source must not change while the run is under way (the
+                // guest only sees the staged copy, so the host checks the source).
+                let source = match self.cfg.profile_digest {
+                    Some(_) => None,
+                    None => Some(workspace_digest(&self.cfg.profile_dir).map_err(|e| format!("cannot digest profile: {e}"))?),
+                };
+                Ok(Plan::Verify { files, bytes, source })
+            }
+            EffectKind::ExportBundle => Err("not implemented in this milestone".into()),
+        }
+    }
+
+    /// Spawns the VM for `paths`: Firecracker (unjailed) or the fake guest.
+    fn launch(&self, paths: &VmPaths, task_dir: &Path, attempt: &str) -> io::Result<Child> {
+        match (&self.cfg.jail, &self.cfg.launcher) {
+            (JailMode::Jailed(_), _) => Err(io::Error::other("jailed launch is not implemented yet")),
+            (JailMode::Unjailed, GuestLauncher::Real { .. }) => {
+                let console = File::options().append(true).open(&paths.console_log)?;
+                let stderr = File::options().append(true).open(&paths.stderr_log)?;
+                // In the worker's process group (no process_group(0)): every 3a kill path
+                // reaches it.
+                Command::new(&self.cfg.firecracker_bin)
+                    .args(["--no-api", "--config-file"])
+                    .arg(&paths.vm_json)
+                    .arg("--id")
+                    .arg(attempt)
+                    .env_clear()
+                    .envs(self.guest_env())
+                    .current_dir(&paths.dir)
+                    .stdin(Stdio::null())
+                    .stdout(console)
+                    .stderr(stderr)
+                    .spawn()
+            }
+            (JailMode::Unjailed, fake @ GuestLauncher::Fake { .. }) => spawn_fake(fake, &paths.uds, task_dir, &self.guest_env()),
+        }
+    }
+
+    /// Preflight ⇒ prepare ⇒ spawn ⇒ boot ⇒ one request ⇒ reply ⇒ shutdown ⇒ outcome.
+    fn run_blocking(&self, req: &EffectRequest, ctx: &AttemptCtx) -> WorkerResult {
+        let fail = |reason: String| WorkerResult::Outcome(ExecOutcome::failure(req, ctx, reason));
+        let is_patch = matches!(req.kind, EffectKind::ApplyPatch { .. });
+        if matches!(req.kind, EffectKind::ExportBundle) {
+            return fail("not implemented in this milestone".into());
+        }
+
+        // Preflight, before every launch.
+        if matches!(self.cfg.launcher, GuestLauncher::Fake { .. }) && self.env_value(TEST_WORKERS_ENV).as_deref() != Some("1") {
+            return fail(format!("firecracker worker unavailable: the fake guest launcher needs {TEST_WORKERS_ENV}=1"));
+        }
+        if let Err(e) = preflight(&self.cfg) {
+            return fail(format!("firecracker worker unavailable: {e}"));
+        }
+
+        // Prepare: ws.lock, ws.img, the request, scratch.img, the logs, vm.json.
+        let task_dir = self.cfg.work_root.join(req.task_id.as_str());
+        let paths = VmPaths::new(&self.job_dir, &self.cfg.work_root, &req.task_id);
+        let lock = match fs::create_dir_all(&task_dir).and_then(|()| File::options().create(true).truncate(false).write(true).open(task_dir.join("ws.lock"))) {
+            Ok(f) => f,
+            Err(e) => return fail(format!("cannot prepare the VM: {e}")),
+        };
+        match lock.try_lock() {
+            Ok(()) => {}
+            // Another VM has the image: for a patch it may be applying it right now.
+            Err(TryLockError::WouldBlock) if is_patch => return WorkerResult::Outcome(ExecOutcome::unresolved(req, ctx, WS_BUSY)),
+            Err(TryLockError::WouldBlock) => return fail(WS_BUSY.into()),
+            Err(TryLockError::Error(e)) => return fail(format!("cannot prepare the VM: cannot lock {}: {e}", task_dir.join("ws.lock").display())),
+        }
+        let snapshot = matches!(req.kind, EffectKind::ReadSnapshot);
+        if !snapshot && !paths.ws_img.is_file() {
+            return fail(WORKSPACE_MISSING.into());
+        }
+        let plan = match self.plan(req) {
+            Ok(p) => p,
+            Err(reason) => return fail(reason),
+        };
+        if [&self.cfg.image_dir, &paths.dir, &paths.ws_img].iter().any(|p| p.to_str().is_none()) {
+            return fail("cannot prepare the VM: a VM path is not valid UTF-8".into());
+        }
+        // ws.img is created by ReadSnapshot only, from zero on every attempt, so a retry
+        // starts clean.
+        if snapshot && let Err(e) = sparse(&paths.ws_img, WS_IMAGE_BYTES) {
+            return fail(format!("cannot prepare the VM: {}: {e}", paths.ws_img.display()));
+        }
+        let view = paths.host_view(&self.cfg.image_dir);
+        let _scratch = ScratchGuard(paths.scratch_img.clone());
+        let prepared = sparse(&paths.scratch_img, SCRATCH_IMAGE_BYTES)
+            .and_then(|()| File::create(&paths.console_log).map(drop))
+            .and_then(|()| File::create(&paths.stderr_log).map(drop))
+            .and_then(|()| File::create(&paths.firecracker_log).map(drop))
+            .and_then(|()| write_vm_json(&paths.vm_json, &self.cfg, &view));
+        if let Err(e) = prepared {
+            return fail(format!("cannot prepare the VM: {e}"));
+        }
+
+        // Spawn and boot.
+        let attempt = ctx.attempt_id.to_string();
+        let mut vm = match self.launch(&paths, &task_dir, &attempt) {
+            Ok(child) => Vm { child, status: None },
+            Err(e) => return fail(format!("cannot start firecracker: {e}")),
+        };
+        let boot_deadline = Instant::now() + self.boot_timeout;
+        let connected = GuestLink::connect_until(&paths.uds, boot_deadline, || vm.exited());
+        let mut link = match connected {
+            Ok(link) => link,
+            Err(e) => {
+                vm.kill();
+                return fail(not_up(&e));
+            }
+        };
+        let hello = Message::Hello {
+            protocol: GUEST_PROTOCOL,
+            attempt_token: self.cfg.attempt_token.clone(),
+            task_id: req.task_id.as_str().to_string(),
+            effect_id: req.effect_id.as_str().to_string(),
+            attempt_id: attempt.clone(),
+            lease_generation: ctx.lease_generation,
+            mode: Mode::Job,
+        };
+        let ready = link.hello(hello, boot_deadline).and_then(|ready| match ready {
+            Message::Ready { mode: Mode::Job, .. } => link.set_write_timeout(Some(WRITE_TIMEOUT)),
+            _ => Err(LinkError::Protocol("guest is not in job mode".into())),
+        });
+        if let Err(e) = ready {
+            drop(link);
+            vm.kill();
+            return fail(not_up(&e));
+        }
+
+        // Serve: one request, one reply. From the first byte of the request on, a lost
+        // connection or a violation leaves the effect unknown for a patch.
+        let served = self.serve(&mut link, &plan, req, &mut vm);
+        let reply = match served {
+            Ok(reply) => reply,
+            Err(served) => {
+                drop(link);
+                let status = vm.wait_or_kill(SHUTDOWN_WAIT);
+                let reason = match served {
+                    Served::Lost => format!("guest exited before reporting: {}", exit_code_text(&status)),
+                    Served::Violation(why) => why,
+                };
+                return if is_patch { WorkerResult::NoOutcome(reason) } else { fail(reason) };
+            }
+        };
+
+        // Done: Shutdown/Bye, wait for the exit, then the outcome.
+        if link.send(&Message::Shutdown).is_ok() {
+            let _ = link.recv(Instant::now() + SHUTDOWN_WAIT);
+        }
+        drop(link);
+        vm.wait_or_kill(SHUTDOWN_WAIT);
+        drop(vm);
+        let out = match reply {
+            Reply::Refused(reason) => ExecOutcome::failure(req, ctx, reason),
+            Reply::Snapshot(files, digest) => outcomes::snapshot_manifest(req, ctx, files, digest),
+            Reply::Patch(touched, digest) => outcomes::patch_applied(req, ctx, touched, digest),
+            Reply::Verified(check) => match self.check_profile(&plan, &check) {
+                Ok(()) => outcomes::evidence(req, ctx, &check),
+                Err(reason) => ExecOutcome::failure(req, ctx, reason),
+            },
+        };
+        drop(_scratch);
+        drop(lock);
+        WorkerResult::Outcome(out)
+    }
+
+    /// The profile the guest ran must be the pinned one, or (unpinned) the source as it was
+    /// when the run started and still is now.
+    fn check_profile(&self, plan: &Plan, check: &Check) -> Result<(), String> {
+        if let Some(pinned) = self.cfg.profile_digest
+            && check.profile_digest != pinned
+        {
+            return Err(format!("profile digest mismatch: pinned {pinned}, found {}", check.profile_digest));
+        }
+        if let Plan::Verify { source: Some(source), .. } = plan {
+            let unchanged = workspace_digest(&self.cfg.profile_dir).is_ok_and(|d| d == *source);
+            if check.profile_digest != *source || !unchanged {
+                return Err("protected profile changed during verification".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn serve(&self, link: &mut GuestLink, plan: &Plan, req: &EffectRequest, vm: &mut Vm) -> Result<Reply, Served> {
+        let link_err = |e: LinkError| match e {
+            LinkError::Protocol(_) => Served::Violation(e.to_string()),
+            _ => Served::Lost,
+        };
+        let reply_until = match plan {
+            Plan::Snapshot { files, bytes } => {
+                link.send(&Message::ReadSnapshot { file_count: *files, total_bytes: *bytes }).map_err(link_err)?;
+                link.send_tree(&self.cfg.snapshot_dir).map_err(link_err)?;
+                Instant::now() + REPLY_TIMEOUT
+            }
+            Plan::Patch { expected_base, editable_paths } => {
+                link.send(&Message::ApplyPatch { expected_base: *expected_base, editable_paths: editable_paths.clone() })
+                    .map_err(link_err)?;
+                link.send_patch(&req.payload).map_err(link_err)?;
+                if self.test_hook(KILL_VM_AFTER_REQUEST_ENV) {
+                    vm.kill();
+                    return Err(Served::Lost);
+                }
+                Instant::now() + REPLY_TIMEOUT
+            }
+            Plan::Verify { files, bytes, .. } => {
+                link.send(&Message::RunVerification {
+                    profile_digest: self.cfg.profile_digest,
+                    timeout_secs: self.cfg.verify_timeout_secs,
+                    file_count: *files,
+                    total_bytes: *bytes,
+                })
+                .map_err(link_err)?;
+                link.send_tree(&self.cfg.profile_dir).map_err(link_err)?;
+                Instant::now() + Duration::from_secs(self.cfg.verify_timeout_secs) + VERIFY_REPLY_MARGIN
+            }
+        };
+        let violation = |why: String| Served::Violation(LinkError::Protocol(why).to_string());
+        let expected = match plan {
+            Plan::Snapshot { .. } => "SnapshotDone",
+            Plan::Patch { .. } => "PatchApplied",
+            Plan::Verify { .. } => "Verified",
+        };
+        match (plan, link.recv(reply_until).map_err(link_err)?) {
+            (_, Message::Refused { reason }) => Ok(Reply::Refused(reason)),
+            (Plan::Snapshot { .. }, Message::SnapshotDone { files, workspace_digest }) => Ok(Reply::Snapshot(files, workspace_digest)),
+            (Plan::Patch { .. }, Message::PatchApplied { paths, workspace_digest }) => Ok(Reply::Patch(paths, workspace_digest)),
+            (
+                Plan::Verify { .. },
+                Message::Verified {
+                    profile_id,
+                    command,
+                    profile_digest,
+                    workspace_digest,
+                    exit_code,
+                    stdout_b64,
+                    stdout_truncated,
+                    stderr_b64,
+                    stderr_truncated,
+                },
+            ) => {
+                let stdout = unb64(&stdout_b64).map_err(|e| violation(format!("stdout_b64: {e}")))?;
+                let stderr = unb64(&stderr_b64).map_err(|e| violation(format!("stderr_b64: {e}")))?;
+                let (stdout, stdout_truncated) = capped(stdout, stdout_truncated);
+                let (stderr, stderr_truncated) = capped(stderr, stderr_truncated);
+                Ok(Reply::Verified(Check {
+                    profile_id,
+                    command,
+                    profile_digest,
+                    workspace_digest,
+                    exit_code,
+                    stdout,
+                    stdout_truncated,
+                    stderr,
+                    stderr_truncated,
+                }))
+            }
+            (_, other) => Err(violation(format!("expected {expected}, got {}", type_name(&other)))),
+        }
+    }
+}
+
+impl Worker for FirecrackerWorker {
+    /// `run_job` for callers that need an outcome (the conformance suite): a job whose
+    /// effect is unknown is an unresolved outcome.
+    async fn run(&self, req: &EffectRequest, ctx: &AttemptCtx) -> ExecOutcome {
+        match self.run_job(req, ctx).await {
+            WorkerResult::Outcome(out) => out,
+            WorkerResult::NoOutcome(reason) => ExecOutcome::unresolved(req, ctx, reason),
+        }
+    }
+
+    /// The inspector answers this from the controller.
+    async fn reconcile(&self, _req: &EffectRequest, _ctx: &AttemptCtx) -> Reconciliation {
+        Reconciliation::Unknown
+    }
+
+    fn current_workspace(&self, _task: &TaskId) -> Option<Result<Digest, String>> {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jail::JailConfig;
+    use crate::job::{JobRequest, WorkerConfig};
+    use agentos_core::contract::Contract;
+    use agentos_core::effect::{AttemptId, EffectKind};
+
+    fn config() -> FirecrackerConfig {
+        FirecrackerConfig {
+            firecracker_bin: "/home/x/bin/firecracker".into(),
+            image_dir: "/home/x/registry/images/python-stdlib-v1@0545ba17".into(),
+            image_digest: Digest::of(b"image"),
+            snapshot_dir: "/home/x/snapshot".into(),
+            profile_dir: "/home/x/profile".into(),
+            profile_digest: None,
+            work_root: "/home/x/work".into(),
+            verify_timeout_secs: 60,
+            vcpus: 2,
+            memory_mib: 512,
+            attempt_token: "0123456789abcdef0123456789abcdef".into(),
+            launcher: GuestLauncher::Real { firecracker_bin: "/home/x/bin/firecracker".into() },
+            jail: JailMode::Unjailed,
+        }
+    }
+
+    #[test]
+    fn vm_json_matches_the_golden_file() {
+        let cfg = config();
+        let task: TaskId = serde_json::from_str("\"task-1\"").unwrap();
+        let paths = VmPaths::new(Path::new("/home/x/jobs/effect-1-attempt-1"), &cfg.work_root, &task);
+        let rendered = render_vm_json(&cfg, &paths.host_view(&cfg.image_dir));
+        let golden: serde_json::Value = serde_json::from_str(include_str!("../tests/golden/vm.json")).unwrap();
+        assert_eq!(rendered, golden);
+        assert_eq!(rendered["network-interfaces"], serde_json::json!([]));
+        assert_eq!(rendered["machine-config"]["smt"], false);
+        let ids: Vec<&str> = rendered["drives"].as_array().unwrap().iter().map(|d| d["drive_id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["rootfs", "workspace", "scratch"]);
+        assert_eq!(rendered["vsock"]["guest_cid"], 3);
+
+        // The written file keeps the documented field order.
+        let dir = tempfile::tempdir().unwrap();
+        write_vm_json(&dir.path().join("vm.json"), &cfg, &paths.host_view(&cfg.image_dir)).unwrap();
+        let written = fs::read_to_string(dir.path().join("vm.json")).unwrap();
+        let order: Vec<usize> = ["boot-source", "drives", "machine-config", "vsock", "network-interfaces", "logger"]
+            .iter()
+            .map(|k| written.find(&format!("\"{k}\"")).unwrap())
+            .collect();
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{written}");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&written).unwrap(), golden);
+    }
+
+    #[test]
+    fn firecracker_config_round_trips_with_jail_unjailed_and_jailed() {
+        let unjailed = config();
+        let mut jailed = config();
+        jailed.jail = JailMode::Jailed(JailConfig {
+            jailer_bin: "/home/x/bin/jailer".into(),
+            uid: crate::jail::JAIL_UID,
+            gid: crate::jail::JAIL_GID,
+            cgroup_root: "/sys/fs/cgroup".into(),
+        });
+        jailed.launcher = GuestLauncher::Fake { program: "/bin/agentos".into(), prefix_args: vec!["supervise".into()] };
+        jailed.profile_digest = Some(Digest::of(b"p"));
+        for cfg in [unjailed, jailed] {
+            let json = serde_json::to_string(&cfg).unwrap();
+            assert_eq!(serde_json::from_str::<FirecrackerConfig>(&json).unwrap(), cfg);
+            let worker = WorkerConfig::Firecracker(cfg.clone());
+            let json = serde_json::to_string(&worker).unwrap();
+            assert_eq!(serde_json::from_str::<WorkerConfig>(&json).unwrap(), worker);
+        }
+    }
+
+    #[test]
+    fn exit_codes_are_named() {
+        for code in [0, 1, 2, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157] {
+            assert_eq!(exit_code_text(&ExitStatus::from_raw(code << 8)), format!("firecracker exit code {code}"));
+        }
+        assert_eq!(exit_code_text(&ExitStatus::from_raw(9)), "firecracker killed by signal 9");
+    }
+
+    #[test]
+    fn config_validation_rejects_vcpus_0_and_33_and_memory_127() {
+        let with = |vcpus, memory_mib| FirecrackerConfig { vcpus, memory_mib, ..config() }.validate();
+        assert_eq!(with(0, 256).unwrap_err(), "worker_vcpus must be between 1 and 32");
+        assert_eq!(with(33, 256).unwrap_err(), "worker_vcpus must be between 1 and 32");
+        assert_eq!(with(1, 127).unwrap_err(), "worker_memory_mib must be at least 128");
+        for (v, m) in [(1, 128), (32, 128), (1, 65536)] {
+            with(v, m).unwrap();
+        }
+    }
+
+    fn request(cfg: FirecrackerConfig) -> JobRequest {
+        let json = r#"{"goal":"g","repository":{"source":"s","revision":"r"},"profile":"p","editable_paths":["src/**"],"verification_profile":"v","capabilities":["snapshot.read"],"limits":{"model_requests":1,"max_output_tokens_per_request":1,"tool_actions":1,"deadline_seconds":1,"worker_vcpus":1,"worker_memory_mib":1}}"#;
+        JobRequest {
+            effect_id: serde_json::from_str("\"abc\"").unwrap(),
+            task_id: TaskId::new(),
+            kind: EffectKind::ReadSnapshot,
+            payload: vec![],
+            contract: Contract::parse(json).unwrap(),
+            attempt_id: AttemptId::new(),
+            lease_generation: 1,
+            lease_expiry_ms: 1,
+            task_deadline_ms: 1,
+            worker: WorkerConfig::Firecracker(cfg),
+        }
+    }
+
+    #[test]
+    fn relative_paths_and_bad_tokens_are_rejected_by_job_dir_create() {
+        let root = tempfile::tempdir().unwrap();
+        type Field = fn(&mut FirecrackerConfig) -> &mut PathBuf;
+        let fields: [(&str, Field); 5] = [
+            ("firecracker_bin", |c| &mut c.firecracker_bin),
+            ("image_dir", |c| &mut c.image_dir),
+            ("snapshot_dir", |c| &mut c.snapshot_dir),
+            ("profile_dir", |c| &mut c.profile_dir),
+            ("work_root", |c| &mut c.work_root),
+        ];
+        for (name, field) in fields {
+            let mut cfg = config();
+            *field(&mut cfg) = PathBuf::from("relative/path");
+            let err = JobDir::create(root.path(), &request(cfg)).err().unwrap();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{name}");
+            assert!(err.to_string().starts_with(name), "{err}");
+        }
+        for token in ["", "0123456789abcdef0123456789abcde", "0123456789ABCDEF0123456789ABCDEF"] {
+            let cfg = FirecrackerConfig { attempt_token: token.into(), ..config() };
+            let err = JobDir::create(root.path(), &request(cfg)).err().unwrap();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{token:?}");
+            assert!(err.to_string().contains("attempt_token"), "{err}");
+        }
+        let mut jailed = config();
+        jailed.jail = JailMode::Jailed(JailConfig { jailer_bin: "jailer".into(), uid: 1, gid: 1, cgroup_root: "/sys/fs/cgroup".into() });
+        assert!(JobDir::create(root.path(), &request(jailed)).is_err());
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0, "nothing was created");
+        JobDir::create(root.path(), &request(config())).unwrap();
+        // run_worker re-checks the same rule.
+        assert!(WorkerConfig::Firecracker(FirecrackerConfig { work_root: "w".into(), ..config() }).check_paths().is_err());
+    }
+
+    #[test]
+    fn image_manifest_rejects_unknown_fields_and_wrong_protocol() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(KERNEL_FILE), b"k").unwrap();
+        fs::write(dir.path().join(ROOTFS_FILE), b"r").unwrap();
+        let good = r#"{"id":"python-stdlib-v1","protocol":1,"kernel":"vmlinux","rootfs":"rootfs.squashfs","agent_version":"0.1.0","kernel_sha256":"0545ba1781fc06cfa1d7699069057f4538103fd1644100cf0da434899a1ed447","built_from":"test"}"#;
+        let write = |s: &str| fs::write(dir.path().join("image.json"), s).unwrap();
+        write(good);
+        assert_eq!(read_image(dir.path()).unwrap().id, "python-stdlib-v1");
+
+        write(&good.replace(r#""built_from":"test""#, r#""built_from":"test","extra":1"#));
+        assert!(read_image(dir.path()).unwrap_err().contains("unknown field `extra`"));
+        write(&good.replace(r#""protocol":1"#, r#""protocol":2"#));
+        assert!(read_image(dir.path()).unwrap_err().contains("protocol 2, expected 1"));
+        write(&good.replace(r#""kernel":"vmlinux""#, r#""kernel":"../../etc/vmlinux""#));
+        assert!(read_image(dir.path()).unwrap_err().contains("expected \"vmlinux\""));
+        write(good);
+        fs::remove_file(dir.path().join(ROOTFS_FILE)).unwrap();
+        assert!(read_image(dir.path()).unwrap_err().contains("is missing"));
+    }
+}

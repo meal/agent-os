@@ -10,6 +10,7 @@ use std::time::Duration;
 use agentos_core::ids::{Digest, TaskId};
 
 use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor, Reconciliation};
+use crate::firecracker::{FirecrackerWorker, WorkerResult};
 use crate::fixture::FixtureExecutor;
 use crate::job::{HostConfig, JobDir, WorkerConfig};
 use crate::process::{run_in_group, GroupError};
@@ -154,13 +155,7 @@ pub async fn run_worker(job: &JobDir) -> io::Result<()> {
     let request = job.request()?;
     // `JobDir::create` checks this too, but a hand-written or older request.json must not
     // resolve against the worker's working directory.
-    if let WorkerConfig::Host(h) = &request.worker {
-        for (name, p) in [("snapshot_dir", &h.snapshot_dir), ("profile_dir", &h.profile_dir), ("work_root", &h.work_root)] {
-            if !p.is_absolute() {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{name} {} must be absolute", p.display())));
-            }
-        }
-    }
+    request.worker.check_paths()?;
     let req = EffectRequest {
         effect_id: request.effect_id,
         task_id: request.task_id,
@@ -180,6 +175,12 @@ pub async fn run_worker(job: &JobDir) -> io::Result<()> {
         WorkerConfig::Scripted(config) => {
             ScriptedWorker::new(config.script.clone()).inside_worker(groups).run(&req, &ctx("scripted")).await
         }
+        WorkerConfig::Firecracker(config) => match FirecrackerWorker::new(config, job).run_job(&req, &ctx("firecracker")).await {
+            WorkerResult::Outcome(out) => out,
+            // A request was sent and its effect is unknown: no outcome, exit 1 (the caller
+            // logs the reason to supervisor.log); the controller reconciles by inspection.
+            WorkerResult::NoOutcome(reason) => return Err(io::Error::other(reason)),
+        },
     };
     job.write_outcome(&out)
 }

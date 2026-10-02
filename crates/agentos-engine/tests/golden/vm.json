@@ -1,0 +1,44 @@
+{
+  "boot-source": {
+    "kernel_image_path": "/home/x/registry/images/python-stdlib-v1@0545ba17/vmlinux",
+    "boot_args": "console=ttyS0 reboot=k panic=1 pci=off nomodule quiet loglevel=4 init=/sbin/agentos-guest"
+  },
+  "drives": [
+    {
+      "drive_id": "rootfs",
+      "is_root_device": true,
+      "is_read_only": true,
+      "path_on_host": "/home/x/registry/images/python-stdlib-v1@0545ba17/rootfs.squashfs",
+      "cache_type": "Unsafe"
+    },
+    {
+      "drive_id": "workspace",
+      "is_root_device": false,
+      "is_read_only": false,
+      "path_on_host": "/home/x/work/task-1/ws.img",
+      "cache_type": "Writeback"
+    },
+    {
+      "drive_id": "scratch",
+      "is_root_device": false,
+      "is_read_only": false,
+      "path_on_host": "/home/x/jobs/effect-1-attempt-1/scratch.img",
+      "cache_type": "Unsafe"
+    }
+  ],
+  "machine-config": {
+    "vcpu_count": 2,
+    "mem_size_mib": 512,
+    "smt": false,
+    "huge_pages": "None"
+  },
+  "vsock": {
+    "guest_cid": 3,
+    "uds_path": "v.sock"
+  },
+  "network-interfaces": [],
+  "logger": {
+    "log_path": "/home/x/jobs/effect-1-attempt-1/firecracker.log",
+    "level": "Warning"
+  }
+}

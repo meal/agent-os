@@ -8,9 +8,9 @@ use std::time::Duration;
 use agentos_core::effect::EffectKind;
 use agentos_core::ids::{Digest, TaskId};
 use serde::Deserialize;
-use serde_json::json;
 
-use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor, Reconciliation, VerificationReport};
+use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor, Reconciliation};
+use crate::outcomes::{self, Check};
 use crate::patch::{git, paths_of_file};
 use crate::process::{run_in_group, GroupError};
 use crate::workspace::{copy_tree, symlink_on_path, excluded_entries, has_excluded_component, purge_excluded, workspace_digest};
@@ -42,9 +42,11 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> io::Result<T> + Send + 
     tokio::task::spawn_blocking(f).await.map_err(io::Error::other)?
 }
 
-fn truncated(bytes: &[u8]) -> (String, bool) {
+/// At most `OUTPUT_LIMIT` bytes, and whether more were captured.
+fn truncated(mut bytes: Vec<u8>) -> (Vec<u8>, bool) {
     let cut = bytes.len() > OUTPUT_LIMIT;
-    (String::from_utf8_lossy(&bytes[..bytes.len().min(OUTPUT_LIMIT)]).into_owned(), cut)
+    bytes.truncate(OUTPUT_LIMIT);
+    (bytes, cut)
 }
 
 impl FixtureExecutor {
@@ -99,27 +101,14 @@ impl FixtureExecutor {
         })
         .await;
         match copied {
-            Ok((files, digest)) => {
-                let output = json!({ "files": files, "workspace_digest": digest });
-                let mut out = ExecOutcome::success(req, ctx, output.to_string().into_bytes());
-                out.new_workspace = Some(digest);
-                out
-            }
+            Ok((files, digest)) => outcomes::snapshot_manifest(req, ctx, files, digest),
             Err(e) => ExecOutcome::failure(req, ctx, format!("snapshot failed: {e}")),
         }
     }
 
-    /// The success outcome of an applied patch; reconciliation rebuilds the same bytes.
-    fn patch_applied(req: &EffectRequest, ctx: &AttemptCtx, paths: Vec<String>, digest: Digest) -> ExecOutcome {
-        let output = json!({ "applied": true, "paths": paths, "workspace_digest": digest });
-        let mut out = ExecOutcome::success(req, ctx, output.to_string().into_bytes());
-        out.new_workspace = Some(digest);
-        out
-    }
-
     async fn apply_patch(&self, req: &EffectRequest, ctx: &AttemptCtx, expected_base: Digest) -> ExecOutcome {
         match self.try_apply_patch(req, expected_base).await {
-            Ok((paths, digest)) => FixtureExecutor::patch_applied(req, ctx, paths, digest),
+            Ok((paths, digest)) => outcomes::patch_applied(req, ctx, paths, digest),
             Err(reason) => ExecOutcome::failure(req, ctx, reason),
         }
     }
@@ -210,11 +199,7 @@ impl FixtureExecutor {
 
     async fn run_verification(&self, req: &EffectRequest, ctx: &AttemptCtx) -> ExecOutcome {
         match self.try_run_verification(req).await {
-            Ok((evidence, report)) => {
-                let mut out = ExecOutcome::success(req, ctx, evidence.to_string().into_bytes());
-                out.verification = Some(report);
-                out
-            }
+            Ok(check) => outcomes::evidence(req, ctx, &check),
             Err(reason) => ExecOutcome::failure(req, ctx, reason),
         }
     }
@@ -227,7 +212,7 @@ impl FixtureExecutor {
     async fn try_run_verification(
         &self,
         req: &EffectRequest,
-    ) -> Result<(serde_json::Value, VerificationReport), String> {
+    ) -> Result<Check, String> {
         let ws = self.workspace(&req.task_id);
         if !ws.is_dir() {
             return Err("workspace missing: no snapshot was read".into());
@@ -303,30 +288,19 @@ impl FixtureExecutor {
             return Err(format!("workspace polluted by excluded entries: {}", polluted.join(", ")));
         }
 
-        let exit_code = output.status.code();
-        let passed = exit_code == Some(0);
-        let (stdout, stdout_truncated) = truncated(&output.stdout);
-        let (stderr, stderr_truncated) = truncated(&output.stderr);
-        let summary = stdout
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("exit code {exit_code:?}"));
-        let evidence = json!({
-            "summary": summary,
-            "profile_id": profile.id,
-            "profile_digest": profile_digest,
-            "workspace_digest": workspace,
-            "command": profile.command,
-            "exit_code": exit_code,
-            "passed": passed,
-            "stdout": stdout,
-            "stdout_truncated": stdout_truncated,
-            "stderr": stderr,
-            "stderr_truncated": stderr_truncated,
-        });
-        Ok((evidence, VerificationReport { passed, workspace, summary }))
+        let (stdout, stdout_truncated) = truncated(output.stdout);
+        let (stderr, stderr_truncated) = truncated(output.stderr);
+        Ok(Check {
+            profile_id: profile.id,
+            command: profile.command,
+            profile_digest,
+            workspace_digest: workspace,
+            exit_code: output.status.code(),
+            stdout,
+            stdout_truncated,
+            stderr,
+            stderr_truncated,
+        })
     }
 }
 
@@ -347,7 +321,7 @@ impl Executor for FixtureExecutor {
         };
         match self.patch_state(req, expected_base).await {
             Ok(None) => Reconciliation::NotApplied,
-            Ok(Some((paths, digest))) => Reconciliation::Applied(FixtureExecutor::patch_applied(req, ctx, paths, digest)),
+            Ok(Some((paths, digest))) => Reconciliation::Applied(outcomes::patch_applied(req, ctx, paths, digest)),
             Err(reason) => {
                 tracing::warn!(effect_id = %req.effect_id, reason, "patch cannot be reconciled");
                 Reconciliation::Unknown
@@ -370,6 +344,7 @@ mod tests {
     use super::*;
     use agentos_core::contract::Contract;
     use agentos_core::effect::{AttemptId, EffectId, Outcome};
+    use serde_json::json;
 
     const STAGED: &str = r#"{"id": "staged", "command": ["python3", "-c", "print('STAGED')"], "protected": true}"#;
 

@@ -9,7 +9,11 @@ use agentos_core::ids::{Digest, TaskId};
 use agentos_engine::agent::{Agent, AgentAction, Observation};
 use agentos_engine::crash::CrashHook;
 use agentos_engine::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor};
+use agentos_core::guest::mint_attempt_token;
+use agentos_engine::firecracker::FirecrackerConfig;
 use agentos_engine::fixture::FixtureExecutor;
+use agentos_engine::guestlink::GuestLauncher;
+use agentos_engine::jail::JailMode;
 use agentos_engine::job::{HostConfig, WorkerConfig};
 use agentos_engine::supervised::{ExecCounts, SupervisedExecutor};
 use agentos_engine::supervisor::SupervisorCmd;
@@ -55,6 +59,43 @@ pub fn host_config(root: &Path) -> HostConfig {
 /// A supervised executor running `worker` jobs under `jobs_root` with the real supervisor
 /// binary, counting launches in `counts`, consulting `crash` right after each launch, and
 /// with `env` set in the supervisor's (and worker's) environment.
+/// A dummy registered guest image under `<root>/image`: `image.json` naming a 16-byte
+/// `vmlinux` and `rootfs.squashfs` (the fake tier never boots them).
+pub fn fake_image(root: &Path) -> PathBuf {
+    let dir = root.join("image");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("image.json"),
+        r#"{"id":"python-stdlib-v1","protocol":1,"kernel":"vmlinux","rootfs":"rootfs.squashfs","agent_version":"0.1.0","kernel_sha256":"0545ba1781fc06cfa1d7699069057f4538103fd1644100cf0da434899a1ed447","built_from":"test"}"#,
+    )
+    .unwrap();
+    fs::write(dir.join("vmlinux"), [0x7fu8; 16]).unwrap();
+    fs::write(dir.join("rootfs.squashfs"), [0x68u8; 16]).unwrap();
+    dir
+}
+
+/// A Firecracker worker config over `root`'s `snapshot`, `profile` and `work`, with the fake
+/// guest (`agentos-supervisor fake-guest`) as its launcher, unjailed, and the dummy image
+/// pinned by its digest.
+pub fn fake_firecracker_config(root: &Path) -> FirecrackerConfig {
+    let image_dir = fake_image(root);
+    FirecrackerConfig {
+        firecracker_bin: root.join("bin/firecracker"),
+        image_digest: workspace_digest(&image_dir).unwrap(),
+        image_dir,
+        snapshot_dir: root.join("snapshot"),
+        profile_dir: root.join("profile"),
+        profile_digest: None,
+        work_root: root.join("work"),
+        verify_timeout_secs: 60,
+        vcpus: 1,
+        memory_mib: 256,
+        attempt_token: mint_attempt_token(),
+        launcher: GuestLauncher::Fake { program: SUPERVISOR_BIN.into(), prefix_args: Vec::new() },
+        jail: JailMode::Unjailed,
+    }
+}
+
 pub fn supervised(
     jobs_root: &Path,
     worker: WorkerConfig,
