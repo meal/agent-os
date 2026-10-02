@@ -11,10 +11,10 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 const OWNER: &str = "local-owner";
 
 /// Stored in `PRAGMA user_version`. Bump it on every change to [`SCHEMA`] an older build
-/// could misread, and teach [`Db::open`] to migrate from the previous version; a database
-/// newer than this build is refused rather than misread. 0 is a database created before
-/// versioning (identical to version 1) or a brand-new file.
-pub const SCHEMA_VERSION: i64 = 1;
+/// could misread. A database newer than this build is refused rather than misread; so is an
+/// older one that already holds tables (v0.1 databases are not migrated). 0 with no tables
+/// is a brand-new file.
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Event types the store and the engine's state machine own. An audit row may not use
 /// them, so it can never forge a lifecycle event, an effect transition, or a receipt verdict
@@ -24,6 +24,7 @@ const RESERVED_EVENT_TYPES: &[&str] = &[
     "VerifyFailed", "WorkspaceUpdated", "ActionUsed", "CancelRequested", "CancelCompleted", "Failed",
     "EffectIntended", "EffectDispatched", "EffectCompleted", "EffectFailed", "EffectUnknown", "EffectAbandoned",
     "ArtifactRegistered", "TaskEventRejected", "ReceiptIgnored", "ReceiptRejected",
+    "CapabilitiesIssued", "CapabilityGranted", "CapabilityDenied", "CapabilityRevoked",
 ];
 
 const SCHEMA: &str = "
@@ -95,15 +96,19 @@ CREATE TABLE IF NOT EXISTS usage(
     settled_tool_actions INTEGER,
     status TEXT NOT NULL CHECK(status IN ('Reserved', 'Settled', 'Uncertain', 'Released'))
 );
--- Reserved for Phase 3 (capability leases and observed revisions); unused in Phases 1-2.
+-- Capability handles issued at approval. `id` is the full handle and never leaves the
+-- store; `scope` is the broker `Scope` as JSON; `expires_ts` NULL means no expiry.
 CREATE TABLE IF NOT EXISTS capabilities(
     id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL REFERENCES tasks(id),
-    resource TEXT NOT NULL,
     operation TEXT NOT NULL,
-    expires_ts INTEGER NOT NULL,
-    revoked INTEGER NOT NULL DEFAULT 0
+    scope TEXT NOT NULL,
+    created_ts INTEGER NOT NULL,
+    expires_ts INTEGER,
+    revoked INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(task_id, operation)
 );
+-- Reserved for a later phase (observed revisions); unused so far.
 CREATE TABLE IF NOT EXISTS observations(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id TEXT NOT NULL REFERENCES tasks(id),
@@ -126,8 +131,8 @@ pub enum DbError {
     NotFound(TaskId),
     #[error("corrupt stored value: {0}")]
     Corrupt(String),
-    #[error("capability {0:?} is not granted by the task contract")]
-    CapabilityDenied(Capability),
+    #[error("capability {capability:?} denied: {reason}")]
+    CapabilityDenied { capability: Capability, reason: String },
     #[error("workspace version conflict: expected {expected}, actual {actual}")]
     VersionConflict { expected: Digest, actual: Digest },
     #[error("budget exceeded: {0}")]
@@ -144,6 +149,8 @@ pub enum DbError {
     ReservedEventType(String),
     #[error("database schema version {found} is newer than the {supported} this build supports; upgrade agentos")]
     SchemaVersion { found: i64, supported: i64 },
+    #[error("database was created by an older Agent OS; v0.1 databases are not migrated (schema version {found}, this build needs {supported})")]
+    OldSchema { found: i64, supported: i64 },
     #[error("effect not found: {0}")]
     EffectNotFound(EffectId),
     #[error("effect {effect} cannot move from {from:?} to {to:?}")]
@@ -171,9 +178,13 @@ pub struct StoredEvent {
     pub ts: i64,
 }
 
+/// Unix seconds; injectable for tests through [`Db::with_clock`].
+pub(crate) type Clock = Box<dyn Fn() -> i64 + Send>;
+
 /// One SQLite connection. Not shared across threads: each thread opens its own `Db`.
 pub struct Db {
     conn: Connection,
+    clock: Clock,
 }
 
 pub(crate) fn now_ts() -> i64 {
@@ -287,15 +298,45 @@ impl Db {
         }
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        let current: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if current == SCHEMA_VERSION {
+            // The common case takes no write lock, so opening never waits for a writer.
+            return Ok(Db { conn, clock: Box::new(now_ts) });
+        }
+        // One write transaction, so a concurrent first opener never sees the tables of a
+        // database whose version is not recorded yet (`user_version` is transactional).
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        let version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version > SCHEMA_VERSION {
             return Err(DbError::SchemaVersion { found: version, supported: SCHEMA_VERSION });
         }
-        conn.execute_batch(SCHEMA)?;
         if version < SCHEMA_VERSION {
-            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            let has_tasks: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tasks')",
+                [],
+                |r| r.get(0),
+            )?;
+            if has_tasks {
+                return Err(DbError::OldSchema { found: version, supported: SCHEMA_VERSION });
+            }
+            tx.execute_batch(SCHEMA)?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
-        Ok(Db { conn })
+        tx.commit()?;
+        Ok(Db { conn, clock: Box::new(now_ts) })
+    }
+
+    /// Replaces the clock used for capability expiry and deadlines (`approve_task`,
+    /// `check`, the authorization in `record_intent`/`mark_dispatched`, `deadline_passed`).
+    /// Every other timestamp keeps the real clock.
+    pub fn with_clock(mut self, clock: Box<dyn Fn() -> i64 + Send>) -> Db {
+        self.clock = clock;
+        self
+    }
+
+    /// Now, by the injectable clock (unix seconds).
+    pub(crate) fn now(&self) -> i64 {
+        (self.clock)()
     }
 
     /// Current value of a PRAGMA, rendered as text (diagnostics and tests).
@@ -323,16 +364,16 @@ impl Db {
         let id = TaskId::new();
         // A placeholder base digest by design: the task's ReadSnapshot effect replaces it with
         // the real workspace digest (WorkspaceUpdated) before any other work. `checkpoint`
-        // stays NULL: journal replay is the checkpoint mechanism.
+        // stays NULL: journal replay is the checkpoint mechanism. `deadline_ts` is 0 (not
+        // started) until the owner approves the task (`approve_task`).
         let base = Digest::of(contract.repository.revision.as_bytes());
         let task = Task::new(id.clone(), base);
         let now = now_ts();
-        let deadline = now + i64::from(contract.limits.deadline_seconds);
         let tx = self.immediate()?;
         tx.execute(
             "INSERT INTO tasks(id, owner, contract_digest, contract_json, state, cancel_requested,
                 workspace_digest, verified_digest, actions_used, step, checkpoint, deadline_ts, created_ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, NULL, 0, 0, NULL, ?7, ?8)",
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, NULL, 0, 0, NULL, 0, ?7)",
             params![
                 id.as_str(),
                 OWNER,
@@ -340,7 +381,6 @@ impl Db {
                 serde_json::to_string(contract)?,
                 state_to_str(task.state)?,
                 task.workspace_digest.to_string(),
-                deadline,
                 now
             ],
         )?;

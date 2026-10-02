@@ -95,7 +95,15 @@ impl Env {
         Env::with_caps(tool_actions, ALL_CAPS)
     }
 
+    /// An approved task (the owner said yes; handles are issued).
     pub fn with_caps(tool_actions: u32, caps: &[&str]) -> Env {
+        let env = Env::unapproved(tool_actions, caps);
+        env.db.approve_task(&env.task).unwrap();
+        env
+    }
+
+    /// A task the owner has not approved yet: no handles, no deadline.
+    pub fn unapproved(tool_actions: u32, caps: &[&str]) -> Env {
         let dir = tempfile::tempdir().unwrap();
         copy_dir(&fixtures().join("parser-repo"), &dir.path().join("snapshot"));
         copy_dir(&fixtures().join("profiles/parser-checks-v1"), &dir.path().join("profile"));

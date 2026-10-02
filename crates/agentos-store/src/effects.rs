@@ -29,6 +29,7 @@
 
 use std::collections::HashSet;
 
+use agentos_core::broker::Resource;
 use agentos_core::budget::{check_model_budget, tool_actions_for, BudgetError, Reservation, UsageTotals};
 use agentos_core::effect::{
     accept_receipt, AttemptId, EffectId, EffectKind, EffectRecord, EffectState, Outcome, Receipt,
@@ -39,6 +40,7 @@ use agentos_core::state::{reduce, Task, TaskEvent, TransitionError};
 use rusqlite::{params, OptionalExtension, Transaction};
 use serde_json::json;
 
+use crate::caps::{authorize_in, reauthorize_in};
 use crate::db::{
     digest_from_str, event_name, insert_event, load_task, now_ts, store_task, Db, DbError, Result,
 };
@@ -213,6 +215,9 @@ fn expect_one(n: usize, what: &str, effect: &EffectId) -> Result<()> {
 impl Db {
     /// Records an effect as INTENDED together with its usage reservation, any tool action it
     /// consumes, and an `EffectIntended` event. Idempotent: an existing effect is returned as is.
+    /// A new effect is authorized by the broker for `kind`'s capability on `resource`; the
+    /// decision (`CapabilityGranted`/`CapabilityDenied`) is journaled, and a denial is also
+    /// recorded as a `Denied` audit row, both committed although the intent is refused.
     pub fn record_intent(
         &self,
         task_id: &TaskId,
@@ -220,6 +225,7 @@ impl Db {
         request_digest: Digest,
         expected_workspace: &Digest,
         reserve: Reservation,
+        resource: &Resource,
     ) -> Result<EffectRecord> {
         let tx = self.immediate()?;
         let (task, contract) = load_task(&tx, task_id)?;
@@ -245,19 +251,25 @@ impl Db {
             return Err(DbError::InvalidReservation { expected: consumes, got: reserve.tool_actions });
         }
         let capability = kind.capability();
-        if !contract.capabilities.contains(&capability) {
-            drop(tx);
-            self.append_audit(
-                task_id,
-                "Denied",
-                &json!({
-                    "reason": "CapabilityDenied",
-                    "capability": capability,
-                    "effect_id": effect_id,
-                    "kind": kind,
-                }),
-            )?;
-            return Err(DbError::CapabilityDenied(capability));
+        match authorize_in(&tx, task_id, capability, resource, self.now()) {
+            Ok(_) => {}
+            Err(e @ DbError::CapabilityDenied { .. }) => {
+                // Nothing but the decision is written yet: commit it with the audit row.
+                insert_event(
+                    &tx,
+                    task_id,
+                    "Denied",
+                    &json!({
+                        "reason": "CapabilityDenied",
+                        "capability": capability,
+                        "effect_id": effect_id,
+                        "kind": kind,
+                    }),
+                )?;
+                tx.commit()?;
+                return Err(e);
+            }
+            Err(e) => return Err(e),
         }
         if let EffectKind::ApplyPatch { expected_base } = &kind {
             let actual = task.workspace_digest;
@@ -342,7 +354,9 @@ impl Db {
 
     /// INTENDED -> DISPATCHED, or a re-dispatch of a DISPATCHED or UNKNOWN effect under a
     /// strictly newer lease (the superseded attempt is closed). Refused unless the task may
-    /// dispatch (Running or Verifying, no cancel pending).
+    /// dispatch (Running or Verifying, no cancel pending) and the effect's capability handle
+    /// is still live (not revoked, not expired); that re-authorization is journaled, and a
+    /// denial is committed although the dispatch is refused.
     pub fn mark_dispatched(
         &self,
         effect: &EffectId,
@@ -372,6 +386,15 @@ impl Db {
                 state: task.state,
                 cancel_requested: task.cancel_requested,
             });
+        }
+        match reauthorize_in(&tx, &rec.task_id, rec.kind.capability(), self.now()) {
+            Ok(_) => {}
+            Err(e @ DbError::CapabilityDenied { .. }) => {
+                // Only the decision is written: commit it.
+                tx.commit()?;
+                return Err(e);
+            }
+            Err(e) => return Err(e),
         }
 
         let now = now_ts();

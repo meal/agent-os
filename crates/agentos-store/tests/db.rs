@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Barrier};
 use std::thread;
 
+use agentos_core::broker::Resource;
 use agentos_core::budget::Reservation;
 use agentos_core::contract::Contract;
 use agentos_core::effect::{AttemptId, EffectKind, Outcome, Receipt, ReceiptVerdict};
@@ -40,7 +41,10 @@ fn open(dir: &tempfile::TempDir) -> Db {
 fn verify_passed(db: &Db, id: &TaskId, workspace: Digest) {
     let kind = EffectKind::RunVerification;
     let reserve = Reservation::for_kind(&kind, 0);
-    let rec = db.record_intent(id, kind, Digest::of(workspace.as_bytes()), &workspace, reserve).unwrap();
+    // Intents need the owner's approval (idempotent).
+    db.approve_task(id).unwrap();
+    let profile = Resource::Profile("parser-checks-v1".into());
+    let rec = db.record_intent(id, kind, Digest::of(workspace.as_bytes()), &workspace, reserve, &profile).unwrap();
     let attempt = AttemptId::new();
     db.mark_dispatched(&rec.effect_id, &attempt, "w", 1).unwrap();
     let evidence = Digest::of(b"evidence");
@@ -233,7 +237,7 @@ fn audit_events_keep_seq_gapless_and_leave_task_untouched() {
     let db = open(&dir);
     let id = running(&db);
     let before = db.task(&id).unwrap();
-    let s1 = db.append_audit(&id, "CapabilityDenied", &serde_json::json!({"why": "x"})).unwrap();
+    let s1 = db.append_audit(&id, "PolicyNote", &serde_json::json!({"why": "x"})).unwrap();
     assert_eq!(s1, 3);
     assert_eq!(db.task(&id).unwrap(), before);
     db.append(&id, &TaskEvent::ActionUsed).unwrap();
@@ -242,7 +246,7 @@ fn audit_events_keep_seq_gapless_and_leave_task_untouched() {
     let seqs: Vec<u64> = db.events(&id).unwrap().iter().map(|e| e.seq).collect();
     assert_eq!(seqs, vec![1, 2, 3, 4, 5]);
     let evs = db.events(&id).unwrap();
-    assert_eq!(evs[2].event_type, "CapabilityDenied");
+    assert_eq!(evs[2].event_type, "PolicyNote");
     assert_eq!(evs[2].payload, serde_json::json!({"why": "x"}));
 }
 

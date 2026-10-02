@@ -130,6 +130,8 @@ pub async fn submit(home: &Home, task_file: &Path, yes: bool, patch: Option<&Pat
 
     match (lock, patch) {
         (Some(lock), Some(patch)) => {
+            // `--yes` is the owner's approval: issue the task's capability handles.
+            store.db.approve_task(&task)?;
             let state = drive(home, &store, &lock, &task, patch, crash).await?;
             print_state(&task, state);
         }

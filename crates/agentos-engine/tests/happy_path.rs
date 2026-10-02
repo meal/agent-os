@@ -1,5 +1,6 @@
 mod common;
 
+use agentos_core::broker::Resource;
 use agentos_core::effect::{EffectKind, EffectState, Outcome};
 use agentos_core::ids::Digest;
 use agentos_core::budget::Reservation;
@@ -205,7 +206,7 @@ async fn store_rejects_intent_against_outdated_workspace() {
     let kind = EffectKind::ApplyPatch { expected_base: stale };
     let err = env
         .db
-        .record_intent(&env.task, kind.clone(), Digest::of(b"p2"), &stale, Reservation::for_kind(&kind, 0))
+        .record_intent(&env.task, kind.clone(), Digest::of(b"p2"), &stale, Reservation::for_kind(&kind, 0), &Resource::Paths(vec!["src/parser.py".into()]))
         .unwrap_err();
     assert!(matches!(err, DbError::VersionConflict { expected, actual } if expected == stale && actual == before.workspace_digest));
     assert_eq!(env.denials("VersionConflict").len(), 1);
@@ -383,7 +384,8 @@ async fn run_task_on_a_terminal_task_returns_without_new_events() {
 
 #[tokio::test]
 async fn cancel_requested_before_the_loop_cancels_without_acting() {
-    let env = Env::new(10);
+    // Cancelled before the owner approved it: nothing is issued, nothing runs.
+    let env = Env::unapproved(10, common::ALL_CAPS);
     env.db.append(&env.task, &TaskEvent::CancelRequested).unwrap();
     let mut agent = FakeAgent::from_fixture_patch(fix_patch());
 
@@ -758,4 +760,67 @@ async fn bytecode_planted_by_one_verification_cannot_pass_a_later_one() {
     assert!(env.effects("ApplyPatch").iter().all(|e| e.state == EffectState::Completed));
     assert_eq!(env.ws_digest(), workspace_digest(&env.snapshot_dir()).unwrap(), "back to the buggy source");
     assert_eq!(env.db.task(&env.task).unwrap().verified_digest, None);
+}
+
+#[tokio::test]
+async fn every_new_effect_is_authorized_once_at_intent_and_once_at_dispatch() {
+    let env = Env::new(10);
+    let mut agent = FakeAgent::from_fixture_patch(fix_patch());
+
+    assert_eq!(run(&env, &mut agent).await, TaskState::Succeeded);
+
+    let decisions: Vec<(String, String)> = env
+        .events()
+        .into_iter()
+        .filter(|e| e.event_type == "CapabilityGranted")
+        .map(|e| (e.payload["operation"].as_str().unwrap().to_string(), e.payload["resource"].as_str().unwrap().to_string()))
+        .collect();
+    let ops: Vec<&str> = decisions.iter().map(|(op, _)| op.as_str()).collect();
+    assert_eq!(
+        ops,
+        ["snapshot.read", "snapshot.read", "workspace.apply_patch", "workspace.apply_patch", "verification.run", "verification.run"]
+    );
+    assert_eq!(decisions[0].1, "task");
+    assert!(decisions[2].1.starts_with("paths:"), "{decisions:?}");
+    assert_eq!(decisions[4].1, "profile:parser-checks-v1");
+    assert_eq!(env.count("CapabilityDenied"), 0);
+    // Each decision immediately precedes the intent or dispatch it authorized.
+    let types = env.event_types();
+    for (i, t) in types.iter().enumerate().filter(|(_, t)| *t == "CapabilityGranted") {
+        assert!(matches!(types[i + 1].as_str(), "EffectIntended" | "EffectDispatched"), "{t} at {i}: {types:?}");
+    }
+}
+
+#[tokio::test]
+async fn an_unapproved_task_fails_at_the_snapshot_pre_check_without_journaling_a_decision() {
+    let env = Env::unapproved(10, common::ALL_CAPS);
+    let mut agent = FakeAgent::from_fixture_patch(fix_patch());
+
+    assert_eq!(run(&env, &mut agent).await, TaskState::Failed);
+
+    let failed = env.events().into_iter().find(|e| e.event_type == "Failed").unwrap();
+    assert_eq!(failed.payload["Failed"]["reason"], "capability snapshot.read not granted");
+    assert!(env.effects("ReadSnapshot").is_empty());
+    assert_eq!(env.count("CapabilityDenied"), 0, "the pre-check is pure");
+    assert_eq!(env.count("CapabilityGranted"), 0);
+}
+
+#[tokio::test]
+async fn a_revoked_patch_capability_is_denied_at_intent_and_journaled() {
+    let env = Env::new(10);
+    let mut agent = FakeAgent::scripted(vec![AgentAction::ApplyPatch(fix_patch()), AgentAction::Finish]);
+    env.db.revoke(&env.task, Some(agentos_core::contract::Capability::WorkspaceApplyPatch)).unwrap();
+
+    assert_eq!(run(&env, &mut agent).await, TaskState::Failed);
+
+    assert!(matches!(
+        &agent.observations()[1],
+        Observation::PatchRejected { reason } if reason == "capability WorkspaceApplyPatch not granted"
+    ));
+    assert!(env.effects("ApplyPatch").is_empty());
+    let decisions: Vec<_> = env.events().into_iter().filter(|e| e.event_type == "CapabilityDenied").collect();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].payload["operation"], "workspace.apply_patch");
+    assert_eq!(decisions[0].payload["reason"], "revoked");
+    assert_eq!(env.denials("CapabilityDenied").len(), 1, "the engine's Denied row is kept");
 }

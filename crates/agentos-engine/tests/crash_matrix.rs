@@ -8,6 +8,7 @@ mod common;
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 
+use agentos_core::broker::Resource;
 use agentos_core::budget::Reservation;
 use agentos_core::effect::{AttemptId, EffectId, EffectKind, EffectRecord, EffectState, Outcome, Receipt, ReceiptVerdict};
 use agentos_core::ids::{Digest, TaskId};
@@ -50,6 +51,7 @@ impl World {
         let db = Db::open(&dir.path().join("agentos.db")).unwrap();
         let (contract, digest) = contract(10);
         let task = db.create_task(&contract, &digest).unwrap();
+        db.approve_task(&task).unwrap();
         World { dir, task, counts: ExecCounts::default() }
     }
 
@@ -677,7 +679,7 @@ async fn during_model_call_the_reservation_stays_uncertain() {
         let kind = EffectKind::ExportBundle;
         let reserve = Reservation { tool_actions: 0, model_requests: 1 };
         let base = ctl.db.task(&w.task).unwrap().workspace_digest;
-        let rec = ctl.db.record_intent(&w.task, kind, Digest::of(b"prompt"), &base, reserve).unwrap();
+        let rec = ctl.db.record_intent(&w.task, kind, Digest::of(b"prompt"), &base, reserve, &Resource::Task).unwrap();
         ctl.db.mark_dispatched(&rec.effect_id, &AttemptId::new(), "model-broker", 1).unwrap();
         rec.effect_id
         // The controller dies with the model call in flight.

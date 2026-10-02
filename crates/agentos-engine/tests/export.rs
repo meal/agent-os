@@ -282,6 +282,7 @@ async fn a_task_cancelled_before_it_started_exports_an_empty_patch() {
 fn submitted_task(env: &Env, repository: Digest, profile: Digest) -> TaskId {
     let digest = Digest::of(&serde_json::to_vec(&env.contract).unwrap());
     let task = env.db.create_task(&env.contract, &digest).unwrap();
+    env.db.approve_task(&task).unwrap();
     let payload = json!({
         "contract_digest": digest, "repository_digest": repository, "profile_id": "parser-checks-v1",
         "profile_digest": profile, "guest_image": "fixture-executor-v0", "model": "fake-agent",

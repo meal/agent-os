@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
+use agentos_core::broker::Resource;
 use agentos_core::budget::{BudgetError, Reservation};
 use agentos_core::contract::{Capability, Contract};
 use agentos_core::effect::{
@@ -41,6 +42,15 @@ fn contract(caps: &[&str], model_requests: u32, tool_actions: u32) -> (Contract,
     (Contract::parse(&json).unwrap(), Digest::of(json.as_bytes()))
 }
 
+/// The resources the engine passes for each kind (see the runner).
+fn profile() -> Resource {
+    Resource::Profile("parser-checks-v1".into())
+}
+
+fn src() -> Resource {
+    Resource::Paths(vec!["src/a.py".into()])
+}
+
 struct Fx {
     _dir: tempfile::TempDir,
     path: PathBuf,
@@ -73,17 +83,17 @@ impl Fx {
     fn read(&self, req: &[u8], model_requests: u32) -> Result<EffectRecord, DbError> {
         let kind = EffectKind::ReadSnapshot;
         let r = Reservation::for_kind(&kind, model_requests);
-        self.db.record_intent(&self.id, kind, Digest::of(req), &self.base(), r)
+        self.db.record_intent(&self.id, kind, Digest::of(req), &self.base(), r, &Resource::Task)
     }
     fn verify(&self, req: &[u8], model_requests: u32) -> Result<EffectRecord, DbError> {
         let kind = EffectKind::RunVerification;
         let r = Reservation::for_kind(&kind, model_requests);
-        self.db.record_intent(&self.id, kind, Digest::of(req), &self.base(), r)
+        self.db.record_intent(&self.id, kind, Digest::of(req), &self.base(), r, &profile())
     }
     fn patch(&self, req: &[u8], expected: Digest) -> Result<EffectRecord, DbError> {
         let kind = EffectKind::ApplyPatch { expected_base: expected };
         let r = Reservation::for_kind(&kind, 1);
-        self.db.record_intent(&self.id, kind, Digest::of(req), &expected, r)
+        self.db.record_intent(&self.id, kind, Digest::of(req), &expected, r, &src())
     }
     /// Intent + dispatch at `lease`; returns the effect and the attempt.
     fn dispatched(&self, req: &[u8], lease: u64) -> (EffectRecord, AttemptId) {
@@ -132,6 +142,7 @@ fn setup_with(caps: &[&str], model_requests: u32, tool_actions: u32) -> Fx {
     let db = Db::open(&path).unwrap();
     let (c, d) = contract(caps, model_requests, tool_actions);
     let id = db.create_task(&c, &d).unwrap();
+    db.approve_task(&id).unwrap();
     db.append(&id, &TaskEvent::Started).unwrap();
     Fx { _dir: dir, path, db, id }
 }
@@ -190,7 +201,7 @@ fn idempotent_retry_survives_reopen_and_ignores_new_reservation() {
     let db = fx.reopen();
     let kind = EffectKind::ReadSnapshot;
     let again = db
-        .record_intent(&fx.id, kind, Digest::of(b"req"), &fx.base(), Reservation { tool_actions: 1, model_requests: 9 })
+        .record_intent(&fx.id, kind, Digest::of(b"req"), &fx.base(), Reservation { tool_actions: 1, model_requests: 9 }, &Resource::Task)
         .unwrap();
     assert_eq!(again, a);
     assert_eq!(fx.usage().reserved_model_requests, 1);
@@ -254,7 +265,7 @@ fn concurrent_identical_intents_create_one_effect() {
                 barrier.wait();
                 let k = EffectKind::ReadSnapshot;
                 let r = Reservation::for_kind(&k, 1);
-                db.record_intent(&id, k, Digest::of(b"req"), &base, r).unwrap()
+                db.record_intent(&id, k, Digest::of(b"req"), &base, r, &Resource::Task).unwrap()
             })
         })
         .collect();
@@ -316,12 +327,12 @@ fn reservation_must_match_the_kinds_tool_action_cost() {
     let base = fx.base();
     let err = fx
         .db
-        .record_intent(&fx.id, EffectKind::ReadSnapshot, Digest::of(b"r"), &base, Reservation { tool_actions: 0, model_requests: 1 })
+        .record_intent(&fx.id, EffectKind::ReadSnapshot, Digest::of(b"r"), &base, Reservation { tool_actions: 0, model_requests: 1 }, &Resource::Task)
         .unwrap_err();
     assert!(matches!(err, DbError::InvalidReservation { expected: 1, got: 0 }), "{err:?}");
     let err = fx
         .db
-        .record_intent(&fx.id, EffectKind::ExportBundle, Digest::of(b"r"), &base, Reservation { tool_actions: 1, model_requests: 0 })
+        .record_intent(&fx.id, EffectKind::ExportBundle, Digest::of(b"r"), &base, Reservation { tool_actions: 1, model_requests: 0 }, &Resource::Task)
         .unwrap_err();
     assert!(matches!(err, DbError::InvalidReservation { expected: 0, got: 1 }), "{err:?}");
     assert_eq!(fx.count("SELECT count(*) FROM effects"), 0);
@@ -332,12 +343,17 @@ fn missing_capability_is_denied_with_a_durable_audit_event() {
     let fx = setup_with(&["snapshot.read", "workspace.apply_patch"], 10, 100);
     let (task, events) = (fx.task(), fx.events());
     let err = fx.verify(b"v", 1).unwrap_err();
-    assert!(matches!(err, DbError::CapabilityDenied(Capability::VerificationRun)), "{err:?}");
+    assert!(
+        matches!(err, DbError::CapabilityDenied { capability: Capability::VerificationRun, ref reason } if reason == "unknown_handle"),
+        "{err:?}"
+    );
     assert_eq!(fx.task(), task);
     assert_eq!(fx.count("SELECT count(*) FROM effects"), 0);
     assert_eq!(fx.count("SELECT count(*) FROM usage"), 0);
     let after = fx.reopen().events(&fx.id).unwrap();
-    assert_eq!(after.len(), events.len() + 1);
+    // The broker's journaled decision, then the engine-facing `Denied` audit row.
+    assert_eq!(after.len(), events.len() + 2);
+    assert_eq!(after[events.len()].event_type, "CapabilityDenied");
     let denied = after.last().unwrap();
     assert_eq!(denied.event_type, "Denied");
     assert_eq!(denied.payload["reason"], "CapabilityDenied");
@@ -372,7 +388,7 @@ fn apply_patch_whose_expected_base_disagrees_is_a_version_conflict() {
     let base = fx.base();
     let kind = EffectKind::ApplyPatch { expected_base: Digest::of(b"other") };
     let r = Reservation::for_kind(&kind, 0);
-    let err = fx.db.record_intent(&fx.id, kind, Digest::of(b"p"), &base, r).unwrap_err();
+    let err = fx.db.record_intent(&fx.id, kind, Digest::of(b"p"), &base, r, &src()).unwrap_err();
     assert!(matches!(err, DbError::VersionConflict { .. }), "{err:?}");
     assert_eq!(fx.count("SELECT count(*) FROM effects"), 0);
 }
@@ -383,7 +399,7 @@ fn non_patch_kinds_just_record_the_expected_workspace() {
     let k = EffectKind::RunVerification;
     let e = fx
         .db
-        .record_intent(&fx.id, k.clone(), Digest::of(b"v"), &Digest::of(b"whatever"), Reservation::for_kind(&k, 0))
+        .record_intent(&fx.id, k.clone(), Digest::of(b"v"), &Digest::of(b"whatever"), Reservation::for_kind(&k, 0), &profile())
         .unwrap();
     let stored: String = Connection::open(&fx.path)
         .unwrap()
@@ -435,7 +451,7 @@ fn action_consuming_intent_while_verifying_is_a_transition_error_not_budget() {
 fn record_intent_for_missing_task_is_not_found() {
     let fx = setup();
     let k = EffectKind::ReadSnapshot;
-    let r = fx.db.record_intent(&TaskId::new(), k.clone(), Digest::of(b"r"), &fx.base(), Reservation::for_kind(&k, 0));
+    let r = fx.db.record_intent(&TaskId::new(), k.clone(), Digest::of(b"r"), &fx.base(), Reservation::for_kind(&k, 0), &Resource::Task);
     assert!(matches!(r, Err(DbError::NotFound(_))));
 }
 
@@ -1070,6 +1086,7 @@ fn outstanding_effects_are_scoped_to_their_task() {
     fx.read(b"1", 0).unwrap();
     let (c, d) = contract(ALL_CAPS, 10, 100);
     let other = fx.db.create_task(&c, &d).unwrap();
+    fx.db.approve_task(&other).unwrap();
     assert!(fx.db.outstanding_effects(&other).unwrap().is_empty());
     assert_eq!(fx.db.usage_summary(&other).unwrap(), UsageSummary::default());
 }

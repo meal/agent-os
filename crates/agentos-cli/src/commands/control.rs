@@ -52,6 +52,10 @@ pub async fn resume(home: &Home, task: &TaskId, patch: Option<&Path>, crash: Opt
         // Before recovery, which leaves a paused task's effects untouched.
         store.db.append(task, &TaskEvent::Resumed)?;
     }
+    if t.state == TaskState::Ready && !t.cancel_requested {
+        // Resuming a READY task is the owner's approval: issue its capability handles.
+        store.db.approve_task(task)?;
+    }
     let state = if t.state.is_terminal() { t.state } else { drive(home, &store, &lock, task, patch, crash).await? };
     print_state(task, state);
     Ok(())

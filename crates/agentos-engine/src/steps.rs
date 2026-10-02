@@ -3,6 +3,7 @@
 //! [`complete`]. A crash between any two leaves state that recovery resumes from; the
 //! crash hook is consulted at each of those boundaries ([`run_attempt`], [`finish_attempt`]).
 
+use agentos_core::broker::Resource;
 use agentos_core::budget::Reservation;
 use agentos_core::contract::Contract;
 use agentos_core::effect::{AttemptId, EffectKind, EffectRecord, Outcome, ReceiptVerdict};
@@ -42,16 +43,18 @@ impl<'a, E> Cx<'a, E> {
     }
 }
 
-/// Step 1: durably record the intent (and its reservation) before anything runs.
+/// Step 1: durably record the intent (and its reservation) before anything runs. The store
+/// authorizes the effect's capability on `resource` and journals that decision.
 pub fn intend(
     db: &Db,
     task: &TaskId,
     kind: EffectKind,
     request: Digest,
     expected_workspace: &Digest,
+    resource: &Resource,
 ) -> Result<EffectRecord> {
     let reserve = Reservation::for_kind(&kind, 0);
-    let rec = db.record_intent(task, kind, request, expected_workspace, reserve)?;
+    let rec = db.record_intent(task, kind, request, expected_workspace, reserve, resource)?;
     tracing::info!(
         task_id = %task, step = rec.step, effect_id = %rec.effect_id, kind = rec.kind.tag(),
         "effect intended"

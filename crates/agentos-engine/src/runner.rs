@@ -4,6 +4,7 @@
 //! outstanding effects ([`crate::recover`]), replays the open session into a fresh agent
 //! and carries on exactly where the killed controller stopped.
 
+use agentos_core::broker::Resource;
 use agentos_core::contract::{Capability, Contract};
 use agentos_core::effect::{EffectId, EffectKind, EffectRecord, EffectState, ReceiptVerdict};
 use agentos_core::ids::{Digest, TaskId};
@@ -140,14 +141,15 @@ async fn ensure_snapshot<E: Executor>(cx: &Cx<'_, E>) -> Result<std::result::Res
     let events = db.events(task)?;
     let (rec, resumed) = match journal::intended(&events, "ReadSnapshot", None)? {
         Some(id) => (db.effect(&id)?, true),
-        None if !cx.contract.capabilities.contains(&Capability::SnapshotRead) => {
-            let reason = format!("capability {} not granted", capability_name(Capability::SnapshotRead));
-            return Ok(Err(fail(db, task, &reason)?));
-        }
         None => {
+            if let Err(denial) = granted(db, task, Capability::SnapshotRead, &Resource::Task)? {
+                tracing::info!(task_id = %task, denial, "snapshot denied by the broker");
+                let reason = format!("capability {} not granted", capability_name(Capability::SnapshotRead));
+                return Ok(Err(fail(db, task, &reason)?));
+            }
             let t = db.task(task)?;
             let request = Digest::of(cx.contract.repository.revision.as_bytes());
-            let rec = intend(db, task, EffectKind::ReadSnapshot, request, &t.workspace_digest)?;
+            let rec = intend(db, task, EffectKind::ReadSnapshot, request, &t.workspace_digest, &Resource::Task)?;
             cx.crash(CrashPoint::AfterIntent, Some(rec.kind.tag()))?;
             let verdict = run_attempt(cx, &rec, Vec::new()).await?;
             if verdict != ReceiptVerdict::Apply {
@@ -202,22 +204,30 @@ pub(crate) fn recovered_patch<E>(cx: &Cx<'_, E>, rec: &EffectRecord) -> Result<O
     Ok(Some(text))
 }
 
+/// The broker's pure pre-check (nothing journaled): `Err(reason)` when `op` on `resource`
+/// would be denied. Any other store error propagates.
+fn granted(db: &Db, task: &TaskId, op: Capability, resource: &Resource) -> Result<std::result::Result<(), String>> {
+    match db.check(task, op, resource) {
+        Ok(()) => Ok(Ok(())),
+        Err(DbError::CapabilityDenied { reason, .. }) => Ok(Err(reason)),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// The broker pre-check: refused patches create no effect and consume no tool action.
-async fn patch_denial(contract: &Contract, patch: &str, request: Digest) -> Option<serde_json::Value> {
-    match patch_paths(patch).await {
-        Err(detail) => Some(json!({
-            "action": "ApplyPatch", "reason": "InvalidPatch", "detail": detail, "request_digest": request,
-        })),
-        Ok(paths) => {
-            let refused = |reason: &str, bad: Vec<&String>| {
-                (!bad.is_empty()).then(|| {
-                    json!({ "action": "ApplyPatch", "reason": reason, "paths": bad, "request_digest": request })
-                })
-            };
-            refused("PathNotEditable", paths.iter().filter(|p| !contract.path_allowed(p)).collect()).or_else(|| {
-                refused("DigestExcludedPath", paths.iter().filter(|p| has_excluded_component(p)).collect())
-            })
-        }
+/// Returns the patch's paths (the resource its intent is authorized on), or the denial.
+async fn patch_denial(contract: &Contract, patch: &str, request: Digest) -> std::result::Result<Vec<String>, serde_json::Value> {
+    let paths = patch_paths(patch).await.map_err(|detail| {
+        json!({ "action": "ApplyPatch", "reason": "InvalidPatch", "detail": detail, "request_digest": request })
+    })?;
+    let refused = |reason: &str, bad: Vec<&String>| {
+        (!bad.is_empty()).then(|| json!({ "action": "ApplyPatch", "reason": reason, "paths": bad, "request_digest": request }))
+    };
+    let denial = refused("PathNotEditable", paths.iter().filter(|p| !contract.path_allowed(p)).collect())
+        .or_else(|| refused("DigestExcludedPath", paths.iter().filter(|p| has_excluded_component(p)).collect()));
+    match denial {
+        Some(audit) => Err(audit),
+        None => Ok(paths),
     }
 }
 
@@ -235,16 +245,19 @@ async fn apply_patch<E: Executor>(cx: &Cx<'_, E>, since: u64, base: Digest, patc
     if let Some(denied) = journal::denial(&after) {
         return Ok(Next::Observe(journal::denial_observation(denied)?));
     }
-    if let Some(audit) = patch_denial(&cx.contract, &patch, request).await {
-        db.append_audit(task, "Denied", &audit)?;
-        tracing::info!(task_id = %task, %audit, "patch denied");
-        return Ok(Next::Observe(Observation::PatchRejected { reason: audit.to_string() }));
-    }
+    let paths = match patch_denial(&cx.contract, &patch, request).await {
+        Ok(paths) => paths,
+        Err(audit) => {
+            db.append_audit(task, "Denied", &audit)?;
+            tracing::info!(task_id = %task, %audit, "patch denied");
+            return Ok(Next::Observe(Observation::PatchRejected { reason: audit.to_string() }));
+        }
+    };
 
     // Publish the patch itself first so the intent's request digest names a stored blob.
     cx.blobs.put(patch.as_bytes())?;
     let kind = EffectKind::ApplyPatch { expected_base: base };
-    let rec = match intend(db, task, kind, request, &base) {
+    let rec = match intend(db, task, kind, request, &base, &Resource::Paths(paths)) {
         Ok(rec) => rec,
         Err(EngineError::Db(DbError::VersionConflict { expected, actual })) => {
             return Ok(Next::Observe(Observation::VersionConflict { expected, actual }));
@@ -252,8 +265,9 @@ async fn apply_patch<E: Executor>(cx: &Cx<'_, E>, since: u64, base: Digest, patc
         Err(EngineError::Db(DbError::BudgetExceeded(_))) => {
             return Ok(Next::Stop(fail(db, task, "budget exhausted")?));
         }
-        Err(EngineError::Db(DbError::CapabilityDenied(cap))) => {
-            return Ok(Next::Observe(Observation::PatchRejected { reason: format!("capability {cap:?} not granted") }));
+        Err(EngineError::Db(DbError::CapabilityDenied { capability, .. })) => {
+            let reason = format!("capability {capability:?} not granted");
+            return Ok(Next::Observe(Observation::PatchRejected { reason }));
         }
         Err(e) => return Err(e),
     };
@@ -281,7 +295,9 @@ async fn verify<E: Executor>(cx: &Cx<'_, E>, since: Option<u64>) -> Result<Next>
         return effect_turn(cx, db.effect(&id)?, Vec::new()).await;
     }
     // Checked before VERIFYING is entered, so a missing grant cannot strand the task there.
-    if !cx.contract.capabilities.contains(&Capability::VerificationRun) {
+    let profile = Resource::Profile(cx.contract.verification_profile.clone());
+    if let Err(denial) = granted(db, task, Capability::VerificationRun, &profile)? {
+        tracing::info!(task_id = %task, denial, "verification denied by the broker");
         let capability = capability_name(Capability::VerificationRun);
         if journal::denial(&after).is_none() {
             let audit = json!({ "action": "Verify", "reason": "CapabilityDenied", "capability": capability });
@@ -295,7 +311,7 @@ async fn verify<E: Executor>(cx: &Cx<'_, E>, since: Option<u64>) -> Result<Next>
     let t = if t.state == TaskState::Verifying { t } else { db.append(task, &TaskEvent::VerifyStarted)? };
     tracing::info!(task_id = %task, step = t.step, "verification started");
     let workspace = t.workspace_digest;
-    let rec = intend(db, task, EffectKind::RunVerification, Digest::of(workspace.as_bytes()), &workspace)?;
+    let rec = intend(db, task, EffectKind::RunVerification, Digest::of(workspace.as_bytes()), &workspace, &profile)?;
     if rec.state == EffectState::Intended {
         cx.crash(CrashPoint::AfterIntent, Some(rec.kind.tag()))?;
     }

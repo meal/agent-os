@@ -688,3 +688,57 @@ fn tampered_inputs_after_a_crash_fail_the_task_without_stranding_its_in_flight_e
     assert_eq!(cli.json(&["resume", &id])["state"], "FAILED");
     assert_eq!(cli.events(&id).len(), n);
 }
+
+impl Cli {
+    /// The task's capability grants, read straight from the home's store.
+    fn grants(&self, id: &str) -> Vec<agentos_core::broker::CapabilityGrant> {
+        let db = agentos_store::db::Db::open(&self.home().join("agentos.db")).unwrap();
+        db.grants(&serde_json::from_value(json!(id)).unwrap()).unwrap()
+    }
+
+    fn deadline_ts(&self, id: &str) -> i64 {
+        let db = agentos_store::db::Db::open(&self.home().join("agentos.db")).unwrap();
+        db.deadline_ts(&serde_json::from_value(json!(id)).unwrap()).unwrap()
+    }
+}
+
+#[test]
+fn submit_without_yes_issues_no_handles_and_resume_approves() {
+    let cli = Cli::new();
+    let contract = cli.contract(&cli.repo_copy());
+    let out = cli.json(&["submit", &contract, "--fake-agent-patch", fix_patch().to_str().unwrap()]);
+    let id = out["task_id"].as_str().unwrap();
+    assert!(cli.grants(id).is_empty(), "no handles before approval");
+    assert_eq!(cli.deadline_ts(id), 0, "the deadline has not started");
+    assert!(!cli.event_types(id).contains(&"CapabilitiesIssued".to_string()));
+
+    assert_eq!(cli.json(&["resume", id])["state"], "SUCCEEDED");
+    let grants = cli.grants(id);
+    assert_eq!(grants.len(), 4, "one handle per contract capability");
+    assert!(cli.deadline_ts(id) > 0);
+    let types = cli.event_types(id);
+    assert_eq!(types.iter().filter(|t| *t == "CapabilitiesIssued").count(), 1);
+    assert_subsequence(&types, &["TaskCreated", "Submitted", "CapabilitiesIssued", "Started"]);
+    // The journal shows prefixes only.
+    let printed = String::from_utf8(cli.cmd(&["events", id]).assert().success().get_output().stdout.clone()).unwrap();
+    for g in &grants {
+        assert!(printed.contains(g.handle.prefix()));
+        assert!(!printed.contains(&g.handle.to_string()), "full handle in `agentos events`");
+    }
+    // A finished task is not approved again.
+    cli.json(&["resume", id]);
+    assert_eq!(cli.grants(id), grants);
+}
+
+#[test]
+fn submit_yes_approves_before_driving() {
+    let cli = Cli::new();
+    let contract = cli.contract(&cli.repo_copy());
+    let out = cli.submit_yes(&contract, &fix_patch());
+    let id = out["task_id"].as_str().unwrap();
+    assert_eq!(out["state"], "SUCCEEDED");
+    assert_eq!(cli.grants(id).len(), 4);
+    let types = cli.event_types(id);
+    assert_eq!(types.iter().filter(|t| *t == "CapabilitiesIssued").count(), 1);
+    assert_subsequence(&types, &["TaskCreated", "Submitted", "CapabilitiesIssued", "Started", "CapabilityGranted", "EffectIntended"]);
+}
