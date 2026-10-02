@@ -192,9 +192,18 @@ fn create_refuses_existing_directory_and_relative_paths_and_traversal_ids() {
         verify_timeout_secs: 5,
         profile_digest: None,
     };
-    let bad = request_for(&effect_id(2), 1, WorkerConfig::Host(rel.clone()));
-    let err = JobDir::create(root.path(), &bad).err().unwrap();
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    for field in 0..3 {
+        let mut h = rel.clone();
+        h.snapshot_dir = PathBuf::from("/abs/snap");
+        match field {
+            0 => h.snapshot_dir = PathBuf::from("snap"),
+            1 => h.profile_dir = PathBuf::from("profile"),
+            _ => h.work_root = PathBuf::from("work"),
+        }
+        let bad = request_for(&effect_id(2), 1, WorkerConfig::Host(h));
+        let err = JobDir::create(root.path(), &bad).err().unwrap();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "field {field}");
+    }
     let mut abs = rel;
     abs.snapshot_dir = PathBuf::from("/abs/snap");
     let ok = request_for(&effect_id(2), 1, WorkerConfig::Host(abs));
@@ -220,6 +229,45 @@ fn create_returns_a_held_lock_and_dropping_it_frees_it() {
     assert!(job.lock_held());
     drop(lock);
     assert!(!job.lock_held());
+    assert!(!job.lock_held(), "a probe must not leave the lock held");
+    let other = fs::File::open(job.path.join("lock")).unwrap();
+    other.try_lock().expect("exclusive lock is free after probes");
+}
+
+#[test]
+fn concurrent_probes_of_a_dead_job_both_see_it_free() {
+    let root = root();
+    let (job, lock) = JobDir::create(root.path(), &request()).unwrap();
+    drop(lock);
+    for _ in 0..200 {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let job = JobDir::open(&job.path).unwrap();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    job.lock_held()
+                })
+            })
+            .collect();
+        for h in handles {
+            assert!(!h.join().unwrap());
+        }
+    }
+}
+
+#[test]
+fn list_does_not_confuse_effect_a_with_effect_a_dash_b() {
+    let root = root();
+    let a: EffectId = serde_json::from_str("\"a\"").unwrap();
+    let ab: EffectId = serde_json::from_str("\"a-b\"").unwrap();
+    let (ja, _l1) = JobDir::create(root.path(), &request_for(&a, 1, scripted())).unwrap();
+    let (jab, _l2) = JobDir::create(root.path(), &request_for(&ab, 1, scripted())).unwrap();
+    let la: Vec<_> = JobDir::list(root.path(), &a).into_iter().map(|j| j.path).collect();
+    assert_eq!(la, vec![ja.path]);
+    let lab: Vec<_> = JobDir::list(root.path(), &ab).into_iter().map(|j| j.path).collect();
+    assert_eq!(lab, vec![jab.path]);
 }
 
 #[test]

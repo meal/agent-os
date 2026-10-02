@@ -12,6 +12,10 @@
 //! outcome.json + outcome.bin  the controller-visible outcome
 //! ```
 //!
+//! Every file has exactly one writer, which is why temp-file names are fixed:
+//! `request.json`/`lock`/`cancel` belong to the controller, `status.json`/`receipt.json`/
+//! `output.bin` to the supervisor, `outcome.json`/`outcome.bin`/`groups` to the worker.
+//!
 //! Liveness is the advisory lock, never a pid: pids are reused, a lock dies with the
 //! process (and with every process that inherited the descriptor).
 
@@ -153,14 +157,32 @@ impl JobDir {
                 }
             }
         }
+        JobDir::create_with(jobs_root, req, |_| Ok(()))
+    }
+
+    /// `create` with a hook run after the directory exists; any failure from there on
+    /// removes the directory again, so a failed create leaves nothing behind.
+    fn create_with(
+        jobs_root: &Path,
+        req: &JobRequest,
+        after_dir: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> io::Result<(JobDir, File)> {
         fs::create_dir_all(jobs_root)?;
-        let path = jobs_root.join(format!("{}-{attempt}", req.effect_id));
+        let path = jobs_root.join(format!("{}-{}", req.effect_id, req.attempt_id));
         fs::create_dir(&path)?;
-        let lock = File::create(path.join("lock"))?;
-        lock.lock()?;
-        let job = JobDir { path };
-        atomic_write(&job.path.join("request.json"), &json(req)?)?;
-        Ok((job, lock))
+        let built = (|| {
+            sync_dir(jobs_root)?;
+            after_dir(&path)?;
+            let lock = File::create(path.join("lock"))?;
+            lock.lock()?;
+            let job = JobDir { path: path.clone() };
+            atomic_write(&job.path.join("request.json"), &json(req)?)?;
+            Ok((job, lock))
+        })();
+        if built.is_err() {
+            let _ = fs::remove_dir_all(&path);
+        }
+        built
     }
 
     pub fn open(path: &Path) -> io::Result<JobDir> {
@@ -259,27 +281,26 @@ impl JobDir {
             .unwrap_or_default()
     }
 
-    /// Whether some process holds the job's lock. Probes through a fresh descriptor, so
-    /// a lock held by this very process through another descriptor still counts.
+    /// Whether some process holds the job's lock. Probes through a fresh descriptor with
+    /// a shared lock (so concurrent observers never see each other as holders; the
+    /// supervisor's exclusive lock still conflicts). Only a missing lock file means
+    /// "nobody"; any other failure to probe answers held, because an unknown answer must
+    /// never let recovery redispatch beside a live worker.
     pub fn lock_held(&self) -> bool {
-        let Ok(file) = File::open(self.path.join("lock")) else { return false };
-        match file.try_lock() {
-            Ok(()) => false, // released again when `file` drops
-            Err(TryLockError::WouldBlock) => true,
-            Err(TryLockError::Error(e)) => {
-                tracing::warn!(job = %self.path.display(), error = %e, "cannot probe job lock");
-                false
-            }
-        }
+        probe_lock(&self.path.join("lock"), |p| File::open(p), |f| f.try_lock_shared())
     }
 
     /// No further effect can come from this job: it reported a terminal state, left a
     /// valid receipt, or nobody holds its lock. No pid is consulted.
     pub fn is_dead(&self) -> bool {
+        self.is_dead_with(|| self.lock_held())
+    }
+
+    fn is_dead_with(&self, lock_held: impl Fn() -> bool) -> bool {
         if matches!(self.read_status().map(|s| s.state), Some(JobState::Exited | JobState::Killed)) {
             return true;
         }
-        self.read_receipt().is_some() || !self.lock_held()
+        self.read_receipt().is_some() || !lock_held()
     }
 
     /// Every attempt for `effect`, ascending by lease generation (unreadable requests
@@ -294,9 +315,93 @@ impl JobDir {
                 name.to_str().is_some_and(|n| n.starts_with(&prefix) && !n.contains(".tmp"))
             })
             .map(|e| JobDir { path: e.path() })
-            .map(|j| (j.request().ok().map(|r| r.lease_generation), j))
+            .map(|j| {
+                let req = j.request().ok();
+                (req, j)
+            })
+            // The prefix alone also matches effect `a-b` when asked for `a`.
+            .filter(|(req, _)| req.as_ref().is_none_or(|r| r.effect_id == *effect))
+            .map(|(req, j)| (req.map(|r| r.lease_generation), j))
             .collect();
         found.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.path.cmp(&b.1.path)));
         found.into_iter().map(|(_, j)| j).collect()
+    }
+}
+
+fn probe_lock(
+    path: &Path,
+    open: fn(&Path) -> io::Result<File>,
+    try_lock: fn(&File) -> Result<(), TryLockError>,
+) -> bool {
+    let file = match open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return false,
+        Err(e) => {
+            tracing::warn!(job = %path.display(), kind = ?e.kind(), "cannot open job lock; assuming held");
+            return true;
+        }
+    };
+    match try_lock(&file) {
+        Ok(()) => false, // released again when `file` drops
+        Err(TryLockError::WouldBlock) => true,
+        Err(TryLockError::Error(e)) => {
+            tracing::warn!(job = %path.display(), kind = ?e.kind(), "cannot probe job lock; assuming held");
+            true
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req() -> JobRequest {
+        let json = r#"{"goal":"g","repository":{"source":"s","revision":"r"},"profile":"p","editable_paths":["src/**"],"verification_profile":"v","capabilities":["snapshot.read"],"limits":{"model_requests":1,"max_output_tokens_per_request":1,"tool_actions":1,"deadline_seconds":1,"worker_vcpus":1,"worker_memory_mib":1}}"#;
+        JobRequest {
+            effect_id: serde_json::from_str("\"abc\"").unwrap(),
+            task_id: TaskId::new(),
+            kind: EffectKind::ReadSnapshot,
+            payload: vec![],
+            contract: Contract::parse(json).unwrap(),
+            attempt_id: AttemptId::new(),
+            lease_generation: 1,
+            lease_expiry_ms: 1,
+            task_deadline_ms: 1,
+            worker: WorkerConfig::Scripted(ScriptedConfig { script: "x".into() }),
+        }
+    }
+
+    #[test]
+    fn an_unknown_probe_answer_is_held_never_nobody() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("lock");
+        let denied: fn(&Path) -> io::Result<File> = |_| Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        assert!(probe_lock(&p, denied, |_| Ok(())));
+        let missing: fn(&Path) -> io::Result<File> = |_| Err(io::Error::from(io::ErrorKind::NotFound));
+        assert!(!probe_lock(&p, missing, |_| Ok(())));
+        File::create(&p).unwrap();
+        let enolck: fn(&File) -> Result<(), TryLockError> = |_| Err(TryLockError::Error(io::Error::from_raw_os_error(37)));
+        assert!(probe_lock(&p, |p| File::open(p), enolck));
+        assert!(!probe_lock(&p, |p| File::open(p), |f| f.try_lock_shared()));
+    }
+
+    #[test]
+    fn is_dead_is_false_when_the_probe_cannot_tell() {
+        let root = tempfile::tempdir().unwrap();
+        let (job, lock) = JobDir::create(root.path(), &req()).unwrap();
+        drop(lock);
+        assert!(job.is_dead());
+        let unknown = || probe_lock(&job.path.join("lock"), |_| Err(io::Error::from(io::ErrorKind::PermissionDenied)), |_| Ok(()));
+        assert!(!job.is_dead_with(unknown));
+    }
+
+    #[test]
+    fn a_failed_create_leaves_no_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let r = req();
+        let err = JobDir::create_with(root.path(), &r, |_| Err(io::Error::other("boom"))).err().unwrap();
+        assert_eq!(err.to_string(), "boom");
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+        JobDir::create(root.path(), &r).unwrap();
     }
 }
