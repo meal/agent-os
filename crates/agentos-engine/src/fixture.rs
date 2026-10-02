@@ -421,6 +421,7 @@ mod tests {
             kind,
             payload: vec![],
             contract: contract(),
+            deadline_ts: 0,
         };
         let snap = exec.run(&req(EffectKind::ReadSnapshot), &ctx).await;
         assert_eq!(snap.receipt.outcome, Outcome::Success);

@@ -19,7 +19,7 @@ use crate::executor::Executor;
 use crate::journal;
 use crate::patch::patch_paths;
 use crate::recover;
-use crate::steps::{intend, run_attempt, Cx};
+use crate::steps::{intend, run_attempt, Attempt, Cx};
 use crate::workspace::has_excluded_component;
 
 pub use crate::steps::{follow_up_event, verification_verdict, WORKER};
@@ -121,13 +121,11 @@ fn interruptible(db: &Db, task: &TaskId, r: Result<Next>) -> Result<Next> {
 /// intent may return it), and gives the agent its observation.
 async fn effect_turn<E: Executor>(cx: &Cx<'_, E>, rec: EffectRecord, payload: Vec<u8>) -> Result<Next> {
     let rec = match rec.state {
-        EffectState::Intended => {
-            let verdict = run_attempt(cx, &rec, payload).await?;
-            if verdict != ReceiptVerdict::Apply {
-                return Err(EngineError::ReceiptNotApplied { effect: rec.effect_id, verdict });
-            }
-            cx.db.effect(&rec.effect_id)?
-        }
+        EffectState::Intended => match run_attempt(cx, &rec, payload).await? {
+            Attempt::Published(ReceiptVerdict::Apply) => cx.db.effect(&rec.effect_id)?,
+            Attempt::Published(verdict) => return Err(EngineError::ReceiptNotApplied { effect: rec.effect_id, verdict }),
+            Attempt::Unresolved(state) => return Ok(Next::Stop(state)),
+        },
         EffectState::Completed | EffectState::Failed => rec,
         state => return Err(EngineError::UnexpectedEffectState { effect: rec.effect_id, state }),
     };
@@ -151,11 +149,11 @@ async fn ensure_snapshot<E: Executor>(cx: &Cx<'_, E>) -> Result<std::result::Res
             let request = Digest::of(cx.contract.repository.revision.as_bytes());
             let rec = intend(db, task, EffectKind::ReadSnapshot, request, &t.workspace_digest, &Resource::Task)?;
             cx.crash(CrashPoint::AfterIntent, Some(rec.kind.tag()))?;
-            let verdict = run_attempt(cx, &rec, Vec::new()).await?;
-            if verdict != ReceiptVerdict::Apply {
-                return Err(EngineError::ReceiptNotApplied { effect: rec.effect_id, verdict });
+            match run_attempt(cx, &rec, Vec::new()).await? {
+                Attempt::Published(ReceiptVerdict::Apply) => (db.effect(&rec.effect_id)?, false),
+                Attempt::Published(verdict) => return Err(EngineError::ReceiptNotApplied { effect: rec.effect_id, verdict }),
+                Attempt::Unresolved(state) => return Ok(Err(state)),
             }
-            (db.effect(&rec.effect_id)?, false)
         }
     };
     if rec.state != EffectState::Completed {

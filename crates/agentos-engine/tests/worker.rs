@@ -54,6 +54,7 @@ impl Fx {
             kind,
             payload: payload.to_vec(),
             contract: self.contract.clone(),
+            deadline_ts: 0,
         }
     }
 

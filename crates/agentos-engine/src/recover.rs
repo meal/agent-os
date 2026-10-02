@@ -43,8 +43,8 @@ use serde_json::json;
 use crate::crash::RunOptions;
 use crate::executor::{AttemptCtx, ExecOutcome, Executor, Reconciliation};
 use crate::journal;
-use crate::runner::{fail, recovered_patch, EngineError, Result};
-use crate::steps::{check_outcome, finish_attempt, request, run_attempt, Cx, WORKER};
+use crate::runner::{recovered_patch, EngineError, Result};
+use crate::steps::{check_outcome, finish_attempt, mark_unreconcilable, request, run_attempt, Attempt, Cx, WORKER};
 
 /// What recovery did with one outstanding effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,6 +150,15 @@ fn expect_applied(rec: &EffectRecord, verdict: ReceiptVerdict) -> Result<()> {
     Ok(())
 }
 
+/// A new attempt either published (and its receipt must apply) or ended unresolved, in
+/// which case the effect is already UNKNOWN and the task failed.
+fn expect_attempt(rec: &EffectRecord, attempt: Attempt) -> Result<()> {
+    match attempt {
+        Attempt::Published(verdict) => expect_applied(rec, verdict),
+        Attempt::Unresolved(_) => Ok(()),
+    }
+}
+
 /// The request payload of `rec`: the patch text for ApplyPatch, empty otherwise. `None`
 /// when the patch text is gone (no journaled turn and no blob holds it).
 fn payload<E>(cx: &Cx<'_, E>, rec: &EffectRecord) -> Result<Option<Vec<u8>>> {
@@ -199,7 +208,7 @@ async fn recover_effect<E: Executor>(cx: &Cx<'_, E>, rec: EffectRecord, report: 
                 return unreconcilable(cx, report, &rec, "its request payload is no longer available");
             };
             decide(cx, report, &rec, Decision::Dispatch, "intended, never dispatched")?;
-            return expect_applied(&rec, run_attempt(cx, &rec, payload).await?);
+            return expect_attempt(&rec, run_attempt(cx, &rec, payload).await?);
         }
         if closing {
             return abandon(cx, report, &rec, "never dispatched, and the task can no longer dispatch it");
@@ -218,7 +227,7 @@ async fn recover_effect<E: Executor>(cx: &Cx<'_, E>, rec: EffectRecord, report: 
                 return unreconcilable(cx, report, &rec, "its request payload is no longer available");
             };
             decide(cx, report, &rec, Decision::Redispatch, "no receipt; retry policy Retry: safe to run again")?;
-            expect_applied(&rec, run_attempt(cx, &rec, payload).await?)
+            expect_attempt(&rec, run_attempt(cx, &rec, payload).await?)
         }
         RetryPolicy::Retry => {
             if rec.state == EffectState::Dispatched {
@@ -243,7 +252,8 @@ async fn reconcile_effect<E: Executor>(
         return unreconcilable(cx, report, &rec, "its request payload is no longer available");
     };
     let ctx = AttemptCtx { attempt_id: AttemptId::new(), lease_generation: rec.lease_generation, worker: WORKER.into() };
-    match cx.exec.reconcile(&request(&rec, payload.clone(), &cx.contract), &ctx).await {
+    let req = request(&rec, payload.clone(), &cx.contract, cx.db.deadline_ts(&cx.task)?);
+    match cx.exec.reconcile(&req, &ctx).await {
         Reconciliation::Applied(out) if usable(&rec, &out) => {
             let reason = "no receipt; reconciliation found the effect applied";
             decide(cx, report, &rec, Decision::PublishReconciled, reason)?;
@@ -253,7 +263,7 @@ async fn reconcile_effect<E: Executor>(
         Reconciliation::NotApplied if can_dispatch => {
             let reason = "no receipt; reconciliation found it not applied, so retry policy ReconcileThenRetry retries it";
             decide(cx, report, &rec, Decision::Redispatch, reason)?;
-            expect_applied(&rec, run_attempt(cx, &rec, payload).await?)
+            expect_attempt(&rec, run_attempt(cx, &rec, payload).await?)
         }
         Reconciliation::NotApplied => {
             abandon(cx, report, &rec, "reconciliation found it not applied, and the task can no longer dispatch it")
@@ -286,11 +296,6 @@ fn unreconcilable<E>(cx: &Cx<'_, E>, report: &mut RecoveryReport, rec: &EffectRe
         return Ok(());
     }
     decide(cx, report, rec, Decision::Unreconcilable, reason)?;
-    if rec.state == EffectState::Dispatched {
-        cx.db.mark_unknown(&rec.effect_id)?;
-    }
-    if !terminal {
-        fail(cx.db, &cx.task, &format!("unreconcilable effect {}", rec.effect_id))?;
-    }
+    mark_unreconcilable(cx.db, rec)?;
     Ok(())
 }

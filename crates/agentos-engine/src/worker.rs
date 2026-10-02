@@ -167,6 +167,7 @@ pub async fn run_worker(job: &JobDir) -> io::Result<()> {
         kind: request.kind,
         payload: request.payload,
         contract: request.contract,
+        deadline_ts: request.task_deadline_ms / 1000,
     };
     let groups = job.path.join("groups");
     let ctx = |worker: &str| AttemptCtx {
@@ -199,6 +200,7 @@ mod tests {
             kind,
             payload: vec![],
             contract: Contract::parse(json).unwrap(),
+            deadline_ts: 0,
         };
         (req, AttemptCtx { attempt_id: AttemptId::new(), lease_generation: 2, worker: "scripted".into() })
     }

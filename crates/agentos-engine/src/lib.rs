@@ -11,6 +11,7 @@ mod process;
 pub mod recover;
 pub mod runner;
 pub mod steps;
+pub mod supervised;
 pub mod supervisor;
 pub mod worker;
 pub mod workspace;

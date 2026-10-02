@@ -9,39 +9,12 @@
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-
-use agentos_core::effect::{EffectId, EffectKind};
+use agentos_core::effect::EffectId;
 use agentos_core::ids::{Digest, TaskId};
 
 use crate::crash::{CrashHook, CrashPoint};
 use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor, Reconciliation};
-
-/// How many times each effect kind was really executed (the inner executor's `run` was
-/// called), shared across executor instances so it survives a simulated restart.
-#[derive(Debug, Clone, Default)]
-pub struct ExecCounts(Arc<[AtomicUsize; 4]>);
-
-fn slot(tag: &str) -> usize {
-    match tag {
-        "read_snapshot" => 0,
-        "apply_patch" => 1,
-        "run_verification" => 2,
-        _ => 3,
-    }
-}
-
-impl ExecCounts {
-    fn record(&self, kind: &EffectKind) {
-        self.0[slot(kind.tag())].fetch_add(1, Ordering::SeqCst);
-    }
-
-    /// Executions of the kind with tag `tag` (`EffectKind::tag`).
-    pub fn get(&self, tag: &str) -> usize {
-        self.0[slot(tag)].load(Ordering::SeqCst)
-    }
-}
+pub use crate::supervised::ExecCounts;
 
 pub struct DurableExecutor<E> {
     inner: E,

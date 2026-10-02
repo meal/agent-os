@@ -413,6 +413,7 @@ fn request(ctl: &Ctl, w: &World, rec: &EffectRecord) -> EffectRequest {
         kind: rec.kind.clone(),
         payload: Vec::new(),
         contract: ctl.db.contract(&w.task).unwrap(),
+        deadline_ts: 0,
     }
 }
 

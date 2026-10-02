@@ -123,6 +123,7 @@ fn failure(req: &JobRequest, reason: &str) -> ExecOutcome {
         kind: req.kind.clone(),
         payload: req.payload.clone(),
         contract: req.contract.clone(),
+        deadline_ts: req.task_deadline_ms / 1000,
     };
     let ctx = AttemptCtx {
         attempt_id: req.attempt_id.clone(),

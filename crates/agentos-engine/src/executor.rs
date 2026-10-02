@@ -16,6 +16,8 @@ pub struct EffectRequest {
     /// Patch text bytes for `ApplyPatch`, empty otherwise.
     pub payload: Vec<u8>,
     pub contract: Contract,
+    /// The task's deadline in unix seconds, 0 for none.
+    pub deadline_ts: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +44,11 @@ pub struct ExecOutcome {
     pub new_workspace: Option<Digest>,
     /// Set when a verification ran to completion.
     pub verification: Option<VerificationReport>,
+    /// The effect may or may not have taken effect and reconciliation could not tell: the
+    /// receipt is a placeholder that must never be applied. The runner marks the effect
+    /// UNKNOWN and fails the task instead.
+    #[serde(default)]
+    pub unresolved: bool,
 }
 
 impl ExecOutcome {
@@ -61,6 +68,13 @@ impl ExecOutcome {
         ExecOutcome::with_outcome(req, ctx, Outcome::Failure(reason), output)
     }
 
+    /// A placeholder for an attempt whose effect cannot be decided (see `unresolved`).
+    pub fn unresolved(req: &EffectRequest, ctx: &AttemptCtx, reason: impl Into<String>) -> ExecOutcome {
+        let mut out = ExecOutcome::failure(req, ctx, reason);
+        out.unresolved = true;
+        out
+    }
+
     fn with_outcome(req: &EffectRequest, ctx: &AttemptCtx, outcome: Outcome, output: Vec<u8>) -> ExecOutcome {
         ExecOutcome {
             receipt: Receipt {
@@ -73,6 +87,7 @@ impl ExecOutcome {
             output,
             new_workspace: None,
             verification: None,
+            unresolved: false,
         }
     }
 }
@@ -110,5 +125,11 @@ pub trait Executor {
     /// gone), or `None` when this executor cannot tell.
     fn current_workspace(&self, _task: &TaskId) -> Option<Result<Digest, String>> {
         None
+    }
+
+    /// Stops every live attempt of `effect` and returns whether all of them are dead. An
+    /// executor without out-of-process jobs has nothing to stop.
+    fn fence_job(&self, _effect: &EffectId) -> impl Future<Output = bool> + Send {
+        async { true }
     }
 }

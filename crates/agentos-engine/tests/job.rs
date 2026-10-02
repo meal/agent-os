@@ -58,6 +58,7 @@ fn outcome_for(req: &JobRequest, output: &[u8]) -> ExecOutcome {
         output: output.to_vec(),
         new_workspace: None,
         verification: None,
+        unresolved: false,
     }
 }
 

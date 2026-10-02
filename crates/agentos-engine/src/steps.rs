@@ -6,16 +6,16 @@
 use agentos_core::broker::Resource;
 use agentos_core::budget::Reservation;
 use agentos_core::contract::Contract;
-use agentos_core::effect::{AttemptId, EffectKind, EffectRecord, Outcome, ReceiptVerdict};
+use agentos_core::effect::{AttemptId, EffectKind, EffectRecord, EffectState, Outcome, ReceiptVerdict};
 use agentos_core::ids::{Digest, TaskId};
-use agentos_core::state::{Task, TaskEvent};
+use agentos_core::state::{Task, TaskEvent, TaskState};
 use agentos_store::blob::BlobStore;
 use agentos_store::db::Db;
 use serde_json::json;
 
 use crate::crash::{CrashPoint, RunOptions};
 use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor};
-use crate::runner::{EngineError, Result};
+use crate::runner::{fail, EngineError, Result};
 
 pub const WORKER: &str = "fixture-executor";
 
@@ -77,13 +77,15 @@ pub fn dispatch(db: &Db, rec: &EffectRecord) -> Result<AttemptCtx> {
     Ok(ctx)
 }
 
-pub fn request(rec: &EffectRecord, payload: Vec<u8>, contract: &Contract) -> EffectRequest {
+/// `deadline_ts` is the task's deadline in unix seconds (`Db::deadline_ts`), 0 for none.
+pub fn request(rec: &EffectRecord, payload: Vec<u8>, contract: &Contract, deadline_ts: i64) -> EffectRequest {
     EffectRequest {
         effect_id: rec.effect_id.clone(),
         task_id: rec.task_id.clone(),
         kind: rec.kind.clone(),
         payload,
         contract: contract.clone(),
+        deadline_ts,
     }
 }
 
@@ -100,15 +102,17 @@ pub fn check_outcome(rec: &EffectRecord, out: &ExecOutcome) -> Result<()> {
     Ok(())
 }
 
-/// Step 3: run the attempt on the executor.
+/// Step 3: run the attempt on the executor. An `unresolved` outcome is returned as it is;
+/// [`run_attempt`] turns it into an UNKNOWN effect and a failed task.
 pub async fn execute<E: Executor>(
     executor: &E,
     rec: &EffectRecord,
     payload: Vec<u8>,
     contract: &Contract,
+    deadline_ts: i64,
     ctx: &AttemptCtx,
 ) -> Result<ExecOutcome> {
-    let out = executor.run(&request(rec, payload, contract), ctx).await;
+    let out = executor.run(&request(rec, payload, contract, deadline_ts), ctx).await;
     check_outcome(rec, &out)?;
     tracing::info!(
         task_id = %rec.task_id, effect_id = %rec.effect_id, outcome = ?out.receipt.outcome,
@@ -159,23 +163,48 @@ pub fn complete(
     Ok(verdict)
 }
 
+/// How an attempt ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Attempt {
+    /// Its outcome was published; the store's verdict on the receipt.
+    Published(ReceiptVerdict),
+    /// The executor could not tell whether the effect took effect: the effect is UNKNOWN
+    /// and the task failed (it is in this state now).
+    Unresolved(TaskState),
+}
+
 /// Steps 2-6 for an effect that is INTENDED, or DISPATCHED/UNKNOWN without a usable
 /// receipt: a new attempt under the next lease generation.
-pub(crate) async fn run_attempt<E: Executor>(
-    cx: &Cx<'_, E>,
-    rec: &EffectRecord,
-    payload: Vec<u8>,
-) -> Result<ReceiptVerdict> {
+pub(crate) async fn run_attempt<E: Executor>(cx: &Cx<'_, E>, rec: &EffectRecord, payload: Vec<u8>) -> Result<Attempt> {
     let kind = Some(rec.kind.tag());
     let ctx = dispatch(cx.db, rec)?;
     cx.crash(CrashPoint::AfterDispatch, kind)?;
-    let out = execute(cx.exec, rec, payload, &cx.contract, &ctx).await?;
+    let deadline_ts = cx.db.deadline_ts(&rec.task_id)?;
+    let out = execute(cx.exec, rec, payload, &cx.contract, deadline_ts, &ctx).await?;
     if let Some(point) = cx.opts.tripped() {
         // The executor was killed before its receipt became durable.
         return Err(EngineError::Crashed(point));
     }
+    if out.unresolved {
+        tracing::warn!(task_id = %rec.task_id, effect_id = %rec.effect_id, "the executor cannot tell whether the effect took effect");
+        return Ok(Attempt::Unresolved(mark_unreconcilable(cx.db, &cx.db.effect(&rec.effect_id)?)?));
+    }
     cx.crash(CrashPoint::AfterExecuteBeforePublish, kind)?;
-    finish_attempt(cx, rec, &out)
+    Ok(Attempt::Published(finish_attempt(cx, rec, &out)?))
+}
+
+/// The end of an effect nobody can decide: a DISPATCHED one becomes UNKNOWN (its reservation
+/// `Uncertain`, since it may have run), and a task that is not terminal yet fails with
+/// "unreconcilable effect <id>". Returns the task's state afterwards.
+pub(crate) fn mark_unreconcilable(db: &Db, rec: &EffectRecord) -> Result<TaskState> {
+    if rec.state == EffectState::Dispatched {
+        db.mark_unknown(&rec.effect_id)?;
+    }
+    let t = db.task(&rec.task_id)?;
+    if t.state.is_terminal() {
+        return Ok(t.state);
+    }
+    fail(db, &rec.task_id, &format!("unreconcilable effect {}", rec.effect_id))
 }
 
 /// Steps 4-6 for an outcome in hand, whether just executed, retained by the executor
@@ -234,7 +263,6 @@ pub fn verification_verdict(out: &ExecOutcome, task: &Task) -> (bool, String) {
 #[cfg(test)]
 mod tests {
     use agentos_core::effect::{AttemptId, EffectId};
-    use agentos_core::state::TaskState;
 
     use super::*;
     use crate::executor::VerificationReport;
@@ -256,6 +284,7 @@ mod tests {
                            "deadline_seconds": 1, "worker_vcpus": 1, "worker_memory_mib": 1}
             }))
             .unwrap(),
+            deadline_ts: 0,
         };
         let ctx = AttemptCtx { attempt_id: AttemptId::new(), lease_generation: 1, worker: "w".into() };
         if ok {
@@ -323,7 +352,7 @@ mod tests {
             task_id: TaskId::new(),
             step: 0,
             kind,
-            state: agentos_core::effect::EffectState::Dispatched,
+            state: EffectState::Dispatched,
             request_digest: d("r"),
             lease_generation: 1,
             result_digest: None,

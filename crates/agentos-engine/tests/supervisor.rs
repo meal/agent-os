@@ -111,6 +111,7 @@ fn parts(req: &JobRequest) -> (EffectRequest, AttemptCtx) {
         kind: req.kind.clone(),
         payload: req.payload.clone(),
         contract: req.contract.clone(),
+        deadline_ts: 0,
     };
     let ctx = AttemptCtx { attempt_id: req.attempt_id.clone(), lease_generation: req.lease_generation, worker: "scripted".into() };
     (effect, ctx)
