@@ -13,7 +13,7 @@ use agentos_core::guest::mint_attempt_token;
 use agentos_engine::firecracker::FirecrackerConfig;
 use agentos_engine::fixture::FixtureExecutor;
 use agentos_engine::guestlink::GuestLauncher;
-use agentos_engine::jail::JailMode;
+use agentos_engine::jail::{JailConfig, JailMode};
 use agentos_engine::job::{HostConfig, WorkerConfig};
 use agentos_engine::supervised::{ExecCounts, SupervisedExecutor};
 use agentos_engine::supervisor::SupervisorCmd;
@@ -91,6 +91,61 @@ pub fn fake_firecracker_config(root: &Path) -> FirecrackerConfig {
         launcher: GuestLauncher::Fake { program: SUPERVISOR_BIN.into(), prefix_args: Vec::new() },
         jail: JailMode::Unjailed,
     }
+}
+
+/// The fake jailer, written as `<root>/fake-jailer.sh` (0755): it parses the documented
+/// jailer argv, records it in `<base>/argv.txt`, creates the "cgroup" directory under
+/// `cgroup_root` and `exec`s the fake guest in place (as the real jailer `exec`s Firecracker,
+/// keeping the pid) in the chroot, on the chroot's socket. The socket is passed bare
+/// (`v.sock`, relative to the chroot, as `vm.json` names it): `<chroot>/v.sock` is longer
+/// than a Unix socket address. The guest's root is the task directory that holds the inode
+/// staged as `<chroot>/ws.img`.
+pub fn fake_jailer(root: &Path, cgroup_root: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let quote = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', r"'\''"));
+    let script = r#"#!/bin/sh
+# fake jailer: records argv, creates the "cgroup", execs the fake guest on the chroot socket (exec in place)
+set -eu
+WORK_ROOT=@WORK_ROOT@; SUPERVISOR=@SUPERVISOR@; CGROUP_ROOT=@CGROUP_ROOT@
+id=; base=; exec_file=; parent=agentos; all="$*"
+while [ $# -gt 0 ]; do case "$1" in
+  --id) id=$2; shift 2;; --exec-file) exec_file=$2; shift 2;; --chroot-base-dir) base=$2; shift 2;;
+  --parent-cgroup) parent=$2; shift 2;; --) shift; break;; *) shift;; esac; done
+chroot="$base/$(basename "$exec_file")/$id/root"
+printf '%s\n' "$all" > "$base/argv.txt"
+mkdir -p "$CGROUP_ROOT/$parent/$id"
+root=$(dirname "$(find "$WORK_ROOT" -samefile "$chroot/ws.img" -print -quit)")   # the hard link finds the task
+cd "$chroot"
+exec "$SUPERVISOR" fake-guest v.sock "$root"
+"#
+    .replace("@WORK_ROOT@", &quote(&root.join("work")))
+    .replace("@SUPERVISOR@", &quote(Path::new(SUPERVISOR_BIN)))
+    .replace("@CGROUP_ROOT@", &quote(cgroup_root));
+    let path = root.join("fake-jailer.sh");
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// `fake_firecracker_config(root)`, jailed through the fake jailer as the test's own uid and
+/// gid, with `<root>/cgroup` standing in for the cgroup v2 root. `<root>/bin/firecracker` is
+/// a 16-byte dummy that names the chroot level (`--exec-file`); nothing executes it.
+///
+/// The launcher stays `Fake` (the brief said `Real`): a `Real` launcher's preflight opens
+/// `/dev/kvm` and runs `firecracker --version`, which the default tier cannot pass; the jailed
+/// launch path does not depend on the launcher (the jailer is what runs).
+pub fn jailed_fake_firecracker_config(root: &Path) -> FirecrackerConfig {
+    let mut cfg = fake_firecracker_config(root);
+    fs::create_dir_all(root.join("bin")).unwrap();
+    fs::write(root.join("bin/firecracker"), [0u8; 16]).unwrap();
+    let cgroup_root = root.join("cgroup");
+    cfg.jail = JailMode::Jailed(JailConfig {
+        jailer_bin: fake_jailer(root, &cgroup_root),
+        uid: rustix::process::geteuid().as_raw(),
+        gid: rustix::process::getegid().as_raw(),
+        cgroup_root,
+    });
+    cfg
 }
 
 /// A supervised executor running `worker` jobs under `jobs_root` with the real supervisor

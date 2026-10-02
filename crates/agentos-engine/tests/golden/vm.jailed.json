@@ -1,0 +1,44 @@
+{
+  "boot-source": {
+    "kernel_image_path": "/vmlinux",
+    "boot_args": "console=ttyS0 reboot=k panic=1 pci=off nomodule quiet loglevel=4 init=/sbin/agentos-guest"
+  },
+  "drives": [
+    {
+      "drive_id": "rootfs",
+      "is_root_device": true,
+      "is_read_only": true,
+      "path_on_host": "/rootfs.squashfs",
+      "cache_type": "Unsafe"
+    },
+    {
+      "drive_id": "workspace",
+      "is_root_device": false,
+      "is_read_only": false,
+      "path_on_host": "/ws.img",
+      "cache_type": "Writeback"
+    },
+    {
+      "drive_id": "scratch",
+      "is_root_device": false,
+      "is_read_only": false,
+      "path_on_host": "/scratch.img",
+      "cache_type": "Unsafe"
+    }
+  ],
+  "machine-config": {
+    "vcpu_count": 2,
+    "mem_size_mib": 512,
+    "smt": false,
+    "huge_pages": "None"
+  },
+  "vsock": {
+    "guest_cid": 3,
+    "uds_path": "v.sock"
+  },
+  "network-interfaces": [],
+  "logger": {
+    "log_path": "/firecracker.log",
+    "level": "Warning"
+  }
+}

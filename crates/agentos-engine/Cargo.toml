@@ -12,7 +12,7 @@ agentos-core = { path = "../agentos-core" }
 agentos-guest = { path = "../agentos-guest" }
 agentos-store = { path = "../agentos-store" }
 tokio = { workspace = true, features = ["io-util"] }
-rustix = { workspace = true, features = ["stdio"] }
+rustix = { workspace = true, features = ["fs", "stdio"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

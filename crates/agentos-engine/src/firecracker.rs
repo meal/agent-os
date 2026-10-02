@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Reconciliation};
 use crate::guestlink::{guest_text, spawn_fake, type_name, GuestLauncher, GuestLink, LinkError};
-use crate::jail::JailMode;
+use crate::jail::{self, JailMode, StageSources};
 use crate::job::JobDir;
 use crate::outcomes::{self, Check};
 use crate::worker::{Worker, TEST_WORKERS_ENV};
@@ -296,9 +296,19 @@ pub fn firecracker_version(firecracker_bin: &Path) -> Result<String, String> {
     version_line(cmd, VERSION_TIMEOUT)
 }
 
+/// `first_stdout_line`, checked: a successful exit and a `Firecracker v1.17.` line.
+fn version_line(cmd: Command, timeout: Duration) -> Result<String, String> {
+    let (status, first) = first_stdout_line(cmd, timeout)?;
+    if !status.success() || !first.starts_with(FIRECRACKER_VERSION_PREFIX) {
+        return Err(format!("expected {FIRECRACKER_VERSION_PREFIX}…, got {} ({status})", guest_text(&format!("{first:?}"))));
+    }
+    Ok(first)
+}
+
 /// Runs `cmd` (stdin null, environment cleared, stdout captured up to 4 KiB) for at most
-/// `timeout`, killing it after that, and returns its checked first stdout line.
-fn version_line(mut cmd: Command, timeout: Duration) -> Result<String, String> {
+/// `timeout`, killing it after that, and returns its exit status and trimmed first stdout
+/// line (unchecked, raw: the caller escapes it before it enters any text).
+pub(crate) fn first_stdout_line(mut cmd: Command, timeout: Duration) -> Result<(ExitStatus, String), String> {
     use std::io::Read;
     use std::sync::mpsc;
     let mut child = cmd
@@ -336,10 +346,7 @@ fn version_line(mut cmd: Command, timeout: Duration) -> Result<String, String> {
     let out = rx.recv_timeout(Duration::from_secs(1)).unwrap_or_default();
     let stdout = String::from_utf8_lossy(&out);
     let first = stdout.lines().next().unwrap_or("").trim();
-    if !status.success() || !first.starts_with(FIRECRACKER_VERSION_PREFIX) {
-        return Err(format!("expected {FIRECRACKER_VERSION_PREFIX}…, got {} ({status})", guest_text(&format!("{first:?}"))));
-    }
-    Ok(first.to_string())
+    Ok((status, first.to_string()))
 }
 
 /// Whether this host can run `cfg`'s VMs: `/dev/kvm` opens read-write, the Firecracker
@@ -574,34 +581,73 @@ impl FirecrackerWorker {
         }
     }
 
-    /// Spawns the VM for `paths`: Firecracker (unjailed) or the fake guest.
-    fn launch(&self, paths: &VmPaths, task_dir: &Path, attempt: &str) -> io::Result<Child> {
-        match (&self.cfg.jail, &self.cfg.launcher) {
-            (JailMode::Jailed(_), _) => Err(io::Error::other("jailed launch is not implemented yet")),
-            (JailMode::Unjailed, GuestLauncher::Real { .. }) => {
-                let console = File::options().append(true).open(&paths.console_log)?;
-                let stderr = File::options().append(true).open(&paths.stderr_log)?;
-                // In the worker's process group (no process_group(0)): every 3a kill path
-                // reaches it.
-                Command::new(&self.cfg.firecracker_bin)
-                    .args(["--no-api", "--config-file"])
-                    .arg(&paths.vm_json)
-                    .arg("--id")
-                    .arg(attempt)
-                    .env_clear()
-                    .envs(self.guest_env())
-                    .current_dir(&paths.dir)
-                    .stdin(Stdio::null())
-                    .stdout(console)
-                    .stderr(stderr)
-                    .spawn()
+    /// Spawns the VM `id` for `paths` and says which socket reaches it: Firecracker against
+    /// `<dir>/vm.json` (unjailed), the fake guest (unjailed, test tier), or, jailed (whatever
+    /// the launcher), the jailer after `jail::plan` and `jail::stage`, reached through the
+    /// chroot's socket. The jailer `exec`s Firecracker in place, so the child is Firecracker
+    /// either way. Errors are effect failure reasons.
+    fn launch(&self, paths: &VmPaths, task_dir: &Path, id: &str) -> Result<(Child, PathBuf), String> {
+        let start = |e: io::Error| format!("cannot start firecracker: {e}");
+        let stdio = || -> io::Result<(File, File)> {
+            Ok((File::options().append(true).open(&paths.console_log)?, File::options().append(true).open(&paths.stderr_log)?))
+        };
+        // Either binary runs in the worker's process group (no process_group(0)): every 3a
+        // kill path reaches it.
+        let (mut cmd, uds) = match (&self.cfg.jail, &self.cfg.launcher) {
+            (JailMode::Jailed(jc), _) => {
+                let plan = jail::plan(jc, &self.cfg.firecracker_bin, &paths.dir, id).map_err(|e| format!("cannot prepare the jail: {e}"))?;
+                let vm_json = render_vm_json(&self.cfg, &jail::chroot_view(&plan));
+                let sources = StageSources {
+                    kernel: &self.cfg.image_dir.join(KERNEL_FILE),
+                    rootfs: &self.cfg.image_dir.join(ROOTFS_FILE),
+                    ws_img: &paths.ws_img,
+                    scratch_img: &paths.scratch_img,
+                    vm_json: &vm_json,
+                };
+                jail::stage(jc, &plan, &paths.dir, sources)?;
+                let mut cmd = Command::new(&jc.jailer_bin);
+                cmd.args(jail::jailer_args(jc, &plan, &self.cfg.firecracker_bin, self.cfg.vcpus, self.cfg.memory_mib));
+                (cmd, jail::host_uds(&plan))
             }
-            (JailMode::Unjailed, fake @ GuestLauncher::Fake { .. }) => spawn_fake(fake, &paths.uds, task_dir, &self.guest_env()),
-        }
+            (JailMode::Unjailed, GuestLauncher::Real { .. }) => {
+                let mut cmd = Command::new(&self.cfg.firecracker_bin);
+                cmd.args(["--no-api", "--config-file"]).arg(&paths.vm_json).arg("--id").arg(id);
+                (cmd, paths.uds.clone())
+            }
+            (JailMode::Unjailed, fake @ GuestLauncher::Fake { .. }) => {
+                let child = spawn_fake(fake, &paths.uds, task_dir, &self.guest_env()).map_err(start)?;
+                return Ok((child, paths.uds.clone()));
+            }
+        };
+        let (console, stderr) = stdio().map_err(start)?;
+        let child = cmd
+            .env_clear()
+            .envs(self.guest_env())
+            .current_dir(&paths.dir)
+            .stdin(Stdio::null())
+            .stdout(console)
+            .stderr(stderr)
+            .spawn()
+            .map_err(start)?;
+        Ok((child, uds))
     }
 
-    /// Preflight ⇒ prepare ⇒ spawn ⇒ boot ⇒ one request ⇒ reply ⇒ shutdown ⇒ outcome.
+    /// `run_vm`, then, jailed and with an outcome (the VM is reaped by then), the jail's
+    /// collection. Without an outcome (a request was sent and the VM was lost) the jail is
+    /// left for the controller, which collects once the job is settled.
     fn run_blocking(&self, req: &EffectRequest, ctx: &AttemptCtx) -> WorkerResult {
+        let result = self.run_vm(req, ctx);
+        if let (JailMode::Jailed(jc), WorkerResult::Outcome(_)) = (&self.cfg.jail, &result)
+            && let Err(e) = jail::collect(&self.job_dir, &jc.cgroup_root)
+        {
+            tracing::warn!(job = %self.job_dir.display(), error = %e, "the jail was not collected");
+        }
+        result
+    }
+
+    /// Preflight ⇒ prepare ⇒ spawn ⇒ boot ⇒ one request ⇒ reply ⇒ shutdown ⇒ outcome. The VM
+    /// is reaped (`Vm` kills and waits when dropped) before this returns.
+    fn run_vm(&self, req: &EffectRequest, ctx: &AttemptCtx) -> WorkerResult {
         let fail = |reason: String| WorkerResult::Outcome(ExecOutcome::failure(req, ctx, reason));
         let is_patch = matches!(req.kind, EffectKind::ApplyPatch { .. });
         if matches!(req.kind, EffectKind::ExportBundle) {
@@ -646,25 +692,31 @@ impl FirecrackerWorker {
         if snapshot && let Err(e) = sparse(&paths.ws_img, WS_IMAGE_BYTES) {
             return fail(format!("cannot prepare the VM: {}: {e}", paths.ws_img.display()));
         }
-        let view = paths.host_view(&self.cfg.image_dir);
         let _scratch = ScratchGuard(paths.scratch_img.clone());
+        // Jailed, `jail::stage` makes firecracker.log (a link to the chroot's) and the
+        // chroot's vm.json.
+        let jailed = matches!(self.cfg.jail, JailMode::Jailed(_));
         let prepared = sparse(&paths.scratch_img, SCRATCH_IMAGE_BYTES)
             .and_then(|()| File::create(&paths.console_log).map(drop))
             .and_then(|()| File::create(&paths.stderr_log).map(drop))
-            .and_then(|()| File::create(&paths.firecracker_log).map(drop))
-            .and_then(|()| write_vm_json(&paths.vm_json, &self.cfg, &view));
+            .and_then(|()| match jailed {
+                true => Ok(()),
+                false => File::create(&paths.firecracker_log)
+                    .map(drop)
+                    .and_then(|()| write_vm_json(&paths.vm_json, &self.cfg, &paths.host_view(&self.cfg.image_dir))),
+            });
         if let Err(e) = prepared {
             return fail(format!("cannot prepare the VM: {e}"));
         }
 
         // Spawn and boot.
         let attempt = ctx.attempt_id.to_string();
-        let mut vm = match self.launch(&paths, &task_dir, &attempt) {
-            Ok(child) => Vm { child, status: None },
-            Err(e) => return fail(format!("cannot start firecracker: {e}")),
+        let (mut vm, uds) = match self.launch(&paths, &task_dir, &attempt) {
+            Ok((child, uds)) => (Vm { child, status: None }, uds),
+            Err(reason) => return fail(reason),
         };
         let boot_deadline = Instant::now() + self.boot_timeout;
-        let connected = GuestLink::connect_until(&paths.uds, boot_deadline, || vm.exited());
+        let connected = GuestLink::connect_until(&uds, boot_deadline, || vm.exited());
         let mut link = match connected {
             Ok(link) => link,
             Err(e) => {
