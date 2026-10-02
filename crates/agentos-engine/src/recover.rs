@@ -260,7 +260,11 @@ async fn recover_effect<E: Executor>(cx: &Cx<'_, E>, rec: EffectRecord, report: 
     }
     // Every attempt is dead now. There was no usable receipt before the wait, so one found
     // now came from a job that finished while we waited (or was left by the fenced one).
-    let reason = format!("published after waiting {:.1} s for a live job", started.elapsed().as_secs_f64());
+    let waited = started.elapsed();
+    let reason = match waited.as_millis() {
+        0 => RETAINED.to_string(),
+        _ => format!("published after waiting {:.1} s for a live job", waited.as_secs_f64()),
+    };
     if use_retained(cx, &rec, report, &reason).await? {
         return Ok(());
     }

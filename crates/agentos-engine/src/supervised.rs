@@ -48,6 +48,11 @@ const GRACE_MS: i64 = 5_000;
 const FENCE_GRACE_MS: i64 = 2_000;
 /// How long the lock may take to come free after the kills.
 const KILL_SETTLE_MS: i64 = 2_000;
+/// The longest lease any job may honestly have: no configuration may use an effect timeout
+/// above it, so it must stay >= the largest `EffectTimeouts` the product ships. It exists
+/// only to bound a forged or corrupt `lease_expiry_ms` (or a wall clock that jumped back):
+/// no wait for a job lasts longer than this plus `GRACE_MS` from now.
+pub const MAX_EFFECT_TIMEOUT_MS: i64 = 600_000;
 
 /// How many times each effect kind was really executed, shared across executor instances
 /// so it survives a simulated restart.
@@ -86,6 +91,8 @@ pub struct SupervisedExecutor {
     /// stand-in: the workspace lives on the host, so the controller can inspect it directly;
     /// 3b moves it into the guest and this into the worker.
     reconciler: Option<FixtureExecutor>,
+    /// `MAX_EFFECT_TIMEOUT_MS` except in tests.
+    max_lease_clamp_ms: i64,
 }
 
 fn now_ms() -> i64 {
@@ -317,7 +324,14 @@ impl SupervisedExecutor {
             crash: None,
             extra_env: Vec::new(),
             reconciler,
+            max_lease_clamp_ms: MAX_EFFECT_TIMEOUT_MS,
         })
+    }
+
+    /// Test seam: replaces `MAX_EFFECT_TIMEOUT_MS` as the clamp on lease-bounded waits.
+    pub fn with_max_lease_clamp(mut self, clamp: Duration) -> SupervisedExecutor {
+        self.max_lease_clamp_ms = millis(clamp);
+        self
     }
 
     pub fn with_timeouts(mut self, timeouts: EffectTimeouts) -> SupervisedExecutor {
@@ -378,6 +392,25 @@ impl SupervisedExecutor {
             tracing::warn!(job = %job.path.display(), error = %e, "cannot reap the supervisor; it stays a zombie");
         }
         Ok(())
+    }
+
+    /// Every job of `effect`. A jobs root that does not exist holds no job (it was removed
+    /// from outside); any other failure to list it is an error, never "no job".
+    fn jobs(&self, effect: &EffectId) -> io::Result<Vec<JobDir>> {
+        match JobDir::list(&self.jobs_root, effect) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound && fs::symlink_metadata(&self.jobs_root).is_err_and(|m| m.kind() == io::ErrorKind::NotFound) => {
+                Ok(Vec::new())
+            }
+            listed => listed,
+        }
+    }
+
+    /// When to stop waiting for a job whose lease ends at `lease_expiry_ms`: its lease plus
+    /// `GRACE_MS`, but never later than the longest honest lease from `now`
+    /// (`MAX_EFFECT_TIMEOUT_MS`) plus `GRACE_MS`, so a forged or corrupt lease cannot stall
+    /// the wait.
+    fn lease_bound(&self, now: i64, lease_expiry_ms: i64) -> i64 {
+        lease_expiry_ms.min(now.saturating_add(self.max_lease_clamp_ms)).saturating_add(GRACE_MS)
     }
 
     fn job_request(&self, req: &EffectRequest, ctx: &AttemptCtx, lease_expiry_ms: i64) -> JobRequest {
@@ -466,12 +499,13 @@ impl SupervisedExecutor {
     /// Waits for every attempt of `effect` to die. A job whose request can be read is waited
     /// for until its OWN lease plus `GRACE_MS`, whatever `bound` says: recovery never fences
     /// a job inside its lease, even when this executor's timeouts are shorter than the ones
-    /// the job was launched under. `bound` (from now) limits only the wait for a job whose
+    /// the job was launched under. Only a lease beyond any honest one is cut short, at
+    /// `MAX_EFFECT_TIMEOUT_MS` from now (see [`SupervisedExecutor::lease_bound`]). `bound` (from now) limits only the wait for a job whose
     /// request cannot be read, which has no known lease. A dead job's leftovers get
     /// `KILL_SETTLE_MS` to die once killed. A jobs root that cannot be listed is
     /// `StillAlive`: it proves nothing about the jobs in it.
     pub async fn wait_for_job(&self, effect: &EffectId, bound: Duration) -> JobWait {
-        let jobs = match JobDir::list(&self.jobs_root, effect) {
+        let jobs = match self.jobs(effect) {
             Ok(jobs) => jobs,
             Err(e) => {
                 tracing::warn!(effect_id = %effect, root = %self.jobs_root.display(), error = %e, "cannot list the effect's jobs; treating them as alive");
@@ -485,7 +519,7 @@ impl SupervisedExecutor {
             .filter(|j| !settled(j))
             .map(|j| match j.is_dead() {
                 true => now.saturating_add(KILL_SETTLE_MS),
-                false => j.request().map_or(unknown_lease, |r| r.lease_expiry_ms.saturating_add(GRACE_MS)),
+                false => j.request().map_or(unknown_lease, |r| self.lease_bound(now, r.lease_expiry_ms)),
             })
             .max()
             .unwrap_or(now);
@@ -524,7 +558,7 @@ impl Executor for SupervisedExecutor {
             return ExecOutcome::failure(req, ctx, "injected crash after the launch");
         }
         let jobs = std::slice::from_ref(&job);
-        if !wait_dead(jobs, lease.saturating_add(GRACE_MS)).await && !self.fence_jobs(jobs).await {
+        if !wait_dead(jobs, self.lease_bound(now_ms(), lease)).await && !self.fence_jobs(jobs).await {
             return ExecOutcome::unresolved(req, ctx, "the job outlived its lease and could not be stopped");
         }
         match receipt_for(&job, req, ctx) {
@@ -536,7 +570,7 @@ impl Executor for SupervisedExecutor {
     /// The receipt of the highest lease generation among `effect`'s jobs. A receipt flagged
     /// `unresolved` is no receipt.
     fn retained_outcome(&self, effect: &EffectId) -> Option<ExecOutcome> {
-        let jobs = match JobDir::list(&self.jobs_root, effect) {
+        let jobs = match self.jobs(effect) {
             Ok(jobs) => jobs,
             Err(e) => {
                 // `await_job` treats the same error as a live job, so recovery never acts
@@ -572,7 +606,7 @@ impl Executor for SupervisedExecutor {
     }
 
     async fn fence_job(&self, effect: &EffectId) -> bool {
-        match JobDir::list(&self.jobs_root, effect) {
+        match self.jobs(effect) {
             Ok(jobs) => self.fence_jobs(&jobs).await,
             Err(e) => {
                 tracing::warn!(effect_id = %effect, error = %e, "cannot list the effect's jobs to fence them");

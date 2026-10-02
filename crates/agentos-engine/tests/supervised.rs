@@ -737,3 +737,51 @@ async fn an_unreadable_jobs_root_is_never_taken_for_no_job() {
     assert!(!exec.fence_job(&req.effect_id).await);
     assert_eq!(exec.retained_outcome(&req.effect_id), None);
 }
+
+#[tokio::test]
+async fn a_forged_endless_lease_is_waited_for_at_most_the_clamp_plus_grace() {
+    let fx = Fx::new();
+    let exec = fx.scripted("true").with_max_lease_clamp(Duration::from_millis(200));
+    let req = fx.request(EffectKind::ReadSnapshot, b"");
+    let job_request = |lease_expiry_ms: i64| JobRequest {
+        effect_id: req.effect_id.clone(),
+        task_id: req.task_id.clone(),
+        kind: req.kind.clone(),
+        payload: Vec::new(),
+        contract: req.contract.clone(),
+        attempt_id: AttemptId::new(),
+        lease_generation: 1,
+        lease_expiry_ms,
+        task_deadline_ms: 0,
+        worker: WorkerConfig::Scripted(ScriptedConfig { script: "true".into() }),
+    };
+    // A lease that never ends (forged, corrupt, or a clock that jumped back), lock held.
+    let (forged, lock) = JobDir::create(&fx.path("jobs"), &job_request(i64::MAX)).unwrap();
+    let started = Instant::now();
+    assert_eq!(exec.await_job(&req.effect_id).await, JobWait::StillAlive);
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_millis(5_100) && waited < Duration::from_secs(8), "waited {waited:?}");
+    assert!(!exec.fence_job(&req.effect_id).await, "no pid known: the fence cannot free the lock");
+    drop(lock);
+    fs::remove_dir_all(&forged.path).unwrap();
+
+    // A lease long past with a held lock: only what is left of the grace (nothing) applies.
+    let (_stale, _lock) = JobDir::create(&fx.path("jobs"), &job_request(now_ms() - 60_000)).unwrap();
+    let started = Instant::now();
+    assert_eq!(exec.await_job(&req.effect_id).await, JobWait::StillAlive);
+    assert!(started.elapsed() < Duration::from_secs(1), "waited {:?}", started.elapsed());
+}
+
+#[tokio::test]
+async fn a_missing_jobs_root_holds_no_job() {
+    let fx = Fx::new();
+    let exec = fx.scripted("true");
+    let req = fx.request(EffectKind::ReadSnapshot, b"");
+    // Removed from outside: no job can live in a directory that does not exist.
+    fs::remove_dir_all(fx.path("jobs")).unwrap();
+    let started = Instant::now();
+    assert_eq!(exec.await_job(&req.effect_id).await, JobWait::Dead);
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(exec.fence_job(&req.effect_id).await);
+    assert_eq!(exec.retained_outcome(&req.effect_id), None);
+}
