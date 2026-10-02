@@ -135,7 +135,7 @@ pub fn authorize(
         return Err(Denial::Expired);
     }
     let in_scope = match (&grant.scope, resource) {
-        (Scope::Paths(pats), Resource::Paths(paths)) => paths.iter().all(|p| path_matches(pats, p)),
+        (Scope::Paths(pats), Resource::Paths(paths)) => !paths.is_empty() && paths.iter().all(|p| path_matches(pats, p)),
         (Scope::Profile(a), Resource::Profile(b)) => a == b,
         (Scope::Task, Resource::Task) => true,
         _ => false,
@@ -235,6 +235,29 @@ mod tests {
         assert_eq!(authorize(&g, &t, op, &paths(&["src/../tests/x"]), 99), Err(Denial::OutOfScope));
         assert_eq!(authorize(&g, &t, op, &paths(&["src/a.py", "tests/x.py"]), 99), Err(Denial::OutOfScope));
         assert_eq!(authorize(&g, &t, op, &r, 99), Ok(()));
+    }
+
+    #[test]
+    fn adjacent_denials_keep_their_order() {
+        let t = TaskId::new();
+        let op = Capability::WorkspaceApplyPatch;
+        let bad = paths(&["tests/x.py"]);
+        let g = grant(&t, src_scope(), Some(100), false);
+        assert_eq!(authorize(&g, &TaskId::new(), Capability::SnapshotRead, &bad, 0), Err(Denial::WrongTask));
+        let revoked = grant(&t, src_scope(), Some(100), true);
+        assert_eq!(authorize(&revoked, &t, op, &bad, 0), Err(Denial::Revoked));
+        assert_eq!(authorize(&g, &t, op, &bad, 100), Err(Denial::Expired));
+    }
+
+    #[test]
+    fn empty_paths_resource_or_scope_is_denied() {
+        let t = TaskId::new();
+        let op = Capability::WorkspaceApplyPatch;
+        let g = grant(&t, src_scope(), None, false);
+        assert_eq!(authorize(&g, &t, op, &Resource::Paths(vec![]), 0), Err(Denial::OutOfScope));
+        let none = grant(&t, Scope::Paths(vec![]), None, false);
+        assert_eq!(authorize(&none, &t, op, &paths(&["src/a.py"]), 0), Err(Denial::OutOfScope));
+        assert_eq!(authorize(&none, &t, op, &Resource::Paths(vec![]), 0), Err(Denial::OutOfScope));
     }
 
     #[test]
