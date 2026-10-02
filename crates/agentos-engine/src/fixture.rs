@@ -15,7 +15,7 @@ use crate::patch::{git, paths_of_file};
 use crate::process::{run_in_group, GroupError};
 use crate::workspace::{copy_tree, symlink_on_path, excluded_entries, has_excluded_component, purge_excluded, workspace_digest};
 
-const OUTPUT_LIMIT: usize = 64 * 1024;
+use agentos_core::guest::OUTPUT_LIMIT;
 
 #[derive(Deserialize)]
 struct Profile {

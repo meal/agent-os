@@ -47,6 +47,8 @@ pub struct Contract {
     pub editable_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_image_digest: Option<String>,
     pub verification_profile: String,
     pub capabilities: Vec<Capability>,
     pub limits: Limits,
@@ -108,6 +110,14 @@ impl Contract {
             if !hex {
                 return Err(ContractError::Invalid(format!(
                     "profile_digest {d:?} must be 64 lowercase hex characters"
+                )));
+            }
+        }
+        if let Some(d) = &self.guest_image_digest {
+            let hex = d.len() == 64 && d.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+            if !hex {
+                return Err(ContractError::Invalid(format!(
+                    "guest_image_digest {d:?} must be 64 lowercase hex characters"
                 )));
             }
         }
@@ -226,5 +236,21 @@ mod tests {
             assert_eq!(path_matches(&pats, p), want, "{p}");
             assert_eq!(c.path_allowed(p), want, "{p}");
         }
+    }
+    #[test] fn guest_image_digest_must_be_64_hex_when_present() {
+        let with = |d: &str| OK.replace("\"verification_profile\"", &format!("\"guest_image_digest\":\"{d}\",\"verification_profile\""));
+        let c = Contract::parse(&with(DIGEST)).unwrap();
+        assert_eq!(c.guest_image_digest.as_deref(), Some(DIGEST));
+        for bad in ["", "abc", &DIGEST[..63], &format!("{DIGEST}0"), &DIGEST.to_uppercase(), &format!("{}g", &DIGEST[..63])] {
+            let err = Contract::parse(&with(bad)).unwrap_err().to_string();
+            assert!(err.contains("guest_image_digest"), "{bad:?}: {err}");
+        }
+    }
+    #[test] fn contract_without_guest_image_digest_reserializes_byte_identically() {
+        let c = Contract::parse(OK).unwrap();
+        assert!(c.guest_image_digest.is_none());
+        let out = serde_json::to_string(&c).unwrap();
+        assert!(!out.contains("guest_image_digest"));
+        assert_eq!(out, r#"{"goal":"g","repository":{"source":"/r","revision":"abc"},"profile":"python-stdlib-v1","editable_paths":["src/**"],"verification_profile":"parser-checks-v1","capabilities":["snapshot.read","workspace.apply_patch","verification.run","artifact.export"],"limits":{"model_requests":12,"max_output_tokens_per_request":4096,"tool_actions":50,"deadline_seconds":1200,"worker_vcpus":2,"worker_memory_mib":2048}}"#);
     }
 }

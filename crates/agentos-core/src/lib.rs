@@ -2,6 +2,7 @@ pub mod broker;
 pub mod budget;
 pub mod contract;
 pub mod effect;
+pub mod guest;
 pub mod ids;
 pub mod lease;
 pub mod patchrules;
