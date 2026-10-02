@@ -26,7 +26,7 @@ use rustix::process::{kill_process, kill_process_group, Pid, Signal};
 use serde::{Deserialize, Serialize};
 
 use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Reconciliation};
-use crate::guestlink::{spawn_fake, type_name, GuestLauncher, GuestLink, LinkError};
+use crate::guestlink::{guest_text, spawn_fake, type_name, GuestLauncher, GuestLink, LinkError};
 use crate::jail::JailMode;
 use crate::job::JobDir;
 use crate::outcomes::{self, Check};
@@ -57,6 +57,8 @@ const VERIFY_REPLY_MARGIN: Duration = Duration::from_secs(60);
 /// Bounds each single write to the guest (a peer that stops reading).
 const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 const EXIT_POLL: Duration = Duration::from_millis(10);
+/// How long `firecracker --version` may take.
+const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 const WS_BUSY: &str = "workspace image is attached to another VM";
 const WORKSPACE_MISSING: &str = "workspace missing: no snapshot was read";
 
@@ -287,17 +289,55 @@ fn executable(path: &Path) -> Result<(), String> {
 }
 
 /// The first line of `firecracker --version`, which must start with `Firecracker v1.17.`.
+/// Bounded by `VERSION_TIMEOUT` (the preflight runs before every launch).
 pub fn firecracker_version(firecracker_bin: &Path) -> Result<String, String> {
-    let out = Command::new(firecracker_bin)
-        .arg("--version")
+    let mut cmd = Command::new(firecracker_bin);
+    cmd.arg("--version");
+    version_line(cmd, VERSION_TIMEOUT)
+}
+
+/// Runs `cmd` (stdin null, environment cleared, stdout captured up to 4 KiB) for at most
+/// `timeout`, killing it after that, and returns its checked first stdout line.
+fn version_line(mut cmd: Command, timeout: Duration) -> Result<String, String> {
+    use std::io::Read;
+    use std::sync::mpsc;
+    let mut child = cmd
         .env_clear()
         .stdin(Stdio::null())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .map_err(|e| e.to_string())?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let (tx, rx) = mpsc::channel();
+    // Detached: a descendant holding the pipe open must not hold this up.
+    thread::spawn(move || {
+        let mut kept = Vec::new();
+        let _ = (&mut stdout).take(4096).read_to_end(&mut kept);
+        let _ = tx.send(kept);
+    });
+    let until = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < until => thread::sleep(EXIT_POLL),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("no answer within {} ms", timeout.as_millis()));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e.to_string());
+            }
+        }
+    };
+    let out = rx.recv_timeout(Duration::from_secs(1)).unwrap_or_default();
+    let stdout = String::from_utf8_lossy(&out);
     let first = stdout.lines().next().unwrap_or("").trim();
-    if !out.status.success() || !first.starts_with(FIRECRACKER_VERSION_PREFIX) {
-        return Err(format!("expected {FIRECRACKER_VERSION_PREFIX}…, got {first:?} ({})", out.status));
+    if !status.success() || !first.starts_with(FIRECRACKER_VERSION_PREFIX) {
+        return Err(format!("expected {FIRECRACKER_VERSION_PREFIX}…, got {} ({status})", guest_text(&format!("{first:?}"))));
     }
     Ok(first.to_string())
 }
@@ -762,8 +802,8 @@ impl FirecrackerWorker {
                     stderr_truncated,
                 },
             ) => {
-                let stdout = unb64(&stdout_b64).map_err(|e| violation(format!("stdout_b64: {e}")))?;
-                let stderr = unb64(&stderr_b64).map_err(|e| violation(format!("stderr_b64: {e}")))?;
+                let stdout = unb64(&stdout_b64).map_err(|e| violation(guest_text(&format!("stdout_b64: {e}"))))?;
+                let stderr = unb64(&stderr_b64).map_err(|e| violation(guest_text(&format!("stderr_b64: {e}"))))?;
                 let (stdout, stdout_truncated) = capped(stdout, stdout_truncated);
                 let (stderr, stderr_truncated) = capped(stderr, stderr_truncated);
                 Ok(Reply::Verified(Check {
@@ -786,6 +826,12 @@ impl FirecrackerWorker {
 impl Worker for FirecrackerWorker {
     /// `run_job` for callers that need an outcome (the conformance suite): a job whose
     /// effect is unknown is an unresolved outcome.
+    ///
+    /// Production never comes through here: `run_worker` calls `run_job`, and a
+    /// `NoOutcome` there writes no `outcome.json` and exits 1 (spec issue 1), so the
+    /// supervisor writes no receipt and the controller reconciles by inspection. This
+    /// method must never be used to write `outcome.json`, least of all for `ApplyPatch`:
+    /// the unresolved placeholder would stand in for an effect that may have happened.
     async fn run(&self, req: &EffectRequest, ctx: &AttemptCtx) -> ExecOutcome {
         match self.run_job(req, ctx).await {
             WorkerResult::Outcome(out) => out,
@@ -940,8 +986,40 @@ mod tests {
         assert!(JobDir::create(root.path(), &request(jailed)).is_err());
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0, "nothing was created");
         JobDir::create(root.path(), &request(config())).unwrap();
+        // A Real launcher must name the same (absolute) binary as the config.
+        let mut two = config();
+        two.launcher = GuestLauncher::Real { firecracker_bin: "/elsewhere/firecracker".into() };
+        let err = JobDir::create(root.path(), &request(two)).err().unwrap();
+        assert!(err.to_string().contains("differs from firecracker_bin"), "{err}");
         // run_worker re-checks the same rule.
         assert!(WorkerConfig::Firecracker(FirecrackerConfig { work_root: "w".into(), ..config() }).check_paths().is_err());
+    }
+
+    #[test]
+    fn firecracker_version_is_bounded_and_checked() {
+        let sh = |script: &str| {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", script]);
+            cmd
+        };
+        let started = Instant::now();
+        let err = version_line(sh("sleep 30"), Duration::from_millis(300)).unwrap_err();
+        assert_eq!(err, "no answer within 300 ms");
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert_eq!(version_line(sh("echo 'Firecracker v1.17.0'; echo x"), Duration::from_secs(5)).unwrap(), "Firecracker v1.17.0");
+        let err = version_line(sh("printf 'Firecracker v1.16.2\\n'"), Duration::from_secs(5)).unwrap_err();
+        assert!(err.starts_with("expected Firecracker v1.17.…, got \"Firecracker v1.16.2\""), "{err}");
+        assert!(firecracker_version(Path::new("/nonexistent/firecracker")).is_err());
+    }
+
+    #[test]
+    fn guest_text_is_one_bounded_line() {
+        use crate::guestlink::{escape_controls, guest_text, GUEST_TEXT_LIMIT};
+        assert_eq!(escape_controls("a\nb\u{1b}c\u{2028}"), "a\\nb\\u{1b}c\\u{2028}");
+        assert_eq!(guest_text("plain"), "plain");
+        let long = guest_text(&"é\n".repeat(10_000));
+        assert!(long.len() <= GUEST_TEXT_LIMIT + " [truncated]".len() && long.ends_with(" [truncated]"), "{long}");
+        assert!(!long.chars().any(|c| c.is_control()));
     }
 
     #[test]

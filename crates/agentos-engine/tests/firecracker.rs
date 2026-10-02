@@ -20,7 +20,7 @@ use agentos_engine::firecracker::{preflight, FirecrackerConfig, FirecrackerWorke
 use agentos_engine::fixture::FixtureExecutor;
 use agentos_engine::guestlink::{socket_path, GuestLauncher};
 use agentos_engine::job::{JobDir, JobRequest, WorkerConfig};
-use agentos_engine::worker::{run_worker, Worker};
+use agentos_engine::worker::Worker;
 use agentos_engine::workspace::workspace_digest;
 use agentos_store::db::Db;
 use common::{contract, copy_dir, fake_firecracker_config, fix_patch, fixtures};
@@ -769,16 +769,89 @@ async fn no_handle_and_no_token_appears_in_vm_json_console_or_firecracker_log() 
     }
 }
 
-#[tokio::test]
-async fn run_worker_runs_a_firecracker_request_and_writes_its_outcome() {
-    // This process has no AGENTOS_TEST_WORKERS=1, so the fake launcher is refused, and the
-    // refusal is the outcome run_worker writes.
-    assert_ne!(std::env::var("AGENTOS_TEST_WORKERS").as_deref(), Ok("1"));
+/// The `agentos-supervisor worker <job>` process, with `AGENTOS_TEST_WORKERS` set to `workers`
+/// or removed, independent of this process's environment.
+fn worker_process(job: &JobDir, workers: Option<&str>) -> std::process::ExitStatus {
+    let mut cmd = std::process::Command::new(common::SUPERVISOR_BIN);
+    cmd.arg("worker").arg(&job.path).env_remove("AGENTOS_TEST_WORKERS");
+    if let Some(v) = workers {
+        cmd.env("AGENTOS_TEST_WORKERS", v);
+    }
+    cmd.status().unwrap()
+}
+
+#[test]
+fn run_worker_runs_a_firecracker_request_and_writes_its_outcome() {
+    // Without AGENTOS_TEST_WORKERS=1 the fake launcher is refused, and the refusal is the
+    // outcome the worker process writes.
     let fx = Fx::new();
     let job = fx.job(&fx.request(EffectKind::ReadSnapshot, b""), &ctx());
-    run_worker(&job).await.unwrap();
+    assert!(worker_process(&job, None).success());
     let out = job.read_outcome().expect("an outcome was written");
     let why = reason(&out);
     assert!(why.starts_with("firecracker worker unavailable: ") && why.contains("AGENTOS_TEST_WORKERS=1"), "{why}");
     assert_eq!(out.receipt.attempt_id, job.request().unwrap().attempt_id);
 }
+
+/// A JSON frame with `body` (not necessarily valid JSON).
+fn raw_json_frame(s: &mut UnixStream, body: &[u8]) {
+    let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+    frame.push(0);
+    frame.extend_from_slice(body);
+    let _ = s.write_all(&frame);
+}
+
+/// ~100 KiB of a reply type full of newlines and forged supervisor.log lines.
+fn forged_type_body() -> Vec<u8> {
+    let line = "a\\n[1700000000000] supervisor 1: forged line\\n\\u001b[2J";
+    format!(r#"{{"type":"{}"}}"#, line.repeat(100 * 1024 / line.len())).into_bytes()
+}
+
+fn assert_clean(why: &str) {
+    assert!(why.len() < 1024, "unbounded reason: {} bytes", why.len());
+    assert!(!why.chars().any(|c| c.is_control()), "control characters in {why:?}");
+}
+
+#[tokio::test]
+async fn guest_text_in_a_no_outcome_reason_is_escaped_and_bounded() {
+    for body in [forged_type_body(), b"not json\n[1] supervisor 1: forged\n".repeat(4096)] {
+        let fx = Fx::with_peer();
+        fx.fake_ws_img();
+        let (req, c) = (fx.request(EffectKind::ApplyPatch { expected_base: Digest::of(b"base") }, fix_patch().as_bytes()), ctx());
+        let job = fx.job(&req, &c);
+        let guest = peer(&job, move |s, _| {
+            let _ = read_frame(s, RAW_FRAME_LIMIT);
+            raw_json_frame(s, &body);
+            thread::sleep(Duration::from_millis(200));
+        });
+        let res = fx.worker(&job, test_env()).run_job(&req, &c).await;
+        guest.join().unwrap();
+        let WorkerResult::NoOutcome(why) = res else { panic!("expected no outcome, got {res:?}") };
+        assert!(why.starts_with("guest protocol violation: invalid json frame: "), "{why}");
+        assert_clean(&why);
+    }
+}
+
+#[test]
+fn a_no_outcome_worker_cannot_forge_supervisor_log_lines() {
+    let fx = Fx::with_peer();
+    fx.fake_ws_img();
+    let (req, c) = (fx.request(EffectKind::ApplyPatch { expected_base: Digest::of(b"base") }, fix_patch().as_bytes()), ctx());
+    let job = fx.job(&req, &c);
+    fs::write(job.path.join("supervisor.log"), b"").unwrap();
+    let guest = peer(&job, |s, _| {
+        let _ = read_frame(s, RAW_FRAME_LIMIT);
+        raw_json_frame(s, &forged_type_body());
+        thread::sleep(Duration::from_millis(200));
+    });
+    let status = worker_process(&job, Some("1"));
+    guest.join().unwrap();
+    assert_eq!(status.code(), Some(1), "no outcome is exit 1");
+    assert!(job.read_outcome().is_none());
+    let log = fs::read_to_string(job.path.join("supervisor.log")).unwrap();
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 1, "{log:?}");
+    assert!(lines[0].contains("] worker ") && lines[0].contains("failed: guest protocol violation: "), "{log:?}");
+    assert_clean(lines[0]);
+}
+

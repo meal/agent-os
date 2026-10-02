@@ -32,6 +32,7 @@ use agentos_core::guest::is_attempt_token;
 
 use crate::executor::ExecOutcome;
 use crate::firecracker::FirecrackerConfig;
+use crate::guestlink::GuestLauncher;
 use crate::jail::JailMode;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +82,9 @@ impl WorkerConfig {
                 if let JailMode::Jailed(j) = &f.jail {
                     paths.extend([("jailer_bin", j.jailer_bin.as_path()), ("cgroup_root", j.cgroup_root.as_path())]);
                 }
+                if let GuestLauncher::Real { firecracker_bin } = &f.launcher {
+                    paths.push(("launcher firecracker_bin", firecracker_bin.as_path()));
+                }
                 if !is_attempt_token(&f.attempt_token) {
                     return Err(invalid("attempt_token must be 32 lowercase hex characters".into()));
                 }
@@ -90,6 +94,17 @@ impl WorkerConfig {
             if !p.is_absolute() {
                 return Err(invalid(format!("{name} {} must be absolute", p.display())));
             }
+        }
+        // One binary: the launcher's copy of the path must not point elsewhere.
+        if let WorkerConfig::Firecracker(f) = self
+            && let GuestLauncher::Real { firecracker_bin } = &f.launcher
+            && *firecracker_bin != f.firecracker_bin
+        {
+            return Err(invalid(format!(
+                "launcher firecracker_bin {} differs from firecracker_bin {}",
+                firecracker_bin.display(),
+                f.firecracker_bin.display()
+            )));
         }
         Ok(())
     }

@@ -31,6 +31,7 @@ use rustix::process::{
 };
 
 use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome};
+use crate::guestlink::escape_controls;
 use crate::job::{JobDir, JobRequest, JobState, JobStatus, KillReason};
 use crate::worker::{run_worker, TEST_WORKERS_ENV};
 
@@ -469,7 +470,8 @@ pub fn main_worker(job_dir: &Path) -> i32 {
         Ok(()) => 0,
         Err(e) => {
             if let Ok(mut f) = OpenOptions::new().append(true).open(job_dir.join(LOG_FILE)) {
-                let _ = writeln!(f, "[{}] worker {}: failed: {e}", now_ms(), std::process::id());
+                // One line, whatever the error carries (guest text included).
+                let _ = writeln!(f, "[{}] worker {}: failed: {}", now_ms(), std::process::id(), escape_controls(&e.to_string()));
             }
             1
         }

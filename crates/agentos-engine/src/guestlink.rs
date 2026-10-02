@@ -86,8 +86,41 @@ fn lost(e: io::Error) -> LinkError {
 fn frame_error(e: FrameError) -> LinkError {
     match e {
         FrameError::Io(e) => LinkError::Lost(normalize(e)),
-        other => LinkError::Protocol(other.to_string()),
+        // A JSON error quotes the guest's bytes (e.g. an unknown `type`).
+        other => LinkError::Protocol(guest_text(&other.to_string())),
     }
+}
+
+/// At most this many bytes of guest-controlled text reach an error or a log line.
+pub const GUEST_TEXT_LIMIT: usize = 512;
+
+/// `s` with every control character (and the Unicode line/paragraph separators) escaped,
+/// so it is always one line of text.
+pub fn escape_controls(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+            out.extend(c.escape_debug());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Guest-controlled text made fit for an error that may end up in a log: control
+/// characters escaped, cut (on a char boundary) to `GUEST_TEXT_LIMIT` bytes and marked.
+pub fn guest_text(s: &str) -> String {
+    let mut out = escape_controls(s);
+    if out.len() > GUEST_TEXT_LIMIT {
+        let mut end = GUEST_TEXT_LIMIT;
+        while !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.truncate(end);
+        out.push_str(" [truncated]");
+    }
+    out
 }
 
 fn remaining(until: Instant) -> Duration {

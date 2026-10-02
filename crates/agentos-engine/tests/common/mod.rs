@@ -56,9 +56,6 @@ pub fn host_config(root: &Path) -> HostConfig {
     }
 }
 
-/// A supervised executor running `worker` jobs under `jobs_root` with the real supervisor
-/// binary, counting launches in `counts`, consulting `crash` right after each launch, and
-/// with `env` set in the supervisor's (and worker's) environment.
 /// A dummy registered guest image under `<root>/image`: `image.json` naming a 16-byte
 /// `vmlinux` and `rootfs.squashfs` (the fake tier never boots them).
 pub fn fake_image(root: &Path) -> PathBuf {
@@ -96,6 +93,9 @@ pub fn fake_firecracker_config(root: &Path) -> FirecrackerConfig {
     }
 }
 
+/// A supervised executor running `worker` jobs under `jobs_root` with the real supervisor
+/// binary, counting launches in `counts`, consulting `crash` right after each launch, and
+/// with `env` set in the supervisor's (and worker's) environment.
 pub fn supervised(
     jobs_root: &Path,
     worker: WorkerConfig,
