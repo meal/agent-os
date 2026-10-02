@@ -45,6 +45,8 @@ pub struct Contract {
     pub repository: RepoRef,
     pub profile: String,
     pub editable_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_digest: Option<String>,
     pub verification_profile: String,
     pub capabilities: Vec<Capability>,
     pub limits: Limits,
@@ -95,6 +97,20 @@ impl Contract {
         }
         check_plain_name("profile", &self.profile)?;
         check_plain_name("verification_profile", &self.verification_profile)?;
+        if self.verification_profile.contains('@') {
+            return Err(ContractError::Invalid(format!(
+                "verification_profile {:?} must not contain '@'",
+                self.verification_profile
+            )));
+        }
+        if let Some(d) = &self.profile_digest {
+            let hex = d.len() == 64 && d.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+            if !hex {
+                return Err(ContractError::Invalid(format!(
+                    "profile_digest {d:?} must be 64 lowercase hex characters"
+                )));
+            }
+        }
         if self.editable_paths.is_empty() {
             return Err(ContractError::Invalid("editable_paths must not be empty".into()));
         }
@@ -111,14 +127,20 @@ impl Contract {
     /// True if `rel` (a repo-relative path) matches one of the editable patterns.
     /// `dir/**` matches anything under `dir/`; any other pattern matches exactly.
     pub fn path_allowed(&self, rel: &str) -> bool {
-        if rel.starts_with('/') || has_parent_component(rel) {
-            return false;
-        }
-        self.editable_paths.iter().any(|pat| match pat.strip_suffix("**") {
-            Some(prefix) if prefix.ends_with('/') => rel.starts_with(prefix),
-            _ => rel == pat,
-        })
+        path_matches(&self.editable_paths, rel)
     }
+}
+
+/// True if `rel` (a repo-relative path) matches one of `patterns`. `dir/**` matches anything
+/// under `dir/`; any other pattern matches exactly. Absolute paths and `..` never match.
+pub fn path_matches(patterns: &[String], rel: &str) -> bool {
+    if rel.starts_with('/') || has_parent_component(rel) {
+        return false;
+    }
+    patterns.iter().any(|pat| match pat.strip_suffix("**") {
+        Some(prefix) if prefix.ends_with('/') => rel.starts_with(prefix),
+        _ => rel == pat,
+    })
 }
 
 #[cfg(test)]
@@ -166,5 +188,43 @@ mod tests {
         assert!(c.path_allowed("src/parser.py"));
         assert!(!c.path_allowed("tests/test_parser.py"));
         assert!(!c.path_allowed("src/../tests/x.py"));
+    }
+    const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    fn with_digest(d: &str) -> String {
+        OK.replace("\"verification_profile\"", &format!("\"profile_digest\":\"{d}\",\"verification_profile\""))
+    }
+    #[test] fn profile_digest_must_be_64_hex_when_present() {
+        let c = Contract::parse(&with_digest(DIGEST)).unwrap();
+        assert_eq!(c.profile_digest.as_deref(), Some(DIGEST));
+        for bad in ["", "abc", &DIGEST[..63], &format!("{DIGEST}0"), &DIGEST.to_uppercase(), &format!("{}g", &DIGEST[..63])] {
+            let err = Contract::parse(&with_digest(bad)).unwrap_err().to_string();
+            assert!(err.contains("profile_digest"), "{bad:?}: {err}");
+        }
+    }
+    #[test] fn contract_without_profile_digest_parses_and_reserializes_byte_identically() {
+        let c = Contract::parse(OK).unwrap();
+        assert!(c.profile_digest.is_none());
+        let out = serde_json::to_string(&c).unwrap();
+        assert!(!out.contains("profile_digest"));
+        let again = Contract::parse(&out).unwrap();
+        assert_eq!(serde_json::to_string(&again).unwrap(), out);
+        let with = serde_json::to_string(&Contract::parse(&with_digest(DIGEST)).unwrap()).unwrap();
+        assert!(with.contains("profile_digest"));
+    }
+    #[test] fn verification_profile_with_at_sign_is_rejected() {
+        let err = Contract::parse(&OK.replace("parser-checks-v1", "parser@checks")).unwrap_err().to_string();
+        assert!(err.contains("verification_profile") && err.contains('@'), "{err}");
+    }
+    #[test] fn path_matches_is_shared_with_path_allowed() {
+        let pats = vec!["src/**".to_string(), "README.md".to_string()];
+        let table = [
+            ("src/a/b.py", true), ("README.md", true), ("src/../x", false), ("/src/a", false),
+            ("srcfoo/x", false), ("src", false), ("README.mdx", false), ("tests/x", false),
+        ];
+        let c = Contract::parse(&OK.replace("[\"src/**\"]", "[\"src/**\",\"README.md\"]")).unwrap();
+        for (p, want) in table {
+            assert_eq!(path_matches(&pats, p), want, "{p}");
+            assert_eq!(c.path_allowed(p), want, "{p}");
+        }
     }
 }
