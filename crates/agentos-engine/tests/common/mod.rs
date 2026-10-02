@@ -98,6 +98,10 @@ pub fn contract(tool_actions: u32) -> (Contract, Digest) {
 }
 
 pub fn contract_with(tool_actions: u32, caps: &[&str]) -> (Contract, Digest) {
+    contract_full(tool_actions, caps, 600)
+}
+
+pub fn contract_full(tool_actions: u32, caps: &[&str], deadline_seconds: u32) -> (Contract, Digest) {
     let caps = serde_json::to_string(caps).unwrap();
     let json = format!(
         r#"{{
@@ -111,7 +115,7 @@ pub fn contract_with(tool_actions: u32, caps: &[&str]) -> (Contract, Digest) {
             "model_requests": 1,
             "max_output_tokens_per_request": 1000,
             "tool_actions": {tool_actions},
-            "deadline_seconds": 600,
+            "deadline_seconds": {deadline_seconds},
             "worker_vcpus": 1,
             "worker_memory_mib": 256
         }}

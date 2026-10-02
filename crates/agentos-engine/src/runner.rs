@@ -18,7 +18,7 @@ use crate::crash::{CrashPoint, RunOptions};
 use crate::executor::Executor;
 use crate::journal;
 use crate::patch::patch_paths;
-use crate::recover;
+use crate::recover::{self, deadline_stop};
 use crate::steps::{intend, run_attempt, Attempt, Cx};
 use crate::workspace::has_excluded_component;
 
@@ -124,7 +124,7 @@ async fn effect_turn<E: Executor>(cx: &Cx<'_, E>, rec: EffectRecord, payload: Ve
         EffectState::Intended => match run_attempt(cx, &rec, payload).await? {
             Attempt::Published(ReceiptVerdict::Apply) => cx.db.effect(&rec.effect_id)?,
             Attempt::Published(verdict) => return Err(EngineError::ReceiptNotApplied { effect: rec.effect_id, verdict }),
-            Attempt::Unresolved(state) => return Ok(Next::Stop(state)),
+            Attempt::Ended(state) => return Ok(Next::Stop(state)),
         },
         EffectState::Completed | EffectState::Failed => rec,
         state => return Err(EngineError::UnexpectedEffectState { effect: rec.effect_id, state }),
@@ -140,6 +140,9 @@ async fn ensure_snapshot<E: Executor>(cx: &Cx<'_, E>) -> Result<std::result::Res
     let (rec, resumed) = match journal::intended(&events, "ReadSnapshot", None)? {
         Some(id) => (db.effect(&id)?, true),
         None => {
+            if let Some(state) = deadline_stop(cx).await? {
+                return Ok(Err(state));
+            }
             if let Err(denial) = granted(db, task, Capability::SnapshotRead, &Resource::Task)? {
                 tracing::info!(task_id = %task, denial, "snapshot denied by the broker");
                 let reason = format!("capability {} not granted", capability_name(Capability::SnapshotRead));
@@ -152,7 +155,7 @@ async fn ensure_snapshot<E: Executor>(cx: &Cx<'_, E>) -> Result<std::result::Res
             match run_attempt(cx, &rec, Vec::new()).await? {
                 Attempt::Published(ReceiptVerdict::Apply) => (db.effect(&rec.effect_id)?, false),
                 Attempt::Published(verdict) => return Err(EngineError::ReceiptNotApplied { effect: rec.effect_id, verdict }),
-                Attempt::Unresolved(state) => return Ok(Err(state)),
+                Attempt::Ended(state) => return Ok(Err(state)),
             }
         }
     };
@@ -243,6 +246,10 @@ async fn apply_patch<E: Executor>(cx: &Cx<'_, E>, since: u64, base: Digest, patc
     if let Some(denied) = journal::denial(&after) {
         return Ok(Next::Observe(journal::denial_observation(denied)?));
     }
+    // Before the patch blob is stored: closing recovery collects unregistered blobs.
+    if let Some(state) = deadline_stop(cx).await? {
+        return Ok(Next::Stop(state));
+    }
     let paths = match patch_denial(&cx.contract, &patch, request).await {
         Ok(paths) => paths,
         Err(audit) => {
@@ -291,6 +298,9 @@ async fn verify<E: Executor>(cx: &Cx<'_, E>, since: Option<u64>) -> Result<Next>
     };
     if let Some(id) = journal::intended(&after, "RunVerification", None)? {
         return effect_turn(cx, db.effect(&id)?, Vec::new()).await;
+    }
+    if let Some(state) = deadline_stop(cx).await? {
+        return Ok(Next::Stop(state));
     }
     // Checked before VERIFYING is entered, so a missing grant cannot strand the task there.
     let profile = Resource::Profile(cx.contract.verification_profile.clone());
@@ -449,6 +459,9 @@ async fn drive<E: Executor, A: Agent>(cx: &Cx<'_, E>, agent: &mut A) -> Result<T
         if let Some(state) = interrupted(db, task)? {
             return Ok(state);
         }
+        if let Some(state) = deadline_stop(cx).await? {
+            return Ok(state);
+        }
         if turn >= turn_limit(&cx.contract) {
             return fail(db, task, "agent turn limit exceeded");
         }
@@ -457,6 +470,9 @@ async fn drive<E: Executor, A: Agent>(cx: &Cx<'_, E>, agent: &mut A) -> Result<T
         let action = agent.next(&obs);
         // A pause or cancel that arrived while the agent was deciding wins over its action.
         if let Some(state) = interrupted(db, task)? {
+            return Ok(state);
+        }
+        if let Some(state) = deadline_stop(cx).await? {
             return Ok(state);
         }
         let since = journal::append_turn(db, task, turn, &obs, &action)?;

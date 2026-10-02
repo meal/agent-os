@@ -53,7 +53,7 @@ use serde_json::json;
 use crate::crash::RunOptions;
 use crate::executor::{AttemptCtx, ExecOutcome, Executor, JobWait, Reconciliation};
 use crate::journal;
-use crate::runner::{recovered_patch, EngineError, Result};
+use crate::runner::{fail, recovered_patch, EngineError, Result};
 use crate::steps::{check_outcome, finish_attempt, mark_unreconcilable, request, run_attempt, Attempt, Cx, WORKER};
 
 /// What recovery did with one outstanding effect.
@@ -121,14 +121,60 @@ pub async fn recover_with<E: Executor>(
     reconcile(&Cx::new(db, blobs, executor, task, opts)?).await
 }
 
+pub const DEADLINE_EXCEEDED: &str = "deadline exceeded";
+
+/// Whether `task`'s deadline has passed while it could still run: a terminal task has
+/// nothing to enforce, and a pending cancel wins over the deadline (it ends CANCELLED).
+fn deadline_due<E>(cx: &Cx<'_, E>) -> Result<bool> {
+    if cx.closing.is_some() {
+        return Ok(false);
+    }
+    let t = cx.db.task(&cx.task)?;
+    Ok(!t.state.is_terminal() && !t.cancel_requested && cx.db.deadline_passed(&cx.task)?)
+}
+
+/// The deadline gate, consulted before each agent turn, intent and dispatch. Past the
+/// deadline it runs recovery in closing mode (live jobs are waited for or fenced, their
+/// receipts published, patches reconciled, nothing dispatched) and fails the task with
+/// `deadline exceeded`; returns the task's state then. `None` while the task may go on.
+pub(crate) async fn deadline_stop<E: Executor>(cx: &Cx<'_, E>) -> Result<Option<TaskState>> {
+    if !deadline_due(cx)? {
+        return Ok(None);
+    }
+    // Boxed: closing recovery reaches `run_attempt` (which gates on the deadline) again.
+    let closing: std::pin::Pin<Box<dyn std::future::Future<Output = Result<RecoveryReport>> + '_>> = Box::pin(reconcile(cx));
+    Ok(closing.await?.state)
+}
+
 pub(crate) async fn reconcile<E: Executor>(cx: &Cx<'_, E>) -> Result<RecoveryReport> {
+    let derived;
+    let cx = if deadline_due(cx)? {
+        tracing::info!(task_id = %cx.task, "deadline passed; closing the task");
+        derived = cx.closing_with(DEADLINE_EXCEEDED);
+        &derived
+    } else {
+        cx
+    };
     let (db, task) = (cx.db, &cx.task);
-    let gc_removed = cx.blobs.gc(&db.referenced_blobs()?)?;
+    // Not in closing mode's mid-run passes: a blob the runner put but has not registered yet
+    // would be lost. The next recovery collects what this skips.
+    let gc_removed = if cx.closing.is_some() { 0 } else { cx.blobs.gc(&db.referenced_blobs()?)? };
     let mut report = RecoveryReport { gc_removed, ..RecoveryReport::default() };
     for rec in db.outstanding_effects(task)? {
         recover_effect(cx, rec, &mut report).await?;
     }
 
+    if let Some(reason) = &cx.closing {
+        let t = db.task(task)?;
+        if !t.state.is_terminal() && !t.cancel_requested {
+            // Everything in flight is decided; now the task ends. Effects that can only be
+            // abandoned on a task that cannot dispatch again (see `abandon`) go second.
+            fail(db, task, reason)?;
+            for rec in db.outstanding_effects(task)? {
+                recover_effect(cx, rec, &mut report).await?;
+            }
+        }
+    }
     let t = db.task(task)?;
     let in_flight = db.outstanding_effects(task)?.iter().any(|e| e.state == EffectState::Dispatched);
     if t.cancel_requested && !t.state.is_terminal() && !in_flight {
@@ -136,7 +182,7 @@ pub(crate) async fn reconcile<E: Executor>(cx: &Cx<'_, E>) -> Result<RecoveryRep
         db.append(task, &TaskEvent::CancelCompleted)?;
     }
     let t = db.task(task)?;
-    if t.state.is_terminal() || t.cancel_requested {
+    if t.state.is_terminal() || t.cancel_requested || cx.closing.is_some() {
         report.abandoned.extend(db.abandon_outstanding(task)?);
     }
     report.state = Some(db.task(task)?.state);
@@ -173,7 +219,7 @@ fn expect_applied(rec: &EffectRecord, verdict: ReceiptVerdict) -> Result<()> {
 fn expect_attempt(rec: &EffectRecord, attempt: Attempt) -> Result<()> {
     match attempt {
         Attempt::Published(verdict) => expect_applied(rec, verdict),
-        Attempt::Unresolved(_) => Ok(()),
+        Attempt::Ended(_) => Ok(()),
     }
 }
 
@@ -219,9 +265,10 @@ async fn use_retained<E: Executor>(
 
 async fn recover_effect<E: Executor>(cx: &Cx<'_, E>, rec: EffectRecord, report: &mut RecoveryReport) -> Result<()> {
     let t = cx.db.task(&cx.task)?;
-    let can_dispatch = t.may_dispatch();
-    // Terminal, or cancel pending (cancel always wins): this task never dispatches again.
-    let closing = t.state.is_terminal() || t.cancel_requested;
+    let can_dispatch = t.may_dispatch() && cx.closing.is_none();
+    // Terminal, cancel pending (cancel always wins), or being closed: this task never
+    // dispatches again.
+    let closing = t.state.is_terminal() || t.cancel_requested || cx.closing.is_some();
 
     if rec.state != EffectState::Intended && use_retained(cx, &rec, report, RETAINED).await? {
         return Ok(());
@@ -330,6 +377,14 @@ fn usable(rec: &EffectRecord, out: &ExecOutcome) -> bool {
 }
 
 fn abandon<E>(cx: &Cx<'_, E>, report: &mut RecoveryReport, rec: &EffectRecord, reason: &str) -> Result<()> {
+    if cx.closing.is_some() {
+        let t = cx.db.task(&cx.task)?;
+        if !t.state.is_terminal() && !t.cancel_requested {
+            // The store abandons only for a task that is terminal or being cancelled; this
+            // one is failed at the end of the closing pass, and the effect is decided then.
+            return Ok(());
+        }
+    }
     decide(cx, report, rec, Decision::Abandon, reason)?;
     cx.db.abandon_effect(&rec.effect_id, reason)?;
     report.abandoned.push(rec.effect_id.clone());

@@ -27,11 +27,27 @@ pub(crate) struct Cx<'a, E> {
     pub contract: Contract,
     pub task: TaskId,
     pub opts: &'a RunOptions,
+    /// Set in closing mode: recovery publishes and reconciles what is in flight, dispatches
+    /// nothing, and fails the task with this reason (see [`Cx::closing_with`]).
+    pub closing: Option<String>,
 }
 
 impl<'a, E> Cx<'a, E> {
     pub fn new(db: &'a Db, blobs: &'a BlobStore, exec: &'a E, task: &TaskId, opts: &'a RunOptions) -> Result<Self> {
-        Ok(Cx { db, blobs, exec, contract: db.contract(task)?, task: task.clone(), opts })
+        Ok(Cx { db, blobs, exec, contract: db.contract(task)?, task: task.clone(), opts, closing: None })
+    }
+
+    /// The same run in closing mode: the task is being ended with `reason`.
+    pub fn closing_with(&self, reason: &str) -> Cx<'a, E> {
+        Cx {
+            db: self.db,
+            blobs: self.blobs,
+            exec: self.exec,
+            contract: self.contract.clone(),
+            task: self.task.clone(),
+            opts: self.opts,
+            closing: Some(reason.to_string()),
+        }
     }
 
     /// `Err(Crashed(point))` when the crash hook fires here.
@@ -168,15 +184,21 @@ pub fn complete(
 pub(crate) enum Attempt {
     /// Its outcome was published; the store's verdict on the receipt.
     Published(ReceiptVerdict),
-    /// The executor could not tell whether the effect took effect: the effect is UNKNOWN
-    /// and the task failed (it is in this state now).
-    Unresolved(TaskState),
+    /// The attempt ended the task instead: the executor could not tell whether the effect
+    /// took effect (the effect is UNKNOWN and the task failed), or the task's deadline had
+    /// passed before dispatch (the task is failed). The task is in this state now.
+    Ended(TaskState),
 }
 
 /// Steps 2-6 for an effect that is INTENDED, or DISPATCHED/UNKNOWN without a usable
 /// receipt: a new attempt under the next lease generation.
 pub(crate) async fn run_attempt<E: Executor>(cx: &Cx<'_, E>, rec: &EffectRecord, payload: Vec<u8>) -> Result<Attempt> {
     let kind = Some(rec.kind.tag());
+    // Before dispatch: past the deadline nothing new runs. In closing mode this effect is
+    // abandoned (it is still INTENDED) or decided like any in-flight one.
+    if let Some(state) = crate::recover::deadline_stop(cx).await? {
+        return Ok(Attempt::Ended(state));
+    }
     let ctx = dispatch(cx.db, rec)?;
     cx.crash(CrashPoint::AfterDispatch, kind)?;
     let deadline_ts = cx.db.deadline_ts(&rec.task_id)?;
@@ -187,7 +209,7 @@ pub(crate) async fn run_attempt<E: Executor>(cx: &Cx<'_, E>, rec: &EffectRecord,
     }
     if out.unresolved {
         tracing::warn!(task_id = %rec.task_id, effect_id = %rec.effect_id, "the executor cannot tell whether the effect took effect");
-        return Ok(Attempt::Unresolved(mark_unreconcilable(cx.db, &cx.db.effect(&rec.effect_id)?)?));
+        return Ok(Attempt::Ended(mark_unreconcilable(cx.db, &cx.db.effect(&rec.effect_id)?)?));
     }
     cx.crash(CrashPoint::AfterExecuteBeforePublish, kind)?;
     Ok(Attempt::Published(finish_attempt(cx, rec, &out)?))
