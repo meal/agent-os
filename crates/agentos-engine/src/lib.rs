@@ -4,6 +4,7 @@ pub mod durable;
 pub mod executor;
 pub mod export;
 pub mod fixture;
+pub mod job;
 mod journal;
 pub mod patch;
 mod process;
