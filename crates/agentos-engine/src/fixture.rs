@@ -2,7 +2,7 @@
 //! and checked by a protected profile that lives outside the workspace.
 
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agentos_core::effect::EffectKind;
@@ -13,7 +13,7 @@ use serde_json::json;
 use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor, Reconciliation, VerificationReport};
 use crate::patch::{git, paths_of_file};
 use crate::process::{run_in_group, GroupError};
-use crate::workspace::{copy_tree, excluded_entries, has_excluded_component, purge_excluded, workspace_digest};
+use crate::workspace::{copy_tree, symlink_on_path, excluded_entries, has_excluded_component, purge_excluded, workspace_digest};
 
 const OUTPUT_LIMIT: usize = 64 * 1024;
 
@@ -45,26 +45,6 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> io::Result<T> + Send + 
 fn truncated(bytes: &[u8]) -> (String, bool) {
     let cut = bytes.len() > OUTPUT_LIMIT;
     (String::from_utf8_lossy(&bytes[..bytes.len().min(OUTPUT_LIMIT)]).into_owned(), cut)
-}
-
-/// The first prefix of `rel` (inside `ws`) that is a symlink, if any.
-fn symlink_on_path(ws: &Path, rel: &str) -> io::Result<Option<String>> {
-    let mut cur = ws.to_path_buf();
-    for comp in Path::new(rel).components() {
-        let Component::Normal(name) = comp else {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("unexpected component in {rel}")));
-        };
-        cur.push(name);
-        match std::fs::symlink_metadata(&cur) {
-            Ok(m) if m.file_type().is_symlink() => {
-                return Ok(Some(cur.strip_prefix(ws).unwrap_or(&cur).display().to_string()));
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(None)
 }
 
 impl FixtureExecutor {
