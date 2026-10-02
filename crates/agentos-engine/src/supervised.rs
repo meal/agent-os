@@ -203,25 +203,27 @@ fn kill_job(job: &JobDir) {
     let _ = pidfd_send_signal(&pidfd, Signal::KILL);
     // The supervisor's session holds only the job: whatever the worker started in a group it
     // had no time to record dies too. Its members keep the session id from being reused.
-    kill_session(supervisor);
+    match proc_stats() {
+        Ok(stats) => kill_session(supervisor, &stats),
+        Err(e) => tracing::warn!(job = %job.path.display(), error = %e, "cannot scan /proc for the job's session"),
+    }
 }
 
-/// SIGKILLs every live member of session `sid`, each through a pidfd opened before its
-/// session is checked again, so a reused pid is never hit. Never our own session.
-fn kill_session(sid: Pid) {
+/// SIGKILLs the live members of session `sid` found in `stats` (one `/proc` snapshot), each
+/// through a pidfd opened before its session is checked again, so a pid reused since the
+/// snapshot is never hit. Never our own session, and never the leader `sid` itself: a
+/// supervisor is only ever signalled through the pidfd its verification opened.
+fn kill_session(sid: Pid, stats: &[(i32, [String; 4])]) {
     if getsid(None).ok() == Some(sid) {
         return;
     }
-    let raw = sid.as_raw_nonzero().get().to_string();
-    let Ok(stats) = proc_stats() else {
-        tracing::warn!(sid = %raw, "cannot scan /proc for the job's session");
-        return;
-    };
+    let raw = sid.as_raw_nonzero().get();
+    let session_field = raw.to_string();
     for (pid, [state, _, _, session]) in stats {
-        if session != raw || state == "Z" {
+        if *session != session_field || state == "Z" || *pid == raw {
             continue;
         }
-        let Some(pid) = signalable(pid) else { continue };
+        let Some(pid) = signalable(*pid) else { continue };
         let Ok(fd) = pidfd_open(pid, PidfdFlags::empty()) else { continue };
         if getsid(Some(pid)).ok() == Some(sid) {
             let _ = pidfd_send_signal(&fd, Signal::KILL);
@@ -282,7 +284,7 @@ fn settled(job: &JobDir) -> bool {
         match Pid::from_raw(sid) {
             Some(session) if workers.contains(&sid) => {
                 tracing::warn!(job = %job.path.display(), sid, "killing what the job's dead supervisor left running");
-                kill_session(session);
+                kill_session(session, &stats);
             }
             _ => tracing::warn!(job = %job.path.display(), sid, "processes left in the recorded session cannot be tied to the job; not killing"),
         }
@@ -461,23 +463,33 @@ impl SupervisedExecutor {
         dead
     }
 
-    /// Waits for every attempt of `effect` to die, until the latest lease among the live
-    /// ones plus `GRACE_MS`, but no longer than `bound`. A job whose request cannot be read
-    /// has no known lease: only `bound` limits the wait for it. A dead job's leftovers get
-    /// `KILL_SETTLE_MS` to die once killed.
+    /// Waits for every attempt of `effect` to die. A job whose request can be read is waited
+    /// for until its OWN lease plus `GRACE_MS`, whatever `bound` says: recovery never fences
+    /// a job inside its lease, even when this executor's timeouts are shorter than the ones
+    /// the job was launched under. `bound` (from now) limits only the wait for a job whose
+    /// request cannot be read, which has no known lease. A dead job's leftovers get
+    /// `KILL_SETTLE_MS` to die once killed. A jobs root that cannot be listed is
+    /// `StillAlive`: it proves nothing about the jobs in it.
     pub async fn wait_for_job(&self, effect: &EffectId, bound: Duration) -> JobWait {
-        let jobs = JobDir::list(&self.jobs_root, effect);
+        let jobs = match JobDir::list(&self.jobs_root, effect) {
+            Ok(jobs) => jobs,
+            Err(e) => {
+                tracing::warn!(effect_id = %effect, root = %self.jobs_root.display(), error = %e, "cannot list the effect's jobs; treating them as alive");
+                return JobWait::StillAlive;
+            }
+        };
         let now = now_ms();
-        let lease_bound = jobs
+        let unknown_lease = now.saturating_add(millis(bound));
+        let until = jobs
             .iter()
             .filter(|j| !settled(j))
             .map(|j| match j.is_dead() {
                 true => now.saturating_add(KILL_SETTLE_MS),
-                false => j.request().map_or(i64::MAX, |r| r.lease_expiry_ms.saturating_add(GRACE_MS)),
+                false => j.request().map_or(unknown_lease, |r| r.lease_expiry_ms.saturating_add(GRACE_MS)),
             })
             .max()
             .unwrap_or(now);
-        if !wait_dead(&jobs, now.saturating_add(millis(bound)).min(lease_bound)).await {
+        if !wait_dead(&jobs, until).await {
             return JobWait::StillAlive;
         }
         match self.retained_outcome(effect) {
@@ -524,8 +536,16 @@ impl Executor for SupervisedExecutor {
     /// The receipt of the highest lease generation among `effect`'s jobs. A receipt flagged
     /// `unresolved` is no receipt.
     fn retained_outcome(&self, effect: &EffectId) -> Option<ExecOutcome> {
-        JobDir::list(&self.jobs_root, effect)
-            .iter()
+        let jobs = match JobDir::list(&self.jobs_root, effect) {
+            Ok(jobs) => jobs,
+            Err(e) => {
+                // `await_job` treats the same error as a live job, so recovery never acts
+                // on this "none".
+                tracing::warn!(effect_id = %effect, error = %e, "cannot list the effect's jobs");
+                return None;
+            }
+        };
+        jobs.iter()
             .filter_map(JobDir::read_receipt)
             .filter(|out| out.receipt.effect_id == *effect && !out.unresolved)
             .max_by_key(|out| out.receipt.lease_generation)
@@ -544,16 +564,20 @@ impl Executor for SupervisedExecutor {
         self.reconciler.as_ref().and_then(|r| r.current_workspace(task))
     }
 
-    /// [`SupervisedExecutor::wait_for_job`], bounded by the longest effect timeout plus
-    /// `GRACE_MS`: a job launched under these timeouts has an earlier lease bound, so the
-    /// bound only limits the wait for a job whose request cannot be read (or one launched
-    /// with longer timeouts, which is then fenced).
+    /// [`SupervisedExecutor::wait_for_job`]; a job whose request cannot be read is waited
+    /// for as long as the longest effect timeout plus `GRACE_MS`.
     async fn await_job(&self, effect: &EffectId) -> JobWait {
         let longest = self.timeouts.verification.max(self.timeouts.other);
         self.wait_for_job(effect, longest + Duration::from_millis(GRACE_MS as u64)).await
     }
 
     async fn fence_job(&self, effect: &EffectId) -> bool {
-        self.fence_jobs(&JobDir::list(&self.jobs_root, effect)).await
+        match JobDir::list(&self.jobs_root, effect) {
+            Ok(jobs) => self.fence_jobs(&jobs).await,
+            Err(e) => {
+                tracing::warn!(effect_id = %effect, error = %e, "cannot list the effect's jobs to fence them");
+                false
+            }
+        }
     }
 }

@@ -40,6 +40,8 @@
 //! Recovery is idempotent: a decision is journaled only when it changes something, so
 //! recovering an already recovered task journals nothing.
 
+use std::time::Instant;
+
 use agentos_core::effect::{accept_receipt, AttemptId, EffectId, EffectKind, EffectRecord, EffectState, ReceiptVerdict, RetryPolicy};
 use agentos_core::ids::TaskId;
 use agentos_core::state::{TaskEvent, TaskState};
@@ -72,8 +74,9 @@ pub enum Decision {
     Unreconcilable,
     /// Provably never took effect and the task can no longer dispatch it: abandoned.
     Abandon,
-    /// A job of the effect was still alive past its lease bound and was fenced; the
-    /// decision journaled next acts on what the fence left.
+    /// A job of the effect was still alive past its lease bound and is fenced; journaled
+    /// before the fence acts. The decision journaled next acts on what the fence left
+    /// (`FenceFailed` if it could not stop the job).
     WaitedForJob,
     /// A job of the effect could not be stopped: left UNKNOWN and the task failed.
     FenceFailed,
@@ -141,6 +144,8 @@ pub(crate) async fn reconcile<E: Executor>(cx: &Cx<'_, E>) -> Result<RecoveryRep
     Ok(report)
 }
 
+const RETAINED: &str = "the executor retained a receipt for this effect";
+
 fn decide<E>(cx: &Cx<'_, E>, report: &mut RecoveryReport, rec: &EffectRecord, decision: Decision, reason: &str) -> Result<()> {
     let d = RecoveryDecision {
         effect_id: rec.effect_id.clone(),
@@ -182,13 +187,19 @@ fn payload<E>(cx: &Cx<'_, E>, rec: &EffectRecord) -> Result<Option<Vec<u8>>> {
 }
 
 /// Uses a receipt the executor retained, if it can be applied. Returns whether it was.
-async fn use_retained<E: Executor>(cx: &Cx<'_, E>, rec: &EffectRecord, report: &mut RecoveryReport) -> Result<bool> {
+/// `reason` is the journaled reason if it is published.
+async fn use_retained<E: Executor>(
+    cx: &Cx<'_, E>,
+    rec: &EffectRecord,
+    report: &mut RecoveryReport,
+    reason: &str,
+) -> Result<bool> {
     let Some(out) = cx.exec.retained_outcome(&rec.effect_id) else {
         return Ok(false);
     };
     let verdict = accept_receipt(rec, &out.receipt);
     if verdict == ReceiptVerdict::Apply && check_outcome(rec, &out).is_ok() {
-        decide(cx, report, rec, Decision::PublishRetained, "the executor retained a receipt for this effect")?;
+        decide(cx, report, rec, Decision::PublishRetained, reason)?;
         expect_applied(rec, finish_attempt(cx, rec, &out)?)?;
         return Ok(true);
     }
@@ -212,7 +223,7 @@ async fn recover_effect<E: Executor>(cx: &Cx<'_, E>, rec: EffectRecord, report: 
     // Terminal, or cancel pending (cancel always wins): this task never dispatches again.
     let closing = t.state.is_terminal() || t.cancel_requested;
 
-    if rec.state != EffectState::Intended && use_retained(cx, &rec, report).await? {
+    if rec.state != EffectState::Intended && use_retained(cx, &rec, report, RETAINED).await? {
         return Ok(());
     }
     if rec.state == EffectState::Intended {
@@ -235,14 +246,22 @@ async fn recover_effect<E: Executor>(cx: &Cx<'_, E>, rec: EffectRecord, report: 
     }
 
     // Dispatched: whatever is decided next, no earlier attempt may still be running.
+    let started = Instant::now();
     if let JobWait::StillAlive = cx.exec.await_job(&rec.effect_id).await {
+        // Journaled before the fence acts. An effect already left UNKNOWN on a terminal task
+        // was decided before; fencing it again journals nothing.
+        if !(t.state.is_terminal() && rec.state == EffectState::Unknown) {
+            let reason = "a job of the effect is alive past its lease bound; fencing it";
+            decide(cx, report, &rec, Decision::WaitedForJob, reason)?;
+        }
         if !cx.exec.fence_job(&rec.effect_id).await {
             return fence_failed(cx, report, &rec);
         }
-        decide(cx, report, &rec, Decision::WaitedForJob, "a job of the effect outlived its lease and was fenced")?;
     }
-    // Every attempt is dead now: a receipt one left while we waited is used like any other.
-    if use_retained(cx, &rec, report).await? {
+    // Every attempt is dead now. There was no usable receipt before the wait, so one found
+    // now came from a job that finished while we waited (or was left by the fenced one).
+    let reason = format!("published after waiting {:.1} s for a live job", started.elapsed().as_secs_f64());
+    if use_retained(cx, &rec, report, &reason).await? {
         return Ok(());
     }
 

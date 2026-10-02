@@ -8,6 +8,7 @@ mod common;
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,6 +25,7 @@ use agentos_engine::job::{JobDir, JobRequest, JobState, ScriptedConfig, WorkerCo
 use agentos_engine::recover::{recover, recover_with, Decision, RecoveryReport};
 use agentos_engine::runner::{run_task, run_task_with, EngineError};
 use agentos_engine::supervised::{ExecCounts, SupervisedExecutor};
+use agentos_engine::supervisor::POLL_ENV;
 use agentos_engine::workspace::workspace_digest;
 use agentos_store::blob::BlobStore;
 use agentos_store::db::{Db, StoredEvent};
@@ -32,7 +34,7 @@ use common::{
     comment_patch, contract, copy_dir, fix_patch, fixtures, host_config, supervised, EXIT_BEFORE_RECEIPT_ENV,
     TEST_WORKERS_ENV,
 };
-use rustix::process::{kill_process, Pid, Signal};
+use rustix::process::{kill_process, pidfd_open, pidfd_send_signal, Pid, PidfdFlags, Signal};
 use tempfile::TempDir;
 
 const KINDS: [&str; 3] = ["read_snapshot", "apply_patch", "run_verification"];
@@ -54,9 +56,21 @@ struct ExecOpts {
     exit_before_receipt: Option<&'static str>,
     /// Verifications run this shell script (a scripted worker) instead of the profile check.
     scripted_verification: Option<String>,
+    /// Effects of this kind run under a supervisor that polls only every 10 s, so it notices
+    /// nothing (the worker's exit, its lease) for that long.
+    slow_poll: Option<&'static str>,
     timeouts: Option<EffectTimeouts>,
+    fence: Fence,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Fence {
+    #[default]
+    Real,
     /// `fence_job` fails without stopping anything.
-    fence_fails: bool,
+    Fails,
+    /// `fence_job` never returns: the controller dies while fencing.
+    Hangs,
 }
 
 /// The controller's executor: supervised jobs, with one kind optionally routed to a
@@ -64,7 +78,7 @@ struct ExecOpts {
 struct Exec {
     plain: SupervisedExecutor,
     special: Option<(&'static str, SupervisedExecutor)>,
-    fence_fails: bool,
+    fence: Fence,
 }
 
 impl Executor for Exec {
@@ -92,7 +106,11 @@ impl Executor for Exec {
     }
 
     async fn fence_job(&self, effect: &EffectId) -> bool {
-        !self.fence_fails && self.plain.fence_job(effect).await
+        match self.fence {
+            Fence::Real => self.plain.fence_job(effect).await,
+            Fence::Fails => false,
+            Fence::Hangs => std::future::pending().await,
+        }
     }
 }
 
@@ -125,6 +143,10 @@ impl World {
         let timeouts = opts.timeouts.unwrap_or_default();
         let plain = supervised(&jobs, host.clone(), &self.counts, hook.clone(), &[]).with_timeouts(timeouts);
         let special = match (&opts.scripted_verification, opts.exit_before_receipt) {
+            (None, None) if opts.slow_poll.is_some() => {
+                let env = [(TEST_WORKERS_ENV, "1"), (POLL_ENV, "10000")];
+                Some((opts.slow_poll.unwrap(), supervised(&jobs, host, &self.counts, hook, &env).with_timeouts(timeouts)))
+            }
             (Some(script), _) => {
                 let worker = WorkerConfig::Scripted(ScriptedConfig { script: script.clone() });
                 let exec = supervised(&jobs, worker, &self.counts, hook, &[(TEST_WORKERS_ENV, "1")]);
@@ -136,7 +158,7 @@ impl World {
             }
             (None, None) => None,
         };
-        Exec { plain, special, fence_fails: opts.fence_fails }
+        Exec { plain, special, fence: opts.fence }
     }
 
     /// A freshly restarted controller over this world's files.
@@ -179,7 +201,7 @@ impl World {
 
     /// Every job directory of `effect`, ascending by lease generation.
     fn jobs(&self, effect: &EffectId) -> Vec<JobDir> {
-        JobDir::list(&self.path("jobs"), effect)
+        JobDir::list(&self.path("jobs"), effect).unwrap()
     }
 
     fn only_job(&self, effect: &EffectId) -> JobDir {
@@ -243,13 +265,14 @@ fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
 }
 
-/// `(state, session)` of `pid`, from `/proc/<pid>/stat`.
-fn proc_state(pid: i32) -> Option<(String, i32)> {
+/// `(state, process group, session)` of `pid`, from `/proc/<pid>/stat`.
+fn proc_state(pid: i32) -> Option<(String, i32, i32)> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let mut fields = stat[stat.rfind(')')? + 1..].split_whitespace();
     let state = fields.next()?.to_string();
-    let session = fields.nth(2)?.parse().ok()?;
-    Some((state, session))
+    let pgrp = fields.nth(1)?.parse().ok()?;
+    let session = fields.next()?.parse().ok()?;
+    Some((state, pgrp, session))
 }
 
 fn all_pids() -> Vec<i32> {
@@ -263,14 +286,34 @@ fn processes_naming(path: &Path) -> Vec<i32> {
         .into_iter()
         .filter(|pid| {
             let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else { return false };
-            cmdline.windows(needle.len()).any(|w| w == needle) && proc_state(*pid).is_some_and(|(s, _)| s != "Z")
+            cmdline.windows(needle.len()).any(|w| w == needle) && proc_state(*pid).is_some_and(|(s, ..)| s != "Z")
         })
         .collect()
 }
 
 /// Live (non-zombie) processes in session `sid`.
 fn session_members(sid: i32) -> Vec<i32> {
-    all_pids().into_iter().filter(|pid| proc_state(*pid).is_some_and(|(s, sess)| sess == sid && s != "Z")).collect()
+    all_pids().into_iter().filter(|pid| proc_state(*pid).is_some_and(|(s, _, sess)| sess == sid && s != "Z")).collect()
+}
+
+/// Live (non-zombie) processes in process group `pgid`.
+fn group_members(pgid: i32) -> Vec<i32> {
+    all_pids().into_iter().filter(|pid| proc_state(*pid).is_some_and(|(s, grp, _)| grp == pgid && s != "Z")).collect()
+}
+
+/// No live process is left in the session of any job's recorded supervisor, nor in its
+/// recorded worker group or `groups`.
+fn assert_job_sessions_empty(w: &World) {
+    for entry in fs::read_dir(w.path("jobs")).unwrap().flatten() {
+        let job = JobDir::open(&entry.path()).unwrap();
+        let Some(status) = job.read_status() else { continue };
+        if let Some(pid) = status.supervisor_pid {
+            assert_eq!(session_members(pid as i32), Vec::<i32>::new(), "session of {}", job.path.display());
+        }
+        for pgid in status.worker_pgid.into_iter().chain(job.groups()) {
+            assert_eq!(group_members(pgid), Vec::<i32>::new(), "group {pgid} of {}", job.path.display());
+        }
+    }
 }
 
 async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
@@ -282,20 +325,21 @@ async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
 }
 
 /// SIGSTOPs a process and SIGKILLs it when dropped, so a failing test never leaves a
-/// stopped supervisor behind.
-struct Stopped(Pid);
+/// stopped supervisor behind. Both go through a pidfd opened before the stop, so a pid
+/// reaped and reused meanwhile is never hit.
+struct Stopped(OwnedFd);
 
 impl Stopped {
     fn stop(pid: i32) -> Stopped {
-        let pid = Pid::from_raw(pid).unwrap();
-        kill_process(pid, Signal::STOP).unwrap();
-        Stopped(pid)
+        let fd = pidfd_open(Pid::from_raw(pid).unwrap(), PidfdFlags::empty()).unwrap();
+        pidfd_send_signal(&fd, Signal::STOP).unwrap();
+        Stopped(fd)
     }
 }
 
 impl Drop for Stopped {
     fn drop(&mut self) {
-        let _ = kill_process(self.0, Signal::KILL);
+        let _ = pidfd_send_signal(&self.0, Signal::KILL);
     }
 }
 
@@ -1111,6 +1155,8 @@ async fn recovery_waits_for_a_running_job_and_publishes_its_receipt_without_a_se
     let decisions: Vec<_> = report.decisions.iter().map(|d| d.decision).collect();
     assert_eq!(decisions, vec![Decision::PublishRetained], "{report:?}");
     assert_eq!(ctl.of_type(&w, "RecoveryDecision").len(), 1);
+    // The audit records that the receipt came from waiting for a live job.
+    assert!(report.decisions[0].reason.contains("waiting"), "{report:?}");
     assert_eq!(w.jobs(&verify.effect_id).len(), 1, "no second attempt");
     let verify = ctl.effect(&w, "run_verification");
     assert_eq!((verify.state, verify.lease_generation), (EffectState::Completed, 1));
@@ -1209,7 +1255,7 @@ async fn recovery_with_a_sigstopped_supervisor_fences_then_redispatches() {
 async fn recovery_marks_unknown_when_fencing_cannot_free_the_lock() {
     let w = World::new();
     w.crash_run(CrashHook::at(CrashPoint::AfterDispatch, "apply_patch")).await;
-    let ctl = w.open_with(None, &ExecOpts { fence_fails: true, ..ExecOpts::default() });
+    let ctl = w.open_with(None, &ExecOpts { fence: Fence::Fails, ..ExecOpts::default() });
     let patch = ctl.effect(&w, "apply_patch");
     // A job of the dispatched attempt, past its lease, whose lock this test holds.
     let ctx = AttemptCtx { attempt_id: AttemptId::new(), lease_generation: patch.lease_generation, worker: "w".into() };
@@ -1218,11 +1264,12 @@ async fn recovery_marks_unknown_when_fencing_cannot_free_the_lock() {
     let report = ctl.recover(&w).await;
 
     let decisions: Vec<_> = report.decisions.iter().map(|d| d.decision).collect();
-    assert_eq!(decisions, vec![Decision::FenceFailed], "{report:?}");
+    assert_eq!(decisions, vec![Decision::WaitedForJob, Decision::FenceFailed], "{report:?}");
     assert_eq!(report.state, Some(TaskState::Failed));
     let journaled = ctl.of_type(&w, "RecoveryDecision");
-    assert_eq!(journaled.len(), 1);
-    assert_eq!(journaled[0]["decision"], "FenceFailed");
+    assert_eq!(journaled.len(), 2);
+    assert_eq!(journaled[0]["decision"], "WaitedForJob", "journaled before the fence");
+    assert_eq!(journaled[1]["decision"], "FenceFailed");
     let patch = ctl.effect(&w, "apply_patch");
     assert_eq!(patch.state, EffectState::Unknown);
     let failed = ctl.of_type(&w, "Failed");
@@ -1252,8 +1299,10 @@ async fn no_live_process_remains_after_any_recovery_case() {
             let ctl = w.open(None);
             ctl.recover(&w).await;
             w.assert_no_live_process().await;
+            assert_job_sessions_empty(&w);
             assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Succeeded, "{kind}");
             w.assert_no_live_process().await;
+            assert_job_sessions_empty(&w);
         }
     }
     // An orphaned check whose supervisor was killed.
@@ -1269,6 +1318,7 @@ async fn no_live_process_remains_after_any_recovery_case() {
     w.restore_profile();
     ctl.recover(&w).await;
     w.assert_no_live_process().await;
+    assert_job_sessions_empty(&w);
 }
 
 /// One attempt's `[start, last sign of life]` in nanoseconds, from the files the script left.
@@ -1318,4 +1368,123 @@ async fn two_attempts_of_the_same_effect_never_run_concurrently() {
     assert!(found[0].1 < found[1].0, "the attempts overlapped: {found:?}");
     assert_eq!(w.counts.get("run_verification"), 2);
     w.assert_no_live_process().await;
+}
+
+/// A job launched under long timeouts is still inside its lease when a controller
+/// configured with much shorter ones recovers: it is waited for (its own lease counts, not
+/// the recovering controller's timeouts), never fenced.
+#[tokio::test]
+async fn recovery_never_fences_a_job_inside_its_own_lease_under_shorter_timeouts() {
+    let w = World::new();
+    // Longer than the recovering controller's own longest timeout plus the 5 s grace.
+    w.slow_profile(6.5);
+    w.crash_run(CrashHook::at(CrashPoint::DuringExecute, "run_verification")).await;
+    let short = EffectTimeouts { verification: Duration::from_millis(100), other: Duration::from_millis(100) };
+    let ctl = w.open_with(None, &ExecOpts { timeouts: Some(short), ..ExecOpts::default() });
+    let verify = ctl.effect(&w, "run_verification");
+    let job = w.only_job(&verify.effect_id);
+    assert!(job.request().unwrap().lease_expiry_ms > now_ms() + 60_000, "launched under the 70 s lease");
+
+    let report = ctl.recover(&w).await;
+
+    let decisions: Vec<_> = report.decisions.iter().map(|d| d.decision).collect();
+    assert_eq!(decisions, vec![Decision::PublishRetained], "{report:?}");
+    assert!(!job.cancel_requested(), "the job was not fenced");
+    assert_eq!(w.jobs(&verify.effect_id).len(), 1);
+    assert_eq!(ctl.effect(&w, "run_verification").lease_generation, 1);
+    assert_eq!(w.counts.get("run_verification"), 1);
+    w.assert_no_live_process().await;
+}
+
+/// The controller dies while fencing: the fence decision is already journaled (decisions
+/// come before the action), and the next recovery still converges.
+#[tokio::test]
+async fn a_crash_during_the_fence_still_converges() {
+    let baseline = baseline().await;
+    let w = World::new();
+    w.crash_run(CrashHook::at(CrashPoint::AfterDispatch, "apply_patch")).await;
+    let lock = {
+        let ctl = w.open_with(None, &ExecOpts { fence: Fence::Hangs, ..ExecOpts::default() });
+        let patch = ctl.effect(&w, "apply_patch");
+        // A job of the dispatched attempt, past its lease, whose lock this test holds.
+        let ctx = AttemptCtx { attempt_id: AttemptId::new(), lease_generation: patch.lease_generation, worker: "w".into() };
+        let (_job, lock) = JobDir::create(&w.path("jobs"), &job_request(&w, &ctl, &patch, &ctx, now_ms() - 60_000)).unwrap();
+        let died = tokio::time::timeout(Duration::from_secs(2), ctl.recover(&w)).await;
+        assert!(died.is_err(), "the fence never returned");
+        let journaled = ctl.of_type(&w, "RecoveryDecision");
+        assert_eq!(journaled.len(), 1);
+        assert_eq!(journaled[0]["decision"], "WaitedForJob", "journaled before the fence ran");
+        assert_eq!(ctl.effect(&w, "apply_patch").state, EffectState::Dispatched);
+        lock
+    };
+    // The job dies meanwhile (its lock is released).
+    drop(lock);
+    let ctl = w.open(None);
+
+    let report = ctl.recover(&w).await;
+
+    let decisions: Vec<_> = report.decisions.iter().map(|d| d.decision).collect();
+    assert_eq!(decisions, vec![Decision::Redispatch], "{report:?}");
+    assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Succeeded);
+    assert_eq!(summarize(&w, &ctl), baseline);
+    assert_eq!(w.counts.get("apply_patch"), 1);
+    assert_journal_sound(&w, &ctl);
+}
+
+/// A jobs root that cannot be listed says nothing about the jobs in it: recovery must not
+/// conclude "no job" and run the effect again beside one.
+#[tokio::test]
+async fn an_unreadable_jobs_root_never_leads_to_a_redispatch() {
+    let w = World::new();
+    w.crash_run(CrashHook::at(CrashPoint::AfterDispatch, "run_verification")).await;
+    let ctl = w.open(None);
+    fs::remove_dir_all(w.path("jobs")).unwrap();
+    fs::write(w.path("jobs"), b"").unwrap();
+
+    let report = ctl.recover(&w).await;
+
+    let decisions: Vec<_> = report.decisions.iter().map(|d| d.decision).collect();
+    assert_eq!(decisions, vec![Decision::WaitedForJob, Decision::FenceFailed], "{report:?}");
+    assert_eq!(ctl.effect(&w, "run_verification").state, EffectState::Unknown);
+    assert_eq!(ctl.db.task(&w.task).unwrap().state, TaskState::Failed);
+    assert_eq!(w.counts.get("run_verification"), 0);
+}
+
+/// A patch job whose supervisor stopped after the patch was applied and before any receipt
+/// is fenced past its lease; the patch is then reconciled (applied once), never recorded as
+/// failed.
+#[tokio::test]
+async fn a_fenced_patch_job_that_applied_its_patch_is_reconciled_not_failed() {
+    let baseline = baseline().await;
+    let w = World::new();
+    let opts = ExecOpts {
+        slow_poll: Some("apply_patch"),
+        timeouts: Some(EffectTimeouts { verification: Duration::from_secs(70), other: Duration::from_secs(2) }),
+        ..ExecOpts::default()
+    };
+    w.crash_run_with(CrashHook::at(CrashPoint::DuringExecute, "apply_patch"), &opts).await;
+    let ctl = w.open(None);
+    let patch = ctl.effect(&w, "apply_patch");
+    let job = w.only_job(&patch.effect_id);
+    // The supervisor sleeps between polls; the worker finishes the patch meanwhile.
+    wait_until("the worker's outcome", || job.read_outcome().is_some()).await;
+    let supervisor = job.read_status().unwrap().supervisor_pid.unwrap() as i32;
+    let _stopped = Stopped::stop(supervisor);
+    assert_eq!(job.read_receipt(), None);
+    assert_ne!(workspace_digest(&w.ws()).unwrap(), w.base(), "the patch is applied");
+
+    let report = ctl.recover(&w).await;
+
+    let decisions: Vec<_> = report.decisions.iter().map(|d| d.decision).collect();
+    assert_eq!(decisions, vec![Decision::WaitedForJob, Decision::PublishReconciled], "{report:?}");
+    assert_eq!(ctl.of_type(&w, "EffectFailed").len(), 0);
+    let patch = ctl.effect(&w, "apply_patch");
+    assert_eq!((patch.state, patch.lease_generation), (EffectState::Completed, 1));
+    assert!(job.is_dead() && job.read_receipt().is_none());
+    assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Succeeded);
+    assert_eq!(summarize(&w, &ctl), baseline);
+    assert_eq!(w.counts.get("apply_patch"), 1);
+    assert_journal_sound(&w, &ctl);
+    w.assert_no_live_process().await;
+    assert_job_sessions_empty(&w);
 }

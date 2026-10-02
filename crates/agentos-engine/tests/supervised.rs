@@ -21,7 +21,9 @@ use agentos_engine::supervised::{ExecCounts, JobWait, SupervisedExecutor};
 use agentos_engine::supervisor::SupervisorCmd;
 use agentos_engine::workspace::workspace_digest;
 use common::{contract, copy_dir, edit_patch, fix_patch, fixtures, Env, FnAgent};
-use rustix::process::{kill_process, Pid, Signal};
+use std::os::fd::OwnedFd;
+
+use rustix::process::{pidfd_open, pidfd_send_signal, Pid, PidfdFlags, Signal};
 use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_agentos-supervisor");
@@ -125,7 +127,7 @@ impl Fx {
     }
 
     fn jobs(&self, effect: &EffectId) -> Vec<JobDir> {
-        JobDir::list(&self.path("jobs"), effect)
+        JobDir::list(&self.path("jobs"), effect).unwrap()
     }
 
     fn job(&self, effect: &EffectId) -> JobDir {
@@ -161,20 +163,21 @@ fn assert_for(out: &ExecOutcome, req: &EffectRequest, ctx: &AttemptCtx) {
 }
 
 /// SIGSTOPs a process and SIGKILLs it when dropped, so a failing test never leaves a
-/// stopped supervisor behind.
-struct Stopped(Pid);
+/// stopped supervisor behind. Both go through a pidfd opened before the stop, so a pid
+/// reaped and reused meanwhile is never hit.
+struct Stopped(OwnedFd);
 
 impl Stopped {
     fn stop(pid: i32) -> Stopped {
-        let pid = Pid::from_raw(pid).unwrap();
-        kill_process(pid, Signal::STOP).unwrap();
-        Stopped(pid)
+        let fd = pidfd_open(Pid::from_raw(pid).unwrap(), PidfdFlags::empty()).unwrap();
+        pidfd_send_signal(&fd, Signal::STOP).unwrap();
+        Stopped(fd)
     }
 }
 
 impl Drop for Stopped {
     fn drop(&mut self) {
-        let _ = kill_process(self.0, Signal::KILL);
+        let _ = pidfd_send_signal(&self.0, Signal::KILL);
     }
 }
 
@@ -569,12 +572,13 @@ async fn a_job_with_only_request_json_is_waited_for_not_redispatched() {
         worker: WorkerConfig::Scripted(ScriptedConfig { script: "true".into() }),
     };
     // A launcher that died between creating the job and the supervisor's first status: the
-    // lock is held (here by the test), and there is nothing else.
-    let (job, lock) = JobDir::create(&fx.path("jobs"), &job_request(now_ms() + 3_600_000)).unwrap();
+    // lock is held (here by the test), and there is nothing else. Its lease plus the 5 s
+    // grace ends in 500 ms: that, not the caller's bound, is how long it is waited for.
+    let (job, lock) = JobDir::create(&fx.path("jobs"), &job_request(now_ms() - 4_500)).unwrap();
     assert_eq!(job.read_status(), None);
     assert_eq!(exec.retained_outcome(&req.effect_id), None);
     let started = Instant::now();
-    assert_eq!(exec.wait_for_job(&req.effect_id, Duration::from_millis(300)).await, JobWait::StillAlive);
+    assert_eq!(exec.wait_for_job(&req.effect_id, Duration::from_millis(10)).await, JobWait::StillAlive);
     let waited = started.elapsed();
     assert!(waited >= Duration::from_millis(300) && waited < Duration::from_secs(2), "waited {waited:?}");
     // No pid is known, so the fence can kill nothing: the job stays alive and is not
@@ -692,4 +696,44 @@ time.sleep(60)
         tokio::time::sleep(left).await;
     }
     assert!(!marker.exists(), "the member outlived the fence and wrote its marker");
+}
+
+#[tokio::test]
+async fn a_readable_job_is_waited_for_until_its_own_lease_plus_grace_whatever_the_bound() {
+    let fx = Fx::new();
+    let exec = fx.scripted("true");
+    let req = fx.request(EffectKind::ReadSnapshot, b"");
+    let job_req = JobRequest {
+        effect_id: req.effect_id.clone(),
+        task_id: req.task_id.clone(),
+        kind: req.kind.clone(),
+        payload: Vec::new(),
+        contract: req.contract.clone(),
+        attempt_id: AttemptId::new(),
+        lease_generation: 1,
+        // Lease plus grace ends in about a second.
+        lease_expiry_ms: now_ms() - 4_000,
+        task_deadline_ms: 0,
+        worker: WorkerConfig::Scripted(ScriptedConfig { script: "true".into() }),
+    };
+    let (_job, _lock) = JobDir::create(&fx.path("jobs"), &job_req).unwrap();
+    let started = Instant::now();
+    assert_eq!(exec.wait_for_job(&req.effect_id, Duration::from_millis(50)).await, JobWait::StillAlive);
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_millis(900) && waited < Duration::from_secs(3), "waited {waited:?}");
+}
+
+#[tokio::test]
+async fn an_unreadable_jobs_root_is_never_taken_for_no_job() {
+    let fx = Fx::new();
+    let exec = fx.scripted("true");
+    let req = fx.request(EffectKind::ReadSnapshot, b"");
+    // The root cannot be listed (ENOTDIR here; EMFILE or EIO in the wild).
+    fs::remove_dir_all(fx.path("jobs")).unwrap();
+    fs::write(fx.path("jobs"), b"").unwrap();
+    let started = Instant::now();
+    assert_eq!(exec.await_job(&req.effect_id).await, JobWait::StillAlive);
+    assert!(started.elapsed() < Duration::from_secs(1), "nothing to wait for: {:?}", started.elapsed());
+    assert!(!exec.fence_job(&req.effect_id).await);
+    assert_eq!(exec.retained_outcome(&req.effect_id), None);
 }

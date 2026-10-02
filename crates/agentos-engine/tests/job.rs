@@ -265,9 +265,9 @@ fn list_does_not_confuse_effect_a_with_effect_a_dash_b() {
     let ab: EffectId = serde_json::from_str("\"a-b\"").unwrap();
     let (ja, _l1) = JobDir::create(root.path(), &request_for(&a, 1, scripted())).unwrap();
     let (jab, _l2) = JobDir::create(root.path(), &request_for(&ab, 1, scripted())).unwrap();
-    let la: Vec<_> = JobDir::list(root.path(), &a).into_iter().map(|j| j.path).collect();
+    let la: Vec<_> = JobDir::list(root.path(), &a).unwrap().into_iter().map(|j| j.path).collect();
     assert_eq!(la, vec![ja.path]);
-    let lab: Vec<_> = JobDir::list(root.path(), &ab).into_iter().map(|j| j.path).collect();
+    let lab: Vec<_> = JobDir::list(root.path(), &ab).unwrap().into_iter().map(|j| j.path).collect();
     assert_eq!(lab, vec![jab.path]);
 }
 
@@ -333,12 +333,17 @@ fn list_orders_attempts_by_lease_generation_and_ignores_tmp() {
     fs::create_dir(&broken).unwrap();
     fs::write(broken.join("request.json"), b"{").unwrap();
 
-    let listed: Vec<PathBuf> = JobDir::list(root.path(), &effect).into_iter().map(|j| j.path).collect();
+    let listed: Vec<PathBuf> = JobDir::list(root.path(), &effect).unwrap().into_iter().map(|j| j.path).collect();
     made.sort();
     let mut expected = vec![broken];
     expected.extend(made.into_iter().map(|(_, p)| p));
     assert_eq!(listed, expected);
-    assert!(JobDir::list(Path::new("/nonexistent/jobs"), &effect).is_empty());
+    // A jobs root that cannot be read proves nothing about the jobs in it: an error, never
+    // "no job".
+    assert!(JobDir::list(Path::new("/nonexistent/jobs"), &effect).is_err());
+    let file = root.path().join("not-a-dir");
+    fs::write(&file, b"").unwrap();
+    assert!(JobDir::list(&file, &effect).is_err());
 }
 
 #[test]

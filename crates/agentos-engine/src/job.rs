@@ -302,27 +302,26 @@ impl JobDir {
     }
 
     /// Every attempt for `effect`, ascending by lease generation (unreadable requests
-    /// first), ignoring half-created `.tmp` entries.
-    pub fn list(jobs_root: &Path, effect: &EffectId) -> Vec<JobDir> {
+    /// first), ignoring half-created `.tmp` entries. Fails closed: a root (or an entry) that
+    /// cannot be read is an error, never "no job", since a job may be running in it.
+    pub fn list(jobs_root: &Path, effect: &EffectId) -> io::Result<Vec<JobDir>> {
         let prefix = format!("{effect}-");
-        let Ok(entries) = fs::read_dir(jobs_root) else { return Vec::new() };
-        let mut found: Vec<(Option<u64>, JobDir)> = entries
-            .flatten()
-            .filter(|e| {
-                let name = e.file_name();
-                name.to_str().is_some_and(|n| n.starts_with(&prefix) && !n.contains(".tmp"))
-            })
-            .map(|e| JobDir { path: e.path() })
-            .map(|j| {
-                let req = j.request().ok();
-                (req, j)
-            })
-            // The prefix alone also matches effect `a-b` when asked for `a`.
-            .filter(|(req, _)| req.as_ref().is_none_or(|r| r.effect_id == *effect))
-            .map(|(req, j)| (req.map(|r| r.lease_generation), j))
-            .collect();
+        let mut found: Vec<(Option<u64>, JobDir)> = Vec::new();
+        for entry in fs::read_dir(jobs_root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if !name.to_str().is_some_and(|n| n.starts_with(&prefix) && !n.contains(".tmp")) {
+                continue;
+            }
+            let job = JobDir { path: entry.path() };
+            match job.request().ok() {
+                // The prefix alone also matches effect `a-b` when asked for `a`.
+                Some(req) if req.effect_id != *effect => {}
+                req => found.push((req.map(|r| r.lease_generation), job)),
+            }
+        }
         found.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.path.cmp(&b.1.path)));
-        found.into_iter().map(|(_, j)| j).collect()
+        Ok(found.into_iter().map(|(_, j)| j).collect())
     }
 }
 
