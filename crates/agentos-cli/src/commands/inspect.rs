@@ -19,6 +19,13 @@ pub fn status(home: &Home, task: &TaskId) -> Result<(), CliError> {
         .into_iter()
         .map(|e| json!({ "effect_id": e.effect_id, "kind": e.kind.tag(), "state": e.state, "lease_generation": e.lease_generation }))
         .collect();
+    // Prefixes only: a full handle is never printed.
+    let capabilities: Vec<_> = store
+        .db
+        .grants(task)?
+        .into_iter()
+        .map(|g| json!({ "operation": g.operation, "handle_prefix": g.handle.prefix(), "revoked": g.revoked, "expires_ts": g.expires_ts }))
+        .collect();
     print(&json!({
         "task_id": t.id,
         "state": t.state.label(),
@@ -30,6 +37,7 @@ pub fn status(home: &Home, task: &TaskId) -> Result<(), CliError> {
         "usage": store.db.usage_summary(task)?,
         "outstanding_effects": outstanding,
         "jobs": jobs,
+        "capabilities": capabilities,
     }));
     Ok(())
 }

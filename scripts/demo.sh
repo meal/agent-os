@@ -4,7 +4,7 @@ set -u
 cargo build -q -p agentos-cli
 BIN=/work/target/debug/agentos
 rm -rf /tmp/demo && mkdir -p /tmp/demo && cd /tmp/demo
-agentos() { "$BIN" --home /tmp/demo/home --profiles /work/fixtures/profiles "$@"; }
+agentos() { "$BIN" --home /tmp/demo/home "$@"; }
 run() { echo "\$ agentos $*"; agentos "$@"; code=$?; [ $code -eq 0 ] || echo "(exit code $code)"; echo; }
 cat > task.json <<'JSON'
 {
@@ -19,7 +19,9 @@ cat > task.json <<'JSON'
 }
 JSON
 cp /work/fixtures/parser-repo.fix.patch fix.patch
-run submit task.json --yes --fake-agent-patch fix.patch --crash-at after-dispatch:apply_patch 2>&1
+run profile register /work/fixtures/profiles/parser-checks-v1
+# The patch job is launched under its own supervisor, then the controller is killed (exit 75).
+run submit task.json --yes --fake-agent-patch fix.patch --crash-at during-execute:apply_patch 2>&1
 ID=$(ls /tmp/demo/home/tasks | grep -v '^\.' | head -1)
 run status "$ID"
 run resume "$ID"
@@ -29,3 +31,7 @@ agentos events "$ID" | sed -E 's/^\{"payload":.*"seq":([0-9]+),"ts":[0-9]+,"type
 echo
 run export "$ID" bundle
 echo "\$ ls bundle"; ls bundle
+echo "\$ ls home/jobs      # one directory per effect attempt"; ls home/jobs | sed -E 's/^([0-9a-f]{8})[0-9a-f]{56}-([0-9a-f]{8})[0-9a-f-]{28}$/\1…-\2…/'
+echo
+run revoke "$ID" --capability artifact.export
+run export "$ID" bundle-after-revoke

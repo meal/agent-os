@@ -114,6 +114,17 @@ pub struct Manifest {
     pub model: Option<String>,
     /// Journal events of the task at export time.
     pub generated_events: usize,
+    /// The task's capability handles, by 8-character prefix only (a full handle never
+    /// leaves the database).
+    #[serde(default)]
+    pub capabilities: Vec<CapabilityEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityEntry {
+    pub operation: String,
+    pub handle_prefix: String,
+    pub revoked: bool,
 }
 
 fn inconsistent(msg: impl Into<String>) -> ExportError {
@@ -305,6 +316,15 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
         contract_digest,
         model: submitted.and_then(|s| s["model"].as_str()).map(str::to_string),
         generated_events: events.len(),
+        capabilities: db
+            .grants(task)?
+            .into_iter()
+            .map(|g| CapabilityEntry {
+                operation: serde_json::to_value(g.operation).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default(),
+                handle_prefix: g.handle.prefix().to_string(),
+                revoked: g.revoked,
+            })
+            .collect(),
     };
     Ok(Contents { manifest, patch_diff, patches, evidence })
 }
@@ -432,6 +452,7 @@ mod tests {
             contract_digest: Digest::of(b"contract"),
             model: None,
             generated_events: 1,
+            capabilities: Vec::new(),
         };
         let evidence = [b"{\"a\":1}".to_vec(), b"{\"b\":2}".to_vec()].into_iter().map(|b| (Digest::of(&b), b)).collect();
         Contents { manifest, patch_diff: b"diff".to_vec(), patches: vec![("patches/0001-x.patch".into(), b"p".to_vec())], evidence }

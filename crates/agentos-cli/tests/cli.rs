@@ -1144,3 +1144,129 @@ fn cli_tampered_staged_profile_fails_the_task_before_any_verification() {
     assert!(!events.iter().any(|e| e["type"] == "EffectIntended"), "nothing ran on the tampered profile");
     assert!(job_dirs(&cli).is_empty());
 }
+
+/// Every full handle of the task, read from the database (they appear nowhere else).
+fn full_handles(cli: &Cli, id: &str) -> Vec<String> {
+    let conn = rusqlite::Connection::open(cli.home().join("agentos.db")).unwrap();
+    let mut stmt = conn.prepare("SELECT id FROM capabilities WHERE task_id = ?1").unwrap();
+    stmt.query_map([id], |r| r.get::<_, String>(0)).unwrap().map(|r| r.unwrap()).collect()
+}
+
+fn denials(cli: &Cli, id: &str) -> Vec<Value> {
+    cli.events(id).into_iter().filter(|e| e["type"] == "CapabilityDenied").map(|e| e["payload"].clone()).collect()
+}
+
+#[test]
+fn export_journals_the_granted_decision() {
+    let cli = Cli::new();
+    let contract = cli.contract(&cli.repo_copy());
+    let id = cli.submit_yes(&contract, &fix_patch())["task_id"].as_str().unwrap().to_string();
+    cli.export(&id, "bundle");
+    let granted: Vec<Value> = cli.events(&id).into_iter().filter(|e| e["type"] == "CapabilityGranted" && e["payload"]["operation"] == "artifact.export").collect();
+    assert_eq!(granted.len(), 1, "{granted:?}");
+    assert!(granted[0]["payload"]["handle_prefix"].as_str().unwrap().len() == 8);
+}
+
+#[test]
+fn export_without_artifact_export_capability_exits_1_writes_nothing_and_journals_the_denial() {
+    let cli = Cli::new();
+    let repo = cli.repo_copy();
+    let mut contract: Value = serde_json::from_str(&fs::read_to_string(cli.contract(&repo)).unwrap()).unwrap();
+    contract["capabilities"] = json!(["snapshot.read", "workspace.apply_patch", "verification.run"]);
+    let file = cli.write("no-export.json", &contract.to_string());
+    let id = cli.submit_yes(&file, &fix_patch())["task_id"].as_str().unwrap().to_string();
+    let dir = cli.path("bundle");
+    cli.cmd(&["export", &id, dir.to_str().unwrap()]).assert().code(1).stdout("").stderr(predicate::str::contains("export denied"));
+    assert!(!dir.exists(), "nothing written");
+    let denied = denials(&cli, &id);
+    assert_eq!(denied.len(), 1, "{denied:?}");
+    assert_eq!((denied[0]["operation"].as_str(), denied[0]["reason"].as_str()), (Some("artifact.export"), Some("unknown_handle")));
+    assert!(!cli.event_types(&id).contains(&"Exported".to_string()));
+}
+
+#[test]
+fn export_after_revoking_artifact_export_is_denied_revoked() {
+    let cli = Cli::new();
+    let contract = cli.contract(&cli.repo_copy());
+    let id = cli.submit_yes(&contract, &fix_patch())["task_id"].as_str().unwrap().to_string();
+    cli.json(&["revoke", &id, "--capability", "artifact.export"]);
+    let dir = cli.path("bundle");
+    cli.cmd(&["export", &id, dir.to_str().unwrap()]).assert().code(1).stderr(predicate::str::contains("revoked"));
+    assert!(!dir.exists());
+    assert_eq!(denials(&cli, &id)[0]["reason"], "revoked");
+}
+
+#[test]
+fn a_task_failed_on_its_deadline_can_still_be_exported() {
+    let cli = Cli::new();
+    let (profiles, slow) = slow_world(&cli);
+    // The 30 s check cannot finish in 3 s: the supervisor kills it at the deadline.
+    let mut contract: Value = serde_json::from_str(&fs::read_to_string(&slow).unwrap()).unwrap();
+    contract["limits"]["deadline_seconds"] = json!(3);
+    let file = cli.write("slow-deadline.json", &contract.to_string());
+    let out = cli.json_with_profiles(&profiles, &["submit", &file, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()]);
+    assert_eq!(out["state"], "FAILED");
+    let id = out["task_id"].as_str().unwrap();
+    let failed = cli.events(id).into_iter().find(|e| e["type"] == "Failed").unwrap();
+    assert!(failed["payload"].to_string().contains("deadline exceeded"), "{failed}");
+    assert_no_job_processes(&cli);
+    let (_, manifest) = cli.export(id, "bundle");
+    assert_eq!(manifest["state"], "FAILED");
+    assert!(manifest["verified_digest"].is_null(), "no success claim");
+}
+
+#[test]
+fn manifest_lists_capabilities_with_prefixes_only() {
+    let cli = Cli::new();
+    let contract = cli.contract(&cli.repo_copy());
+    let id = cli.submit_yes(&contract, &fix_patch())["task_id"].as_str().unwrap().to_string();
+    let (dir, manifest) = cli.export(&id, "bundle");
+    let caps = manifest["capabilities"].as_array().unwrap();
+    assert_eq!(caps.len(), 4);
+    assert!(caps.iter().all(|c| c["handle_prefix"].as_str().unwrap().len() == 8 && c["revoked"] == false));
+    let handles = full_handles(&cli, &id);
+    assert_eq!(handles.len(), 4);
+    let mut everything = String::new();
+    for entry in walk(&dir) {
+        everything.push_str(&String::from_utf8_lossy(&fs::read(entry).unwrap()));
+    }
+    everything.push_str(&serde_json::to_string(&cli.status(&id)).unwrap());
+    for e in cli.events(&id) {
+        everything.push_str(&e.to_string());
+    }
+    for handle in &handles {
+        assert!(!everything.contains(handle.as_str()), "a full handle leaked");
+        assert!(everything.contains(&handle[..8]), "its prefix is shown");
+    }
+}
+
+#[test]
+fn status_lists_capabilities_without_full_handles() {
+    let cli = Cli::new();
+    let contract = cli.contract(&cli.repo_copy());
+    let id = cli.submit_yes(&contract, &fix_patch())["task_id"].as_str().unwrap().to_string();
+    cli.json(&["revoke", &id, "--capability", "verification.run"]);
+    let status = cli.status(&id);
+    let caps = status["capabilities"].as_array().unwrap();
+    assert_eq!(caps.len(), 4);
+    let revoked: Vec<&str> = caps.iter().filter(|c| c["revoked"] == true).map(|c| c["operation"].as_str().unwrap()).collect();
+    assert_eq!(revoked, vec!["verification.run"]);
+    let export = caps.iter().find(|c| c["operation"] == "artifact.export").unwrap();
+    assert!(export["expires_ts"].is_null(), "export never expires");
+    let text = status.to_string();
+    for handle in full_handles(&cli, &id) {
+        assert!(!text.contains(&handle));
+    }
+}
+
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir).unwrap().flatten() {
+        if entry.file_type().unwrap().is_dir() {
+            out.extend(walk(&entry.path()));
+        } else {
+            out.push(entry.path());
+        }
+    }
+    out
+}

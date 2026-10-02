@@ -152,7 +152,7 @@ pub(crate) async fn close<E: Executor>(cx: &Cx<'_, E>, reason: &str) -> Result<T
     let closing = cx.closing_with(reason);
     // Boxed: closing recovery reaches `run_attempt` (which can close) again.
     let pass: std::pin::Pin<Box<dyn std::future::Future<Output = Result<RecoveryReport>> + '_>> = Box::pin(reconcile(&closing));
-    Ok(pass.await?.state.unwrap_or_else(|| TaskState::Failed))
+    Ok(pass.await?.state.unwrap_or(TaskState::Failed))
 }
 
 pub(crate) async fn reconcile<E: Executor>(cx: &Cx<'_, E>) -> Result<RecoveryReport> {

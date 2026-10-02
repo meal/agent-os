@@ -192,6 +192,19 @@ impl Db {
         }
     }
 
+    /// Journaled authorization of `op` on `resource` in its own write transaction, for callers
+    /// outside `record_intent`/`mark_dispatched` (export). A grant journals
+    /// `CapabilityGranted`; a denial journals `CapabilityDenied` and returns
+    /// `DbError::CapabilityDenied`, the journal row committed either way.
+    pub fn authorize(&self, task: &TaskId, op: Capability, resource: &Resource) -> Result<Handle> {
+        let tx = self.immediate()?;
+        load_task(&tx, task)?;
+        let decision = authorize_in(&tx, task, op, resource, self.now());
+        // A denial is durable although the operation is refused.
+        tx.commit()?;
+        decision
+    }
+
     /// Revokes the task's live handles (only `only`'s, when given). Returns the operations
     /// actually revoked; journals `CapabilityRevoked` only when something changed.
     pub fn revoke(&self, task: &TaskId, only: Option<Capability>) -> Result<Vec<Capability>> {

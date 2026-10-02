@@ -107,10 +107,8 @@ pub async fn submit(home: &Home, task_file: &Path, yes: bool, patch: Option<&Pat
     copy_tree(&profile, &staging.path().join("profile"))?;
     let repo_digest = workspace_digest(&staging.path().join("snapshot"))?;
     let profile_digest = workspace_digest(&staging.path().join("profile"))?;
-    if let Some(pin) = &contract.profile_digest {
-        if profile_digest.to_string() != *pin {
-            return Err(CliError::usage(format!("verification profile changed while it was recorded: pinned {pin}, found {profile_digest}")));
-        }
+    if let Some(pin) = contract.profile_digest.as_ref().filter(|pin| **pin != profile_digest.to_string()) {
+        return Err(CliError::usage(format!("verification profile changed while it was recorded: pinned {pin}, found {profile_digest}")));
     }
     if expected_revision.is_some_and(|d| d != repo_digest) {
         return Err(CliError::usage(format!("repository source changed while it was recorded (now {repo_digest})")));
