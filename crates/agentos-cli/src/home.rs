@@ -3,7 +3,7 @@
 //! ```text
 //! <home>/agentos.db          journal (SQLite, WAL)
 //! <home>/blobs/              content-addressed artifacts
-//! <home>/receipts/           executor receipts retained across controller restarts
+//! <home>/jobs/               one directory per effect attempt: request, status, receipt (see agentos-engine job.rs)
 //! <home>/work/<task>/ws      task workspaces
 //! <home>/tasks/<task>/       inputs recorded at submission: snapshot/, profile/, agent.patch
 //! <home>/driver.lock         held by the one process driving tasks (running or recovering)
@@ -15,12 +15,16 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 use agentos_core::ids::TaskId;
-use agentos_engine::fixture::FixtureExecutor;
+use agentos_engine::job::{HostConfig, WorkerConfig};
+use agentos_engine::supervised::{ExecCounts, SupervisedExecutor};
 use agentos_store::blob::BlobStore;
 use agentos_store::db::Db;
 
-use crate::durable::DurableExecutor;
+use crate::commands::supervise::supervisor_cmd;
 use crate::error::CliError;
+
+/// How long a verification check may run (the fixture executor's default).
+const VERIFY_TIMEOUT_SECS: u64 = 60;
 
 pub struct Home {
     pub root: PathBuf,
@@ -120,12 +124,21 @@ impl Home {
     }
 
     /// The executor for `task`, over the inputs recorded at its submission.
-    pub fn executor(&self, task: &TaskId) -> Result<DurableExecutor<FixtureExecutor>, CliError> {
+    pub fn executor(&self, task: &TaskId) -> Result<SupervisedExecutor, CliError> {
         let dir = self.task_dir(task);
         if !dir.join("snapshot").is_dir() || !dir.join("profile").is_dir() {
             return Err(CliError::other(format!("task {task} has no recorded inputs in {}; it was not completely submitted", dir.display())));
         }
-        let fixture = FixtureExecutor::new(dir.join("snapshot"), dir.join("profile"), self.root.join("work"));
-        Ok(DurableExecutor::new(fixture, self.root.join("receipts"))?)
+        // The supervisor runs in its own working directory: every path is absolute.
+        let root = std::path::absolute(&self.root)?;
+        let task_dir = root.join("tasks").join(task.as_str());
+        let host = HostConfig {
+            snapshot_dir: task_dir.join("snapshot"),
+            profile_dir: task_dir.join("profile"),
+            work_root: root.join("work"),
+            verify_timeout_secs: VERIFY_TIMEOUT_SECS,
+            profile_digest: None,
+        };
+        Ok(SupervisedExecutor::new(root.join("jobs"), supervisor_cmd()?, WorkerConfig::Host(host), ExecCounts::default())?)
     }
 }

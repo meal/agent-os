@@ -153,6 +153,13 @@ fn normalized(manifest: &Value) -> Value {
     let obj = m.as_object_mut().unwrap();
     obj.remove("task_id");
     obj.remove("generated_events");
+    if let Some(caps) = obj.get_mut("capabilities").and_then(Value::as_array_mut) {
+        for cap in caps {
+            if let Some(cap) = cap.as_object_mut() {
+                cap.remove("handle_prefix");
+            }
+        }
+    }
     for list in ["patches", "verification_results"] {
         for item in obj[list].as_array_mut().unwrap() {
             item.as_object_mut().unwrap().remove("effect_id");
@@ -741,4 +748,155 @@ fn submit_yes_approves_before_driving() {
     let types = cli.event_types(id);
     assert_eq!(types.iter().filter(|t| *t == "CapabilitiesIssued").count(), 1);
     assert_subsequence(&types, &["TaskCreated", "Submitted", "CapabilitiesIssued", "Started", "CapabilityGranted", "EffectIntended"]);
+}
+
+/// Job directories under the home, as (effect id, directory name): names are
+/// `<effect_id>-<attempt_id>` and effect ids are 64 hex digits.
+fn job_dirs(cli: &Cli) -> Vec<(String, String)> {
+    let Ok(entries) = fs::read_dir(cli.home().join("jobs")) else { return Vec::new() };
+    let mut dirs: Vec<(String, String)> = entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .map(|name| (name[..64].to_string(), name))
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+fn assert_one_job_per_effect(cli: &Cli, what: &str) {
+    let dirs = job_dirs(cli);
+    assert!(!dirs.is_empty(), "{what}: no job directories");
+    let effects: BTreeSet<&String> = dirs.iter().map(|(e, _)| e).collect();
+    assert_eq!(effects.len(), dirs.len(), "{what}: more than one job for an effect: {dirs:?}");
+}
+
+/// Pids of processes whose command line mentions `needle`.
+fn processes_mentioning(needle: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir("/proc").unwrap().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(cmdline) = fs::read(entry.path().join("cmdline")) else { continue };
+        if String::from_utf8_lossy(&cmdline).contains(needle) {
+            found.push(name);
+        }
+    }
+    found
+}
+
+#[test]
+fn supervise_subcommands_are_hidden_from_help() {
+    let cli = Cli::new();
+    let out = cli.cmd(&["--help"]).assert().success().get_output().stdout.clone();
+    assert!(!String::from_utf8_lossy(&out).contains("supervise"));
+}
+
+#[test]
+fn home_has_no_receipts_dir() {
+    let cli = Cli::new();
+    let contract = cli.contract(&cli.repo_copy());
+    assert_eq!(cli.submit_yes(&contract, &fix_patch())["state"], "SUCCEEDED");
+    assert!(!cli.home().join("receipts").exists());
+    assert!(cli.home().join("jobs").is_dir());
+    assert_one_job_per_effect(&cli, "clean run");
+}
+
+#[test]
+fn during_execute_rows_resume_by_publishing_the_receipt_with_one_job_per_effect() {
+    for spec in ["during-execute:apply_patch", "during-execute:run_verification"] {
+        let cli = Cli::new();
+        let contract = cli.contract(&fixtures().join("parser-repo"));
+        let clean = cli.submit_yes(&contract, &fix_patch());
+        let (_, expected) = cli.export(clean["task_id"].as_str().unwrap(), "clean");
+        let before = job_dirs(&cli).len();
+
+        let id = cli.crash(&contract, spec);
+        assert!(job_dirs(&cli).len() > before, "{spec}: the crashed run launched its job");
+        assert_eq!(cli.json(&["resume", &id]), json!({ "task_id": id, "state": "SUCCEEDED" }), "{spec}");
+        // Resume published the crashed effect's receipt instead of launching it again: the
+        // two runs together have exactly two jobs per effect of one clean run.
+        assert_eq!(job_dirs(&cli).len(), 2 * before, "{spec}");
+        assert_one_job_per_effect(&cli, spec);
+        let (_, manifest) = cli.export(&id, "recovered");
+        assert_eq!(normalized(&manifest), normalized(&expected), "{spec}");
+    }
+}
+
+#[test]
+fn status_shows_job_state_for_outstanding_effects() {
+    let cli = Cli::new();
+    let contract = cli.contract(&fixtures().join("parser-repo"));
+    let id = cli.crash(&contract, "during-execute:run_verification");
+    let status = cli.status(&id);
+    let outstanding = status["outstanding_effects"].as_array().unwrap();
+    assert_eq!(outstanding.len(), 1);
+    let jobs = status["jobs"].as_array().unwrap();
+    assert_eq!(jobs.len(), 1, "{status}");
+    assert_eq!(jobs[0]["effect_id"], outstanding[0]["effect_id"]);
+    // The controller died right after the launch: the job is either still running or done.
+    assert!(jobs[0]["alive"] == true || jobs[0]["receipt"] == true, "{status}");
+    // A job that has not written its first status yet has no state; a finished one has.
+    assert!(jobs[0]["state"].is_string() || jobs[0]["receipt"] == false, "{status}");
+    cli.json(&["resume", &id]);
+    assert_eq!(cli.status(&id)["jobs"], json!([]));
+}
+
+#[test]
+fn controller_sigkill_while_a_slow_verification_runs_then_resume_publishes_the_receipt() {
+    let cli = Cli::new();
+    // A registry whose only profile is the parser check preceded by a 3 s sleep.
+    let profiles = cli.path("profiles");
+    copy_tree(&fixtures().join("profiles"), &profiles).unwrap();
+    let slow = profiles.join("slow-checks-v1");
+    copy_tree(&profiles.join("parser-checks-v1"), &slow).unwrap();
+    let script = fs::read_to_string(slow.join("check_parser.py")).unwrap();
+    fs::write(slow.join("check_parser.py"), format!("import time\ntime.sleep(3)\n{script}")).unwrap();
+    fs::write(slow.join("profile.json"), r#"{ "id": "slow-checks-v1", "command": ["python3", "check_parser.py"], "protected": true }"#).unwrap();
+    let contract = cli.write("slow.json", &fs::read_to_string(cli.contract(&cli.repo_copy())).unwrap().replace("parser-checks-v1", "slow-checks-v1"));
+
+    let mut child = StdCommand::new(env!("CARGO_BIN_EXE_agentos"))
+        .arg("--home")
+        .arg(cli.home())
+        .arg("--profiles")
+        .arg(&profiles)
+        .args(["submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let verification_started = || {
+        // Its supervisor is up once it has written a status; before that the job is only a
+        // directory the dying controller still locks, which recovery rightly retries.
+        fs::read_dir(cli.home().join("jobs")).into_iter().flatten().flatten().any(|e| {
+            e.path().join("status.json").is_file() && fs::read_to_string(e.path().join("request.json")).is_ok_and(|r| r.contains("RunVerification"))
+        })
+    };
+    let started = std::time::Instant::now();
+    while !verification_started() {
+        assert!(started.elapsed() < std::time::Duration::from_secs(60), "the verification job never started");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let id = first_task(&cli);
+    let resumed = cli.cmd_with_profiles(&profiles, &["resume", &id]).assert().success().get_output().stdout.clone();
+    assert_eq!(serde_json::from_slice::<Value>(&resumed).unwrap(), json!({ "task_id": id, "state": "SUCCEEDED" }));
+    let verifications = job_dirs(&cli)
+        .into_iter()
+        .filter(|(_, name)| fs::read_to_string(cli.home().join("jobs").join(name).join("request.json")).is_ok_and(|r| r.contains("RunVerification")))
+        .count();
+    assert_eq!(verifications, 1, "exactly one job for the verification effect");
+    assert_one_job_per_effect(&cli, "after sigkill");
+    let jobs = cli.home().join("jobs");
+    assert_eq!(processes_mentioning(jobs.to_str().unwrap()), Vec::<String>::new(), "no supervisor or worker left");
+}
+
+/// The id of the only task in the home.
+fn first_task(cli: &Cli) -> String {
+    let mut ids: Vec<String> = fs::read_dir(cli.home().join("tasks")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(ids.len(), 1, "{ids:?}");
+    ids.remove(0)
 }

@@ -2,6 +2,7 @@ mod control;
 mod export;
 mod inspect;
 mod submit;
+pub mod supervise;
 
 use agentos_core::ids::TaskId;
 use agentos_core::state::TaskState;
@@ -25,6 +26,7 @@ pub async fn dispatch(args: Args) -> Result<(), CliError> {
         }
         Command::Cancel { id } => control::cancel(&home, &task_id(&id)?).await,
         Command::Export { id, dir } => export::export(&home, &task_id(&id)?, &dir),
+        Command::Supervise { .. } => unreachable!("handled before the runtime starts"),
     }
 }
 

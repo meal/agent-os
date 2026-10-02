@@ -6,7 +6,6 @@ mod args;
 mod commands;
 pub mod crash;
 mod drive;
-mod durable;
 mod error;
 mod home;
 
@@ -18,6 +17,11 @@ pub fn run() -> i32 {
     let ansi = std::io::IsTerminal::is_terminal(&std::io::stderr());
     tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).with_ansi(ansi).init();
     let args = args::Args::parse();
+    // The supervisor and its worker are plain synchronous processes (the worker builds its
+    // own runtime), so they are entered before ours exists.
+    if let args::Command::Supervise { verb, job_dir } = &args.command {
+        return commands::supervise::run(verb, job_dir);
+    }
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {

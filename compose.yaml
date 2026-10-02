@@ -2,5 +2,6 @@ services:
   test:
     build: .
     volumes: [".:/work", "cargo-cache:/usr/local/cargo/registry", "target:/work/target"]
+    init: true
     command: cargo test --workspace
 volumes: { cargo-cache: {}, target: {} }

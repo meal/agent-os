@@ -1,6 +1,10 @@
 use agentos_core::ids::TaskId;
 use serde_json::json;
 
+use agentos_core::effect::EffectId;
+use agentos_engine::job::JobDir;
+use serde_json::Value;
+
 use super::print;
 use crate::error::CliError;
 use crate::home::Home;
@@ -8,9 +12,10 @@ use crate::home::Home;
 pub fn status(home: &Home, task: &TaskId) -> Result<(), CliError> {
     let store = home.open()?;
     let t = store.db.task(task)?;
-    let outstanding: Vec<_> = store
-        .db
-        .outstanding_effects(task)?
+    let effects = store.db.outstanding_effects(task)?;
+    let jobs_root = std::path::absolute(&home.root)?.join("jobs");
+    let jobs: Vec<_> = effects.iter().filter_map(|e| latest_job(&jobs_root, &e.effect_id)).collect();
+    let outstanding: Vec<_> = effects
         .into_iter()
         .map(|e| json!({ "effect_id": e.effect_id, "kind": e.kind.tag(), "state": e.state, "lease_generation": e.lease_generation }))
         .collect();
@@ -24,6 +29,7 @@ pub fn status(home: &Home, task: &TaskId) -> Result<(), CliError> {
         "actions_used": t.actions_used,
         "usage": store.db.usage_summary(task)?,
         "outstanding_effects": outstanding,
+        "jobs": jobs,
     }));
     Ok(())
 }
@@ -34,4 +40,20 @@ pub fn events(home: &Home, task: &TaskId) -> Result<(), CliError> {
         print(&json!({ "seq": e.seq, "type": e.event_type, "payload": e.payload, "ts": e.ts }));
     }
     Ok(())
+}
+
+/// The job of the highest lease generation of `effect`: where it stands, whether its
+/// supervisor still holds the lock (`alive`), and whether a receipt is on disk.
+fn latest_job(jobs_root: &std::path::Path, effect: &EffectId) -> Option<Value> {
+    let job = JobDir::list(jobs_root, effect).ok()?.into_iter().next_back()?;
+    let request = job.request().ok()?;
+    let state = job.read_status().map(|s| serde_json::to_value(s.state).unwrap_or(Value::Null)).unwrap_or(Value::Null);
+    Some(json!({
+        "effect_id": effect,
+        "attempt_id": request.attempt_id,
+        "lease_generation": request.lease_generation,
+        "state": state,
+        "alive": !job.is_dead(),
+        "receipt": job.read_receipt().is_some(),
+    }))
 }

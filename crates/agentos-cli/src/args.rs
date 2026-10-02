@@ -8,7 +8,7 @@ use crate::crash::CrashSpec;
 #[derive(Debug, Parser)]
 #[command(name = "agentos", version)]
 pub struct Args {
-    /// Home directory (journal, blobs, receipts, workspaces); created on first use.
+    /// Home directory (journal, blobs, jobs, workspaces); created on first use.
     #[arg(long, global = true, value_name = "DIR")]
     pub home: Option<PathBuf>,
     /// Verification profile registry, one profile per `<id>/` directory [default: <home>/profiles].
@@ -54,4 +54,10 @@ pub enum Command {
     Cancel { id: String },
     /// Write the export bundle of a finished task to DIR.
     Export { id: String, dir: PathBuf },
+    /// Internal: the per-job supervisor and its worker (`run|worker JOB_DIR`).
+    #[command(hide = true)]
+    Supervise {
+        verb: String,
+        job_dir: PathBuf,
+    },
 }
