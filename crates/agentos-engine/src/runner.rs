@@ -57,7 +57,7 @@ fn turn_limit(contract: &Contract) -> u32 {
 }
 
 /// The capability's contract name, e.g. `verification.run`.
-fn capability_name(cap: Capability) -> String {
+pub(crate) fn capability_name(cap: Capability) -> String {
     serde_json::to_value(cap).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()
 }
 
@@ -308,7 +308,7 @@ async fn verify<E: Executor>(cx: &Cx<'_, E>, since: Option<u64>) -> Result<Next>
         tracing::info!(task_id = %task, denial, "verification denied by the broker");
         let capability = capability_name(Capability::VerificationRun);
         if journal::denial(&after).is_none() {
-            let audit = json!({ "action": "Verify", "reason": "CapabilityDenied", "capability": capability });
+            let audit = json!({ "action": "Verify", "reason": "CapabilityDenied", "capability": capability, "denial": denial });
             db.append_audit(task, "Denied", &audit)?;
             tracing::info!(task_id = %task, %audit, "verification denied");
         }

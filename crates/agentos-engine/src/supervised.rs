@@ -470,6 +470,29 @@ impl SupervisedExecutor {
         }
     }
 
+    /// Asks the live jobs of `effects` to stop by dropping their `cancel` marker; the
+    /// supervisors kill their workers within a poll interval. Nothing is waited for: the
+    /// caller (or recovery) reads what the jobs leave. Returns how many markers were dropped.
+    pub fn cancel_jobs(&self, effects: &[EffectId]) -> usize {
+        let mut dropped = 0;
+        for effect in effects {
+            let jobs = match self.jobs(effect) {
+                Ok(jobs) => jobs,
+                Err(e) => {
+                    tracing::warn!(effect_id = %effect, error = %e, "cannot list the effect's jobs to cancel them");
+                    continue;
+                }
+            };
+            for job in jobs.iter().filter(|j| !j.is_dead()) {
+                match job.drop_cancel() {
+                    Ok(()) => dropped += 1,
+                    Err(e) => tracing::warn!(job = %job.path.display(), error = %e, "cannot drop the cancel marker"),
+                }
+            }
+        }
+        dropped
+    }
+
     /// Fences every job in `jobs` that is not dead: drops `cancel`, gives the job
     /// `FENCE_GRACE_MS` to stop, then kills its recorded processes. Returns whether every
     /// job is dead afterwards.

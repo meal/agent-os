@@ -5,7 +5,7 @@
 mod common;
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -290,5 +290,4 @@ async fn unapproved_task_has_no_deadline_and_a_late_approval_starts_a_fresh_one(
     assert!(!db.deadline_passed(&task).unwrap());
     clock.store(1_000_600, Ordering::SeqCst);
     assert!(db.deadline_passed(&task).unwrap());
-    let _ = Path::new("");
 }

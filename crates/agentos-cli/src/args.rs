@@ -52,6 +52,13 @@ pub enum Command {
     },
     /// Cancel a task; in-flight effects are reconciled first.
     Cancel { id: String },
+    /// Revoke a task's capabilities (all, or one by its contract name, e.g. verification.run);
+    /// running jobs that depend on a revoked capability are stopped.
+    Revoke {
+        id: String,
+        #[arg(long, value_name = "NAME")]
+        capability: Option<String>,
+    },
     /// Write the export bundle of a finished task to DIR.
     Export { id: String, dir: PathBuf },
     /// Internal: the per-job supervisor and its worker (`run|worker JOB_DIR`).

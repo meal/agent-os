@@ -843,41 +843,65 @@ fn status_shows_job_state_for_outstanding_effects() {
     assert_eq!(cli.status(&id)["jobs"], json!([]));
 }
 
-#[test]
-fn controller_sigkill_while_a_slow_verification_runs_then_resume_publishes_the_receipt() {
-    let cli = Cli::new();
-    // A registry whose only profile is the parser check preceded by a 3 s sleep.
+/// A registry whose only extra profile is the parser check preceded by a 30 s sleep, and a
+/// contract for it over a copy of the fixture repository.
+fn slow_world(cli: &Cli) -> (PathBuf, String) {
     let profiles = cli.path("profiles");
     copy_tree(&fixtures().join("profiles"), &profiles).unwrap();
     let slow = profiles.join("slow-checks-v1");
     copy_tree(&profiles.join("parser-checks-v1"), &slow).unwrap();
     let script = fs::read_to_string(slow.join("check_parser.py")).unwrap();
-    fs::write(slow.join("check_parser.py"), format!("import time\ntime.sleep(3)\n{script}")).unwrap();
+    fs::write(slow.join("check_parser.py"), format!("import time\ntime.sleep(30)\n{script}")).unwrap();
     fs::write(slow.join("profile.json"), r#"{ "id": "slow-checks-v1", "command": ["python3", "check_parser.py"], "protected": true }"#).unwrap();
     let contract = cli.write("slow.json", &fs::read_to_string(cli.contract(&cli.repo_copy())).unwrap().replace("parser-checks-v1", "slow-checks-v1"));
+    (profiles, contract)
+}
 
-    let mut child = StdCommand::new(env!("CARGO_BIN_EXE_agentos"))
+/// `submit --yes` as a background process.
+fn spawn_submit(cli: &Cli, profiles: &Path, contract: &str) -> std::process::Child {
+    StdCommand::new(env!("CARGO_BIN_EXE_agentos"))
         .arg("--home")
         .arg(cli.home())
         .arg("--profiles")
-        .arg(&profiles)
-        .args(["submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()])
+        .arg(profiles)
+        .args(["submit", contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .unwrap();
-    let verification_started = || {
-        // Its supervisor is up once it has written a status; before that the job is only a
-        // directory the dying controller still locks, which recovery rightly retries.
-        fs::read_dir(cli.home().join("jobs")).into_iter().flatten().flatten().any(|e| {
-            e.path().join("status.json").is_file() && fs::read_to_string(e.path().join("request.json")).is_ok_and(|r| r.contains("RunVerification"))
-        })
-    };
+        .unwrap()
+}
+
+/// Waits until the verification job's supervisor is up (it has written a status). Before
+/// that the job is only a directory the controller still locks, which recovery rightly
+/// retries and a cancel marker would not reach.
+fn wait_for_verification_job(cli: &Cli) {
     let started = std::time::Instant::now();
-    while !verification_started() {
+    loop {
+        let up = fs::read_dir(cli.home().join("jobs")).into_iter().flatten().flatten().any(|e| {
+            e.path().join("status.json").is_file() && fs::read_to_string(e.path().join("request.json")).is_ok_and(|r| r.contains("RunVerification"))
+        });
+        if up {
+            return;
+        }
         assert!(started.elapsed() < std::time::Duration::from_secs(60), "the verification job never started");
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+}
+
+fn assert_no_job_processes(cli: &Cli) {
+    let jobs = cli.home().join("jobs");
+    assert_eq!(processes_mentioning(jobs.to_str().unwrap()), Vec::<String>::new(), "no supervisor or worker left");
+}
+
+#[test]
+fn controller_sigkill_while_a_slow_verification_runs_then_resume_publishes_the_receipt() {
+    let cli = Cli::new();
+    let (profiles, contract) = slow_world(&cli);
+    // Shorten the check: the 30 s sleep becomes 3 s.
+    let script = profiles.join("slow-checks-v1/check_parser.py");
+    fs::write(&script, fs::read_to_string(&script).unwrap().replace("sleep(30)", "sleep(3)")).unwrap();
+    let mut child = spawn_submit(&cli, &profiles, &contract);
+    wait_for_verification_job(&cli);
     child.kill().unwrap();
     child.wait().unwrap();
 
@@ -890,8 +914,68 @@ fn controller_sigkill_while_a_slow_verification_runs_then_resume_publishes_the_r
         .count();
     assert_eq!(verifications, 1, "exactly one job for the verification effect");
     assert_one_job_per_effect(&cli, "after sigkill");
-    let jobs = cli.home().join("jobs");
-    assert_eq!(processes_mentioning(jobs.to_str().unwrap()), Vec::<String>::new(), "no supervisor or worker left");
+    assert_no_job_processes(&cli);
+}
+
+#[test]
+fn revoke_unknown_capability_name_exits_2() {
+    let cli = Cli::new();
+    let contract = cli.contract(&cli.repo_copy());
+    let done = cli.submit_yes(&contract, &fix_patch());
+    let id = done["task_id"].as_str().unwrap();
+    cli.cmd(&["revoke", id, "--capability", "teleport.now"]).assert().code(2).stderr(predicate::str::contains("unknown capability"));
+}
+
+#[test]
+fn revoke_on_a_terminal_task_is_allowed_and_cancels_nothing() {
+    let cli = Cli::new();
+    let contract = cli.contract(&cli.repo_copy());
+    let done = cli.submit_yes(&contract, &fix_patch());
+    let id = done["task_id"].as_str().unwrap();
+    let out = cli.json(&["revoke", id, "--capability", "verification.run"]);
+    assert_eq!(out, json!({ "task_id": id, "revoked": ["verification.run"], "cancelled_jobs": 0 }));
+    // Revoking again changes nothing.
+    assert_eq!(cli.json(&["revoke", id, "--capability", "verification.run"])["revoked"], json!([]));
+    assert_eq!(cli.status(id)["state"], "SUCCEEDED");
+    assert!(cli.event_types(id).contains(&"CapabilityRevoked".to_string()));
+    cli.cmd(&["revoke", "00000000-0000-4000-8000-000000000000"]).assert().code(1).stderr(predicate::str::contains("unknown task"));
+}
+
+#[test]
+fn revoke_verification_run_stops_the_running_check_from_another_process() {
+    let cli = Cli::new();
+    let (profiles, contract) = slow_world(&cli);
+    let started = std::time::Instant::now();
+    let mut child = spawn_submit(&cli, &profiles, &contract);
+    wait_for_verification_job(&cli);
+    let id = first_task(&cli);
+    let out = cli.cmd_with_profiles(&profiles, &["revoke", &id, "--capability", "verification.run"]).assert().success().get_output().stdout.clone();
+    assert_eq!(serde_json::from_slice::<Value>(&out).unwrap(), json!({ "task_id": id, "revoked": ["verification.run"], "cancelled_jobs": 1 }));
+    assert!(child.wait().unwrap().success(), "the driver finished the task");
+    assert!(started.elapsed() < std::time::Duration::from_secs(25), "the 30 s check was stopped, took {:?}", started.elapsed());
+    assert_eq!(cli.status(&id)["state"], "FAILED");
+    let events = cli.events(&id);
+    assert!(events.iter().any(|e| e["type"] == "EffectFailed" && e["payload"].to_string().contains("cancelled")), "the killed check is a recorded failure");
+    assert_eq!(events.iter().filter(|e| e["type"] == "EffectCompleted").count(), 2, "earlier results stay");
+    assert_no_job_processes(&cli);
+}
+
+#[test]
+fn cancel_drops_markers_for_running_jobs_and_ends_cancelled_with_no_live_process() {
+    let cli = Cli::new();
+    let (profiles, contract) = slow_world(&cli);
+    let started = std::time::Instant::now();
+    let mut child = spawn_submit(&cli, &profiles, &contract);
+    wait_for_verification_job(&cli);
+    let id = first_task(&cli);
+    // Another process drives the task: the cancel is only requested, but the running job is
+    // told to stop at once, so the driver does not wait out the check.
+    let out = cli.cmd_with_profiles(&profiles, &["cancel", &id]).assert().success().get_output().stdout.clone();
+    assert_eq!(serde_json::from_slice::<Value>(&out).unwrap()["cancel_requested"], true);
+    child.wait().unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(25), "took {:?}", started.elapsed());
+    assert_eq!(cli.status(&id)["state"], "CANCELLED");
+    assert_no_job_processes(&cli);
 }
 
 /// The id of the only task in the home.

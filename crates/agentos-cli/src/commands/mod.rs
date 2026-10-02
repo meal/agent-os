@@ -1,6 +1,7 @@
 mod control;
 mod export;
 mod inspect;
+mod revoke;
 mod submit;
 pub mod supervise;
 
@@ -25,6 +26,7 @@ pub async fn dispatch(args: Args) -> Result<(), CliError> {
             control::resume(&home, &task_id(&id)?, fake_agent_patch.as_deref(), crash_at.as_ref()).await
         }
         Command::Cancel { id } => control::cancel(&home, &task_id(&id)?).await,
+        Command::Revoke { id, capability } => revoke::revoke(&home, &task_id(&id)?, capability.as_deref()),
         Command::Export { id, dir } => export::export(&home, &task_id(&id)?, &dir),
         Command::Supervise { .. } => unreachable!("handled before the runtime starts"),
     }

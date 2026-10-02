@@ -74,6 +74,9 @@ pub async fn cancel(home: &Home, task: &TaskId) -> Result<(), CliError> {
     if !t.cancel_requested {
         store.db.append(task, &TaskEvent::CancelRequested)?;
     }
+    // Running jobs are asked to stop first, whoever drives the task, so the reconciliation
+    // below (or the driver's) does not wait out their leases.
+    super::revoke::cancel_running_jobs(home, &store, task, None)?;
     let Some(lock) = home.try_lock()? else {
         let state = store.db.task(task)?.state;
         let note = if home.driven_task().as_deref() == Some(task.as_str()) {

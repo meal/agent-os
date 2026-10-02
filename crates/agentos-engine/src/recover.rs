@@ -141,9 +141,18 @@ pub(crate) async fn deadline_stop<E: Executor>(cx: &Cx<'_, E>) -> Result<Option<
     if !deadline_due(cx)? {
         return Ok(None);
     }
-    // Boxed: closing recovery reaches `run_attempt` (which gates on the deadline) again.
-    let closing: std::pin::Pin<Box<dyn std::future::Future<Output = Result<RecoveryReport>> + '_>> = Box::pin(reconcile(cx));
-    Ok(closing.await?.state)
+    Ok(Some(close(cx, DEADLINE_EXCEEDED).await?))
+}
+
+/// Ends the task with `reason` through recovery's closing mode: what is in flight is
+/// decided first (jobs waited for or fenced, receipts published, patches reconciled), then
+/// the task fails, then whatever can only be abandoned on a failed task is. A pending cancel
+/// still wins (the task ends CANCELLED). Returns the task's state.
+pub(crate) async fn close<E: Executor>(cx: &Cx<'_, E>, reason: &str) -> Result<TaskState> {
+    let closing = cx.closing_with(reason);
+    // Boxed: closing recovery reaches `run_attempt` (which can close) again.
+    let pass: std::pin::Pin<Box<dyn std::future::Future<Output = Result<RecoveryReport>> + '_>> = Box::pin(reconcile(&closing));
+    Ok(pass.await?.state.unwrap_or_else(|| TaskState::Failed))
 }
 
 pub(crate) async fn reconcile<E: Executor>(cx: &Cx<'_, E>) -> Result<RecoveryReport> {
@@ -161,6 +170,8 @@ pub(crate) async fn reconcile<E: Executor>(cx: &Cx<'_, E>) -> Result<RecoveryRep
     let gc_removed = if cx.closing.is_some() { 0 } else { cx.blobs.gc(&db.referenced_blobs()?)? };
     let mut report = RecoveryReport { gc_removed, ..RecoveryReport::default() };
     for rec in db.outstanding_effects(task)? {
+        // A dispatch refused on the way can close the task and decide the later effects.
+        let Some(rec) = db.outstanding_effects(task)?.into_iter().find(|e| e.effect_id == rec.effect_id) else { continue };
         recover_effect(cx, rec, &mut report).await?;
     }
 

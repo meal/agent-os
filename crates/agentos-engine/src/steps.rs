@@ -10,12 +10,12 @@ use agentos_core::effect::{AttemptId, EffectKind, EffectRecord, EffectState, Out
 use agentos_core::ids::{Digest, TaskId};
 use agentos_core::state::{Task, TaskEvent, TaskState};
 use agentos_store::blob::BlobStore;
-use agentos_store::db::Db;
+use agentos_store::db::{Db, DbError};
 use serde_json::json;
 
 use crate::crash::{CrashPoint, RunOptions};
 use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor};
-use crate::runner::{fail, EngineError, Result};
+use crate::runner::{capability_name, fail, EngineError, Result};
 
 pub const WORKER: &str = "fixture-executor";
 
@@ -199,7 +199,20 @@ pub(crate) async fn run_attempt<E: Executor>(cx: &Cx<'_, E>, rec: &EffectRecord,
     if let Some(state) = crate::recover::deadline_stop(cx).await? {
         return Ok(Attempt::Ended(state));
     }
-    let ctx = dispatch(cx.db, rec)?;
+    let ctx = match dispatch(cx.db, rec) {
+        Ok(ctx) => ctx,
+        // Revoked or expired since the intent was authorized (the store journaled the
+        // denial): nothing is launched; the task ends and its effects are decided.
+        Err(EngineError::Db(DbError::CapabilityDenied { capability, reason })) => {
+            let why = match reason.as_str() {
+                "expired" => crate::recover::DEADLINE_EXCEEDED.to_string(),
+                "revoked" => format!("capability revoked: {}", capability_name(capability)),
+                other => format!("capability {} denied: {other}", capability_name(capability)),
+            };
+            return Ok(Attempt::Ended(crate::recover::close(cx, &why).await?));
+        }
+        Err(e) => return Err(e),
+    };
     cx.crash(CrashPoint::AfterDispatch, kind)?;
     let deadline_ts = cx.db.deadline_ts(&rec.task_id)?;
     let out = execute(cx.exec, rec, payload, &cx.contract, deadline_ts, &ctx).await?;
