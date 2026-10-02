@@ -150,9 +150,106 @@ pub fn jailed_fake_firecracker_config(root: &Path) -> FirecrackerConfig {
     cfg
 }
 
+/// Which worker the migrated 3a suites (crash matrix, deadline, revoke, supervised) run
+/// against: `AGENTOS_TEST_WORKER` = `host` (default) | `firecracker-fake`, the latter jailed
+/// through the fake jailer with `AGENTOS_TEST_JAIL=fake`. Any other value panics, so a typo
+/// never runs the host tier under the name of another.
+pub fn test_worker() -> &'static str {
+    let worker = match std::env::var("AGENTOS_TEST_WORKER").as_deref() {
+        Err(_) | Ok("") | Ok("host") => "host",
+        Ok("firecracker-fake") => "firecracker-fake",
+        Ok(other) => panic!("AGENTOS_TEST_WORKER={other:?}: this tier knows host and firecracker-fake"),
+    };
+    if test_jail_fake() && worker != "firecracker-fake" {
+        panic!("AGENTOS_TEST_JAIL=fake needs AGENTOS_TEST_WORKER=firecracker-fake");
+    }
+    worker
+}
+
+/// `AGENTOS_TEST_JAIL=fake` (any other non-empty value panics).
+pub fn test_jail_fake() -> bool {
+    match std::env::var("AGENTOS_TEST_JAIL").as_deref() {
+        Err(_) | Ok("") => false,
+        Ok("fake") => true,
+        Ok(other) => panic!("AGENTOS_TEST_JAIL={other:?}: this tier knows only fake"),
+    }
+}
+
+/// Whether the migrated suites run on the Firecracker worker over the fake guest.
+pub fn fake_mode() -> bool {
+    test_worker() == "firecracker-fake"
+}
+
+/// The worker the migrated suites use over `root`'s `snapshot`, `profile` and `work`:
+/// `Host(host_config(root))`, or in fake mode `Firecracker(fake_firecracker_config(root))`
+/// (jailed with `AGENTOS_TEST_JAIL=fake`). The Firecracker config is built once per root
+/// and kept in `<root>/worker-config.json`: a restarted controller must never rewrite the
+/// image, the dummy binary or the fake jailer while a job that outlived it uses them.
+pub fn worker_config(root: &Path) -> WorkerConfig {
+    if !fake_mode() {
+        return WorkerConfig::Host(host_config(root));
+    }
+    let kept = root.join("worker-config.json");
+    if let Ok(bytes) = fs::read(&kept) {
+        return serde_json::from_slice(&bytes).unwrap();
+    }
+    let cfg = if test_jail_fake() { jailed_fake_firecracker_config(root) } else { fake_firecracker_config(root) };
+    let worker = WorkerConfig::Firecracker(cfg);
+    fs::write(&kept, serde_json::to_vec(&worker).unwrap()).unwrap();
+    worker
+}
+
+/// Where the chosen worker keeps `task`'s workspace tree on the host: the host worker's
+/// `<work>/<task>/ws`, or the fake guest's view of `ws.img`, `<work>/<task>/workspace`.
+pub fn workspace_dir(root: &Path, task: &TaskId) -> PathBuf {
+    let task_dir = root.join("work").join(task.as_str());
+    if fake_mode() { task_dir.join("workspace") } else { task_dir.join("ws") }
+}
+
+/// Makes `task`'s workspace gone for the chosen worker: the host directory, or (fake mode)
+/// `ws.img`, which is what the Firecracker worker and the inspector check, and the fake
+/// guest's tree with it.
+pub fn lose_workspace(root: &Path, task: &TaskId) {
+    if fake_mode() {
+        let task_dir = root.join("work").join(task.as_str());
+        fs::remove_file(task_dir.join("ws.img")).unwrap();
+        fs::remove_dir_all(task_dir.join("workspace")).unwrap();
+    } else {
+        fs::remove_dir_all(workspace_dir(root, task)).unwrap();
+    }
+}
+
+/// `(state, process group, session)` of `pid`, from `/proc/<pid>/stat`.
+pub fn proc_state(pid: i32) -> Option<(String, i32, i32)> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let mut fields = stat[stat.rfind(')')? + 1..].split_whitespace();
+    let state = fields.next()?.to_string();
+    let pgrp = fields.nth(1)?.parse().ok()?;
+    let session = fields.next()?.parse().ok()?;
+    Some((state, pgrp, session))
+}
+
+pub fn all_pids() -> Vec<i32> {
+    fs::read_dir("/proc").unwrap().flatten().filter_map(|e| e.file_name().to_str()?.parse().ok()).collect()
+}
+
+/// Live (non-zombie) processes whose command line contains `path`.
+pub fn processes_naming(path: &Path) -> Vec<i32> {
+    let needle = path.as_os_str().as_encoded_bytes();
+    all_pids()
+        .into_iter()
+        .filter(|pid| {
+            let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else { return false };
+            cmdline.windows(needle.len()).any(|w| w == needle) && proc_state(*pid).is_some_and(|(s, ..)| s != "Z")
+        })
+        .collect()
+}
+
 /// A supervised executor running `worker` jobs under `jobs_root` with the real supervisor
 /// binary, counting launches in `counts`, consulting `crash` right after each launch, and
-/// with `env` set in the supervisor's (and worker's) environment.
+/// with `env` set in the supervisor's (and worker's) environment. In fake mode
+/// `AGENTOS_TEST_WORKERS=1` is added (the fake guest launcher, and the inspector that
+/// reconciles through it, run only with it).
 pub fn supervised(
     jobs_root: &Path,
     worker: WorkerConfig,
@@ -162,6 +259,9 @@ pub fn supervised(
 ) -> SupervisedExecutor {
     let cmd = SupervisorCmd { program: SUPERVISOR_BIN.into(), prefix_args: Vec::new() };
     let mut exec = SupervisedExecutor::new(jobs_root.to_path_buf(), cmd, worker, counts.clone()).unwrap().with_crash(crash);
+    if fake_mode() {
+        exec = exec.with_env(TEST_WORKERS_ENV, "1");
+    }
     for (k, v) in env {
         exec = exec.with_env(*k, *v);
     }

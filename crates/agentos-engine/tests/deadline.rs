@@ -16,7 +16,6 @@ use agentos_core::state::{TaskEvent, TaskState};
 use agentos_engine::agent::{AgentAction, FakeAgent, Observation};
 use agentos_engine::crash::{CrashHook, CrashPoint, RunOptions};
 use agentos_engine::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor, JobWait, Reconciliation};
-use agentos_engine::job::WorkerConfig;
 use agentos_engine::recover::{recover, Decision};
 use agentos_engine::runner::{run_task, run_task_with, EngineError};
 use agentos_engine::supervised::{ExecCounts, SupervisedExecutor};
@@ -24,7 +23,7 @@ use agentos_engine::workspace::workspace_digest;
 use agentos_store::blob::BlobStore;
 use agentos_store::db::Db;
 use common::{
-    contract_full, copy_dir, fix_patch, fixtures, host_config, supervised, FnAgent, ALL_CAPS, EXIT_BEFORE_RECEIPT_ENV,
+    contract_full, copy_dir, fix_patch, fixtures, supervised, worker_config, workspace_dir, FnAgent, ALL_CAPS, EXIT_BEFORE_RECEIPT_ENV,
     TEST_WORKERS_ENV,
 };
 use tempfile::TempDir;
@@ -110,7 +109,7 @@ impl World {
     }
 
     fn exec(&self, hook: Option<CrashHook>, env: &[(&str, &str)]) -> SupervisedExecutor {
-        supervised(&self.path("jobs"), WorkerConfig::Host(host_config(self.dir.path())), &self.counts, hook, env)
+        supervised(&self.path("jobs"), worker_config(self.dir.path()), &self.counts, hook, env)
     }
 
     /// Moves the clock past the task's deadline.
@@ -135,7 +134,7 @@ impl World {
     }
 
     fn disk(&self) -> Digest {
-        workspace_digest(&self.path("work").join(self.task.as_str()).join("ws")).unwrap()
+        workspace_digest(&workspace_dir(self.dir.path(), &self.task)).unwrap()
     }
 
     /// Runs the fixture solution until the hook crashes the controller.

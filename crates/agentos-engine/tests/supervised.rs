@@ -15,12 +15,12 @@ use agentos_core::state::TaskState;
 use agentos_engine::agent::{AgentAction, Observation};
 use agentos_engine::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor, Reconciliation};
 use agentos_engine::fixture::FixtureExecutor;
-use agentos_engine::job::{HostConfig, JobDir, JobRequest, JobState, JobStatus, KillReason, ScriptedConfig, WorkerConfig};
+use agentos_engine::job::{JobDir, JobRequest, JobState, JobStatus, KillReason, ScriptedConfig, WorkerConfig};
 use agentos_engine::runner::run_task;
 use agentos_engine::supervised::{ExecCounts, JobWait, SupervisedExecutor};
 use agentos_engine::supervisor::SupervisorCmd;
 use agentos_engine::workspace::workspace_digest;
-use common::{contract, copy_dir, edit_patch, fix_patch, fixtures, Env, FnAgent};
+use common::{contract, copy_dir, edit_patch, fake_mode, fix_patch, fixtures, worker_config, workspace_dir, Env, FnAgent};
 use std::os::fd::OwnedFd;
 
 use rustix::process::{pidfd_open, pidfd_send_signal, Pid, PidfdFlags, Signal};
@@ -38,16 +38,6 @@ fn now_ms() -> i64 {
 
 fn supervisor_cmd() -> SupervisorCmd {
     SupervisorCmd { program: BIN.into(), prefix_args: Vec::new() }
-}
-
-fn host_config(root: &std::path::Path) -> HostConfig {
-    HostConfig {
-        snapshot_dir: root.join("snapshot"),
-        profile_dir: root.join("profile"),
-        work_root: root.join("work"),
-        verify_timeout_secs: 60,
-        profile_digest: None,
-    }
 }
 
 struct Fx {
@@ -80,8 +70,10 @@ impl Fx {
             .with_env(TEST_WORKERS, "1")
     }
 
+    /// The worker under test (`common::worker_config`): the host worker, or the Firecracker
+    /// worker over the fake guest with `AGENTOS_TEST_WORKER=firecracker-fake`.
     fn host(&self) -> SupervisedExecutor {
-        self.executor(WorkerConfig::Host(host_config(self.dir.path())))
+        self.executor(worker_config(self.dir.path()))
     }
 
     /// A host executor whose supervisor exits after the worker's outcome, before the receipt.
@@ -97,8 +89,22 @@ impl Fx {
         FixtureExecutor::new(self.path("snapshot"), self.path("profile"), self.path("work"))
     }
 
+    /// The worker's workspace tree on the host (see `common::workspace_dir`).
     fn ws(&self) -> PathBuf {
-        self.fixture().workspace(&self.task)
+        workspace_dir(self.dir.path(), &self.task)
+    }
+
+    /// A fixture executor whose workspace is a copy of the worker's: the host worker's own
+    /// directory, or the fake guest's tree copied into the host layout (`<work>/<task>/ws`)
+    /// under `<root>/host-view`, so the host's own reconciliation can be asked about it.
+    fn host_view(&self) -> FixtureExecutor {
+        if !fake_mode() {
+            return self.fixture();
+        }
+        let work = self.path("host-view");
+        let _ = fs::remove_dir_all(&work);
+        copy_dir(&self.ws(), &work.join(self.task.as_str()).join("ws"));
+        FixtureExecutor::new(self.path("snapshot"), self.path("profile"), work)
     }
 
     fn base(&self) -> Digest {
@@ -255,7 +261,7 @@ async fn run_matches_fixture_executor_for_all_three_kinds() {
         assert!(!actual.unresolved);
     }
     assert!(exec.retained_outcome(&requests[2].effect_id).unwrap().verification.unwrap().passed);
-    assert_eq!(workspace_digest(&supervised.ws()).unwrap(), workspace_digest(&plain.ws()).unwrap());
+    assert_eq!(workspace_digest(&supervised.ws()).unwrap(), workspace_digest(&plain.fixture().workspace(&plain.task)).unwrap());
 }
 
 #[tokio::test]
@@ -327,6 +333,8 @@ async fn killed_verification_returns_the_failure_receipt() {
     assert_for(&out, &req, &ctx);
     assert!(!out.unresolved);
     let job = fx.job(&req.effect_id);
+    // `run` returns on the receipt, which the supervisor writes just before `Killed`.
+    wait_for("the Killed status", || job.read_status().is_some_and(|s| s.state == JobState::Killed)).await;
     let status = job.read_status().unwrap();
     assert_eq!((status.state, status.reason), (JobState::Killed, Some(KillReason::Lease)));
     assert_eq!(job.read_receipt(), Some(out));
@@ -348,7 +356,7 @@ async fn killed_apply_patch_without_a_receipt_is_reconciled_not_failed() {
     let job = fx.job(&req.effect_id);
     assert_eq!(job.read_receipt(), None);
     assert!(job.read_outcome().is_some(), "the worker did finish");
-    let Reconciliation::Applied(expected) = fx.fixture().reconcile(&req, &ctx).await else { panic!("not applied") };
+    let Reconciliation::Applied(expected) = fx.host_view().reconcile(&req, &ctx).await else { panic!("not applied") };
     assert_eq!(out, expected);
 }
 
@@ -411,12 +419,12 @@ async fn unresolvable_apply_patch_returns_an_unresolved_outcome_and_the_runner_m
     let env = Env::new(10);
     let jobs = env.dir.path().join("jobs");
     let make = || {
-        SupervisedExecutor::new(jobs.clone(), supervisor_cmd(), WorkerConfig::Host(host_config(env.dir.path())), ExecCounts::default())
+        SupervisedExecutor::new(jobs.clone(), supervisor_cmd(), worker_config(env.dir.path()), ExecCounts::default())
             .unwrap()
             .with_env(TEST_WORKERS, "1")
     };
     let exec = ByKind { plain: make(), hooked: make().with_env(EXIT_BEFORE_RECEIPT, "1") };
-    let ws = env.ws();
+    let ws = workspace_dir(env.dir.path(), &env.task);
     let mut agent = FnAgent(move |obs: &Observation| match obs {
         Observation::Start { .. } => {
             fs::write(ws.join("src/stray.py"), "x = 1\n").unwrap();
@@ -455,7 +463,10 @@ async fn fence_job_waits_for_a_cooperative_job_and_reports_dead() {
     assert!(started.elapsed() < Duration::from_secs(2), "a cooperative job dies without being killed");
     let out = running.await.unwrap();
     assert_eq!(failure_reason(&out), "cancelled");
-    let status = fx.job(&req.effect_id).read_status().unwrap();
+    let job = fx.job(&req.effect_id);
+    // `run` returns on the receipt, which the supervisor writes just before `Killed`.
+    wait_for("the Killed status", || job.read_status().is_some_and(|s| s.state == JobState::Killed)).await;
+    let status = job.read_status().unwrap();
     assert_eq!((status.state, status.reason), (JobState::Killed, Some(KillReason::Cancel)));
     // Nothing alive: fencing again is immediate.
     assert!(exec.fence_job(&req.effect_id).await);
@@ -508,7 +519,10 @@ async fn wait_for_job_returns_the_receipt_of_a_job_that_finishes_while_waiting()
         let (exec, req) = (exec.clone(), req.clone());
         tokio::spawn(async move { exec.run(&req, &ctx(1)).await })
     };
-    wait_for("the job directory", || !fx.jobs(&req.effect_id).is_empty()).await;
+    // `JobDir::create` makes the directory before it takes the lock and writes request.json:
+    // a directory seen in between has no lock file yet and reads as dead. request.json is
+    // written with the lock held, and the lock passes to the supervisor without a gap.
+    wait_for("the job directory with its request", || fx.jobs(&req.effect_id).first().is_some_and(|j| j.request().is_ok())).await;
     assert!(!fx.job(&req.effect_id).is_dead(), "still running when the wait starts");
     let JobWait::Receipt(found) = exec.wait_for_job(&req.effect_id, PATIENCE).await else { panic!("no receipt") };
     assert_eq!(found.output, b"done\n");
@@ -519,7 +533,7 @@ async fn wait_for_job_returns_the_receipt_of_a_job_that_finishes_while_waiting()
 async fn launch_failure_is_a_failure_outcome() {
     let fx = Fx::new();
     let cmd = SupervisorCmd { program: fx.path("no-such-supervisor"), prefix_args: Vec::new() };
-    let exec = SupervisedExecutor::new(fx.path("jobs"), cmd, WorkerConfig::Host(host_config(fx.dir.path())), ExecCounts::default())
+    let exec = SupervisedExecutor::new(fx.path("jobs"), cmd, worker_config(fx.dir.path()), ExecCounts::default())
         .unwrap();
     let (req, ctx) = (fx.request(EffectKind::ReadSnapshot, b""), ctx(1));
     let started = Instant::now();

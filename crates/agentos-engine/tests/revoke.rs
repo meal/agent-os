@@ -16,14 +16,13 @@ use agentos_core::state::TaskState;
 use agentos_engine::agent::{AgentAction, FakeAgent};
 use agentos_engine::crash::{CrashHook, CrashPoint, RunOptions};
 use agentos_engine::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor, JobWait, Reconciliation};
-use agentos_engine::job::WorkerConfig;
 use agentos_engine::recover::recover;
 use agentos_engine::runner::{run_task, run_task_with, EngineError};
 use agentos_engine::supervised::{ExecCounts, SupervisedExecutor};
 use agentos_store::blob::BlobStore;
 use agentos_store::db::Db;
 use common::{
-    contract_full, copy_dir, fix_patch, fixtures, host_config, supervised, ALL_CAPS, EXIT_BEFORE_RECEIPT_ENV,
+    contract_full, copy_dir, fix_patch, fixtures, supervised, worker_config, ALL_CAPS, EXIT_BEFORE_RECEIPT_ENV,
     TEST_WORKERS_ENV,
 };
 use tempfile::TempDir;
@@ -102,7 +101,7 @@ impl World {
     }
 
     fn exec(&self, hook: Option<CrashHook>, env: &[(&str, &str)]) -> SupervisedExecutor {
-        supervised(&self.path("jobs"), WorkerConfig::Host(host_config(self.dir.path())), &self.counts, hook, env)
+        supervised(&self.path("jobs"), worker_config(self.dir.path()), &self.counts, hook, env)
     }
 
     fn jobs(&self) -> usize {

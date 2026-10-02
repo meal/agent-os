@@ -31,8 +31,8 @@ use agentos_store::blob::BlobStore;
 use agentos_store::db::{Db, StoredEvent};
 use agentos_store::effects::UsageSummary;
 use common::{
-    comment_patch, contract, copy_dir, fix_patch, fixtures, host_config, supervised, EXIT_BEFORE_RECEIPT_ENV,
-    TEST_WORKERS_ENV,
+    all_pids, comment_patch, contract, copy_dir, fix_patch, fixtures, lose_workspace, proc_state, processes_naming,
+    supervised, worker_config, workspace_dir, EXIT_BEFORE_RECEIPT_ENV, TEST_WORKERS_ENV,
 };
 use rustix::process::{kill_process, pidfd_open, pidfd_send_signal, Pid, PidfdFlags, Signal};
 use tempfile::TempDir;
@@ -139,7 +139,7 @@ impl World {
 
     fn exec(&self, hook: Option<CrashHook>, opts: &ExecOpts) -> Exec {
         let jobs = self.path("jobs");
-        let host = WorkerConfig::Host(host_config(self.dir.path()));
+        let host = worker_config(self.dir.path());
         let timeouts = opts.timeouts.unwrap_or_default();
         let plain = supervised(&jobs, host.clone(), &self.counts, hook.clone(), &[]).with_timeouts(timeouts);
         let special = match (&opts.scripted_verification, opts.exit_before_receipt) {
@@ -175,7 +175,7 @@ impl World {
     }
 
     fn ws(&self) -> PathBuf {
-        self.path("work").join(self.task.as_str()).join("ws")
+        workspace_dir(self.dir.path(), &self.task)
     }
 
     fn base(&self) -> Digest {
@@ -265,32 +265,6 @@ fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
 }
 
-/// `(state, process group, session)` of `pid`, from `/proc/<pid>/stat`.
-fn proc_state(pid: i32) -> Option<(String, i32, i32)> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let mut fields = stat[stat.rfind(')')? + 1..].split_whitespace();
-    let state = fields.next()?.to_string();
-    let pgrp = fields.nth(1)?.parse().ok()?;
-    let session = fields.next()?.parse().ok()?;
-    Some((state, pgrp, session))
-}
-
-fn all_pids() -> Vec<i32> {
-    fs::read_dir("/proc").unwrap().flatten().filter_map(|e| e.file_name().to_str()?.parse().ok()).collect()
-}
-
-/// Live (non-zombie) processes whose command line contains `path`.
-fn processes_naming(path: &Path) -> Vec<i32> {
-    let needle = path.as_os_str().as_encoded_bytes();
-    all_pids()
-        .into_iter()
-        .filter(|pid| {
-            let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else { return false };
-            cmdline.windows(needle.len()).any(|w| w == needle) && proc_state(*pid).is_some_and(|(s, ..)| s != "Z")
-        })
-        .collect()
-}
-
 /// Live (non-zombie) processes in session `sid`.
 fn session_members(sid: i32) -> Vec<i32> {
     all_pids().into_iter().filter(|pid| proc_state(*pid).is_some_and(|(s, _, sess)| sess == sid && s != "Z")).collect()
@@ -343,10 +317,26 @@ impl Drop for Stopped {
     }
 }
 
+/// Whether `job`'s check (or script) has started: the host and scripted workers record its
+/// group in `groups`; the fake guest runs it in a group of its own that the worker never
+/// sees, so there it is a live process whose command line names the guest's workspace (the
+/// check's last argument).
+fn check_started(job: &JobDir) -> bool {
+    if !job.groups().is_empty() {
+        return true;
+    }
+    match job.request().map(|r| (r.worker, r.task_id)) {
+        Ok((WorkerConfig::Firecracker(cfg), task)) => {
+            !processes_naming(&cfg.work_root.join(task.as_str()).join("workspace")).is_empty()
+        }
+        _ => false,
+    }
+}
+
 /// The supervisor pid of a running `job`, once its check (or script) has started.
 async fn running_supervisor(job: &JobDir) -> i32 {
     wait_until("the job's check to run", || {
-        job.read_status().is_some_and(|s| s.state == JobState::Running) && !job.groups().is_empty()
+        job.read_status().is_some_and(|s| s.state == JobState::Running) && check_started(job)
     })
     .await;
     job.read_status().unwrap().supervisor_pid.unwrap() as i32
@@ -711,7 +701,7 @@ fn job_request(w: &World, ctl: &Ctl, rec: &EffectRecord, ctx: &AttemptCtx, lease
         lease_generation: ctx.lease_generation,
         lease_expiry_ms,
         task_deadline_ms: 0,
-        worker: WorkerConfig::Host(host_config(w.dir.path())),
+        worker: worker_config(w.dir.path()),
     }
 }
 
@@ -887,7 +877,7 @@ async fn an_unreconcilable_patch_fails_the_task_and_keeps_its_reservation_uncert
 async fn a_workspace_lost_with_a_patch_in_flight_fails_the_task_cleanly() {
     let w = World::new();
     w.crash_run(CrashHook::at(CrashPoint::AfterDispatch, "apply_patch")).await;
-    std::fs::remove_dir_all(w.ws()).unwrap();
+    lose_workspace(w.dir.path(), &w.task);
     let ctl = w.open(None);
 
     assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Failed);
@@ -906,7 +896,7 @@ async fn a_workspace_lost_with_a_patch_in_flight_fails_the_task_cleanly() {
 async fn a_workspace_lost_between_effects_fails_the_task_cleanly() {
     let w = World::new();
     w.crash_run(CrashHook::at(CrashPoint::AfterComplete, "apply_patch")).await;
-    std::fs::remove_dir_all(w.ws()).unwrap();
+    lose_workspace(w.dir.path(), &w.task);
     let ctl = w.open(None);
 
     assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Failed);
