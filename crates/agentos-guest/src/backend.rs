@@ -144,8 +144,14 @@ impl Backend for FakeBackend {
         visible_vcpus()
     }
 
+    /// Hanging, it first drops `<scratch>/inspect-hung`, so a test can tell the inspection
+    /// is under way (connected, `PatchState` received).
     fn hang_inspect(&self) -> bool {
-        crate::fake::test_hook("AGENTOS_TEST_FAKE_GUEST_HANG_INSPECT")
+        let hang = crate::fake::test_hook("AGENTOS_TEST_FAKE_GUEST_HANG_INSPECT");
+        if hang {
+            let _ = fs::write(self.scratch.join("inspect-hung"), b"");
+        }
+        hang
     }
 
     fn memory_mib(&self) -> u32 {

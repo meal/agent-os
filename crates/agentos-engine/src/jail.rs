@@ -484,35 +484,58 @@ fn read_marker(marker: &Path) -> io::Result<Option<String>> {
     Ok(Some(text.strip_suffix('\n').unwrap_or(&text).to_string()))
 }
 
+/// Why `collect_jail` removed nothing (or not everything).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CollectError {
+    /// The VM's cgroup still has processes: a VM (or what it left) is alive in this jail.
+    Busy(String),
+    /// Anything else (a marker outside the cgroup root, an I/O error).
+    Failed(String),
+}
+
+impl std::fmt::Display for CollectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CollectError::Busy(why) | CollectError::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
 /// After the VM has exited (never before: `rmdir` of a cgroup with a live process fails and a
 /// chroot under a live VM must not be touched): removes the cgroup named by `<dir>/jail/cgroup`
 /// (which must lie under `<cgroup_root>/agentos/`, else nothing at all is removed), then
 /// `<dir>/jail`. A cgroup that still has processes is an error and leaves `jail/` alone.
 pub fn collect(dir: &Path, cgroup_root: &Path) -> Result<Collected, String> {
+    collect_jail(dir, cgroup_root).map_err(|e| e.to_string())
+}
+
+/// `collect`, telling a live jail (`Busy`) apart from every other failure.
+pub fn collect_jail(dir: &Path, cgroup_root: &Path) -> Result<Collected, CollectError> {
+    use CollectError::{Busy, Failed};
     let marker = dir.join(JAIL_MARKER);
     let mut cgroup_removed = false;
     match read_marker(&marker) {
         Ok(None) => {}
         Ok(Some(named)) => {
             let Some(cgroup) = cgroup_under(cgroup_root, &named) else {
-                return Err(format!("marker names a path outside the cgroup root: {}", guest_text(&named)));
+                return Err(Failed(format!("marker names a path outside the cgroup root: {}", guest_text(&named))));
             };
             match fs::remove_dir(&cgroup) {
                 Ok(()) => cgroup_removed = true,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) if matches!(e.kind(), io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::ResourceBusy) => {
-                    return Err(format!("cgroup {} still has processes", guest_text(&cgroup.display().to_string())));
+                    return Err(Busy(format!("cgroup {} still has processes", guest_text(&cgroup.display().to_string()))));
                 }
-                Err(e) => return Err(format!("cannot remove cgroup {}: {e}", guest_text(&cgroup.display().to_string()))),
+                Err(e) => return Err(Failed(format!("cannot remove cgroup {}: {e}", guest_text(&cgroup.display().to_string())))),
             }
         }
-        Err(e) => return Err(format!("cannot read {}: {e}", marker.display())),
+        Err(e) => return Err(Failed(format!("cannot read {}: {e}", marker.display()))),
     }
     let jail = dir.join(JAIL_DIR);
     let jail_removed = match fs::remove_dir_all(&jail) {
         Ok(()) => true,
         Err(e) if e.kind() == io::ErrorKind::NotFound => false,
-        Err(e) => return Err(format!("cannot remove {}: {e}", jail.display())),
+        Err(e) => return Err(Failed(format!("cannot remove {}: {e}", jail.display()))),
     };
     Ok(Collected { cgroup_removed, jail_removed })
 }

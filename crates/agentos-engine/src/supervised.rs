@@ -84,6 +84,26 @@ impl ExecCounts {
     }
 }
 
+/// What the controller makes of a guest's patch-state answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchVerdict {
+    NotApplied,
+    /// Applied; the workspace is now at this digest.
+    Applied(Digest),
+    Unknown,
+}
+
+/// The host's check on a guest's patch-state answer: `NotApplied` only with the base digest,
+/// `Applied` only with a digest that is not the base; anything else (a missing digest, a
+/// state that contradicts its digest, `unknown`) is `Unknown`, never `NotApplied`.
+pub fn patch_verdict(state: PatchStateKind, digest: Option<Digest>, expected_base: Digest) -> PatchVerdict {
+    match (state, digest) {
+        (PatchStateKind::NotApplied, Some(d)) if d == expected_base => PatchVerdict::NotApplied,
+        (PatchStateKind::Applied, Some(d)) if d != expected_base => PatchVerdict::Applied(d),
+        _ => PatchVerdict::Unknown,
+    }
+}
+
 /// How the controller looks at a task's workspace without running a job.
 #[allow(clippy::large_enum_variant, reason = "one per executor, built once")]
 pub enum Reconciler {
@@ -121,13 +141,12 @@ impl Reconciler {
                 return Reconciliation::Unknown;
             }
         };
-        match (state.state, state.workspace_digest) {
-            (PatchStateKind::NotApplied, Some(d)) if d == expected_base => Reconciliation::NotApplied,
-            (PatchStateKind::Applied, Some(d)) if d != expected_base => {
-                Reconciliation::Applied(outcomes::patch_applied(req, ctx, state.paths, d))
-            }
-            (kind, digest) => {
+        match patch_verdict(state.state, state.workspace_digest, expected_base) {
+            PatchVerdict::NotApplied => Reconciliation::NotApplied,
+            PatchVerdict::Applied(d) => Reconciliation::Applied(outcomes::patch_applied(req, ctx, state.paths, d)),
+            PatchVerdict::Unknown => {
                 let reason = guest_text(state.reason.as_deref().unwrap_or(""));
+                let (kind, digest) = (state.state, state.workspace_digest);
                 tracing::warn!(effect_id = %req.effect_id, ?kind, ?digest, reason, "patch cannot be reconciled");
                 Reconciliation::Unknown
             }
@@ -741,6 +760,31 @@ impl Executor for SupervisedExecutor {
                 tracing::warn!(effect_id = %effect, error = %e, "cannot list the effect's jobs to fence them");
                 false
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn patch_verdict_table() {
+        let (base, other) = (Digest::of(b"base"), Digest::of(b"other"));
+        use PatchStateKind::{Applied, NotApplied, Unknown};
+        let rows = [
+            (Applied, None, PatchVerdict::Unknown),
+            (Applied, Some(base), PatchVerdict::Unknown),
+            (Applied, Some(other), PatchVerdict::Applied(other)),
+            (NotApplied, None, PatchVerdict::Unknown),
+            (NotApplied, Some(other), PatchVerdict::Unknown),
+            (NotApplied, Some(base), PatchVerdict::NotApplied),
+            (Unknown, None, PatchVerdict::Unknown),
+            (Unknown, Some(base), PatchVerdict::Unknown),
+            (Unknown, Some(other), PatchVerdict::Unknown),
+        ];
+        for (state, digest, want) in rows {
+            assert_eq!(patch_verdict(state, digest, base), want, "{state:?} {digest:?}");
         }
     }
 }

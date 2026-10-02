@@ -386,6 +386,8 @@ pub enum WorkerResult {
 pub struct FirecrackerWorker {
     cfg: FirecrackerConfig,
     job_dir: PathBuf,
+    /// `<home>/inspect`, whose dead inspections of the task are collected before a boot.
+    inspect_root: Option<PathBuf>,
     boot_timeout: Duration,
     env: Vec<(String, String)>,
 }
@@ -426,6 +428,11 @@ impl Drop for ScratchGuard {
 struct Vm {
     child: Child,
     status: Option<ExitStatus>,
+    /// Leads its own process group (the inspector's): the group is swept once at the end,
+    /// even when the leader exited by itself, so no descendant (the fake guest's `git`)
+    /// outlives it.
+    own_group: bool,
+    swept: bool,
 }
 
 impl Vm {
@@ -439,16 +446,32 @@ impl Vm {
 
     /// SIGKILLs the process (and the group it may lead; never the worker's own) and reaps it.
     fn kill(&mut self) -> ExitStatus {
-        if let Some(status) = self.status {
-            return status;
-        }
-        if let Some(pid) = i32::try_from(self.child.id()).ok().and_then(Pid::from_raw) {
-            let _ = kill_process(pid, Signal::KILL);
-            let _ = kill_process_group(pid, Signal::KILL);
-        }
-        let status = self.child.wait().unwrap_or_else(|_| ExitStatus::from_raw(9));
-        self.status = Some(status);
+        let pid = i32::try_from(self.child.id()).ok().and_then(Pid::from_raw);
+        let status = match self.status {
+            Some(status) => status,
+            None => {
+                if let Some(pid) = pid {
+                    let _ = kill_process(pid, Signal::KILL);
+                    let _ = kill_process_group(pid, Signal::KILL);
+                }
+                let status = self.child.wait().unwrap_or_else(|_| ExitStatus::from_raw(9));
+                self.status = Some(status);
+                status
+            }
+        };
+        self.sweep(pid);
         status
+    }
+
+    /// For a VM leading its own group: SIGKILLs what is left of the group, once. The group
+    /// id stays reserved while any member lives, so this reaches only the VM's descendants.
+    fn sweep(&mut self, pid: Option<Pid>) {
+        if self.own_group && !self.swept {
+            self.swept = true;
+            if let Some(pid) = pid {
+                let _ = kill_process_group(pid, Signal::KILL);
+            }
+        }
     }
 
     /// Waits up to `within` for the exit, then kills.
@@ -456,7 +479,7 @@ impl Vm {
         let until = Instant::now() + within;
         while Instant::now() < until {
             if self.exited().is_some() {
-                return self.status.expect("set by exited");
+                return self.kill();
             }
             thread::sleep(EXIT_POLL);
         }
@@ -639,7 +662,9 @@ fn launch(
 
 impl FirecrackerWorker {
     pub fn new(cfg: &FirecrackerConfig, job: &JobDir) -> FirecrackerWorker {
-        FirecrackerWorker { cfg: cfg.clone(), job_dir: job.path.clone(), boot_timeout: BOOT_TIMEOUT, env: Vec::new() }
+        // `<home>/jobs/<job>` ⇒ `<home>/inspect`, as `SupervisedExecutor` derives it.
+        let inspect_root = job.path.parent().and_then(Path::parent).map(|home| home.join("inspect"));
+        FirecrackerWorker { cfg: cfg.clone(), job_dir: job.path.clone(), inspect_root, boot_timeout: BOOT_TIMEOUT, env: Vec::new() }
     }
 
     /// Test seam: replaces `BOOT_TIMEOUT`.
@@ -741,6 +766,12 @@ impl FirecrackerWorker {
             Err(TryLockError::WouldBlock) => return fail(WS_BUSY.into()),
             Err(TryLockError::Error(e)) => return fail(format!("cannot prepare the VM: cannot lock {}: {e}", task_dir.join("ws.lock").display())),
         }
+        // A dead inspector's VM may still have the image (it held the lock and died).
+        if let Some(root) = &self.inspect_root
+            && let Err(busy) = collect_dead_inspections(&self.cfg, &root.join(req.task_id.as_str()))
+        {
+            return if is_patch { WorkerResult::Outcome(ExecOutcome::unresolved(req, ctx, busy)) } else { fail(busy) };
+        }
         let snapshot = matches!(req.kind, EffectKind::ReadSnapshot);
         if !snapshot && !paths.ws_img.is_file() {
             return fail(WORKSPACE_MISSING.into());
@@ -765,7 +796,7 @@ impl FirecrackerWorker {
         // Spawn and boot.
         let attempt = ctx.attempt_id.to_string();
         let (mut vm, uds) = match launch(&self.cfg, &paths, &task_dir, &attempt, &self.env, Group::Caller) {
-            Ok((child, uds)) => (Vm { child, status: None }, uds),
+            Ok((child, uds)) => (Vm { child, status: None, own_group: false, swept: false }, uds),
             Err(reason) => return fail(reason),
         };
         let boot_deadline = Instant::now() + self.boot_timeout;
@@ -948,7 +979,7 @@ pub enum Answer {
 /// The controller's inspection boots: the task's guest image booted in inspect mode over
 /// the task's `ws.img`, one query, then shut down. Runs in the controller process, in a
 /// process group of its own; bounded by `INSPECT_TIMEOUT`; jailed like a job VM.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Inspector {
     cfg: FirecrackerConfig,
     /// `<home>/inspect`: inspections of a task live in `<inspect_root>/<task>/<uuid>/`.
@@ -956,6 +987,20 @@ pub struct Inspector {
     inspect_timeout: Duration,
     boot_timeout: Duration,
     env: Vec<(String, String)>,
+}
+
+/// Never prints the config's attempt token.
+impl std::fmt::Debug for Inspector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cfg = FirecrackerConfig { attempt_token: "<redacted>".into(), ..self.cfg.clone() };
+        f.debug_struct("Inspector")
+            .field("cfg", &cfg)
+            .field("inspect_root", &self.inspect_root)
+            .field("inspect_timeout", &self.inspect_timeout)
+            .field("boot_timeout", &self.boot_timeout)
+            .field("env", &self.env)
+            .finish()
+    }
 }
 
 fn inspect_failed(why: impl std::fmt::Display) -> String {
@@ -969,6 +1014,45 @@ fn duration_text(d: Duration) -> String {
     } else {
         format!("{}ms", d.as_millis())
     }
+}
+
+/// Collects the dead inspections of a task (`<inspect_root>/<task>/*`). Called only with
+/// the task's `ws.lock` held, by the inspector and by the worker before it boots: every
+/// inspection holds that lock while its VM runs, so a directory found here is a dead
+/// inspector's. Its jail is collected, then the directory removed. A jail whose cgroup still
+/// has processes is proof that the dead inspector's VM lives on with `ws.img` attached (the
+/// lock died with its holder): that is `Err(WS_BUSY)`, and no second VM may boot on the
+/// image. Any other failure is a warning and keeps the directory for the next try.
+pub(crate) fn collect_dead_inspections(cfg: &FirecrackerConfig, task_root: &Path) -> Result<(), String> {
+    let entries = match fs::read_dir(task_root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            tracing::warn!(dir = %task_root.display(), error = %e, "cannot list dead inspections");
+            return Ok(());
+        }
+    };
+    let mut live = false;
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            tracing::warn!(path = %dir.display(), "not an inspect directory; left alone");
+            continue;
+        }
+        match jail::collect_jail(&dir, collect_root(cfg)) {
+            Ok(_) => {
+                if let Err(e) = fs::remove_dir_all(&dir) {
+                    tracing::warn!(dir = %dir.display(), error = %e, "cannot remove a dead inspection");
+                }
+            }
+            Err(jail::CollectError::Busy(e)) => {
+                tracing::warn!(dir = %dir.display(), error = %e, "a dead inspection's VM is still alive on the workspace image");
+                live = true;
+            }
+            Err(e) => tracing::warn!(dir = %dir.display(), error = %e, "a dead inspection's jail was not collected; kept"),
+        }
+    }
+    if live { Err(WS_BUSY.into()) } else { Ok(()) }
 }
 
 /// The cgroup root `jail::collect` checks markers against: the jail's, or (unjailed, where
@@ -1013,36 +1097,6 @@ impl Inspector {
         &self.cfg
     }
 
-    /// Collects every inspect directory of the task: one controller runs per home, so any
-    /// found is a dead inspector's. Its jail is collected first; a directory whose jail
-    /// cannot be collected is kept (a chroot is never removed under a cgroup that still
-    /// has processes) and the next inspection tries again. Failures are warnings.
-    fn collect_dead(&self, task_root: &Path) {
-        let entries = match fs::read_dir(task_root) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return,
-            Err(e) => {
-                tracing::warn!(dir = %task_root.display(), error = %e, "cannot list dead inspections");
-                return;
-            }
-        };
-        for entry in entries.flatten() {
-            let dir = entry.path();
-            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
-                tracing::warn!(path = %dir.display(), "not an inspect directory; left alone");
-                continue;
-            }
-            match jail::collect(&dir, collect_root(&self.cfg)) {
-                Ok(_) => {
-                    if let Err(e) = fs::remove_dir_all(&dir) {
-                        tracing::warn!(dir = %dir.display(), error = %e, "cannot remove a dead inspection");
-                    }
-                }
-                Err(e) => tracing::warn!(dir = %dir.display(), error = %e, "a dead inspection's jail was not collected; kept"),
-            }
-        }
-    }
-
     /// One inspection boot (blocking): `ws.img` must exist; preflight; dead inspections of
     /// the task collected; `ws.lock` taken; `<inspect_root>/<task>/<uuid>/` prepared; the
     /// VM (`inspect-<uuid>`) spawned in a new process group, asked `query` in inspect mode,
@@ -1058,7 +1112,6 @@ impl Inspector {
         fake_gate(&self.cfg, &self.env).map_err(inspect_failed)?;
         preflight(&self.cfg).map_err(|e| inspect_failed(format!("firecracker worker unavailable: {e}")))?;
         let task_root = self.inspect_root.join(task.as_str());
-        self.collect_dead(&task_root);
 
         let lock_path = task_dir.join("ws.lock");
         let lock = File::options()
@@ -1072,6 +1125,8 @@ impl Inspector {
             Err(TryLockError::WouldBlock) => return Err(WS_BUSY.into()),
             Err(TryLockError::Error(e)) => return Err(inspect_failed(format!("cannot lock {}: {e}", lock_path.display()))),
         }
+        // Under the lock: no VM of this process owns any of the task's inspect directories.
+        collect_dead_inspections(&self.cfg, &task_root)?;
 
         let uuid = AttemptId::new().to_string();
         let id = format!("inspect-{uuid}");
@@ -1117,7 +1172,7 @@ impl Inspector {
         }
         prepare_vm_files(&self.cfg, paths).map_err(|e| format!("cannot prepare the VM: {e}"))?;
         let (child, uds) = launch(&self.cfg, paths, task_dir, id, &self.env, Group::Own)?;
-        let mut vm = Vm { child, status: None };
+        let mut vm = Vm { child, status: None, own_group: true, swept: false };
 
         let boot_deadline = deadline.min(Instant::now() + self.boot_timeout);
         let mut link = GuestLink::connect_until(&uds, boot_deadline, || vm.exited()).map_err(|e| not_up(&e))?;

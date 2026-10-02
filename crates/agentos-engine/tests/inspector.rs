@@ -163,6 +163,11 @@ impl Fx {
         self.base()
     }
 
+    /// Dropped by the fake guest once it hangs in `PatchState` (its scratch is per boot).
+    fn hung_marker(&self) -> PathBuf {
+        self.task_dir().join("scratch/inspect-hung")
+    }
+
     fn fake_guest_needle(&self) -> String {
         format!("fake-guest v.sock {}", self.task_dir().display())
     }
@@ -170,6 +175,13 @@ impl Fx {
 
 fn succeeded(out: &ExecOutcome) {
     assert_eq!(out.receipt.outcome, Outcome::Success, "{}", String::from_utf8_lossy(&out.output));
+}
+
+fn failure_reason(out: &ExecOutcome) -> String {
+    match &out.receipt.outcome {
+        Outcome::Failure(r) => r.clone(),
+        Outcome::Success => panic!("expected a failure, got success: {}", String::from_utf8_lossy(&out.output)),
+    }
 }
 
 /// Pids (other than ours) whose command line contains `needle` and that are not zombies.
@@ -527,13 +539,10 @@ async fn inspector_dies_with_the_controller() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    // Mid-inspection: the guest is up and bound its socket in the inspect directory.
+    // Mid-inspection: the guest is connected and hangs in the PatchState it received.
     let needle = fx.fake_guest_needle();
-    wait_until("the inspector's guest", PATIENCE, || {
-        !pids_with(&needle).is_empty() && fx.inspect_dirs().iter().any(|d| d.join("v.sock").exists())
-    });
+    wait_until("the inspector's guest to hang in PatchState", PATIENCE, || fx.hung_marker().exists());
     let guest = pids_with(&needle)[0];
-    thread::sleep(Duration::from_millis(300));
     assert!(child.try_wait().unwrap().is_none(), "the inspection is still under way");
     assert!(!gone(guest));
 
@@ -692,4 +701,78 @@ async fn controller_collects_a_dead_jobs_jail_only_after_settlement() {
     assert!(!cgroup.exists(), "the cgroup is removed");
     // The receipt handling is 3a's: no receipt, so recovery would reconcile or retry.
     assert_eq!(job.read_receipt(), None);
+}
+
+#[tokio::test]
+async fn two_concurrent_inspections_of_a_task_never_delete_each_others_directory() {
+    let fx = Fx::new();
+    fx.snapshot().await;
+    let first = Inspector::new(fx.cfg.clone(), fx.inspect_root())
+        .with_env(env_with(&[(HANG_INSPECT, "1")]))
+        .with_inspect_timeout(Duration::from_secs(3));
+    let (task, base) = (fx.task.clone(), fx.base());
+    let running = thread::spawn(move || first.query(&task, Query::PatchState { expected_base: base, patch: fix_patch().into_bytes() }));
+    wait_until("the first inspection to hang", PATIENCE, || fx.hung_marker().exists());
+    let dirs = fx.inspect_dirs();
+    assert_eq!(dirs.len(), 1);
+    let live = dirs[0].clone();
+
+    // The second inspection of the same task, in the same process, while the first runs.
+    assert_eq!(fx.inspector().query(&fx.task, Query::Digest).unwrap_err(), "workspace image is attached to another VM");
+    assert_eq!(Reconciler::Firecracker(fx.inspector()).reconcile(&fx.patch(&fix_patch()), &ctx()).await, Reconciliation::Unknown);
+    for name in ["v.sock", "scratch.img", "console.log", "vm.json"] {
+        assert!(live.join(name).exists(), "the running inspection's {name} is untouched");
+    }
+    assert_eq!(fx.inspect_dirs(), vec![live.clone()]);
+    assert!(!running.is_finished(), "the first inspection still runs");
+
+    let err = running.join().unwrap().unwrap_err();
+    assert_eq!(err, "workspace inspection failed: timeout after 3s");
+    // Serialized afterwards: the next one collects the first's directory and answers.
+    assert_eq!(fx.inspector().query(&fx.task, Query::Digest).unwrap(), Answer::Digest(fx.base()));
+    assert!(fx.inspect_dirs().is_empty());
+}
+
+#[tokio::test]
+async fn a_live_orphan_inspection_vm_blocks_inspection_and_every_job_boot() {
+    let fx = Fx::jailed();
+    let base = fx.snapshot().await;
+    // A dead inspector's directory whose cgroup still has a member: its VM lives on with
+    // ws.img attached (the lock died with the controller that held it).
+    let (orphan, cgroup) = plant_dead_inspection(&fx);
+    fs::write(cgroup.join("cgroup.procs"), b"4242\n").unwrap();
+    let ws_ino = fs::metadata(fx.ws_img()).unwrap().ino();
+
+    let busy = "workspace image is attached to another VM";
+    assert_eq!(fx.inspector().query(&fx.task, Query::Digest).unwrap_err(), busy);
+    let reconciler = Reconciler::Firecracker(fx.inspector());
+    assert_eq!(reconciler.reconcile(&fx.patch(&fix_patch()), &ctx()).await, Reconciliation::Unknown);
+    assert_eq!(reconciler.current_workspace(&fx.task), Some(Err(busy.into())));
+    assert_eq!(fx.inspect_dirs(), vec![orphan.clone()], "no new inspection was prepared");
+    assert!(orphan.join("jail").is_dir() && cgroup.is_dir(), "the live jail is left alone");
+
+    // The worker refuses to boot read-write beside it, for every kind; nothing is started.
+    let cases = [
+        (fx.patch(&fix_patch()), true),
+        (fx.request(EffectKind::RunVerification, b""), false),
+        (fx.request(EffectKind::ReadSnapshot, b""), false),
+    ];
+    for (req, unresolved) in cases {
+        let c = ctx();
+        let job = fx.job(&req, &c);
+        let out = FirecrackerWorker::new(&fx.cfg, &job).with_env(test_env()).run(&req, &c).await;
+        assert_eq!(failure_reason(&out), busy, "{:?}", req.kind);
+        assert_eq!(out.unresolved, unresolved, "{:?}", req.kind);
+        for name in ["vm.json", "v.sock", "jail", "console.log", "scratch.img"] {
+            assert!(!job.path.join(name).exists(), "{name} was created for {:?}", req.kind);
+        }
+    }
+    assert!(pids_with(&fx.fake_guest_needle()).is_empty(), "no VM was started");
+    assert_eq!(fs::metadata(fx.ws_img()).unwrap().ino(), ws_ino);
+    assert_eq!(workspace_digest(&fx.guest_workspace()).unwrap(), base, "the snapshot did not touch the workspace");
+
+    // Once the orphan is gone, its jail is collected and inspection works again.
+    fs::remove_file(cgroup.join("cgroup.procs")).unwrap();
+    assert_eq!(fx.inspector().query(&fx.task, Query::Digest).unwrap(), Answer::Digest(base));
+    assert!(!orphan.exists() && !cgroup.exists());
 }
