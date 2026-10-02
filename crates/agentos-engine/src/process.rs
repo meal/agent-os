@@ -53,6 +53,11 @@ fn kill_group(pgid: Option<Pid>) {
 /// With `groups_file`, the group id is appended to it (durably) before the wait, so a
 /// supervisor that outlives this process can still kill the group. If it cannot be
 /// recorded, the group is killed at once and nothing runs unrecorded.
+///
+/// Known window: between `spawn` and the fsynced record the group exists unrecorded. A
+/// worker SIGKILLed inside that window leaves the check's group running where the
+/// supervisor cannot see it. Closing it needs a pre-exec gate (the child waits until the
+/// parent has recorded it), left to a later task.
 pub(crate) async fn run_in_group(
     mut cmd: Command,
     timeout: Duration,

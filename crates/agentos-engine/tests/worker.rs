@@ -181,6 +181,73 @@ async fn verification_with_the_right_pinned_digest_passes() {
     assert_eq!(evidence(&outs[2])["profile_digest"], serde_json::json!(pinned));
 }
 
+/// Replaces `path` atomically, so a reader sees one whole version or the other.
+fn swap_in(path: &std::path::Path, bytes: &[u8]) {
+    // The temp file lives outside the profile directory, so staging never copies it.
+    let tmp = path.parent().unwrap().with_extension("swap");
+    fs::write(&tmp, bytes).unwrap();
+    fs::rename(&tmp, path).unwrap();
+}
+
+#[tokio::test]
+async fn a_source_profile_swapped_during_staging_cannot_pass_a_pinned_verification() {
+    let fx = Fx::new();
+    // The pinned profile always fails; the swapped-in one would always pass.
+    fx.script_profile("import sys; sys.exit(1)");
+    let source = fx.path("profile/profile.json");
+    let pinned_bytes = fs::read(&source).unwrap();
+    let pinned = workspace_digest(&fx.path("profile")).unwrap();
+    let tampered = serde_json::json!({ "id": "pg-test", "command": ["true"], "protected": true }).to_string();
+    let worker = fx.worker(Some(pinned), 60);
+    succeeded(&worker.run(&fx.request(EffectKind::ReadSnapshot, b""), &ctx()).await);
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let swapper = {
+        let (stop, source, pinned_bytes) = (stop.clone(), source.clone(), pinned_bytes.clone());
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                swap_in(&source, tampered.as_bytes());
+                swap_in(&source, &pinned_bytes);
+            }
+        })
+    };
+    let mut ran = 0;
+    for _ in 0..60 {
+        let out = worker.run(&fx.request(EffectKind::RunVerification, b""), &ctx()).await;
+        if let Some(report) = &out.verification {
+            ran += 1;
+            assert!(!report.passed, "a swapped source produced a passing pinned verification: {}", String::from_utf8_lossy(&out.output));
+            assert_eq!(evidence(&out)["profile_digest"], serde_json::json!(pinned));
+            assert_eq!(evidence(&out)["command"], serde_json::json!(["python3", "-c", "import sys; sys.exit(1)"]));
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    swapper.join().unwrap();
+    assert!(ran > 0, "no verification ran to completion; the race was not exercised");
+}
+
+#[tokio::test]
+async fn run_worker_rejects_relative_host_paths() {
+    let fx = Fx::new();
+    let req = fx.job_request(EffectKind::ReadSnapshot, b"", WorkerConfig::Host(fx.host(None, 60)));
+    let (job, lock) = JobDir::create(&fx.path("jobs"), &req).unwrap();
+    drop(lock);
+    for field in ["snapshot_dir", "profile_dir", "work_root"] {
+        // A hand-written (or older) request.json, never checked by `JobDir::create`.
+        let mut raw: serde_json::Value = serde_json::from_slice(&fs::read(job.path.join("request.json")).unwrap()).unwrap();
+        let original = raw["worker"]["Host"][field].clone();
+        raw["worker"]["Host"][field] = serde_json::json!("relative/dir");
+        fs::write(job.path.join("request.json"), raw.to_string()).unwrap();
+        let err = run_worker(&job).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{field}: {err}");
+        assert!(err.to_string().contains(field), "{err}");
+        assert!(job.read_outcome().is_none());
+        assert!(!fx.path("work").exists() && !std::path::Path::new("relative").exists());
+        raw["worker"]["Host"][field] = original;
+        fs::write(job.path.join("request.json"), raw.to_string()).unwrap();
+    }
+}
+
 #[tokio::test]
 async fn scripted_worker_is_refused_without_the_env_guard() {
     assert_ne!(

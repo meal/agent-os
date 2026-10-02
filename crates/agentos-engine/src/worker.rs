@@ -18,6 +18,21 @@ use crate::process::{run_in_group, GroupError};
 pub const TEST_WORKERS_ENV: &str = "AGENTOS_TEST_WORKERS";
 
 const SCRIPT_OUTPUT_LIMIT: usize = 1024 * 1024;
+const REASON_STDERR_LIMIT: usize = 4 * 1024;
+
+/// At most `REASON_STDERR_LIMIT` bytes of `stderr` (cut on a char boundary), marked when cut.
+fn excerpt(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let text = text.trim();
+    if text.len() <= REASON_STDERR_LIMIT {
+        return text.to_string();
+    }
+    let mut end = REASON_STDERR_LIMIT;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{} [truncated]", &text[..end])
+}
 
 pub trait Worker {
     /// Runs one attempt of an effect; every failure is an `Outcome::Failure`.
@@ -88,7 +103,8 @@ fn test_workers_enabled() -> bool {
 }
 
 /// The script runs in its own process group with no timeout of its own: the supervisor
-/// enforces the lease and the deadline by killing the recorded groups.
+/// enforces the lease and the deadline by killing the recorded groups. (See `run_in_group`
+/// for the window in which a group exists but is not yet recorded.)
 async fn run_scripted(
     script: &str,
     groups_file: Option<&Path>,
@@ -107,8 +123,8 @@ async fn run_scripted(
         Err(GroupError::Io(e)) => return ExecOutcome::failure(req, ctx, format!("cannot run script: {e}")),
     };
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return ExecOutcome::failure(req, ctx, format!("script failed ({}): {}", output.status, stderr.trim()));
+        let stderr = excerpt(&output.stderr);
+        return ExecOutcome::failure(req, ctx, format!("script failed ({}): {stderr}", output.status));
     }
     // A cut output is not the output the script produced.
     if output.stdout.len() > SCRIPT_OUTPUT_LIMIT {
@@ -136,6 +152,15 @@ impl Worker for ScriptedWorker {
 /// itself could not be read or written.
 pub async fn run_worker(job: &JobDir) -> io::Result<()> {
     let request = job.request()?;
+    // `JobDir::create` checks this too, but a hand-written or older request.json must not
+    // resolve against the worker's working directory.
+    if let WorkerConfig::Host(h) = &request.worker {
+        for (name, p) in [("snapshot_dir", &h.snapshot_dir), ("profile_dir", &h.profile_dir), ("work_root", &h.work_root)] {
+            if !p.is_absolute() {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{name} {} must be absolute", p.display())));
+            }
+        }
+    }
     let req = EffectRequest {
         effect_id: request.effect_id,
         task_id: request.task_id,
@@ -210,6 +235,16 @@ mod tests {
         let out = run_scripted("head -c 1048576 /dev/zero", None, true, &req, &ctx).await;
         assert_eq!(out.receipt.outcome, Outcome::Success);
         assert_eq!(out.output.len(), SCRIPT_OUTPUT_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn a_failure_reason_keeps_at_most_4_kib_of_stderr() {
+        let (req, ctx) = req();
+        let out = run_scripted("head -c 100000 /dev/zero | tr '\\0' x >&2; exit 1", None, true, &req, &ctx).await;
+        let Outcome::Failure(reason) = out.receipt.outcome else { panic!("expected failure") };
+        assert!(reason.starts_with("script failed"), "{reason}");
+        assert!(reason.len() <= 4096 + 100, "reason is {} bytes", reason.len());
+        assert!(reason.contains(&"x".repeat(4000)) && reason.ends_with("[truncated]"), "{reason}");
     }
 
     #[tokio::test]

@@ -32,6 +32,9 @@ pub struct FixtureExecutor {
     groups_file: Option<PathBuf>,
     /// The digest the staged profile must have before anything of it runs.
     pinned_profile: Option<Digest>,
+    /// Test seam: runs with the source profile directory right after the profile is staged.
+    #[cfg(test)]
+    after_stage: Option<fn(&Path)>,
 }
 
 /// Runs blocking filesystem work off the async runtime.
@@ -73,6 +76,8 @@ impl FixtureExecutor {
             verify_timeout: Duration::from_secs(60),
             groups_file: None,
             pinned_profile: None,
+            #[cfg(test)]
+            after_stage: None,
         }
     }
 
@@ -235,7 +240,10 @@ impl FixtureExecutor {
     }
 
     /// Runs the profile from a fresh per-run copy outside the workspace, so code under test
-    /// cannot rewrite the protected source; any change to either copy voids the evidence.
+    /// cannot rewrite the protected source. The command, id and digest all come from that
+    /// staged copy, so a pin covers exactly what runs. Unpinned, any change to the source
+    /// while the run is staged or under way voids the evidence; pinned, the source is not
+    /// consulted after staging, and any change to the staged copy voids it.
     async fn try_run_verification(
         &self,
         req: &EffectRequest,
@@ -244,12 +252,6 @@ impl FixtureExecutor {
         if !ws.is_dir() {
             return Err("workspace missing: no snapshot was read".into());
         }
-        let raw = std::fs::read(self.profile_dir.join("profile.json"))
-            .map_err(|e| format!("cannot read profile: {e}"))?;
-        let profile: Profile = serde_json::from_slice(&raw).map_err(|e| format!("invalid profile.json: {e}"))?;
-        let Some((program, args)) = profile.command.split_first() else {
-            return Err("profile command is empty".into());
-        };
         let (ws_real, profile_real) = (
             ws.canonicalize().map_err(|e| e.to_string())?,
             self.profile_dir.canonicalize().map_err(|e| e.to_string())?,
@@ -258,19 +260,36 @@ impl FixtureExecutor {
             return Err("profile and workspace overlap".into());
         }
 
-        let profile_digest = workspace_digest(&self.profile_dir).map_err(|e| format!("cannot digest profile: {e}"))?;
+        let source_digest = match self.pinned_profile {
+            Some(_) => None,
+            None => Some(workspace_digest(&self.profile_dir).map_err(|e| format!("cannot digest profile: {e}"))?),
+        };
         // Entries the digest ignores must not decide the check: a bytecode cache planted by
         // an earlier run could stand in for the source the evidence names.
         purge_excluded(&ws).map_err(|e| format!("cannot clean workspace: {e}"))?;
         let run_dir = tempfile::tempdir_in(self.task_dir(&req.task_id)).map_err(|e| format!("scratch dir: {e}"))?;
         let run_profile = run_dir.path().join("profile");
         copy_tree(&self.profile_dir, &run_profile).map_err(|e| format!("cannot stage profile: {e}"))?;
-        if let Some(pinned) = self.pinned_profile {
-            let staged = workspace_digest(&run_profile).map_err(|e| format!("cannot digest profile: {e}"))?;
-            if staged != pinned {
-                return Err(format!("profile digest mismatch: pinned {pinned}, found {staged}"));
-            }
+        #[cfg(test)]
+        if let Some(hook) = self.after_stage {
+            hook(&self.profile_dir);
         }
+        let profile_digest = workspace_digest(&run_profile).map_err(|e| format!("cannot digest profile: {e}"))?;
+        match (self.pinned_profile, source_digest) {
+            (Some(pinned), _) if profile_digest != pinned => {
+                return Err(format!("profile digest mismatch: pinned {pinned}, found {profile_digest}"));
+            }
+            (None, Some(source)) if profile_digest != source => {
+                return Err("protected profile changed during verification".into());
+            }
+            _ => {}
+        }
+        // Parsed from the bytes just digested, never from the shared source.
+        let raw = std::fs::read(run_profile.join("profile.json")).map_err(|e| format!("cannot read profile: {e}"))?;
+        let profile: Profile = serde_json::from_slice(&raw).map_err(|e| format!("invalid profile.json: {e}"))?;
+        let Some((program, args)) = profile.command.split_first() else {
+            return Err("profile command is empty".into());
+        };
         let workspace = workspace_digest(&ws).map_err(|e| format!("cannot digest workspace: {e}"))?;
 
         let mut cmd = tokio::process::Command::new(program);
@@ -291,7 +310,8 @@ impl FixtureExecutor {
         };
 
         let unchanged = |dir: &Path, want: Digest| workspace_digest(dir).is_ok_and(|d| d == want);
-        if !unchanged(&self.profile_dir, profile_digest) || !unchanged(&run_profile, profile_digest) {
+        let source_changed = source_digest.is_some_and(|d| !unchanged(&self.profile_dir, d));
+        if source_changed || !unchanged(&run_profile, profile_digest) {
             return Err("protected profile changed during verification".into());
         }
         if !unchanged(&ws, workspace) {
@@ -362,5 +382,70 @@ impl Executor for FixtureExecutor {
         } else {
             Err(format!("workspace directory {} is missing", ws.display()))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentos_core::contract::Contract;
+    use agentos_core::effect::{AttemptId, EffectId, Outcome};
+
+    const STAGED: &str = r#"{"id": "staged", "command": ["python3", "-c", "print('STAGED')"], "protected": true}"#;
+
+    fn tamper(profile_dir: &Path) {
+        let tampered = r#"{"id": "tampered", "command": ["python3", "-c", "print('TAMPERED')"], "protected": true}"#;
+        std::fs::write(profile_dir.join("profile.json"), tampered).unwrap();
+    }
+
+    fn contract() -> Contract {
+        Contract::parse(r#"{"goal":"g","repository":{"source":"s","revision":"r"},"profile":"p","editable_paths":["src/**"],"verification_profile":"v","capabilities":["snapshot.read"],"limits":{"model_requests":1,"max_output_tokens_per_request":1,"tool_actions":1,"deadline_seconds":1,"worker_vcpus":1,"worker_memory_mib":1}}"#).unwrap()
+    }
+
+    /// Runs snapshot then verification with `tamper` hooked in after staging.
+    async fn verify_with_tampering(pinned: bool) -> (ExecOutcome, Digest) {
+        let dir = tempfile::tempdir().unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        copy_tree(&fixtures.join("parser-repo"), &dir.path().join("snapshot")).unwrap();
+        std::fs::create_dir(dir.path().join("profile")).unwrap();
+        std::fs::write(dir.path().join("profile/profile.json"), STAGED).unwrap();
+        let digest = workspace_digest(&dir.path().join("profile")).unwrap();
+        let mut exec = FixtureExecutor::new(dir.path().join("snapshot"), dir.path().join("profile"), dir.path().join("work"))
+            .with_pinned_profile(pinned.then_some(digest));
+        exec.after_stage = Some(tamper);
+        let task = TaskId::new();
+        let ctx = AttemptCtx { attempt_id: AttemptId::new(), lease_generation: 1, worker: "t".into() };
+        let req = |kind: EffectKind| EffectRequest {
+            effect_id: EffectId::derive(&task, 0, &kind, &Digest::of(b"")),
+            task_id: task.clone(),
+            kind,
+            payload: vec![],
+            contract: contract(),
+        };
+        let snap = exec.run(&req(EffectKind::ReadSnapshot), &ctx).await;
+        assert_eq!(snap.receipt.outcome, Outcome::Success);
+        (exec.run(&req(EffectKind::RunVerification), &ctx).await, digest)
+    }
+
+    #[tokio::test]
+    async fn a_pinned_verification_runs_the_staged_command_not_the_source() {
+        let (out, pinned) = verify_with_tampering(true).await;
+        assert_eq!(out.receipt.outcome, Outcome::Success, "{}", String::from_utf8_lossy(&out.output));
+        let evidence: serde_json::Value = serde_json::from_slice(&out.output).unwrap();
+        assert_eq!(evidence["stdout"].as_str().unwrap().trim(), "STAGED");
+        assert_eq!(evidence["profile_id"], "staged");
+        assert_eq!(evidence["command"], json!(["python3", "-c", "print('STAGED')"]));
+        assert_eq!(evidence["profile_digest"], json!(pinned));
+        assert!(out.verification.unwrap().passed);
+    }
+
+    #[tokio::test]
+    async fn an_unpinned_verification_still_voids_evidence_when_the_source_changes() {
+        let (out, _) = verify_with_tampering(false).await;
+        let Outcome::Failure(reason) = &out.receipt.outcome else {
+            panic!("expected failure, got {}", String::from_utf8_lossy(&out.output))
+        };
+        assert_eq!(reason, "protected profile changed during verification");
+        assert!(out.verification.is_none());
     }
 }
