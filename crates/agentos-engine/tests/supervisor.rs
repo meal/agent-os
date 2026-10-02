@@ -3,7 +3,7 @@ mod common;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -21,6 +21,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_agentos-supervisor");
 const TEST_WORKERS: &str = "AGENTOS_TEST_WORKERS";
 const EXIT_BEFORE_RECEIPT: &str = "AGENTOS_TEST_SUPERVISOR_EXIT_BEFORE_RECEIPT";
 const POLL: &str = "AGENTOS_SUPERVISOR_POLL_MS";
+const PANIC_AFTER_SPAWN: &str = "AGENTOS_TEST_SUPERVISOR_PANIC_AFTER_SPAWN";
 /// Upper bound for anything a test waits on; every test should finish well inside it.
 const PATIENCE: Duration = Duration::from_secs(5);
 
@@ -92,6 +93,11 @@ impl Fx {
     }
 }
 
+/// Where `JobDir::create` will put `req`'s job, for scripts that must name it up front.
+fn job_path(fx: &Fx, req: &JobRequest) -> PathBuf {
+    fx.path("jobs").join(format!("{}-{}", req.effect_id, req.attempt_id))
+}
+
 fn apply_patch() -> EffectKind {
     EffectKind::ApplyPatch { expected_base: Digest::of(b"base") }
 }
@@ -113,7 +119,7 @@ fn parts(req: &JobRequest) -> (EffectRequest, AttemptCtx) {
 fn spawn_with(job: &JobDir, lock: File, env: &[(&str, &str)]) -> Child {
     let mut cmd = Command::new(BIN);
     cmd.arg("run").arg(&job.path).stdin(Stdio::from(lock)).stdout(Stdio::null()).stderr(Stdio::null());
-    cmd.env_remove(TEST_WORKERS).env_remove(EXIT_BEFORE_RECEIPT).env_remove(POLL);
+    cmd.env_remove(TEST_WORKERS).env_remove(EXIT_BEFORE_RECEIPT).env_remove(POLL).env_remove(PANIC_AFTER_SPAWN);
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -237,30 +243,30 @@ fn normal_exit_writes_receipt_before_terminal_status() {
 fn lease_expiry_kills_a_forked_grandchild_and_its_files_never_appear() {
     let fx = Fx::new();
     let (p, m) = (fx.path("pids"), fx.path("marker"));
-    let (p, m) = (p.display(), m.display());
+    let mut req = fx.scripted(EffectKind::ReadSnapshot, "", 1000);
+    let groups = job_path(&fx, &req).join("groups");
     // If the subshell survived the kill, the marker would appear about 1.5 s after the start.
-    let script = format!(
-        "echo $$ >> {p}; (sleep 1.5 & echo $! >> {p}; wait; touch {m}) & echo $! >> {p}; sleep 30 & echo $! >> {p}; wait"
-    );
-    let req = fx.scripted(EffectKind::ReadSnapshot, &script, 1000);
+    // The Python child leads a group of its own, which the script records like a check would.
+    req.worker = WorkerConfig::Scripted(ScriptedConfig {
+        script: format!(
+            "echo $$ >> {p}; (sleep 1.5 & echo $! >> {p}; wait; touch {m}) & echo $! >> {p}; \
+             python3 -c 'import os, time; os.setpgid(0, 0); time.sleep(30)' & echo $! >> {p}; echo $! >> {g}; \
+             sleep 30 & echo $! >> {p}; wait",
+            p = p.display(),
+            m = m.display(),
+            g = groups.display(),
+        ),
+    });
     let (job, lock) = fx.create(&req);
-    // A recorded group that is not the supervisor's descendant: only the `groups` kill reaches it.
-    let mut outsider = Command::new("sleep").arg("30").process_group(0).spawn().unwrap();
-    job.record_group(outsider.id() as i32).unwrap();
     let mut child = spawn(&job, lock);
     assert!(wait_exit(&mut child).success());
-    let mut ended = None;
-    wait_for("the recorded group to die", || {
-        ended = outsider.try_wait().unwrap();
-        ended.is_some()
-    });
-    assert_eq!(ended.unwrap().signal(), Some(Signal::KILL.as_raw()));
 
     let status = assert_killed(&job, KillReason::Lease);
     assert_failure_receipt(&job, &req, "lease expired");
     assert!(job.read_outcome().is_none(), "the worker was killed before it wrote an outcome");
     let mut recorded = pids(&fx.path("pids"));
-    assert_eq!(recorded.len(), 4, "the script did not start all its processes: {recorded:?}");
+    assert_eq!(recorded.len(), 5, "the script did not start all its processes: {recorded:?}");
+    assert_eq!(job.groups().len(), 2, "the script's group and the Python child's group");
     recorded.push(status.worker_pgid.unwrap());
     assert_all_gone(&recorded);
     sleep(Duration::from_secs(2));
@@ -450,11 +456,14 @@ fn invalid_outcome_from_the_worker_becomes_a_failure_receipt() {
         ("torn output", Some(|_, _| ())),
         ("no outcome", None),
     ];
-    for (case, forge) in cases {
+    for (kind, (case, forge)) in [EffectKind::ReadSnapshot, apply_patch(), EffectKind::ExportBundle]
+        .into_iter()
+        .flat_map(|kind| cases.iter().map(move |c| (kind.clone(), *c)))
+    {
         let fx = Fx::new();
         let staged = fx.path("staged");
         fs::create_dir(&staged).unwrap();
-        let req = fx.scripted(EffectKind::ReadSnapshot, "", 5000);
+        let req = fx.scripted(kind.clone(), "", 5000);
         if let Some(forge) = forge {
             let (mut effect, mut ctx) = parts(&req);
             forge(&mut effect, &mut ctx);
@@ -464,8 +473,7 @@ fn invalid_outcome_from_the_worker_becomes_a_failure_receipt() {
             }
         }
         let mut req = req;
-        let jobs = fx.path("jobs");
-        let job_path = jobs.join(format!("{}-{}", req.effect_id, req.attempt_id));
+        let job_path = job_path(&fx, &req);
         req.worker = WorkerConfig::Scripted(ScriptedConfig {
             script: format!(
                 "cp {s}/outcome.bin {s}/outcome.json {j}/ 2>/dev/null; kill -9 $PPID; sleep 30",
@@ -476,10 +484,17 @@ fn invalid_outcome_from_the_worker_becomes_a_failure_receipt() {
         let (job, lock) = fx.create(&req);
         assert_eq!(job.path, job_path);
         let mut child = spawn(&job, lock);
-        assert!(wait_exit(&mut child).success(), "{case}");
+        assert!(wait_exit(&mut child).success(), "{kind:?} {case}");
 
-        assert_eq!(status(&job).state, JobState::Exited, "{case}");
-        assert_failure_receipt(&job, &req, "worker produced an invalid outcome");
+        assert_eq!(status(&job).state, JobState::Exited, "{kind:?} {case}");
+        if kind == EffectKind::ReadSnapshot {
+            assert_failure_receipt(&job, &req, "worker produced an invalid outcome");
+        } else {
+            // The effect may or may not have happened: the controller reconciles it.
+            assert!(job.read_receipt().is_none(), "{kind:?} {case}");
+            assert!(!job.path.join("receipt.json").exists() && !job.path.join("output.bin").exists(), "{kind:?} {case}");
+            assert!(job.is_dead(), "{kind:?} {case}");
+        }
     }
 }
 
@@ -488,9 +503,11 @@ fn supervisor_survives_the_launcher_dying() {
     let fx = Fx::new();
     let req = fx.scripted(EffectKind::ReadSnapshot, "sleep 0.5; echo done", 5000);
     let (job, lock) = fx.create(&req);
-    // The launcher hands its stdin (the lock) to a background supervisor, then lingers
-    // without the lock until it is SIGKILLed.
-    let mut launcher = Command::new("sh")
+    // The launcher leads its own session and group, hands its stdin (the lock) to a
+    // background supervisor, then lingers without the lock until its whole group is
+    // SIGKILLed: a supervisor that stayed in the launcher's group would die with it.
+    let mut launcher = Command::new("setsid")
+        .arg("sh")
         .arg("-c")
         .arg("exec 3<&0; \"$0\" run \"$1\" 0<&3 3<&- >/dev/null 2>&1 & echo $!; exec sleep 30 0</dev/null 3<&-")
         .arg(BIN)
@@ -504,7 +521,11 @@ fn supervisor_survives_the_launcher_dying() {
     let mut line = String::new();
     BufReader::new(launcher.stdout.take().unwrap()).read_line(&mut line).unwrap();
     let supervisor: u32 = line.trim().parse().unwrap();
-    launcher.kill().unwrap();
+    // The supervisor leaves the launcher's session before it writes any status.
+    wait_for("the supervisor to start", || job.read_status().is_some());
+    let launcher_pid = Pid::from_raw(launcher.id() as i32).unwrap();
+    assert_eq!(rustix::process::getsid(Some(launcher_pid)).unwrap(), launcher_pid, "the launcher leads its session");
+    kill_process_group(launcher_pid, Signal::KILL).unwrap();
     launcher.wait().unwrap();
     assert!(job.lock_held(), "the supervisor died with its launcher");
 
@@ -609,4 +630,107 @@ fn an_unreadable_request_exits_1_and_is_logged() {
     assert!(log.contains("request"), "{log}");
     assert!(job.read_receipt().is_none());
     assert!(!job.lock_held());
+}
+
+#[test]
+fn lease_kill_writes_receipt_before_killed_status_and_holds_the_lock_until_exit() {
+    let fx = Fx::new();
+    let req = fx.scripted(EffectKind::ReadSnapshot, "sleep 30", 500);
+    let (job, lock) = fx.create(&req);
+    let mut child = spawn(&job, lock);
+    let (mut saw_killed, started) = (false, Instant::now());
+    loop {
+        let held = job.lock_held();
+        let status = job.read_status();
+        if let Some(s) = &status
+            && s.state == JobState::Killed
+        {
+            assert!(job.read_receipt().is_some(), "the status became Killed before the receipt");
+            saw_killed = true;
+        }
+        if !held {
+            // Only an exiting supervisor may have dropped it, after its terminal status.
+            assert_eq!(job.read_status().map(|s| s.state), Some(JobState::Killed), "the lock was free while the job ran");
+            break;
+        }
+        assert!(started.elapsed() < PATIENCE, "the supervisor never released the lock");
+        sleep(Duration::from_millis(1));
+    }
+    assert!(wait_exit(&mut child).success());
+    assert!(saw_killed || job.read_status().is_some());
+    assert_killed(&job, KillReason::Lease);
+    assert_failure_receipt(&job, &req, "lease expired");
+}
+
+#[test]
+fn a_recorded_group_in_another_session_is_never_killed() {
+    let fx = Fx::new();
+    let req = fx.scripted(EffectKind::ReadSnapshot, "echo hi", 5000);
+    let (job, lock) = fx.create(&req);
+    // A forged `groups` file: a group in a session of its own, and one in the test's
+    // session (where the controller would live).
+    let mut own_session = Command::new("setsid").arg("sleep").arg("30").spawn().unwrap();
+    let mut test_session = Command::new("sleep").arg("30").process_group(0).spawn().unwrap();
+    wait_for("the helper's session", || {
+        let pid = Pid::from_raw(own_session.id() as i32).unwrap();
+        rustix::process::getsid(Some(pid)).is_ok_and(|sid| sid == pid)
+    });
+    job.record_group(own_session.id() as i32).unwrap();
+    job.record_group(test_session.id() as i32).unwrap();
+    let mut child = spawn(&job, lock);
+    assert!(wait_exit(&mut child).success());
+
+    assert_eq!(status(&job).state, JobState::Exited);
+    assert_eq!(job.read_receipt().unwrap().output, b"hi\n");
+    sleep(Duration::from_millis(100));
+    let survived = [own_session.try_wait().unwrap(), test_session.try_wait().unwrap()];
+    for helper in [&mut own_session, &mut test_session] {
+        let _ = helper.kill();
+        let _ = helper.wait();
+    }
+    assert_eq!(survived, [None, None], "a group outside the supervisor's session was killed");
+    let log = fs::read_to_string(job.path.join("supervisor.log")).unwrap();
+    assert_eq!(log.matches("not in our session").count(), 2, "{log}");
+}
+
+#[test]
+fn a_panic_after_the_spawn_kills_the_job_before_the_lock_is_released() {
+    let fx = Fx::new();
+    let (p, m) = (fx.path("pids"), fx.path("marker"));
+    let mut req = fx.scripted(EffectKind::ReadSnapshot, "", 5000);
+    let trigger = job_path(&fx, &req).join("panic-now");
+    req.worker = WorkerConfig::Scripted(ScriptedConfig {
+        script: format!(
+            "echo $$ >> {p}; (sleep 1 & echo $! >> {p}; wait; touch {m}) & echo $! >> {p}; touch {t}; sleep 30",
+            p = p.display(),
+            m = m.display(),
+            t = trigger.display(),
+        ),
+    });
+    let (job, lock) = fx.create(&req);
+    let mut child = spawn_with(&job, lock, &[(TEST_WORKERS, "1"), (PANIC_AFTER_SPAWN, "1")]);
+    let started = Instant::now();
+    loop {
+        if !job.lock_held() {
+            // Everything of the job must already be dead when the lock frees.
+            let pids = if p.exists() { pids(&p) } else { Vec::new() };
+            assert_all_gone(&pids);
+            if let Some(pgid) = job.read_status().and_then(|s| s.worker_pgid) {
+                assert!(gone(pgid), "the worker outlived the lock");
+            }
+            break;
+        }
+        assert!(started.elapsed() < PATIENCE, "the supervisor never released the lock");
+        sleep(Duration::from_millis(1));
+    }
+    assert_eq!(wait_exit(&mut child).code(), Some(1));
+
+    let log = fs::read_to_string(job.path.join("supervisor.log")).unwrap();
+    assert!(log.contains("panicked"), "{log}");
+    assert_eq!(status(&job).state, JobState::Running, "no terminal status after a panic");
+    assert!(job.read_receipt().is_none());
+    assert_eq!(pids(&p).len(), 3, "the script did not start before the panic");
+    assert!(trigger.exists());
+    sleep(Duration::from_millis(1500));
+    assert!(!m.exists(), "a process of the job outlived the panicking supervisor");
 }
