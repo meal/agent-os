@@ -112,7 +112,7 @@ pub(crate) fn denial(events: &[StoredEvent]) -> Option<&Value> {
 
 /// The observation a patch denial gave the agent, rebuilt from its audit payload.
 pub(crate) fn denial_observation(payload: &Value) -> Result<Observation> {
-    if payload["action"] == "ReadFile" {
+    if matches!(payload["action"].as_str(), Some("ReadFile" | "ListFiles")) {
         return Ok(Observation::FileReadRejected { reason: payload.to_string() });
     }
     Ok(match payload["reason"].as_str() {
@@ -373,6 +373,13 @@ mod tests {
                 Observation::FileReadRejected { reason: "capability snapshot.read not granted".into() }
             );
         }
+        // A non-capability denial journaled by a listing is a read rejection too, never a
+        // rejected patch.
+        let listed = json!({ "action": "ListFiles", "reason": "SomethingElse" });
+        assert_eq!(
+            denial_observation(&listed).unwrap(),
+            Observation::FileReadRejected { reason: listed.to_string() }
+        );
         // Patch denials are unchanged.
         let patch = json!({ "action": "ApplyPatch", "reason": "PathNotEditable", "paths": ["x"] });
         assert_eq!(denial_observation(&patch).unwrap(), Observation::PatchRejected { reason: patch.to_string() });

@@ -353,3 +353,35 @@ async fn a_passing_check_the_task_did_not_accept_is_not_reported_as_accepted() {
     assert_eq!(result.workspace_digest, manifest.final_workspace_digest);
     assert!(!result.accepted_for_final_workspace, "but the task never accepted it");
 }
+
+#[tokio::test]
+async fn a_bundle_lists_model_requests_and_responses() {
+    let (env, exec, _provider) = common::flow("parser-fix", 12, 10);
+    assert_eq!(common::run_model(&env, &exec).await, TaskState::Succeeded);
+    let out_root = tempfile::tempdir().unwrap();
+    let bundle = out_root.path().join("bundle");
+
+    let manifest = export(&env, &env.task, &bundle).unwrap();
+
+    assert_eq!(read_manifest(&bundle), manifest);
+    assert_eq!(manifest.model, None, "no Submitted row, no recorded model");
+    let calls = env.effects("ModelCall");
+    assert_eq!(manifest.model_calls.len(), 6);
+    for (i, (entry, rec)) in manifest.model_calls.iter().zip(&calls).enumerate() {
+        assert_eq!(entry.effect_id, rec.effect_id, "intent order");
+        assert_eq!(entry.state, "COMPLETED");
+        assert_eq!(entry.request_digest, rec.request_digest);
+        assert_eq!(entry.response_digest, rec.result_digest);
+        assert_eq!(entry.request_file, format!("model/{:04}-request.json", i + 1));
+        let response_file = entry.response_file.clone().unwrap();
+        assert_eq!(response_file, format!("model/{:04}-response.json", i + 1));
+        assert_eq!(Digest::of(&fs::read(bundle.join(&entry.request_file)).unwrap()), entry.request_digest);
+        assert_eq!(Some(Digest::of(&fs::read(bundle.join(&response_file)).unwrap())), entry.response_digest);
+    }
+    let mut names = entries(&bundle.join("model"));
+    names.sort();
+    assert_eq!(names.len(), 12);
+    // Reads are not exported; patches and evidence are as for any task.
+    assert_eq!(manifest.patches.len(), 2);
+    assert_eq!(manifest.verification_results.len(), 2);
+}

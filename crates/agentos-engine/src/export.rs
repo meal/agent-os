@@ -7,7 +7,10 @@
 //!   `git apply patch.diff` on a pristine copy of the base snapshot reproduces the final
 //!   workspace (git applies later diffs of a file on top of the earlier ones);
 //! - `patches/NNNN-<digest>.patch`: each applied patch on its own;
-//! - `evidence/<digest>.json`: the snapshot manifest and every verification result.
+//! - `evidence/<digest>.json`: the snapshot manifest and every verification result;
+//! - `model/NNNN-request.json`, `model/NNNN-response.json`: the request sent for each finished
+//!   model call and the response it got (none for a call whose answer was lost), in intent
+//!   order, as listed in [`Manifest::model_calls`].
 //!
 //! Each verification result reports `passed`, the check's own verdict from its evidence,
 //! and `accepted_for_final_workspace`, the engine's decision: only the result whose
@@ -73,6 +76,19 @@ pub struct PatchEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCallEntry {
+    pub effect_id: EffectId,
+    pub request_digest: Digest,
+    /// `None` for a call that failed without an answer (lost, then forfeited).
+    pub response_digest: Option<Digest>,
+    /// `COMPLETED` or `FAILED`.
+    pub state: String,
+    /// Path inside the bundle.
+    pub request_file: String,
+    pub response_file: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerificationResult {
     pub effect_id: EffectId,
     /// False when the check did not run to completion (e.g. a timeout).
@@ -108,6 +124,9 @@ pub struct Manifest {
     pub verified_digest: Option<Digest>,
     pub verification_profile_digest: Option<Digest>,
     pub verification_results: Vec<VerificationResult>,
+    /// The model calls that finished, in intent order.
+    #[serde(default)]
+    pub model_calls: Vec<ModelCallEntry>,
     pub usage_summary: UsageSummary,
     pub contract_digest: Digest,
     /// The model recorded at submission, if any.
@@ -197,6 +216,8 @@ struct Contents {
     manifest: Manifest,
     patch_diff: Vec<u8>,
     patches: Vec<(String, Vec<u8>)>,
+    /// `model/NNNN-request.json` and `-response.json` files, in order.
+    model_files: Vec<(String, Vec<u8>)>,
     evidence: BTreeMap<Digest, Vec<u8>>,
 }
 
@@ -229,6 +250,7 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
     let (mut base, mut last) = (None, None);
     let (mut patch_diff, mut patches, mut entries) = (Vec::new(), Vec::new(), Vec::new());
     let mut results = Vec::new();
+    let (mut model_calls, mut model_files) = (Vec::new(), Vec::new());
     for rec in effects(db, &events)? {
         match (&rec.kind, rec.state) {
             (EffectKind::ReadSnapshot, EffectState::Completed) => {
@@ -268,6 +290,32 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
                 });
                 evidence.insert(d, bytes);
             }
+            (EffectKind::ModelCall { .. }, EffectState::Completed | EffectState::Failed) => {
+                let n = model_calls.len() + 1;
+                let request = match blobs.exists(&rec.request_digest) {
+                    true => read_blob(blobs, &rec.request_digest)?,
+                    false => return Err(inconsistent(format!("the request of model call {} is gone", rec.effect_id))),
+                };
+                let request_file = format!("model/{n:04}-request.json");
+                model_files.push((request_file.clone(), request));
+                let response_file = match rec.result_digest {
+                    Some(d) => {
+                        let file = format!("model/{n:04}-response.json");
+                        model_files.push((file.clone(), read_blob(blobs, &d)?));
+                        Some(file)
+                    }
+                    None => None,
+                };
+                model_calls.push(ModelCallEntry {
+                    effect_id: rec.effect_id.clone(),
+                    request_digest: rec.request_digest,
+                    response_digest: rec.result_digest,
+                    state: if rec.state == EffectState::Completed { "COMPLETED" } else { "FAILED" }.to_string(),
+                    request_file,
+                    response_file,
+                });
+            }
+            // File listings and reads are not exported.
             _ => {}
         }
     }
@@ -320,6 +368,7 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
         verified_digest: verified,
         verification_profile_digest: profile,
         verification_results: results,
+        model_calls,
         usage_summary: db.usage_summary(task)?,
         contract_digest,
         model: submitted.and_then(|s| s["model"].as_str()).map(str::to_string),
@@ -335,7 +384,7 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
             .collect(),
         guest_image_digest,
     };
-    Ok(Contents { manifest, patch_diff, patches, evidence })
+    Ok(Contents { manifest, patch_diff, patches, model_files, evidence })
 }
 
 fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -410,15 +459,21 @@ fn write_bundle(contents: Contents, out_dir: &Path, before: BeforeWrite) -> Resu
     let root = tmp.path();
     fs::create_dir(root.join("patches"))?;
     fs::create_dir(root.join("evidence"))?;
+    if !contents.model_files.is_empty() {
+        fs::create_dir(root.join("model"))?;
+    }
     let mut files: Vec<(String, &[u8])> = vec![("patch.diff".into(), &contents.patch_diff)];
     files.extend(contents.patches.iter().map(|(rel, bytes)| (rel.clone(), bytes.as_slice())));
+    files.extend(contents.model_files.iter().map(|(rel, bytes)| (rel.clone(), bytes.as_slice())));
     files.extend(contents.evidence.iter().map(|(d, bytes)| (format!("evidence/{d}.json"), bytes.as_slice())));
     let manifest_json = serde_json::to_vec_pretty(&contents.manifest).map_err(DbError::from)?;
     files.push(("manifest.json".into(), &manifest_json));
     write_checked(root, &files, before)?;
     let files = files.len();
-    for dir in ["patches", "evidence", ""] {
-        sync_dir(&root.join(dir))?;
+    for dir in ["patches", "evidence", "model", ""] {
+        if root.join(dir).exists() {
+            sync_dir(&root.join(dir))?;
+        }
     }
     {
         use std::os::unix::fs::PermissionsExt;
@@ -457,6 +512,7 @@ mod tests {
             verified_digest: None,
             verification_profile_digest: None,
             verification_results: Vec::new(),
+            model_calls: Vec::new(),
             usage_summary: UsageSummary::default(),
             contract_digest: Digest::of(b"contract"),
             model: None,
@@ -465,7 +521,7 @@ mod tests {
             guest_image_digest: None,
         };
         let evidence = [b"{\"a\":1}".to_vec(), b"{\"b\":2}".to_vec()].into_iter().map(|b| (Digest::of(&b), b)).collect();
-        Contents { manifest, patch_diff: b"diff".to_vec(), patches: vec![("patches/0001-x.patch".into(), b"p".to_vec())], evidence }
+        Contents { manifest, patch_diff: b"diff".to_vec(), patches: vec![("patches/0001-x.patch".into(), b"p".to_vec())], model_files: Vec::new(), evidence }
     }
 
     fn names(dir: &Path) -> Vec<String> {

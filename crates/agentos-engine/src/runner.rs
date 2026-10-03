@@ -16,9 +16,11 @@ use serde_json::json;
 use crate::agent::{Agent, AgentAction, Observation};
 use crate::crash::{CrashPoint, RunOptions};
 use crate::executor::Executor;
+use crate::guestlink::guest_text;
 use crate::journal;
 use crate::patch::patch_paths;
 use crate::recover::{self, deadline_stop};
+use crate::shadow::check_path;
 use crate::steps::{intend, run_attempt, Attempt, Cx};
 use crate::workspace::has_excluded_component;
 
@@ -336,15 +338,157 @@ fn finish(db: &Db, task: &TaskId) -> Result<TaskState> {
     fail(db, task, "agent finished without verified success")
 }
 
-async fn act<E: Executor>(cx: &Cx<'_, E>, since: u64, base: Digest, action: AgentAction) -> Result<Next> {
+/// Publishes the serialized model request as an artifact of type `model-request`. Before the
+/// turn that names it is journaled it is registered unlinked (`effect` is `None`), so that
+/// recovery's blob collection keeps it even if the controller dies before the intent; after
+/// the intent the same call links it to the effect.
+fn ensure_request_artifact<E>(cx: &Cx<'_, E>, effect: Option<&EffectId>, request: &Digest, body: &[u8]) -> Result<()> {
+    if !cx.blobs.exists(request) {
+        cx.blobs.put(body)?;
+    }
+    let provenance = json!({ "source": "agent" }).to_string();
+    cx.db.register_artifact(request, body.len() as u64, "model-request", effect, &provenance)?;
+    Ok(())
+}
+
+/// The bytes a `CallModel` sends. A body that does not hash to `request` (a journaled action
+/// carries none) is read back from the blob store, where the request was published before the
+/// turn was journaled.
+fn request_body(blobs: &BlobStore, request: &Digest, body: Vec<u8>, rec: Option<&EffectRecord>) -> Result<Vec<u8>> {
+    if Digest::of(&body) == *request {
+        return Ok(body);
+    }
+    let stored = match rec {
+        Some(rec) => journal::model_request_body(blobs, rec)?,
+        None => blobs.exists(request).then(|| blobs.get(request)).transpose()?,
+    };
+    match stored {
+        Some(bytes) if Digest::of(&bytes) == *request => Ok(bytes),
+        _ => Err(EngineError::Protocol(format!("the model request {request} is gone"))),
+    }
+}
+
+/// The model name the request body carries, bounded for the effect kind.
+fn model_of(body: &[u8]) -> String {
+    let value: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+    value["model"].as_str().map_or_else(|| "unknown".to_string(), |m| m.chars().take(128).collect())
+}
+
+/// Sends the request for the turn journaled at `since`, once: the effect it already produced
+/// is reused (never intended or sent again), a missing grant ends the task, an exhausted
+/// budget ends it too.
+async fn call_model<E: Executor>(cx: &Cx<'_, E>, since: u64, turn: u32, base: Digest, request: Digest, body: Vec<u8>) -> Result<Next> {
+    let (db, task) = (cx.db, &cx.task);
+    let after = journal::events_after(db, task, since)?;
+    if let Some(id) = journal::intended(&after, "ModelCall", Some(&request))? {
+        let rec = db.effect(&id)?;
+        let body = request_body(cx.blobs, &request, body, Some(&rec))?;
+        ensure_request_artifact(cx, Some(&rec.effect_id), &request, &body)?;
+        return effect_turn(cx, rec, body).await;
+    }
+    if let Some(state) = deadline_stop(cx).await? {
+        return Ok(Next::Stop(state));
+    }
+    let not_granted = || format!("capability {} not granted", capability_name(Capability::ModelRequest));
+    if let Err(denial) = granted(db, task, Capability::ModelRequest, &Resource::Task)? {
+        let capability = capability_name(Capability::ModelRequest);
+        let audit = json!({ "action": "CallModel", "reason": "CapabilityDenied", "capability": capability, "denial": denial });
+        db.append_audit(task, "Denied", &audit)?;
+        tracing::info!(task_id = %task, %audit, "model call denied");
+        return Ok(Next::Stop(fail(db, task, &not_granted())?));
+    }
+    let body = request_body(cx.blobs, &request, body, None)?;
+    let kind = EffectKind::ModelCall { model: model_of(&body), turn };
+    let rec = match intend(db, task, kind, request, &base, &Resource::Task) {
+        Ok(rec) => rec,
+        Err(EngineError::Db(DbError::BudgetExceeded(_))) => return Ok(Next::Stop(fail(db, task, "budget exhausted")?)),
+        Err(EngineError::Db(DbError::CapabilityDenied { .. })) => return Ok(Next::Stop(fail(db, task, &not_granted())?)),
+        Err(e) => return Err(e),
+    };
+    if rec.state == EffectState::Intended {
+        cx.crash(CrashPoint::AfterIntent, Some(rec.kind.tag()))?;
+    }
+    ensure_request_artifact(cx, Some(&rec.effect_id), &request, &body)?;
+    effect_turn(cx, rec, body).await
+}
+
+/// The intent of a read (a listing or a file), with the error mapping both share: an exhausted
+/// budget ends the task, a missing grant is a rejection the agent sees. `Ok(Err(next))` is that
+/// early exit.
+fn intend_read(db: &Db, task: &TaskId, kind: EffectKind, request: Digest, base: &Digest) -> Result<std::result::Result<EffectRecord, Next>> {
+    match intend(db, task, kind, request, base, &Resource::Task) {
+        Ok(rec) => Ok(Ok(rec)),
+        Err(EngineError::Db(DbError::BudgetExceeded(_))) => Ok(Err(Next::Stop(fail(db, task, "budget exhausted")?))),
+        Err(EngineError::Db(DbError::CapabilityDenied { .. })) => {
+            let reason = format!("capability {} not granted", capability_name(Capability::SnapshotRead));
+            Ok(Err(Next::Observe(Observation::FileReadRejected { reason })))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Lists the workspace for the turn journaled at `since`, as a read effect.
+async fn list_files<E: Executor>(cx: &Cx<'_, E>, since: u64, turn: u32, base: Digest) -> Result<Next> {
+    let (db, task) = (cx.db, &cx.task);
+    let after = journal::events_after(db, task, since)?;
+    if let Some(id) = journal::intended(&after, "ListFiles", None)? {
+        return effect_turn(cx, db.effect(&id)?, Vec::new()).await;
+    }
+    if let Some(denied) = journal::denial(&after) {
+        return Ok(Next::Observe(journal::denial_observation(denied)?));
+    }
+    if let Some(state) = deadline_stop(cx).await? {
+        return Ok(Next::Stop(state));
+    }
+    let rec = match intend_read(db, task, EffectKind::ListFiles { turn }, Digest::of(b"list_files"), &base)? {
+        Ok(rec) => rec,
+        Err(next) => return Ok(next),
+    };
+    if rec.state == EffectState::Intended {
+        cx.crash(CrashPoint::AfterIntent, Some(rec.kind.tag()))?;
+    }
+    effect_turn(cx, rec, Vec::new()).await
+}
+
+/// Reads one file of the workspace for the turn journaled at `since`. A path that can never
+/// name a file of it is refused here, journaled escaped, and never becomes an effect.
+async fn read_file<E: Executor>(cx: &Cx<'_, E>, since: u64, turn: u32, base: Digest, path: String) -> Result<Next> {
+    let (db, task) = (cx.db, &cx.task);
+    let request = Digest::of(path.as_bytes());
+    let after = journal::events_after(db, task, since)?;
+    if let Some(id) = journal::intended(&after, "ReadFile", Some(&request))? {
+        return effect_turn(cx, db.effect(&id)?, Vec::new()).await;
+    }
+    if let Some(denied) = journal::denial(&after) {
+        return Ok(Next::Observe(journal::denial_observation(denied)?));
+    }
+    if let Some(state) = deadline_stop(cx).await? {
+        return Ok(Next::Stop(state));
+    }
+    if let Err(detail) = check_path(&path) {
+        let audit = json!({ "action": "ReadFile", "reason": "InvalidPath", "path": guest_text(&path), "detail": detail });
+        db.append_audit(task, "Denied", &audit)?;
+        tracing::info!(task_id = %task, %audit, "file read denied");
+        return Ok(Next::Observe(Observation::FileReadRejected { reason: audit.to_string() }));
+    }
+    let rec = match intend_read(db, task, EffectKind::ReadFile { path, turn }, request, &base)? {
+        Ok(rec) => rec,
+        Err(next) => return Ok(next),
+    };
+    if rec.state == EffectState::Intended {
+        cx.crash(CrashPoint::AfterIntent, Some(rec.kind.tag()))?;
+    }
+    effect_turn(cx, rec, Vec::new()).await
+}
+
+async fn act<E: Executor>(cx: &Cx<'_, E>, since: u64, turn: u32, base: Digest, action: AgentAction) -> Result<Next> {
     match action {
         AgentAction::ApplyPatch(patch) => apply_patch(cx, since, base, patch).await,
         AgentAction::Verify => verify(cx, Some(since)).await,
         AgentAction::Finish => Ok(Next::Stop(finish(cx.db, &cx.task)?)),
-        // Until the model workflow is wired in.
-        AgentAction::CallModel { .. } | AgentAction::ListFiles | AgentAction::ReadFile(_) => {
-            Ok(Next::Stop(fail(cx.db, &cx.task, "model actions are not wired yet")?))
-        }
+        AgentAction::CallModel { request, body } => call_model(cx, since, turn, base, request, body).await,
+        AgentAction::ListFiles => list_files(cx, since, turn, base).await,
+        AgentAction::ReadFile(path) => read_file(cx, since, turn, base, path).await,
     }
 }
 
@@ -439,10 +583,14 @@ async fn drive<E: Executor, A: Agent>(cx: &Cx<'_, E>, agent: &mut A) -> Result<T
     let turns = journal::session_turns(&db.events(task)?)?;
     let t = db.task(task)?;
     let mut base = t.workspace_digest;
+    // The last turn's *emitted* action is what is performed again below: unlike the journaled
+    // one it carries a model request's body.
+    let mut last_emitted = None;
     for turn in &turns {
         base = observed_workspace(&turn.observation).unwrap_or(base);
         let emitted = agent.next(&turn.observation);
-        if emitted != turn.action {
+        // Compared by description (a model request by its digest): the body is not journaled.
+        if describe(&emitted) != describe(&turn.action) {
             fail(db, task, &format!("agent replay diverged at turn {}", turn.turn))?;
             return Err(EngineError::NondeterministicAgent {
                 turn: turn.turn,
@@ -450,12 +598,13 @@ async fn drive<E: Executor, A: Agent>(cx: &Cx<'_, E>, agent: &mut A) -> Result<T
                 emitted: describe(&emitted),
             });
         }
+        last_emitted = Some(emitted);
     }
-    let mut next = match turns.last() {
+    let mut next = match turns.last().zip(last_emitted) {
         // The last journaled action may be unfinished: perform it, idempotently.
-        Some(last) => match interrupted(db, task)? {
+        Some((last, action)) => match interrupted(db, task)? {
             Some(state) => return Ok(state),
-            None => interruptible(db, task, act(cx, last.seq, base, last.action.clone()).await)?,
+            None => interruptible(db, task, act(cx, last.seq, last.turn, base, action).await)?,
         },
         None if t.state == TaskState::Verifying => interruptible(db, task, verify(cx, None).await)?,
         None => Next::Observe(Observation::Start { files, workspace: base }),
@@ -485,8 +634,60 @@ async fn drive<E: Executor, A: Agent>(cx: &Cx<'_, E>, agent: &mut A) -> Result<T
         if let Some(state) = deadline_stop(cx).await? {
             return Ok(state);
         }
+        // The request body is a registered artifact before the turn that names it exists, or
+        // recovery's blob collection could delete it and an intended call would be lost.
+        if let AgentAction::CallModel { request, body } = &action {
+            ensure_request_artifact(cx, None, request, body)?;
+        }
         let since = journal::append_turn(db, task, turn, &obs, &action)?;
         cx.crash(CrashPoint::AfterAgentTurnJournaled, action_kind(&action))?;
-        next = interruptible(db, task, act(cx, since, base, action).await)?;
+        next = interruptible(db, task, act(cx, since, turn, base, action).await)?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(request: Digest) -> EffectRecord {
+        let kind = EffectKind::ModelCall { model: "m".into(), turn: 1 };
+        EffectRecord {
+            effect_id: EffectId::derive(&TaskId::new(), 1, &kind, &request),
+            task_id: TaskId::new(),
+            step: 1,
+            kind,
+            state: EffectState::Intended,
+            request_digest: request,
+            lease_generation: 0,
+            result_digest: None,
+        }
+    }
+
+    #[test]
+    fn a_journaled_call_without_a_body_is_resent_from_its_stored_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::open(dir.path().join("blobs")).unwrap();
+        let body = br#"{"model":"m","messages":[]}"#.to_vec();
+        let request = Digest::of(&body);
+
+        // A body that hashes to the request is used as it is.
+        assert_eq!(request_body(&blobs, &request, body.clone(), None).unwrap(), body);
+        // An empty one (what the journal holds) needs the blob; without it the call is lost.
+        assert!(matches!(request_body(&blobs, &request, Vec::new(), None), Err(EngineError::Protocol(_))));
+        assert!(matches!(request_body(&blobs, &request, Vec::new(), Some(&rec(request))), Err(EngineError::Protocol(_))));
+        blobs.put(&body).unwrap();
+        assert_eq!(request_body(&blobs, &request, Vec::new(), None).unwrap(), body);
+        assert_eq!(request_body(&blobs, &request, Vec::new(), Some(&rec(request))).unwrap(), body);
+        // A body for another request is not trusted either.
+        assert_eq!(request_body(&blobs, &request, b"other".to_vec(), None).unwrap(), body);
+    }
+
+    #[test]
+    fn the_model_name_comes_from_the_body_and_is_bounded() {
+        assert_eq!(model_of(br#"{"model":"claude-opus-5-5"}"#), "claude-opus-5-5");
+        assert_eq!(model_of(b"not json"), "unknown");
+        assert_eq!(model_of(br#"{"model":7}"#), "unknown");
+        let long = format!(r#"{{"model":"{}"}}"#, "x".repeat(500));
+        assert_eq!(model_of(long.as_bytes()).len(), 128);
     }
 }

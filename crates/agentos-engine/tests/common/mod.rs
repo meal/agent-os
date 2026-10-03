@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 use agentos_core::contract::Contract;
 use agentos_core::effect::{EffectId, EffectRecord};
 use agentos_core::ids::{Digest, TaskId};
-use agentos_engine::agent::{Agent, AgentAction, Observation};
+use agentos_core::state::TaskState;
+use agentos_engine::agent::{Agent, AgentAction, ModelAgent, Observation};
+use agentos_engine::model::fake::FakeProvider;
 use agentos_engine::crash::CrashHook;
 use agentos_engine::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor};
 use agentos_core::guest::mint_attempt_token;
@@ -448,6 +450,11 @@ fn contract_limits(model_requests: u32, tool_actions: u32, caps: &[&str], deadli
     (Contract::parse(&json).unwrap(), Digest::of(json.as_bytes()))
 }
 
+/// An approved task whose contract grants `MODEL_CAPS` and `model_requests` model requests.
+pub fn model_env(model_requests: u32, tool_actions: u32) -> Env {
+    Env::with_model(model_requests, tool_actions)
+}
+
 pub struct Env {
     pub dir: TempDir,
     pub db: Db,
@@ -609,4 +616,29 @@ pub fn routing_over<J: Executor>(
     let model = ModelExecutor::new(root.join("model"), provider, counts.clone()).with_crash(hook.clone());
     let reads = ShadowReader::new(root.join("agentos.db"), root.join("snapshot"), root.join("shadow")).with_crash(hook);
     RoutingExecutor::new(jobs, model, reads)
+}
+
+/// A model-driven task over `model_env(model_requests, tool_actions)`, with the routing
+/// executor answering model calls from `provider` (the returned handle shares its counter).
+pub fn flow_with(provider: FakeProvider, model_requests: u32, tool_actions: u32) -> (Env, RoutingExecutor<FixtureExecutor>, FakeProvider) {
+    let env = model_env(model_requests, tool_actions);
+    let counts = ExecCounts::default();
+    let exec = routing_over(env.dir.path(), env.fixture_exec(), Some(Box::new(provider.clone_handle())), &counts, None);
+    (env, exec, provider)
+}
+
+/// [`flow_with`] a provider answering from `fixtures/transcripts/<transcript>.json`.
+pub fn flow(transcript_name: &str, model_requests: u32, tool_actions: u32) -> (Env, RoutingExecutor<FixtureExecutor>, FakeProvider) {
+    flow_with(FakeProvider::from_file(&transcript(transcript_name)).unwrap(), model_requests, tool_actions)
+}
+
+/// A fresh `ModelAgent` for `env`'s contract.
+pub fn model_agent(env: &Env) -> ModelAgent {
+    ModelAgent::new(env.contract.clone(), "claude-opus-5-5")
+}
+
+/// Runs the task with a fresh `ModelAgent`.
+pub async fn run_model<E: Executor>(env: &Env, exec: &E) -> TaskState {
+    let mut agent = model_agent(env);
+    agentos_engine::runner::run_task(&env.db, &env.blobs, exec, &mut agent, &env.task).await.unwrap()
 }

@@ -302,3 +302,63 @@ fn one_tool_use_among_text_and_thinking_blocks_still_maps_normally() {
     ]);
     assert_eq!(a.next(&response_with(content, "tool_use")), AgentAction::Verify);
 }
+
+/// What the journal does to an observation between the live run and a replay.
+fn journaled(obs: &Observation) -> Observation {
+    serde_json::from_slice(&serde_json::to_vec(obs).unwrap()).unwrap()
+}
+
+#[test]
+fn replaying_the_journal_round_trip_gives_the_live_request_digests() {
+    // Floats anywhere in a response (thinking, text, a tool input, usage-like fields) must
+    // survive the journal's JSON round trip exactly, or the replayed request differs.
+    let floats = [0.1, 0.30000000000000004, 1.0 / 3.0, 2.2250738585072014e-308, 1.7976931348623157e308, 123456789.12345679, 5e-324, 0.1 + 0.7];
+    let live_response = |tool: &str, input: Value| {
+        // Parsed from text, as a retained provider response is, not built from f64 literals.
+        let text = format!(
+            r#"[{{"type":"thinking","thinking":"t","signature":"s","score":{}}},{{"type":"text","text":"x","weights":[{}]}},{{"type":"tool_use","id":"toolu_1","name":"{tool}","input":{}}}]"#,
+            "0.12345678901234567890123", "0.30000000000000004123, 1e-7, 4.35, 2.9999999999999996", input
+        );
+        response_with(serde_json::from_str(&text).unwrap(), "tool_use")
+    };
+    let mut observations = vec![start(), live_response("list_files", json!({}))];
+    for f in floats {
+        observations.push(Observation::Files { files: vec![format!("{f}")] });
+        observations.push(live_response("read_file", json!({"path": "src/parser.py", "ratio": f})));
+    }
+
+    let mut live = agent();
+    let mut replay = agent();
+    for obs in &observations {
+        let (x, y) = (live.next(obs), replay.next(&journaled(obs)));
+        if let (AgentAction::CallModel { request: a, body: b1 }, AgentAction::CallModel { request: b, body: b2 }) = (&x, &y) {
+            assert_eq!(a, b, "the digest of the request survives the journal");
+            assert_eq!(b1, b2);
+        } else {
+            assert_eq!(x, y);
+        }
+    }
+}
+
+#[test]
+fn many_long_floats_survive_the_journal_round_trip() {
+    // Provider text carries floats with up to 17+ significant digits; serde_json without
+    // `float_roundtrip` can parse such text one ulp off. The pin: parse, journal, parse
+    // again must be a fixed point, for a deterministic spread of doubles.
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    for _ in 0..50_000 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let f = f64::from_bits(x);
+        if !f.is_finite() {
+            continue;
+        }
+        for text in [format!("{f:.20e}"), format!("{f:.25e}"), format!("{}", (x >> 11) as f64 / (1u64 << 53) as f64)] {
+            let live: Value = serde_json::from_str(&format!("[{text}]")).unwrap();
+            let replay: Value = serde_json::from_slice(&serde_json::to_vec(&live).unwrap()).unwrap();
+            assert_eq!(live, replay, "{text}");
+            assert_eq!(serde_json::to_vec(&live).unwrap(), serde_json::to_vec(&replay).unwrap(), "{text}");
+        }
+    }
+}

@@ -36,8 +36,9 @@ enum Mode {
 
 /// A provider that never touches the network: answers from a transcript by conversation
 /// depth, or from a position-keyed script.
+#[derive(Clone)]
 pub struct FakeProvider {
-    mode: Mode,
+    mode: Arc<Mode>,
     calls: Arc<AtomicUsize>,
 }
 
@@ -47,11 +48,17 @@ impl FakeProvider {
     }
 
     pub fn from_transcript(t: Transcript) -> FakeProvider {
-        FakeProvider { mode: Mode::Transcript(t), calls: Arc::new(AtomicUsize::new(0)) }
+        FakeProvider { mode: Arc::new(Mode::Transcript(t)), calls: Arc::new(AtomicUsize::new(0)) }
     }
 
     pub fn scripted(results: Vec<ProviderResult>) -> FakeProvider {
-        FakeProvider { mode: Mode::Scripted(Mutex::new(results.into())), calls: Arc::new(AtomicUsize::new(0)) }
+        FakeProvider { mode: Arc::new(Mode::Scripted(Mutex::new(results.into()))), calls: Arc::new(AtomicUsize::new(0)) }
+    }
+
+    /// Another handle on the same script and call counter, for a test that hands the provider
+    /// to an executor and keeps watching `calls()`.
+    pub fn clone_handle(&self) -> FakeProvider {
+        self.clone()
     }
 
     pub fn calls(&self) -> usize {
@@ -93,7 +100,7 @@ impl ModelProvider for FakeProvider {
     fn complete<'a>(&'a self, body: &'a [u8]) -> BoxFuture<'a, ProviderResult> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            match &self.mode {
+            match &*self.mode {
                 Mode::Transcript(t) => answer(t, body),
                 Mode::Scripted(q) => q
                     .lock()

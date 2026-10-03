@@ -8,7 +8,7 @@ version = "0.1.0"
 
 [workspace.dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
 thiserror = "2.0.21"
 blake3 = "1.8.7"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
