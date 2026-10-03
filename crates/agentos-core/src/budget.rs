@@ -21,12 +21,23 @@ impl Reservation {
     }
 }
 
-/// Only snapshot reads and patch applications consume a tool action; verification and
-/// export are controller work, not agent actions.
+/// Snapshot reads, patch applications, file listings and file reads consume a tool
+/// action; verification, export and model calls are not agent tool actions.
 pub fn tool_actions_for(kind: &EffectKind) -> u32 {
     match kind {
-        EffectKind::ReadSnapshot | EffectKind::ApplyPatch { .. } => 1,
-        EffectKind::RunVerification | EffectKind::ExportBundle => 0,
+        EffectKind::ReadSnapshot
+        | EffectKind::ApplyPatch { .. }
+        | EffectKind::ListFiles { .. }
+        | EffectKind::ReadFile { .. } => 1,
+        EffectKind::RunVerification | EffectKind::ExportBundle | EffectKind::ModelCall { .. } => 0,
+    }
+}
+
+/// Only a model call consumes a model request.
+pub fn model_requests_for(kind: &EffectKind) -> u32 {
+    match kind {
+        EffectKind::ModelCall { .. } => 1,
+        _ => 0,
     }
 }
 
@@ -129,12 +140,31 @@ mod tests {
     }
 
     #[test]
-    fn only_snapshot_and_patch_consume_tool_actions() {
+    fn tool_actions_and_model_requests_per_kind() {
         let d = Digest::of(b"x");
         assert_eq!(tool_actions_for(&EffectKind::ReadSnapshot), 1);
         assert_eq!(tool_actions_for(&EffectKind::ApplyPatch { expected_base: d }), 1);
         assert_eq!(tool_actions_for(&EffectKind::RunVerification), 0);
         assert_eq!(tool_actions_for(&EffectKind::ExportBundle), 0);
+        let mc = EffectKind::ModelCall { model: "m".into(), turn: 1 };
+        assert_eq!(tool_actions_for(&EffectKind::ListFiles { turn: 0 }), 1);
+        assert_eq!(tool_actions_for(&EffectKind::ReadFile { path: "p".into(), turn: 0 }), 1);
+        assert_eq!(tool_actions_for(&mc), 0);
+        assert_eq!(model_requests_for(&mc), 1);
+        for k in [
+            EffectKind::ReadSnapshot,
+            EffectKind::ApplyPatch { expected_base: d },
+            EffectKind::RunVerification,
+            EffectKind::ExportBundle,
+            EffectKind::ListFiles { turn: 0 },
+            EffectKind::ReadFile { path: "p".into(), turn: 0 },
+        ] {
+            assert_eq!(model_requests_for(&k), 0, "{k:?}");
+        }
+        assert_eq!(
+            Reservation::for_kind(&mc, 1),
+            Reservation { tool_actions: 0, model_requests: 1 }
+        );
         assert_eq!(
             Reservation::for_kind(&EffectKind::ReadSnapshot, 3),
             Reservation { tool_actions: 1, model_requests: 3 }

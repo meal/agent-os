@@ -147,7 +147,7 @@ pub fn authorize(
 pub fn scope_for(op: Capability, contract: &Contract) -> Scope {
     match op {
         Capability::WorkspaceApplyPatch => Scope::Paths(contract.editable_paths.clone()),
-        Capability::SnapshotRead | Capability::ArtifactExport => Scope::Task,
+        Capability::SnapshotRead | Capability::ArtifactExport | Capability::ModelRequest => Scope::Task,
         Capability::VerificationRun => Scope::Profile(contract.verification_profile.clone()),
     }
 }
@@ -318,6 +318,7 @@ mod tests {
         assert_eq!(scope_for(Capability::WorkspaceApplyPatch, &c), Scope::Paths(vec!["src/**".into()]));
         assert_eq!(scope_for(Capability::SnapshotRead, &c), Scope::Task);
         assert_eq!(scope_for(Capability::ArtifactExport, &c), Scope::Task);
+        assert_eq!(scope_for(Capability::ModelRequest, &c), Scope::Task);
         assert_eq!(scope_for(Capability::VerificationRun, &c), Scope::Profile("parser-checks-v1".into()));
     }
 }

@@ -15,6 +15,9 @@ pub enum Outcome {
 pub enum RetryPolicy {
     Retry,
     ReconcileThenRetry,
+    /// A lost attempt is forfeited (FAILED, reservation uncertain) and asked again
+    /// under a new effect, never re-dispatched.
+    ForfeitThenRetry,
     NoRetry,
 }
 
@@ -24,12 +27,18 @@ pub enum EffectKind {
     ApplyPatch { expected_base: Digest },
     RunVerification,
     ExportBundle,
+    ModelCall { model: String, turn: u32 },
+    ListFiles { turn: u32 },
+    ReadFile { path: String, turn: u32 },
 }
 
 impl EffectKind {
     pub fn capability(&self) -> Capability {
         match self {
-            EffectKind::ReadSnapshot => Capability::SnapshotRead,
+            EffectKind::ReadSnapshot | EffectKind::ListFiles { .. } | EffectKind::ReadFile { .. } => {
+                Capability::SnapshotRead
+            }
+            EffectKind::ModelCall { .. } => Capability::ModelRequest,
             EffectKind::ApplyPatch { .. } => Capability::WorkspaceApplyPatch,
             EffectKind::RunVerification => Capability::VerificationRun,
             EffectKind::ExportBundle => Capability::ArtifactExport,
@@ -38,7 +47,11 @@ impl EffectKind {
 
     pub fn retry_policy(&self) -> RetryPolicy {
         match self {
-            EffectKind::ReadSnapshot | EffectKind::RunVerification => RetryPolicy::Retry,
+            EffectKind::ReadSnapshot
+            | EffectKind::RunVerification
+            | EffectKind::ListFiles { .. }
+            | EffectKind::ReadFile { .. } => RetryPolicy::Retry,
+            EffectKind::ModelCall { .. } => RetryPolicy::ForfeitThenRetry,
             // Safe to retry after reconciling because of the expected-version check.
             EffectKind::ApplyPatch { .. } | EffectKind::ExportBundle => {
                 RetryPolicy::ReconcileThenRetry
@@ -53,6 +66,9 @@ impl EffectKind {
             EffectKind::ApplyPatch { .. } => "apply_patch",
             EffectKind::RunVerification => "run_verification",
             EffectKind::ExportBundle => "export_bundle",
+            EffectKind::ModelCall { .. } => "model_call",
+            EffectKind::ListFiles { .. } => "list_files",
+            EffectKind::ReadFile { .. } => "read_file",
         }
     }
 }
@@ -92,6 +108,18 @@ impl EffectId {
         put(&mut h, kind.tag().as_bytes());
         if let EffectKind::ApplyPatch { expected_base } = kind {
             put(&mut h, expected_base.to_string().as_bytes());
+        }
+        match kind {
+            EffectKind::ModelCall { model, turn } => {
+                put(&mut h, model.as_bytes());
+                put(&mut h, &turn.to_le_bytes());
+            }
+            EffectKind::ListFiles { turn } => put(&mut h, &turn.to_le_bytes()),
+            EffectKind::ReadFile { path, turn } => {
+                put(&mut h, path.as_bytes());
+                put(&mut h, &turn.to_le_bytes());
+            }
+            _ => {}
         }
         put(&mut h, request_digest.as_bytes());
         EffectId(h.finalize().to_hex().to_string())
@@ -242,6 +270,9 @@ mod tests {
             EffectKind::ApplyPatch { expected_base: b },
             EffectKind::RunVerification,
             EffectKind::ExportBundle,
+            EffectKind::ModelCall { model: "m".into(), turn: 1 },
+            EffectKind::ListFiles { turn: 1 },
+            EffectKind::ReadFile { path: "src/a.py".into(), turn: 1 },
         ];
         let ids: Vec<_> = kinds.iter().map(|k| id_of("t", 1, k, b"r")).collect();
         for i in 0..ids.len() {
@@ -249,6 +280,21 @@ mod tests {
                 assert_ne!(ids[i], ids[j]);
             }
         }
+    }
+
+    #[test]
+    fn model_turn_and_path_change_the_id() {
+        let mc = |m: &str, t| EffectKind::ModelCall { model: m.into(), turn: t };
+        let rf = |p: &str, t| EffectKind::ReadFile { path: p.into(), turn: t };
+        let lf = |t| EffectKind::ListFiles { turn: t };
+        assert_ne!(id_of("t", 1, &mc("m", 1), b"r"), id_of("t", 1, &mc("m", 2), b"r"));
+        assert_ne!(id_of("t", 1, &mc("m", 1), b"r"), id_of("t", 1, &mc("n", 1), b"r"));
+        assert_eq!(id_of("t", 1, &mc("m", 1), b"r"), id_of("t", 1, &mc("m", 1), b"r"));
+        assert_ne!(id_of("t", 1, &lf(1), b"r"), id_of("t", 1, &lf(2), b"r"));
+        assert_eq!(id_of("t", 1, &lf(1), b"r"), id_of("t", 1, &lf(1), b"r"));
+        assert_ne!(id_of("t", 1, &rf("a", 1), b"r"), id_of("t", 1, &rf("b", 1), b"r"));
+        assert_ne!(id_of("t", 1, &rf("a", 1), b"r"), id_of("t", 1, &rf("a", 2), b"r"));
+        assert_eq!(id_of("t", 1, &rf("a", 1), b"r"), id_of("t", 1, &rf("a", 1), b"r"));
     }
 
     #[test]
@@ -285,6 +331,15 @@ mod tests {
         );
         assert_eq!(EffectKind::RunVerification.capability(), Capability::VerificationRun);
         assert_eq!(EffectKind::ExportBundle.capability(), Capability::ArtifactExport);
+        assert_eq!(
+            EffectKind::ModelCall { model: "m".into(), turn: 1 }.capability(),
+            Capability::ModelRequest
+        );
+        assert_eq!(EffectKind::ListFiles { turn: 1 }.capability(), Capability::SnapshotRead);
+        assert_eq!(
+            EffectKind::ReadFile { path: "p".into(), turn: 1 }.capability(),
+            Capability::SnapshotRead
+        );
     }
 
     #[test]
@@ -297,6 +352,38 @@ mod tests {
         );
         assert_eq!(EffectKind::RunVerification.retry_policy(), RetryPolicy::Retry);
         assert_eq!(EffectKind::ExportBundle.retry_policy(), RetryPolicy::ReconcileThenRetry);
+        assert_eq!(
+            EffectKind::ModelCall { model: "m".into(), turn: 1 }.retry_policy(),
+            RetryPolicy::ForfeitThenRetry
+        );
+        assert_eq!(EffectKind::ListFiles { turn: 1 }.retry_policy(), RetryPolicy::Retry);
+        assert_eq!(
+            EffectKind::ReadFile { path: "p".into(), turn: 1 }.retry_policy(),
+            RetryPolicy::Retry
+        );
+    }
+
+    #[test]
+    fn tags_are_stable() {
+        assert_eq!(EffectKind::ReadSnapshot.tag(), "read_snapshot");
+        assert_eq!(EffectKind::RunVerification.tag(), "run_verification");
+        assert_eq!(EffectKind::ExportBundle.tag(), "export_bundle");
+        assert_eq!(EffectKind::ModelCall { model: "m".into(), turn: 1 }.tag(), "model_call");
+        assert_eq!(EffectKind::ListFiles { turn: 1 }.tag(), "list_files");
+        assert_eq!(EffectKind::ReadFile { path: "p".into(), turn: 1 }.tag(), "read_file");
+    }
+
+    #[test]
+    fn new_kinds_serde_round_trip() {
+        let cases = [
+            (EffectKind::ModelCall { model: "m".into(), turn: 3 }, r#"{"ModelCall":{"model":"m","turn":3}}"#),
+            (EffectKind::ListFiles { turn: 1 }, r#"{"ListFiles":{"turn":1}}"#),
+            (EffectKind::ReadFile { path: "p".into(), turn: 2 }, r#"{"ReadFile":{"path":"p","turn":2}}"#),
+        ];
+        for (k, json) in cases {
+            assert_eq!(serde_json::to_string(&k).unwrap(), json);
+            assert_eq!(serde_json::from_str::<EffectKind>(json).unwrap(), k);
+        }
     }
 
     #[test]

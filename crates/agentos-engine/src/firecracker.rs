@@ -753,6 +753,9 @@ impl FirecrackerWorker {
                 Ok(Plan::Verify { files, bytes, source })
             }
             EffectKind::ExportBundle => Err("not implemented in this milestone".into()),
+            EffectKind::ModelCall { .. } | EffectKind::ListFiles { .. } | EffectKind::ReadFile { .. } => {
+                Err(format!("not a worker effect: {}", req.kind.tag()))
+            }
         }
     }
 

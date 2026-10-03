@@ -25,6 +25,8 @@ pub enum Capability {
     VerificationRun,
     #[serde(rename = "artifact.export")]
     ArtifactExport,
+    #[serde(rename = "model.request")]
+    ModelRequest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +163,18 @@ mod tests {
       "capabilities":["snapshot.read","workspace.apply_patch","verification.run","artifact.export"],
       "limits":{"model_requests":12,"max_output_tokens_per_request":4096,"tool_actions":50,
                 "deadline_seconds":1200,"worker_vcpus":2,"worker_memory_mib":2048}}"#;
+
+    #[test]
+    fn model_request_capability_parses_and_serializes_as_model_dot_request() {
+        let j = OK.replace("\"artifact.export\"]", "\"artifact.export\",\"model.request\"]");
+        assert_ne!(j, OK);
+        let c = Contract::parse(&j).unwrap();
+        assert!(c.capabilities.contains(&Capability::ModelRequest));
+        assert_eq!(serde_json::to_value(Capability::ModelRequest).unwrap(), serde_json::json!("model.request"));
+        let ok = Contract::parse(OK).unwrap();
+        let out = serde_json::to_string(&ok).unwrap();
+        assert_eq!(serde_json::to_string(&Contract::parse(&out).unwrap()).unwrap(), out);
+    }
 
     #[test] fn parses_spec_example() { assert!(Contract::parse(OK).is_ok()); }
     #[test] fn rejects_unknown_field() {

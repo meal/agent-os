@@ -62,13 +62,16 @@ pub const MAX_EFFECT_TIMEOUT_MS: i64 = 600_000;
 /// How many times each effect kind was really executed, shared across executor instances
 /// so it survives a simulated restart.
 #[derive(Debug, Clone, Default)]
-pub struct ExecCounts(Arc<[AtomicUsize; 4]>);
+pub struct ExecCounts(Arc<[AtomicUsize; 7]>);
 
 fn slot(tag: &str) -> usize {
     match tag {
         "read_snapshot" => 0,
         "apply_patch" => 1,
         "run_verification" => 2,
+        "model_call" => 4,
+        "list_files" => 5,
+        "read_file" => 6,
         _ => 3,
     }
 }
@@ -612,6 +615,11 @@ impl SupervisedExecutor {
             RetryPolicy::NoRetry => {
                 ExecOutcome::unresolved(req, ctx, "the job died without a receipt and its kind is never retried")
             }
+            RetryPolicy::ForfeitThenRetry => ExecOutcome::unresolved(
+                req,
+                ctx,
+                "the job died without a receipt; its kind is forfeited, never retried",
+            ),
         }
     }
 

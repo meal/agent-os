@@ -4,7 +4,7 @@
 //! crash hook is consulted at each of those boundaries ([`run_attempt`], [`finish_attempt`]).
 
 use agentos_core::broker::Resource;
-use agentos_core::budget::Reservation;
+use agentos_core::budget::{model_requests_for, Reservation};
 use agentos_core::contract::Contract;
 use agentos_core::effect::{AttemptId, EffectKind, EffectRecord, EffectState, Outcome, ReceiptVerdict};
 use agentos_core::ids::{Digest, TaskId};
@@ -69,7 +69,7 @@ pub fn intend(
     expected_workspace: &Digest,
     resource: &Resource,
 ) -> Result<EffectRecord> {
-    let reserve = Reservation::for_kind(&kind, 0);
+    let reserve = Reservation::for_kind(&kind, model_requests_for(&kind));
     let rec = db.record_intent(task, kind, request, expected_workspace, reserve, resource)?;
     tracing::info!(
         task_id = %task, step = rec.step, effect_id = %rec.effect_id, kind = rec.kind.tag(),
@@ -144,6 +144,9 @@ fn artifact_type(kind: &EffectKind, outcome: &Outcome) -> &'static str {
         (EffectKind::ApplyPatch { .. }, _) => "patch-result",
         (EffectKind::RunVerification, _) => "verification-evidence",
         (EffectKind::ExportBundle, _) => "export-bundle",
+        (EffectKind::ModelCall { .. }, _) => "model-response",
+        (EffectKind::ListFiles { .. }, _) => "file-list",
+        (EffectKind::ReadFile { .. }, _) => "file-content",
     }
 }
 
@@ -266,7 +269,7 @@ pub(crate) fn finish_attempt<E>(cx: &Cx<'_, E>, rec: &EffectRecord, out: &ExecOu
 ///   as rejected when a cancel is pending or the task is terminal, and errors otherwise.
 /// - RunVerification: `VerifyPassed` for the task's current digest only when the check ran,
 ///   passed, and its evidence is for exactly that digest; otherwise `VerifyFailed`.
-/// - ExportBundle: none.
+/// - ExportBundle, ModelCall, ListFiles, ReadFile: none.
 pub fn follow_up_event(kind: &EffectKind, out: &ExecOutcome, task: &Task) -> Option<TaskEvent> {
     match kind {
         EffectKind::ReadSnapshot | EffectKind::ApplyPatch { .. } => match (&out.receipt.outcome, out.new_workspace) {
@@ -278,7 +281,10 @@ pub fn follow_up_event(kind: &EffectKind, out: &ExecOutcome, task: &Task) -> Opt
         } else {
             TaskEvent::VerifyFailed
         }),
-        EffectKind::ExportBundle => None,
+        EffectKind::ExportBundle
+        | EffectKind::ModelCall { .. }
+        | EffectKind::ListFiles { .. }
+        | EffectKind::ReadFile { .. } => None,
     }
 }
 

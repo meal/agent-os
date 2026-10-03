@@ -311,6 +311,9 @@ impl Executor for FixtureExecutor {
             EffectKind::ApplyPatch { expected_base } => self.apply_patch(req, ctx, expected_base).await,
             EffectKind::RunVerification => self.run_verification(req, ctx).await,
             EffectKind::ExportBundle => ExecOutcome::failure(req, ctx, "not implemented in this milestone"),
+            EffectKind::ModelCall { .. } | EffectKind::ListFiles { .. } | EffectKind::ReadFile { .. } => {
+                ExecOutcome::failure(req, ctx, format!("not a worker effect: {}", req.kind.tag()))
+            }
         }
     }
 

@@ -345,6 +345,10 @@ async fn recover_effect<E: Executor>(cx: &Cx<'_, E>, rec: EffectRecord, report: 
         }
         RetryPolicy::ReconcileThenRetry => reconcile_effect(cx, rec, report, can_dispatch).await,
         RetryPolicy::NoRetry => unreconcilable(cx, report, &rec, "no receipt; retry policy NoRetry"),
+        // Temporary: the forfeit decision arrives with `Db::forfeit_effect` (Task 3).
+        RetryPolicy::ForfeitThenRetry => {
+            unreconcilable(cx, report, &rec, "no receipt; retry policy ForfeitThenRetry (forfeit is Task 3)")
+        }
     }
 }
 

@@ -140,7 +140,7 @@ fn failure(req: &JobRequest, reason: &str) -> ExecOutcome {
 fn fallback_receipt(req: &JobRequest, reason: &str) -> Option<ExecOutcome> {
     match req.kind.retry_policy() {
         RetryPolicy::Retry => Some(failure(req, reason)),
-        RetryPolicy::ReconcileThenRetry | RetryPolicy::NoRetry => None,
+        RetryPolicy::ReconcileThenRetry | RetryPolicy::ForfeitThenRetry | RetryPolicy::NoRetry => None,
     }
 }
 
