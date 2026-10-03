@@ -25,6 +25,12 @@ use agentos_engine::firecracker::{preflight, FirecrackerConfig};
 use agentos_engine::guestlink::GuestLauncher;
 use agentos_engine::jail::{self, JailConfig, JailDecision, JailMode, JAIL_GID, JAIL_UID};
 use agentos_engine::job::{HostConfig, WorkerConfig};
+use agentos_engine::model::anthropic::AnthropicProvider;
+use agentos_engine::model::executor::ModelExecutor;
+use agentos_engine::model::fake::FakeProvider;
+use agentos_engine::model::provider::{ApiKey, ModelProvider};
+use agentos_engine::routing::RoutingExecutor;
+use agentos_engine::shadow::ShadowReader;
 use agentos_engine::supervised::{ExecCounts, SupervisedExecutor};
 use agentos_store::blob::BlobStore;
 use agentos_store::db::Db;
@@ -70,6 +76,10 @@ pub struct Home {
     pub jail_gid: u32,
     /// `--allow-unjailed`: consulted at `submit` only; later commands follow the record.
     pub allow_unjailed: bool,
+    /// `--api-key-file`: where the Anthropic key is read from (else `ANTHROPIC_API_KEY`).
+    pub api_key_file: Option<PathBuf>,
+    /// `--anthropic-base-url` [default: the provider's own].
+    pub anthropic_base_url: Option<String>,
 }
 
 /// The worker recorded in a task's `Submitted` event.
@@ -164,6 +174,8 @@ impl Home {
             jail_uid: JAIL_UID,
             jail_gid: JAIL_GID,
             allow_unjailed: false,
+            api_key_file: None,
+            anthropic_base_url: None,
         })
     }
 
@@ -435,10 +447,93 @@ impl Home {
         }
     }
 
+    /// The `Submitted` payload of `task`, if it has one.
+    fn submitted_payload(&self, store: &Store, task: &TaskId) -> Result<Option<Value>, CliError> {
+        Ok(store.db.events(task)?.into_iter().find(|e| e.event_type == "Submitted").map(|e| e.payload))
+    }
+
+    /// The model recorded at `task`'s submission (`Submitted.model`); `None` when the task has
+    /// no `Submitted` event or no such field (a 3a task).
+    pub fn recorded_model(&self, store: &Store, task: &TaskId) -> Result<Option<String>, CliError> {
+        Ok(self.submitted_payload(store, task)?.and_then(|p| p["model"].as_str().map(str::to_string)))
+    }
+
+    /// The Anthropic key: the first line-and-trim of `--api-key-file`, else `ANTHROPIC_API_KEY`.
+    /// It is never taken from argv (so it never shows in `/proc/*/cmdline`), and no message
+    /// here quotes it.
+    pub fn api_key(&self) -> Result<ApiKey, CliError> {
+        let raw = match &self.api_key_file {
+            Some(path) => fs::read_to_string(path).map_err(|e| CliError::usage(format!("cannot read {}: {e}", path.display())))?,
+            None => match std::env::var("ANTHROPIC_API_KEY") {
+                Ok(v) if !v.trim().is_empty() => v,
+                _ => return Err(CliError::usage("no API key: pass --api-key-file FILE or set ANTHROPIC_API_KEY")),
+            },
+        };
+        let source = self.api_key_file.as_ref().map_or_else(|| "ANTHROPIC_API_KEY".to_string(), |p| p.display().to_string());
+        let key = ApiKey::new(&raw).map_err(|e| CliError::usage(format!("{source}: {e}")))?;
+        // One line of printable ASCII: anything else is not a key and is no header value.
+        if !key.expose().bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(CliError::usage(format!("{source}: the API key must be one line of printable characters")));
+        }
+        Ok(key)
+    }
+
+    /// The provider for `task`'s recorded model: Anthropic (needs the key), the scripted fake
+    /// over the task's own copy of the transcript, or none for the fake agent. With `lenient`
+    /// (recovery and cancel, which never send) a provider that cannot be built is `None`
+    /// instead of an error, so a task can always be cancelled.
+    fn provider(&self, store: &Store, task: &TaskId, lenient: bool) -> Result<Option<Box<dyn ModelProvider>>, CliError> {
+        let Some(model) = self.recorded_model(store, task)? else { return Ok(None) };
+        let built = if model.starts_with("anthropic:") {
+            self.api_key().map(|key| {
+                let provider = AnthropicProvider::new(key);
+                let provider = match &self.anthropic_base_url {
+                    Some(url) => provider.with_base_url(url.clone()),
+                    None => provider,
+                };
+                Some(Box::new(provider) as Box<dyn ModelProvider>)
+            })
+        } else if model.starts_with("fake:") {
+            self.fake_provider(store, task).map(Some)
+        } else {
+            Ok(None)
+        };
+        match built {
+            Err(_) if lenient => Ok(None),
+            r => r,
+        }
+    }
+
+    /// The scripted provider over `<task>/transcript.json`, which must still be the file whose
+    /// digest `Submitted` recorded: a resume replays the same transcript or none.
+    fn fake_provider(&self, store: &Store, task: &TaskId) -> Result<Box<dyn ModelProvider>, CliError> {
+        let path = self.task_dir(task).join(crate::drive::TRANSCRIPT);
+        let bytes = fs::read(&path).map_err(|e| CliError::other(format!("task {task}: cannot read its recorded transcript {}: {e}", path.display())))?;
+        let recorded = self.submitted_payload(store, task)?.and_then(|p| p["transcript_digest"].as_str().map(str::to_string));
+        let actual = Digest::of(&bytes).to_string();
+        if recorded.as_deref() != Some(actual.as_str()) {
+            return Err(CliError::other(format!(
+                "task {task}: the recorded transcript changed: expected {}, found {actual}",
+                recorded.as_deref().unwrap_or("none")
+            )));
+        }
+        Ok(Box::new(FakeProvider::from_file(&path).map_err(|e| CliError::other(format!("task {task}: {e}")))?))
+    }
+
     /// The executor for `task`, over the inputs and the worker recorded at its submission.
     /// For the Firecracker worker the preflight and the jail are checked here, before the
-    /// caller touches the task.
-    pub fn executor(&self, store: &Store, task: &TaskId) -> Result<SupervisedExecutor, CliError> {
+    /// caller touches the task. A model task needs its provider (the key, for Anthropic).
+    pub fn executor(&self, store: &Store, task: &TaskId) -> Result<RoutingExecutor<SupervisedExecutor>, CliError> {
+        self.build_executor(store, task, false)
+    }
+
+    /// Like [`Home::executor`] for paths that never send a model request (cancel, recovery of
+    /// a finished task): a missing key or transcript does not block them.
+    pub fn recovery_executor(&self, store: &Store, task: &TaskId) -> Result<RoutingExecutor<SupervisedExecutor>, CliError> {
+        self.build_executor(store, task, true)
+    }
+
+    fn build_executor(&self, store: &Store, task: &TaskId, lenient: bool) -> Result<RoutingExecutor<SupervisedExecutor>, CliError> {
         let recorded = self.task_worker(store, task)?;
         let dir = self.task_dir(task);
         if !dir.join("snapshot").is_dir() || !dir.join("profile").is_dir() {
@@ -467,15 +562,19 @@ impl Home {
                 profile_digest,
             }),
         };
-        let mut exec = SupervisedExecutor::new(root.join("jobs"), supervisor_cmd()?, worker, ExecCounts::default())?;
+        let provider = self.provider(store, task, lenient)?;
+        let mut jobs = SupervisedExecutor::new(root.join("jobs"), supervisor_cmd()?, worker, ExecCounts::default())?;
         // The supervisor's environment is cleared: the test switches (and only they, and
-        // only in the test tier) travel explicitly.
+        // only in the test tier) travel explicitly. The API key travels nowhere: it lives in
+        // the provider, in this process.
         if env_on(TEST_WORKERS_ENV) {
             for (k, v) in std::env::vars().filter(|(k, _)| k.starts_with("AGENTOS_TEST_")) {
-                exec = exec.with_env(k, v);
+                jobs = jobs.with_env(k, v);
             }
         }
-        Ok(exec)
+        let model = ModelExecutor::new(root.join("model"), provider, ExecCounts::default());
+        let reads = ShadowReader::new(root.join("agentos.db"), task_dir.join("snapshot"), root.join("tasks"));
+        Ok(RoutingExecutor::new(jobs, model, reads))
     }
 }
 

@@ -22,6 +22,10 @@ mod kvm;
 /// The Firecracker process scan, shared with the engine's tests.
 #[path = "../../agentos-engine/tests/common/procs.rs"]
 mod procs;
+/// The local fake of the Messages API, shared with the engine's tests.
+#[path = "../../agentos-engine/tests/common/http.rs"]
+#[allow(dead_code)]
+mod http;
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures").canonicalize().unwrap()
@@ -81,7 +85,10 @@ fn real_kvm() -> kvm::Kvm {
 
 /// The CLI's own configuration and test switches: never inherited from the test's
 /// environment, so every command runs exactly the worker its helper chose.
-const SCRUBBED_ENV: [&str; 10] = [
+const SCRUBBED_ENV: [&str; 13] = [
+    "AGENTOS_API_KEY_FILE",
+    "AGENTOS_ANTHROPIC_BASE_URL",
+    "ANTHROPIC_API_KEY",
     "AGENTOS_WORKER",
     "AGENTOS_FIRECRACKER",
     "AGENTOS_JAILER",
@@ -2303,4 +2310,456 @@ fn test_switches_reach_the_supervisor_only_through_the_forwarding() {
     for want in ["AGENTOS_TEST_WORKERS=1", "AGENTOS_TEST_FAKE_GUEST=1"] {
         assert!(supervisor.lines().any(|l| l == want), "the supervisor lacks {want}:\n{supervisor}");
     }
+}
+
+// ---- Phase 4: --model, --api-key-file, --anthropic-base-url ----
+
+/// A recognisable key: every scan below looks for `SECRET`.
+const CANARY: &str = "sk-ant-test-SECRET";
+
+fn transcript(name: &str) -> PathBuf {
+    fixtures().join("transcripts").join(name)
+}
+
+fn fake_spec(name: &str) -> String {
+    format!("fake:{}", transcript(name).display())
+}
+
+fn fake_api(name: &str) -> http::FakeApi {
+    http::serve(http::Reply::Transcript(transcript(name)))
+}
+
+impl Cli {
+    /// A contract that may call the model: the fifth capability and a token cap.
+    fn model_contract(&self, repo: &Path, model_requests: u32, tool_actions: u32) -> String {
+        let contract = json!({
+            "goal": "fix the parser",
+            "repository": { "source": repo, "revision": "recorded-at-submission" },
+            "profile": "python-stdlib-v1",
+            "editable_paths": ["src/**"],
+            "verification_profile": "parser-checks-v1",
+            "capabilities": ["snapshot.read", "workspace.apply_patch", "verification.run", "artifact.export", "model.request"],
+            "limits": {
+                "model_requests": model_requests, "max_output_tokens_per_request": 1000, "tool_actions": tool_actions,
+                "deadline_seconds": 600, "worker_vcpus": 1, "worker_memory_mib": 256
+            }
+        });
+        self.write(&format!("model-task-{}.json", Digest::of(contract.to_string().as_bytes())), &contract.to_string())
+    }
+
+    /// `model_contract` naming the verification profile `id` instead.
+    fn model_contract_for_profile(&self, id: &str) -> String {
+        let mut contract: Value = serde_json::from_str(&fs::read_to_string(self.model_contract(&self.repo_copy(), 12, 10)).unwrap()).unwrap();
+        contract["verification_profile"] = json!(id);
+        self.write(&format!("model-env-{}.json", Digest::of(contract.to_string().as_bytes())), &contract.to_string())
+    }
+
+    /// `submit --yes --model <spec>` with the key in the environment; the task id.
+    fn submit_model(&self, contract: &str, spec: &str) -> Value {
+        self.json(&["submit", contract, "--yes", "--model", spec])
+    }
+
+    /// `Cli::crash` for a model task.
+    fn crash_model(&self, contract: &str, spec: &str, point: &str) -> String {
+        let assert = self.cmd(&["submit", contract, "--yes", "--model", spec, "--crash-at", point]).assert().code(75);
+        let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+        let crashed: Value = stderr
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|v| v.get("crashed").is_some())
+            .unwrap_or_else(|| panic!("no crash report on stderr: {stderr}"));
+        assert_eq!(crashed["crashed"], point.split(':').next().unwrap(), "{stderr}");
+        crashed["task_id"].as_str().unwrap().to_string()
+    }
+}
+
+/// The profile whose command prints the worker's and the supervisor's environments and
+/// exits 0, registered; returns its id.
+fn env_dump_profile(cli: &Cli) -> String {
+    let dir = profile_variant(cli, "env-dump", "env-dump-v1", "");
+    let command = "p=$PPID; tr '\\0' '\\n' < /proc/$p/environ; echo ---; tr '\\0' '\\n' < /proc/$(awk '/^PPid:/{print $2}' /proc/$p/status)/environ; exit 0";
+    fs::write(dir.join("profile.json"), json!({ "id": "env-dump-v1", "command": ["sh", "-c", command], "protected": true }).to_string()).unwrap();
+    register(cli, &dir);
+    "env-dump-v1".to_string()
+}
+
+fn status_usage(status: &Value, field: &str) -> u64 {
+    status["usage"][field].as_u64().unwrap_or_else(|| panic!("no usage.{field} in {status}"))
+}
+
+fn events_of<'a>(events: &'a [Value], ty: &str) -> Vec<&'a Value> {
+    events.iter().filter(|e| e["type"] == ty).collect()
+}
+
+fn model_dirs(cli: &Cli) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(cli.home().join("model")) else { return Vec::new() };
+    entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()
+}
+
+/// Every file of the home, wherever it is (database and its WAL included), must be free of
+/// `needle`.
+fn assert_home_free_of(cli: &Cli, needle: &str, what: &str) {
+    let files = walk(&cli.home());
+    assert!(files.len() > 5, "the scan saw only {} files: {files:?}", files.len());
+    for file in files {
+        let bytes = fs::read(&file).unwrap_or_default();
+        assert!(!bytes.windows(needle.len()).any(|w| w == needle.as_bytes()), "{what}: {needle} found in {}", file.display());
+    }
+}
+
+fn assert_text_free_of(text: &str, needle: &str, what: &str) {
+    assert!(!text.contains(needle), "{what} leaks {needle}:\n{text}");
+}
+
+#[test]
+fn submit_with_a_fake_transcript_runs_the_model_agent_to_success() {
+    let cli = Cli::new();
+    let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
+    let done = cli.submit_model(&contract, &fake_spec("parser-fix.json"));
+    assert_eq!(done["state"], "SUCCEEDED", "{done}");
+    let id = done["task_id"].as_str().unwrap();
+    let status = cli.status(id);
+    assert_eq!(status["model"], "fake:parser-fix.json", "{status}");
+    assert_eq!(status_usage(&status, "settled_model_requests"), 6, "{status}");
+    let events = cli.events(id);
+    let intended = events_of(&events, "EffectIntended").into_iter().filter(|e| e["payload"]["kind"].get("ModelCall").is_some()).count();
+    assert_eq!(intended, 6, "{events:?}");
+    let submitted = cli.submitted(id);
+    assert_eq!(submitted["model"], "fake:parser-fix.json");
+    assert_eq!(submitted["transcript_digest"], digest_of_file(&transcript("parser-fix.json")));
+    assert_eq!(digest_of_file(&cli.home().join("tasks").join(id).join("transcript.json")), digest_of_file(&transcript("parser-fix.json")));
+    let (dir, manifest) = cli.export(id, "bundle");
+    assert_eq!(manifest["model"], "fake:parser-fix.json");
+    let calls = manifest["model_calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 6, "{manifest}");
+    for call in calls {
+        assert!(dir.join(call["request_file"].as_str().unwrap()).is_file(), "{call}");
+        assert!(dir.join(call["response_file"].as_str().unwrap()).is_file(), "{call}");
+    }
+    assert_eq!(model_dirs(&cli).len(), 6, "{:?}", model_dirs(&cli));
+}
+
+#[test]
+fn submit_with_anthropic_against_the_local_api_fixes_the_fixture() {
+    let cli = Cli::new();
+    let api = fake_api("parser-fix-direct.json");
+    let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
+    let done = {
+        let out = cli
+            .cmd(&["submit", &contract, "--yes", "--model", "anthropic:claude-opus-5-5", "--anthropic-base-url", &api.url()])
+            .env("ANTHROPIC_API_KEY", CANARY)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice::<Value>(&out).unwrap()
+    };
+    assert_eq!(done["state"], "SUCCEEDED", "{done}");
+    assert_eq!(api.hits(), 4);
+    for request in api.requests() {
+        let header = |name: &str| request.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+        assert_eq!(header("x-api-key").as_deref(), Some(CANARY));
+        assert_eq!(header("anthropic-version").as_deref(), Some("2023-06-01"));
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["model"], "claude-opus-5-5");
+        assert_eq!(body["max_tokens"], 1000);
+    }
+    assert_eq!(cli.submitted(done["task_id"].as_str().unwrap())["model"], "anthropic:claude-opus-5-5");
+}
+
+#[test]
+fn api_key_reaches_only_the_provider_and_never_the_journal_blobs_home_or_job_environments() {
+    let cli = Cli::new();
+    let profile = env_dump_profile(&cli);
+    let api = fake_api("parser-fix-direct.json");
+    let contract = cli.model_contract_for_profile(&profile);
+    let url = api.url();
+
+    let mut seen_requests = 0;
+    for (round, via_file) in [false, true].into_iter().enumerate() {
+        let key_file = cli.write("key.txt", &format!("{CANARY}\n"));
+        let mut args = vec!["submit", contract.as_str(), "--yes", "--model", "anthropic:claude-opus-5-5", "--anthropic-base-url", url.as_str()];
+        if via_file {
+            args.extend(["--api-key-file", key_file.as_str()]);
+        }
+        let mut cmd = cli.cmd(&args);
+        if !via_file {
+            cmd.env("ANTHROPIC_API_KEY", CANARY);
+        }
+        let out = cmd.assert().success().get_output().clone();
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned());
+        let done: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(done["state"], "SUCCEEDED", "round {round}: {done}");
+        let id = done["task_id"].as_str().unwrap().to_string();
+
+        // Positive control: the key really travelled, in the header of the provider's own request.
+        let requests = api.requests();
+        assert!(requests.len() > seen_requests, "round {round}: the fake API saw no request");
+        let first = &requests[seen_requests];
+        assert_eq!(first.headers.iter().find(|(k, _)| k == "x-api-key").map(|(_, v)| v.as_str()), Some(CANARY), "round {round}");
+        seen_requests = requests.len();
+
+        // Negative scan: everything the controller wrote or printed.
+        assert_text_free_of(&stdout, "SECRET", "submit stdout");
+        assert_text_free_of(&stderr, "SECRET", "submit stderr");
+        let status = serde_json::to_string(&cli.status(&id)).unwrap();
+        assert_text_free_of(&status, "SECRET", "status");
+        let events = serde_json::to_string(&cli.events(&id)).unwrap();
+        assert_text_free_of(&events, "SECRET", "events");
+        let (bundle, manifest) = cli.export(&id, &format!("bundle-{round}"));
+        assert_text_free_of(&manifest.to_string(), "SECRET", "the manifest");
+        for file in walk(&bundle) {
+            let bytes = fs::read(&file).unwrap();
+            assert!(!bytes.windows(6).any(|w| w == b"SECRET"), "the export bundle file {} leaks the key", file.display());
+        }
+        assert_home_free_of(&cli, "SECRET", "the home");
+        for sub in ["blobs", "jobs", "model", "tasks"] {
+            assert!(cli.home().join(sub).is_dir(), "round {round}: {sub} should exist so its scan is not vacuous");
+        }
+
+        // The verification evidence holds the worker's and the supervisor's environments.
+        let mut dumps = 0;
+        for file in walk(&cli.home().join("blobs")) {
+            let Ok(blob) = serde_json::from_slice::<Value>(&fs::read(&file).unwrap()) else { continue };
+            let Some(stdout) = blob.get("stdout").and_then(Value::as_str) else { continue };
+            if !stdout.contains("---") {
+                continue;
+            }
+            dumps += 1;
+            assert!(stdout.contains("PATH="), "round {round}: {stdout}");
+            assert!(!stdout.contains("ANTHROPIC_API_KEY") && !stdout.contains("SECRET"), "round {round}: a job environment holds the key:\n{stdout}");
+        }
+        assert!(dumps >= 1, "round {round}: no environment dump among the evidence blobs");
+    }
+}
+
+#[test]
+fn missing_key_is_a_usage_error_before_anything_is_written() {
+    let cli = Cli::new();
+    let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
+    cli.cmd(&["submit", &contract, "--yes", "--model", "anthropic:x"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("no API key: pass --api-key-file FILE or set ANTHROPIC_API_KEY"));
+    assert_nothing_recorded(&cli);
+}
+
+#[test]
+fn an_unreadable_key_file_exits_2() {
+    let cli = Cli::new();
+    let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
+    let missing = cli.path("no-such-key");
+    cli.cmd(&["submit", &contract, "--yes", "--model", "anthropic:x", "--api-key-file", missing.to_str().unwrap()])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("cannot read"));
+    let empty = cli.write("empty-key", "  \n");
+    cli.cmd(&["submit", &contract, "--yes", "--model", "anthropic:x", "--api-key-file", &empty]).assert().code(2);
+    assert_nothing_recorded(&cli);
+}
+
+#[test]
+fn unknown_model_spec_exits_2() {
+    let cli = Cli::new();
+    let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
+    cli.cmd(&["submit", &contract, "--yes", "--model", "gpt:4"]).assert().code(2).stderr(predicate::str::contains("unknown model spec"));
+    for bad in ["anthropic:", "anthropic:a/b", &format!("anthropic:{}", "m".repeat(200)), "fake:"] {
+        cli.cmd(&["submit", &contract, "--yes", "--model", bad]).env("ANTHROPIC_API_KEY", CANARY).assert().code(2);
+    }
+    cli.cmd(&["submit", &contract, "--yes", "--model", "fake:/no/such/transcript.json"]).assert().code(2);
+    let bad = cli.write("bad-transcript.json", "{\"responses\": 3}");
+    cli.cmd(&["submit", &contract, "--yes", "--model", &format!("fake:{bad}")]).assert().code(2);
+    assert_nothing_recorded(&cli);
+}
+
+#[test]
+fn yes_without_patch_or_model_exits_2_with_the_new_text() {
+    let cli = Cli::new();
+    let contract = cli.contract(&cli.repo_copy());
+    cli.cmd(&["submit", &contract, "--yes"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--yes needs --fake-agent-patch FILE or --model anthropic:<model>|fake:<transcript>"));
+    assert_nothing_recorded(&cli);
+}
+
+#[test]
+fn patch_and_model_together_exit_2() {
+    let cli = Cli::new();
+    let contract = cli.contract(&cli.repo_copy());
+    cli.cmd(&["submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap(), "--model", &fake_spec("parser-fix.json")])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("pass either --fake-agent-patch or --model"));
+    assert_nothing_recorded(&cli);
+}
+
+#[test]
+fn resume_of_a_model_task_needs_no_patch_and_refuses_one() {
+    let cli = Cli::new();
+    let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
+    let id = cli.json(&["submit", &contract, "--model", &fake_spec("parser-fix.json")])["task_id"].as_str().unwrap().to_string();
+    assert_eq!(cli.status(&id)["state"], "READY");
+    assert_eq!(cli.json(&["resume", &id]), json!({ "task_id": id, "state": "SUCCEEDED" }));
+
+    let other = cli.model_contract(&cli.repo_copy(), 12, 11);
+    let id = cli.json(&["submit", &other, "--model", &fake_spec("parser-fix.json")])["task_id"].as_str().unwrap().to_string();
+    cli.cmd(&["resume", &id, "--fake-agent-patch", fix_patch().to_str().unwrap()])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(format!("task {id} runs a model, not the fake agent")));
+    assert_eq!(cli.status(&id)["state"], "READY", "the refusal changed nothing");
+}
+
+#[test]
+fn a_replaced_transcript_fails_the_resume_instead_of_replaying_another_file() {
+    let cli = Cli::new();
+    let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
+    let id = cli.json(&["submit", &contract, "--model", &fake_spec("parser-fix.json")])["task_id"].as_str().unwrap().to_string();
+    fs::write(cli.home().join("tasks").join(&id).join("transcript.json"), fs::read(transcript("parser-fix-direct.json")).unwrap()).unwrap();
+    cli.cmd(&["resume", &id]).assert().code(1).stderr(predicate::str::contains("transcript"));
+    assert_eq!(cli.status(&id)["state"], "READY");
+}
+
+#[test]
+fn resume_of_an_anthropic_task_without_a_key_is_a_usage_error_and_changes_nothing() {
+    let cli = Cli::new();
+    let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
+    let id = cli.json(&["submit", &contract, "--model", "anthropic:claude-opus-5-5"])["task_id"].as_str().unwrap().to_string();
+    cli.cmd(&["resume", &id]).assert().code(2).stderr(predicate::str::contains("no API key: pass --api-key-file FILE or set ANTHROPIC_API_KEY"));
+    assert_eq!(cli.status(&id)["state"], "READY");
+    assert_eq!(cli.status(&id)["model"], "anthropic:claude-opus-5-5");
+}
+
+#[test]
+fn a_crash_on_the_model_call_resumes_with_a_forfeit_and_no_second_charge() {
+    for (point, decision, uncertain) in [
+        ("after-dispatch:model_call", "Forfeit", 1),
+        ("during-execute:model_call", "Forfeit", 1),
+        ("after-execute-before-publish:model_call", "PublishRetained", 0),
+    ] {
+        let cli = Cli::new();
+        let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
+        let id = cli.crash_model(&contract, &fake_spec("parser-fix-direct.json"), point);
+        if point.starts_with("after-dispatch") {
+            let status = cli.status(&id);
+            let outstanding = status["outstanding_effects"].as_array().unwrap();
+            assert_eq!(outstanding.len(), 1, "{status}");
+            assert_eq!((outstanding[0]["kind"].clone(), outstanding[0]["state"].clone()), (json!("model_call"), json!("Dispatched")), "{status}");
+            assert_eq!(status_usage(&status, "reserved_model_requests"), 1, "{status}");
+        }
+        assert_eq!(cli.json(&["resume", &id]), json!({ "task_id": id, "state": "SUCCEEDED" }), "{point}");
+        let events = cli.events(&id);
+        let decisions: Vec<&str> = events_of(&events, "RecoveryDecision").iter().map(|e| e["payload"]["decision"].as_str().unwrap()).collect();
+        assert_eq!(decisions, [decision], "{point}: {events:?}");
+        assert_eq!(events_of(&events, "EffectForfeited").len(), usize::from(decision == "Forfeit"), "{point}");
+        let status = cli.status(&id);
+        assert_eq!(status_usage(&status, "settled_model_requests"), 4, "{point}: {status}");
+        assert_eq!(status_usage(&status, "uncertain_model_requests"), uncertain, "{point}: {status}");
+        assert_eq!(status_usage(&status, "reserved_model_requests"), 0, "{point}: {status}");
+        for e in events_of(&events, "EffectDispatched") {
+            let is_model = events_of(&events, "EffectIntended").iter().any(|i| i["payload"]["effect_id"] == e["payload"]["effect_id"] && i["payload"]["kind"].get("ModelCall").is_some());
+            if is_model {
+                assert_eq!(e["payload"]["lease_generation"], 1, "{point}: a model call was dispatched again: {e}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_4xx_from_the_api_is_journaled_bounded_and_the_task_fails_on_budget() {
+    let cli = Cli::new();
+    let api = http::serve(http::Reply::Status(400, "x".repeat(100_000)));
+    let contract = cli.model_contract(&cli.repo_copy(), 2, 10);
+    let out = cli
+        .cmd(&["submit", &contract, "--yes", "--model", "anthropic:claude-opus-5-5", "--anthropic-base-url", &api.url()])
+        .env("ANTHROPIC_API_KEY", CANARY)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let done: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(done["state"], "FAILED", "{done}");
+    let id = done["task_id"].as_str().unwrap();
+    assert_eq!(api.hits(), 2);
+    let events = cli.events(id);
+    assert_eq!(events_of(&events, "Failed")[0]["payload"]["Failed"]["reason"], "budget exhausted", "{events:?}");
+    let reasons: Vec<String> = walk(&cli.home().join("blobs"))
+        .iter()
+        .filter_map(|f| serde_json::from_slice::<Value>(&fs::read(f).unwrap()).ok())
+        .filter_map(|b| b["reason"].as_str().map(str::to_string))
+        .filter(|r| r.starts_with("http 400: "))
+        .collect();
+    assert_eq!(reasons.len(), 2, "{reasons:?}");
+    assert!(reasons.iter().all(|r| r.len() <= 600), "{:?}", reasons.iter().map(String::len).collect::<Vec<_>>());
+}
+
+#[test]
+fn status_and_export_show_the_fake_agent_model_for_patch_tasks() {
+    let cli = Cli::new();
+    let contract = cli.contract(&cli.repo_copy());
+    let done = cli.submit_yes(&contract, &fix_patch());
+    let id = done["task_id"].as_str().unwrap();
+    assert_eq!(cli.status(id)["model"], "fake-agent");
+    let (_, manifest) = cli.export(id, "bundle");
+    assert_eq!(manifest["model"], "fake-agent");
+    assert_eq!(manifest["model_calls"], json!([]));
+}
+
+#[test]
+fn model_tasks_run_on_the_firecracker_worker_too() {
+    if !fake_mode() {
+        println!("SKIPPED: needs AGENTOS_TEST_WORKER=firecracker-fake");
+        return;
+    }
+    let cli = Cli::new();
+    let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
+    let done = cli.submit_model(&contract, &fake_spec("parser-fix.json"));
+    assert_eq!(done["state"], "SUCCEEDED", "{done}");
+    let id = done["task_id"].as_str().unwrap();
+    assert_tier_worker(&cli, id);
+    assert!(cli.home().join("tasks").join(id).join("shadow").is_dir(), "the reads were served from the host-side shadow workspace");
+    assert_eq!(cli.status(id)["model"], "fake:parser-fix.json");
+}
+
+#[test]
+fn api_key_never_reaches_the_guest() {
+    if !real_mode() {
+        println!("SKIPPED: needs the KVM tier (AGENTOS_TEST_WORKER=firecracker)");
+        return;
+    }
+    let cli = Cli::new();
+    let profile = env_dump_profile(&cli);
+    let api = fake_api("parser-fix-direct.json");
+    let contract = cli.model_contract_for_profile(&profile);
+    let out = cli
+        .cmd(&["submit", &contract, "--yes", "--model", "anthropic:claude-opus-5-5", "--anthropic-base-url", &api.url()])
+        .env("ANTHROPIC_API_KEY", CANARY)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let done: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(done["state"], "SUCCEEDED", "{done}");
+    assert!(api.requests().iter().all(|r| r.headers.iter().any(|(k, v)| k == "x-api-key" && v == CANARY)), "positive control");
+    assert_home_free_of(&cli, "SECRET", "the home, job directories (console.log, firecracker.log, vm.json) included");
+}
+
+/// The key is never an argument (it would show in `/proc/*/cmdline`): there is no flag for it,
+/// and the help names only the file and the environment variable.
+#[test]
+fn there_is_no_flag_that_takes_the_key_itself() {
+    let cli = Cli::bare();
+    let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
+    cli.cmd(&["submit", &contract, "--yes", "--model", "anthropic:x", "--api-key", CANARY]).assert().code(2).stderr(predicate::str::contains("unexpected argument"));
+    let help = String::from_utf8(cli.cmd(&["submit", "--help"]).assert().success().get_output().stdout.clone()).unwrap();
+    assert!(help.contains("--api-key-file") && !help.contains("--api-key <"), "{help}");
+    assert_nothing_recorded_or_bare(&cli);
+}
+
+fn assert_nothing_recorded_or_bare(cli: &Cli) {
+    assert!(!cli.home().join("agentos.db").exists() || cli.task_footprint() == (Vec::new(), 0), "a refused invocation left a task behind");
 }

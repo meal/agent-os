@@ -9,13 +9,14 @@ use agentos_core::guest::{GUEST_MIN_MEMORY_MIB, MAX_VCPUS};
 use agentos_core::ids::{Digest, TaskId};
 use agentos_engine::firecracker::firecracker_version;
 use agentos_engine::guestlink::GuestLauncher;
+use agentos_engine::model::fake::Transcript;
 use agentos_engine::workspace::{copy_tree, workspace_digest};
 use serde_json::json;
 
 use super::{print, print_state};
 use crate::args::WorkerKind;
 use crate::crash::CrashSpec;
-use crate::drive::{drive, AGENT_PATCH};
+use crate::drive::{agent_for, drive, ModelSpec, AGENT_PATCH, FAKE_AGENT, TRANSCRIPT};
 use crate::error::CliError;
 use crate::home::Home;
 
@@ -25,7 +26,6 @@ pub const RECORDED_AT_SUBMISSION: &str = "recorded-at-submission";
 const GUEST_IMAGE: &str = "fixture-executor-v0";
 /// `Submitted.firecracker_version` when the fake guest stands in for Firecracker.
 const FAKE_FIRECRACKER_VERSION: &str = "fake";
-const MODEL: &str = "fake-agent";
 
 /// The contract and inputs, checked before anything is written.
 struct Request {
@@ -35,6 +35,10 @@ struct Request {
     /// Set when the contract names a digest instead of `recorded-at-submission`.
     expected_revision: Option<Digest>,
     patch: Option<String>,
+    /// `--model`, parsed.
+    model: Option<ModelSpec>,
+    /// The bytes of a `fake:` transcript, read and parsed once: what is recorded and run.
+    transcript: Option<Vec<u8>>,
     /// `None` for the host worker.
     firecracker: Option<FirecrackerRecord>,
 }
@@ -81,7 +85,7 @@ fn host_kernel() -> String {
     rustix::system::uname().release().to_string_lossy().into_owned()
 }
 
-fn validate(home: &Home, task: &Path, yes: bool, patch: Option<&Path>) -> Result<Request, CliError> {
+fn validate(home: &Home, task: &Path, yes: bool, patch: Option<&Path>, model: Option<&str>) -> Result<Request, CliError> {
     let text = fs::read_to_string(task).map_err(|e| CliError::usage(format!("cannot read {}: {e}", task.display())))?;
     let contract = Contract::parse(&text).map_err(|e| CliError::usage(e.to_string()))?;
     let source = Path::new(&contract.repository.source)
@@ -112,20 +116,39 @@ fn validate(home: &Home, task: &Path, yes: bool, patch: Option<&Path>) -> Result
             Some(wanted)
         }
     };
-    let patch = match (yes, patch) {
-        (true, None) => {
-            return Err(CliError::usage(
-                "--yes needs --fake-agent-patch FILE: the fake agent is the only agent until the model broker exists",
-            ))
+    let (patch, model, transcript) = match (yes, patch, model) {
+        (_, Some(_), Some(_)) => return Err(CliError::usage("pass either --fake-agent-patch or --model")),
+        (true, None, None) => {
+            return Err(CliError::usage("--yes needs --fake-agent-patch FILE or --model anthropic:<model>|fake:<transcript>"));
         }
-        (_, Some(p)) => Some(fs::read_to_string(p).map_err(|e| CliError::usage(format!("cannot read {}: {e}", p.display())))?),
-        (false, None) => None,
+        (_, Some(p), None) => {
+            (Some(fs::read_to_string(p).map_err(|e| CliError::usage(format!("cannot read {}: {e}", p.display())))?), None, None)
+        }
+        (_, None, Some(spec)) => {
+            let spec: ModelSpec = spec.parse().map_err(CliError::usage)?;
+            match &spec {
+                ModelSpec::Fake(path) => {
+                    let bytes = fs::read(path).map_err(|e| CliError::usage(format!("cannot read {}: {e}", path.display())))?;
+                    serde_json::from_slice::<Transcript>(&bytes).map_err(|e| CliError::usage(format!("{}: {e}", path.display())))?;
+                    (None, Some(spec), Some(bytes))
+                }
+                // The key is resolved before anything is written: a missing one is exit 2
+                // with the task untouched.
+                ModelSpec::Anthropic(_) => {
+                    if yes {
+                        home.api_key()?;
+                    }
+                    (None, Some(spec), None)
+                }
+            }
+        }
+        (false, None, None) => (None, None, None),
     };
     let firecracker = match home.worker.unwrap_or(WorkerKind::Host) {
         WorkerKind::Host => None,
         WorkerKind::Firecracker => Some(check_firecracker(home, &contract)?),
     };
-    Ok(Request { contract, source, profile, expected_revision, patch, firecracker })
+    Ok(Request { contract, source, profile, expected_revision, patch, model, transcript, firecracker })
 }
 
 fn capability_names(contract: &Contract) -> Vec<String> {
@@ -133,7 +156,7 @@ fn capability_names(contract: &Contract) -> Vec<String> {
 }
 
 /// What the owner approves, on stderr.
-fn summarize(task: &TaskId, contract: &Contract, repo: &Digest, profile: &Digest, patch: Option<&str>, fc: Option<&FirecrackerRecord>) {
+fn summarize(task: &TaskId, contract: &Contract, repo: &Digest, profile: &Digest, agent: &str, fc: Option<&FirecrackerRecord>) {
     let l = &contract.limits;
     eprintln!("task {task} submitted; approve these permissions before it runs:");
     eprintln!("  goal:                 {}", contract.goal);
@@ -145,7 +168,6 @@ fn summarize(task: &TaskId, contract: &Contract, repo: &Digest, profile: &Digest
         "  limits:               model_requests={} max_output_tokens_per_request={} tool_actions={} deadline_seconds={} worker_vcpus={} worker_memory_mib={}",
         l.model_requests, l.max_output_tokens_per_request, l.tool_actions, l.deadline_seconds, l.worker_vcpus, l.worker_memory_mib
     );
-    let agent = patch.map_or_else(|| "none yet".to_string(), |p| format!("{MODEL} (patch {})", Digest::of(p.as_bytes())));
     eprintln!("  agent:                {agent}");
     match fc {
         None => eprintln!("  worker:               host (not sandboxed)"),
@@ -158,8 +180,8 @@ fn summarize(task: &TaskId, contract: &Contract, repo: &Digest, profile: &Digest
     }
 }
 
-pub async fn submit(home: &Home, task_file: &Path, yes: bool, patch: Option<&Path>, crash: Option<&CrashSpec>) -> Result<(), CliError> {
-    let Request { mut contract, source, profile, expected_revision, patch, firecracker } = validate(home, task_file, yes, patch)?;
+pub async fn submit(home: &Home, task_file: &Path, yes: bool, patch: Option<&Path>, model: Option<&str>, crash: Option<&CrashSpec>) -> Result<(), CliError> {
+    let Request { mut contract, source, profile, expected_revision, patch, model, transcript, firecracker } = validate(home, task_file, yes, patch, model, )?;
 
     let store = home.open()?;
     let lock = if yes { Some(home.lock()?) } else { None };
@@ -179,6 +201,9 @@ pub async fn submit(home: &Home, task_file: &Path, yes: bool, patch: Option<&Pat
     if let Some(p) = &patch {
         fs::write(staging.path().join(AGENT_PATCH), p)?;
     }
+    if let Some(bytes) = &transcript {
+        fs::write(staging.path().join(TRANSCRIPT), bytes)?;
+    }
     contract.repository.revision = repo_digest.to_string();
     contract.repository.source = source.display().to_string();
     let contract_digest = Digest::of(&serde_json::to_vec(&contract)?);
@@ -191,10 +216,14 @@ pub async fn submit(home: &Home, task_file: &Path, yes: bool, patch: Option<&Pat
         "repository_digest": repo_digest,
         "profile_id": contract.verification_profile,
         "profile_digest": profile_digest,
-        "model": MODEL,
+        "model": model.as_ref().map_or_else(|| FAKE_AGENT.to_string(), ModelSpec::recorded),
         "fake_agent_patch_digest": patch.as_ref().map(|p| Digest::of(p.as_bytes())),
     });
     let fields = submitted.as_object_mut().expect("an object");
+    let transcript_digest = transcript.as_ref().map(|b| Digest::of(b));
+    if let Some(d) = &transcript_digest {
+        fields.insert("transcript_digest".into(), json!(d));
+    }
     match &firecracker {
         None => {
             fields.insert("worker".into(), json!(WorkerKind::Host.as_str()));
@@ -211,16 +240,23 @@ pub async fn submit(home: &Home, task_file: &Path, yes: bool, patch: Option<&Pat
     }
     store.db.append_audit(&task, "Submitted", &submitted)?;
     tracing::info!(task_id = %task, %contract_digest, %repo_digest, %profile_digest, "task submitted");
-    summarize(&task, &contract, &repo_digest, &profile_digest, patch.as_deref(), firecracker.as_ref());
+    let agent = match (&patch, &model, &transcript_digest) {
+        (Some(p), _, _) => format!("{FAKE_AGENT} (patch {})", Digest::of(p.as_bytes())),
+        (None, Some(m), Some(d)) => format!("{} (transcript {d})", m.recorded()),
+        (None, Some(m), None) => m.recorded(),
+        (None, None, _) => "none yet".to_string(),
+    };
+    summarize(&task, &contract, &repo_digest, &profile_digest, &agent, firecracker.as_ref());
 
-    match (lock, patch) {
-        (Some(lock), Some(patch)) => {
+    match lock.filter(|_| patch.is_some() || model.is_some()) {
+        Some(lock) => {
             // The executor (preflight and jail included) before the approval: a host that
             // changed since the checks above leaves the task READY, not approved.
             let exec = home.executor(&store, &task)?;
+            let agent = agent_for(home, &store, &task, None)?;
             // `--yes` is the owner's approval: issue the task's capability handles.
             store.db.approve_task(&task)?;
-            let state = drive(home, &store, &lock, &task, patch, crash, exec).await?;
+            let state = drive(home, &store, &lock, &task, agent, crash, exec).await?;
             print_state(&task, state);
         }
         _ => print(&json!({

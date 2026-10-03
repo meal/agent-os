@@ -56,6 +56,13 @@ pub struct Args {
     /// (recorded as `jailed: false`).
     #[arg(long, global = true, env = "AGENTOS_ALLOW_UNJAILED", value_parser = FalseyValueParser::new())]
     pub allow_unjailed: bool,
+    /// File holding the Anthropic API key (one line); else ANTHROPIC_API_KEY. The key is never
+    /// taken from the command line.
+    #[arg(long, global = true, env = "AGENTOS_API_KEY_FILE", value_name = "FILE")]
+    pub api_key_file: Option<PathBuf>,
+    /// The Anthropic API base URL [default: https://api.anthropic.com] (tests point it at a local fake).
+    #[arg(long, global = true, env = "AGENTOS_ANTHROPIC_BASE_URL", value_name = "URL")]
+    pub anthropic_base_url: Option<String>,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -69,9 +76,13 @@ pub enum Command {
         /// Approve the permissions shown and start the task now.
         #[arg(long)]
         yes: bool,
-        /// Patch text the fake agent applies (the only agent until the model broker exists).
+        /// Patch text the fake agent applies.
         #[arg(long, value_name = "FILE")]
         fake_agent_patch: Option<PathBuf>,
+        /// anthropic:<model> for a real model, fake:<transcript file> for the scripted provider;
+        /// without it the fake agent runs (it needs --fake-agent-patch).
+        #[arg(long, value_name = "SPEC")]
+        model: Option<String>,
         /// Debug: kill this process at an engine crash point, POINT[:KIND][:N].
         #[arg(long, value_name = "POINT[:KIND][:N]")]
         crash_at: Option<CrashSpec>,

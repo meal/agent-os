@@ -8,7 +8,7 @@ use serde_json::json;
 
 use super::{print, print_state};
 use crate::crash::CrashSpec;
-use crate::drive::{agent_patch, drive};
+use crate::drive::{agent_for, drive};
 use crate::error::CliError;
 use crate::home::Home;
 
@@ -39,14 +39,14 @@ pub async fn resume(home: &Home, task: &TaskId, patch: Option<&Path>, crash: Opt
         let in_flight = store.db.outstanding_effects(task)?.iter().any(|e| matches!(e.state, EffectState::Intended | EffectState::Dispatched));
         if in_flight {
             let lock = home.lock()?;
-            let exec = home.executor(&store, task)?;
+            let exec = home.recovery_executor(&store, task)?;
             lock.driving(task)?;
             recover(&store.db, &store.blobs, &exec, task).await?;
         }
         print_state(task, t.state);
         return Ok(());
     }
-    let patch = agent_patch(home, task, patch)?;
+    let agent = agent_for(home, &store, task, patch)?;
     let lock = home.lock()?;
     // Before anything is written: a worker that cannot run (preflight, jail) leaves the task
     // exactly as it was.
@@ -60,7 +60,7 @@ pub async fn resume(home: &Home, task: &TaskId, patch: Option<&Path>, crash: Opt
         // Resuming a READY task is the owner's approval: issue its capability handles.
         store.db.approve_task(task)?;
     }
-    let state = if t.state.is_terminal() { t.state } else { drive(home, &store, &lock, task, patch, crash, exec).await? };
+    let state = if t.state.is_terminal() { t.state } else { drive(home, &store, &lock, task, agent, crash, exec).await? };
     print_state(task, state);
     Ok(())
 }
@@ -104,7 +104,7 @@ pub async fn cancel(home: &Home, task: &TaskId) -> Result<(), CliError> {
             // Reconciles in-flight effects and completes the cancel once none is in flight.
             // Reconciling needs the worker (preflight, recorded jail). If it cannot run, the
             // cancel stays requested and completes on a later resume or cancel.
-            let exec = home.executor(&store, task).map_err(|e| {
+            let exec = home.recovery_executor(&store, task).map_err(|e| {
                 CliError {
                     code: e.code,
                     message: format!(

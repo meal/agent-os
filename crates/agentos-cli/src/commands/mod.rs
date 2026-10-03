@@ -24,6 +24,8 @@ pub async fn dispatch(args: Args) -> Result<(), CliError> {
         jail_uid: args.jail_uid,
         jail_gid: args.jail_gid,
         allow_unjailed: args.allow_unjailed,
+        api_key_file: args.api_key_file,
+        anthropic_base_url: args.anthropic_base_url,
         ..Home::new(args.home, args.profiles)?
     };
     // Every command on an existing task follows the worker recorded at its submission; a
@@ -34,8 +36,8 @@ pub async fn dispatch(args: Args) -> Result<(), CliError> {
         home.task_worker(&home.open()?, &task_id(id)?)?;
     }
     match args.command {
-        Command::Submit { task, yes, fake_agent_patch, crash_at } => {
-            submit::submit(&home, &task, yes, fake_agent_patch.as_deref(), crash_at.as_ref()).await
+        Command::Submit { task, yes, fake_agent_patch, model, crash_at } => {
+            submit::submit(&home, &task, yes, fake_agent_patch.as_deref(), model.as_deref(), crash_at.as_ref()).await
         }
         Command::Status { id } => inspect::status(&home, &task_id(&id)?),
         Command::Events { id } => inspect::events(&home, &task_id(&id)?),

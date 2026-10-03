@@ -6,6 +6,7 @@ use agentos_engine::job::JobDir;
 use serde_json::Value;
 
 use super::print;
+use crate::drive::FAKE_AGENT;
 use crate::error::CliError;
 use crate::home::Home;
 
@@ -40,6 +41,7 @@ pub fn status(home: &Home, task: &TaskId) -> Result<(), CliError> {
         "jobs": jobs,
         "capabilities": capabilities,
         "worker": worker.kind.as_str(),
+        "model": home.recorded_model(&store, task)?.unwrap_or_else(|| FAKE_AGENT.to_string()),
     });
     if let Some((id, digest)) = &worker.image {
         shown["guest_image"] = json!({ "id": id, "digest": digest });
