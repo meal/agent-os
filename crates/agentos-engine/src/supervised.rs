@@ -386,6 +386,42 @@ fn settled(job: &JobDir) -> bool {
     clean
 }
 
+/// Every job of `effect` under `jobs_root`. A jobs root that does not exist holds no job (it
+/// was removed from outside, or nothing ever ran); any other failure to list it is an error,
+/// never "no job".
+fn jobs_of(jobs_root: &Path, effect: &EffectId) -> io::Result<Vec<JobDir>> {
+    match JobDir::list(jobs_root, effect) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound && fs::symlink_metadata(jobs_root).is_err_and(|m| m.kind() == io::ErrorKind::NotFound) => {
+            Ok(Vec::new())
+        }
+        listed => listed,
+    }
+}
+
+/// Asks the live jobs of `effects` under `jobs_root` to stop by dropping their `cancel`
+/// marker; the supervisors kill their workers (and VMs) within a poll interval. Needs no
+/// worker configuration, so a controller whose worker cannot run (preflight, jail) can still
+/// stop what is running. Returns how many markers were dropped.
+pub fn cancel_jobs_in(jobs_root: &Path, effects: &[EffectId]) -> usize {
+    let mut dropped = 0;
+    for effect in effects {
+        let jobs = match jobs_of(jobs_root, effect) {
+            Ok(jobs) => jobs,
+            Err(e) => {
+                tracing::warn!(effect_id = %effect, error = %e, "cannot list the effect's jobs to cancel them");
+                continue;
+            }
+        };
+        for job in jobs.iter().filter(|j| !j.is_dead()) {
+            match job.drop_cancel() {
+                Ok(()) => dropped += 1,
+                Err(e) => tracing::warn!(job = %job.path.display(), error = %e, "cannot drop the cancel marker"),
+            }
+        }
+    }
+    dropped
+}
+
 impl SupervisedExecutor {
     pub fn new(
         jobs_root: PathBuf,
@@ -494,12 +530,7 @@ impl SupervisedExecutor {
     /// Every job of `effect`. A jobs root that does not exist holds no job (it was removed
     /// from outside); any other failure to list it is an error, never "no job".
     fn jobs(&self, effect: &EffectId) -> io::Result<Vec<JobDir>> {
-        match JobDir::list(&self.jobs_root, effect) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound && fs::symlink_metadata(&self.jobs_root).is_err_and(|m| m.kind() == io::ErrorKind::NotFound) => {
-                Ok(Vec::new())
-            }
-            listed => listed,
-        }
+        jobs_of(&self.jobs_root, effect)
     }
 
     /// When to stop waiting for a job whose lease ends at `lease_expiry_ms`: its lease plus
@@ -588,23 +619,7 @@ impl SupervisedExecutor {
     /// supervisors kill their workers within a poll interval. Nothing is waited for: the
     /// caller (or recovery) reads what the jobs leave. Returns how many markers were dropped.
     pub fn cancel_jobs(&self, effects: &[EffectId]) -> usize {
-        let mut dropped = 0;
-        for effect in effects {
-            let jobs = match self.jobs(effect) {
-                Ok(jobs) => jobs,
-                Err(e) => {
-                    tracing::warn!(effect_id = %effect, error = %e, "cannot list the effect's jobs to cancel them");
-                    continue;
-                }
-            };
-            for job in jobs.iter().filter(|j| !j.is_dead()) {
-                match job.drop_cancel() {
-                    Ok(()) => dropped += 1,
-                    Err(e) => tracing::warn!(job = %job.path.display(), error = %e, "cannot drop the cancel marker"),
-                }
-            }
-        }
-        dropped
+        cancel_jobs_in(&self.jobs_root, effects)
     }
 
     /// Fences every job in `jobs` that is not dead: drops `cancel`, gives the job

@@ -1806,12 +1806,23 @@ fn later_commands_use_the_recorded_worker_and_a_disagreeing_flag_exits_2() {
     let ready = cli.json_as(Mode::Fake, &["submit", &contract, "--fake-agent-patch", fix_patch().to_str().unwrap()]);
     let id = ready["task_id"].as_str().unwrap().to_string();
     let events = cli.events(&id);
-    for args in [vec!["resume", id.as_str()], vec!["status", id.as_str()], vec!["cancel", id.as_str()]] {
+    let bundle = cli.path("refused-bundle");
+    for args in [
+        vec!["resume", id.as_str()],
+        vec!["status", id.as_str()],
+        vec!["cancel", id.as_str()],
+        vec!["revoke", id.as_str(), "--capability", "verification.run"],
+        vec!["export", id.as_str(), bundle.to_str().unwrap()],
+        vec!["events", id.as_str()],
+        vec!["pause", id.as_str()],
+    ] {
         let mut args: Vec<&str> = args;
         args.extend(["--worker", "host"]);
         cli.cmd_as(Mode::PlainFake, &args).assert().code(2).stdout("").stderr(predicate::str::contains("task was submitted with worker firecracker"));
     }
     assert_eq!(cli.events(&id), events, "the task is untouched");
+    assert!(!bundle.exists());
+    assert!(cli.grants(&id).is_empty(), "nothing approved, nothing revoked");
     // Without the flag every command uses the record.
     assert_eq!(cli.json_as(Mode::PlainFake, &["resume", &id])["state"], "SUCCEEDED");
     assert_eq!(cli.json_as(Mode::Plain, &["status", &id])["worker"], "firecracker");
@@ -2030,4 +2041,85 @@ fn firecracker_task_runs_to_succeeded_with_the_fake_guest_and_host_paths_do_not_
     }
     assert!(checked >= 2, "the verification evidence was checked");
     assert_no_job_processes(&cli);
+}
+
+/// Waits (bounded) until no process names the home: the job's supervisor, worker and fake
+/// guest are gone.
+fn wait_for_no_home_processes(cli: &Cli, bound: std::time::Duration) {
+    let started = std::time::Instant::now();
+    while !processes_mentioning(cli.home().to_str().unwrap()).is_empty() {
+        assert!(started.elapsed() < bound, "processes still name the home after {bound:?}: {:?}", processes_mentioning(cli.home().to_str().unwrap()));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// A Firecracker task (fake guest) whose controller died right after launching a 30 s
+/// verification: the supervisor and the guest outlive it. `probe` is the jail probe answer at
+/// submission. Returns the profiles registry, the task id and the image digest.
+fn fc_task_with_a_running_slow_verification(cli: &Cli, probe: Option<&str>) -> (PathBuf, String, String) {
+    let digest = cli.register_guest_image();
+    let (profiles, contract) = slow_world(cli);
+    let mut cmd = Command::from_std(cli.std_cmd(
+        Mode::Fake,
+        false,
+        &profiles,
+        &["submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap(), "--crash-at", "during-execute:run_verification"],
+    ));
+    if let Some(p) = probe {
+        cmd.env("AGENTOS_TEST_JAIL_PROBE", p);
+    }
+    cmd.assert().code(75);
+    wait_for_verification_job(cli);
+    let id = first_task(cli);
+    assert_eq!(cli.submitted(&id)["worker"], "firecracker");
+    assert!(!processes_mentioning(cli.home().to_str().unwrap()).is_empty(), "the verification job outlived its controller");
+    (profiles, id, digest)
+}
+
+#[test]
+fn cancel_records_its_intent_and_stops_running_jobs_even_when_the_worker_cannot_run() {
+    let started = std::time::Instant::now();
+    // A tampered image: the preflight fails.
+    let cli = Cli::bare();
+    let (profiles, id, digest) = fc_task_with_a_running_slow_verification(&cli, None);
+    cli.tamper_image(&digest);
+    let assert = Command::from_std(cli.std_cmd(Mode::PlainFake, false, &profiles, &["cancel", &id])).assert().code(1).stdout("");
+    let stderr = stderr_of(&assert);
+    assert!(stderr.contains("firecracker worker unavailable: guest image digest mismatch"), "{stderr}");
+    assert!(stderr.contains("the cancel is requested and completes on a later"), "{stderr}");
+    let status = cli.json_as(Mode::Plain, &["status", &id]);
+    assert_eq!(status["cancel_requested"], true, "{status}");
+    assert!(!TERMINAL.contains(&status["state"].as_str().unwrap()), "{status}");
+    assert!(cli.event_types(&id).contains(&"CancelRequested".to_string()));
+    wait_for_no_home_processes(&cli, std::time::Duration::from_secs(15));
+
+    // Recorded jailed, jailer gone: the jail recheck fails.
+    let cli = Cli::bare();
+    let (profiles, id, _) = fc_task_with_a_running_slow_verification(&cli, Some("ok"));
+    let assert = Command::from_std(cli.std_cmd(Mode::PlainFake, false, &profiles, &["cancel", &id]))
+        .env("AGENTOS_TEST_JAIL_PROBE", "fail:jailer gone")
+        .assert()
+        .code(1);
+    assert!(stderr_of(&assert).contains("task was submitted jailed: jailer unavailable: jailer gone"));
+    assert_eq!(cli.json_as(Mode::Plain, &["status", &id])["cancel_requested"], true);
+    wait_for_no_home_processes(&cli, std::time::Duration::from_secs(15));
+    assert!(started.elapsed() < std::time::Duration::from_secs(50), "the 30 s checks were stopped, took {:?}", started.elapsed());
+}
+
+#[test]
+fn revoke_stops_a_running_job_even_when_the_worker_cannot_run() {
+    let started = std::time::Instant::now();
+    let cli = Cli::bare();
+    let (profiles, id, digest) = fc_task_with_a_running_slow_verification(&cli, Some("ok"));
+    cli.tamper_image(&digest);
+    let out = Command::from_std(cli.std_cmd(Mode::PlainFake, false, &profiles, &["revoke", &id, "--capability", "verification.run"]))
+        .env("AGENTOS_TEST_JAIL_PROBE", "fail:jailer gone")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(serde_json::from_slice::<Value>(&out).unwrap(), json!({ "task_id": id, "revoked": ["verification.run"], "cancelled_jobs": 1 }));
+    wait_for_no_home_processes(&cli, std::time::Duration::from_secs(15));
+    assert!(started.elapsed() < std::time::Duration::from_secs(25), "the 30 s check was stopped, took {:?}", started.elapsed());
 }

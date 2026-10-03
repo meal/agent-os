@@ -113,11 +113,12 @@ pub fn probe_hook(get: impl Fn(&str) -> Option<String>) -> Result<Option<Result<
 /// The cgroup v2 mount point `/proc/mounts` names: the one root the probe checks, the
 /// worker's `collect` cleans and the real jailer writes to.
 fn cgroup_root() -> PathBuf {
-    fs::read_to_string("/proc/mounts")
-        .ok()
-        .as_deref()
-        .and_then(jail::find_cgroup2_root)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_CGROUP_ROOT))
+    cgroup_root_from(fs::read_to_string("/proc/mounts").ok().as_deref())
+}
+
+/// `cgroup_root` over `/proc/mounts` text (`None`: unreadable).
+fn cgroup_root_from(proc_mounts: Option<&str>) -> PathBuf {
+    proc_mounts.and_then(jail::find_cgroup2_root).unwrap_or_else(|| PathBuf::from(DEFAULT_CGROUP_ROOT))
 }
 
 pub struct Store {
@@ -385,6 +386,17 @@ impl Home {
         Ok(PreparedFirecracker { cfg, jailed })
     }
 
+    /// The jail configuration: the jailer, the jail uid/gid, and the cgroup root `/proc/mounts`
+    /// names (the one the probe checks, `collect` cleans and the real jailer writes to).
+    fn jail_config(&self) -> std::io::Result<JailConfig> {
+        Ok(JailConfig {
+            jailer_bin: std::path::absolute(self.jailer_bin())?,
+            uid: self.jail_uid,
+            gid: self.jail_gid,
+            cgroup_root: cgroup_root(),
+        })
+    }
+
     /// The jail of `cfg`'s VMs and whether it counts as jailed (what `Submitted.jailed`
     /// records). The `Fake` launcher is never probed and never really jailed: without the
     /// probe hook it is unjailed; with it, the hook's answer drives the decision and the record
@@ -393,12 +405,7 @@ impl Home {
         if recorded == Some(false) {
             return Ok((JailMode::Unjailed, false));
         }
-        let jail_cfg = JailConfig {
-            jailer_bin: std::path::absolute(self.jailer_bin())?,
-            uid: self.jail_uid,
-            gid: self.jail_gid,
-            cgroup_root: cgroup_root(),
-        };
+        let jail_cfg = self.jail_config()?;
         let probe = match (probe_hook(|k| std::env::var(k).ok())?, &cfg.launcher) {
             (Some(answer), _) => Some(answer),
             (None, GuestLauncher::Fake { .. }) => None,
@@ -503,6 +510,24 @@ mod tests {
         assert_eq!(home.jailer_bin(), Path::new("/h/bin/jailer"));
         let home = Home { firecracker: Some("/x/firecracker".into()), jailer: Some("/y/my-jailer".into()), ..Home::new(Some("/h".into()), None).unwrap() };
         assert_eq!(home.jailer_bin(), Path::new("/y/my-jailer"));
+    }
+
+    #[test]
+    fn jail_cgroup_root_is_the_cgroup2_mount_point_from_proc_mounts() {
+        let host = "sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0\n\
+                    cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime,nsdelegate 0 0\n";
+        assert_eq!(cgroup_root_from(Some(host)), Path::new("/sys/fs/cgroup"));
+        let elsewhere = "proc /proc proc rw 0 0\nnone /mnt/cg\\040two cgroup2 rw 0 0\n";
+        assert_eq!(cgroup_root_from(Some(elsewhere)), Path::new("/mnt/cg two"), "the mount point, unescaped");
+        let v1_only = "cgroup /sys/fs/cgroup/cpu cgroup rw,cpu 0 0\n";
+        assert_eq!(cgroup_root_from(Some(v1_only)), Path::new(DEFAULT_CGROUP_ROOT), "none: the default, which the probe then refuses");
+        assert_eq!(cgroup_root_from(None), Path::new(DEFAULT_CGROUP_ROOT));
+        // And it is what the jail is built with on this host.
+        let mounts = fs::read_to_string("/proc/mounts").ok();
+        let home = Home { jailer: Some("/j/jailer".into()), jail_uid: 7, jail_gid: 8, ..Home::new(Some("/h".into()), None).unwrap() };
+        let cfg = home.jail_config().unwrap();
+        assert_eq!(cfg.cgroup_root, cgroup_root_from(mounts.as_deref()));
+        assert_eq!((cfg.jailer_bin.as_path(), cfg.uid, cfg.gid), (Path::new("/j/jailer"), 7, 8));
     }
 
     #[test]

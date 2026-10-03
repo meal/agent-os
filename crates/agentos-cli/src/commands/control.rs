@@ -75,20 +75,15 @@ pub async fn cancel(home: &Home, task: &TaskId) -> Result<(), CliError> {
         print(&json!({ "task_id": task, "state": t.state.label(), "note": "already finished; nothing to cancel" }));
         return Ok(());
     }
-    // Whether this process completes the cancel; if so, and effects are outstanding, their
-    // reconciliation needs the worker: checked before the task is touched.
-    let lock = home.try_lock()?;
-    let mut exec = match &lock {
-        Some(_) if !store.db.outstanding_effects(task)?.is_empty() => Some(home.executor(&store, task)?),
-        _ => None,
-    };
+    // The intent and the stop come first, whatever the worker's state: a job that outlived
+    // its controller must not run to its lease because the worker cannot start again.
     if !t.cancel_requested {
         store.db.append(task, &TaskEvent::CancelRequested)?;
     }
     // Running jobs are asked to stop first, whoever drives the task, so the reconciliation
     // below (or the driver's) does not wait out their leases.
     super::revoke::cancel_running_jobs(home, &store, task, None)?;
-    let Some(lock) = lock else {
+    let Some(lock) = home.try_lock()? else {
         let state = store.db.task(task)?.state;
         let note = if home.driven_task().as_deref() == Some(task.as_str()) {
             "another agentos process is driving this task; it completes the cancel at its next step".to_string()
@@ -107,10 +102,16 @@ pub async fn cancel(home: &Home, task: &TaskId) -> Result<(), CliError> {
             store.db.append(task, &TaskEvent::CancelCompleted)?;
         } else {
             // Reconciles in-flight effects and completes the cancel once none is in flight.
-            let exec = match exec.take() {
-                Some(exec) => exec,
-                None => home.executor(&store, task)?,
-            };
+            // Reconciling needs the worker (preflight, recorded jail). If it cannot run, the
+            // cancel stays requested and completes on a later resume or cancel.
+            let exec = home.executor(&store, task).map_err(|e| {
+                CliError {
+                    code: e.code,
+                    message: format!(
+                        "{e}; the cancel is requested and completes on a later `agentos resume {task}` or `agentos cancel {task}`"
+                    ),
+                }
+            })?;
             recover(&store.db, &store.blobs, &exec, task).await?;
         }
     }

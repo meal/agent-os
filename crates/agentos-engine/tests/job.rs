@@ -11,6 +11,7 @@ use agentos_engine::executor::ExecOutcome;
 use agentos_engine::job::{
     HostConfig, JobDir, JobRequest, JobState, JobStatus, KillReason, ScriptedConfig, WorkerConfig,
 };
+use agentos_engine::supervised::cancel_jobs_in;
 use tempfile::TempDir;
 
 fn effect_id(n: u32) -> EffectId {
@@ -366,4 +367,22 @@ fn groups_file_append_and_read() {
     let mut f = fs::OpenOptions::new().append(true).open(job.path.join("groups")).unwrap();
     std::io::Write::write_all(&mut f, b"garbage\n300\n").unwrap();
     assert_eq!(job.groups(), vec![100, 200, 300]);
+}
+
+#[test]
+fn cancel_jobs_in_drops_markers_for_live_jobs_only_and_tolerates_a_missing_root() {
+    let root = root();
+    let (live, other, dead) = (effect_id(1), effect_id(2), effect_id(3));
+    let (live_job, _live_lock) = JobDir::create(root.path(), &request_for(&live, 1, scripted())).unwrap();
+    let (other_job, _other_lock) = JobDir::create(root.path(), &request_for(&other, 1, scripted())).unwrap();
+    let (dead_job, dead_lock) = JobDir::create(root.path(), &request_for(&dead, 1, scripted())).unwrap();
+    drop(dead_lock);
+
+    assert_eq!(cancel_jobs_in(root.path(), &[live.clone(), dead.clone()]), 1, "only the live job is asked to stop");
+    assert!(live_job.cancel_requested());
+    assert!(!dead_job.cancel_requested(), "a dead job gets no marker");
+    assert!(!other_job.cancel_requested(), "an effect not asked for is left alone");
+    assert_eq!(cancel_jobs_in(root.path(), &[]), 0);
+    // No jobs root at all: nothing ran, nothing to stop.
+    assert_eq!(cancel_jobs_in(&root.path().join("missing"), &[live]), 0);
 }

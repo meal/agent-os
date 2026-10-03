@@ -4,7 +4,7 @@
 
 use agentos_core::contract::Capability;
 use agentos_core::ids::TaskId;
-use agentos_engine::job::JobDir;
+use agentos_engine::supervised::cancel_jobs_in;
 use serde_json::{json, Value};
 
 use super::print;
@@ -35,26 +35,8 @@ pub fn cancel_running_jobs(home: &Home, store: &Store, task: &TaskId, only: Opti
         .map(|e| e.effect_id)
         .collect();
     // Dropping a cancel marker needs no worker (and so no preflight): whatever the worker,
-    // the job's supervisor kills it within a poll interval (as `SupervisedExecutor::cancel_jobs`).
-    let jobs_root = std::path::absolute(&home.root)?.join("jobs");
-    let mut dropped = 0;
-    for effect in &effects {
-        let jobs = match JobDir::list(&jobs_root, effect) {
-            Ok(jobs) => jobs,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => {
-                tracing::warn!(effect_id = %effect, error = %e, "cannot list the effect's jobs to cancel them");
-                continue;
-            }
-        };
-        for job in jobs.iter().filter(|j| !j.is_dead()) {
-            match job.drop_cancel() {
-                Ok(()) => dropped += 1,
-                Err(e) => tracing::warn!(job = %job.path.display(), error = %e, "cannot drop the cancel marker"),
-            }
-        }
-    }
-    Ok(dropped)
+    // the job's supervisor kills it within a poll interval.
+    Ok(cancel_jobs_in(&std::path::absolute(&home.root)?.join("jobs"), &effects))
 }
 
 pub fn revoke(home: &Home, task: &TaskId, capability: Option<&str>) -> Result<(), CliError> {
