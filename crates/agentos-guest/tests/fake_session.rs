@@ -310,5 +310,10 @@ fn fake_start_recreates_an_empty_scratch_dir() {
 fn no_arguments_prints_the_usage_and_exits_2() {
     let out = Command::new(env!("CARGO_BIN_EXE_agentos-guest")).output().unwrap();
     assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("usage: agentos-guest --fake UDS ROOT"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("usage: agentos-guest --fake UDS ROOT"), "{stderr}");
+    // The exec-check line is the trampoline's own usage, with every required option.
+    let exec_check = agentos_guest::trampoline::USAGE.trim_start_matches("usage: ");
+    assert!(stderr.contains(exec_check), "{stderr}");
+    assert!(exec_check.contains("--uid U --gid G"), "{exec_check}");
 }

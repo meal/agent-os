@@ -24,6 +24,33 @@ docker compose run --rm test cargo test -p agentos-engine --test supervisor     
 docker compose run --rm test cargo build -p agentos-cli     # the `agentos` binary
 ```
 
+### The KVM tier (Firecracker)
+
+Needs `/dev/kvm` on the host. Nothing is installed on the host: Firecracker and the jailer go
+to `build/firecracker/v1.17.0/` (git-ignored), the guest image to the `guest-images` compose
+volume.
+
+```sh
+docker compose run --rm test sh scripts/fetch-firecracker.sh    # pinned v1.17.0, sha256-verified
+docker compose run --rm test-kvm sh scripts/build-guest-image.sh \
+    guest/python-stdlib-v1 build/guest-images/python-stdlib-v1 --verify   # builds twice, cmp
+docker compose run --rm test-kvm sh scripts/demo.sh --worker firecracker
+```
+
+`test-kvm` extends `test` with what the jailer needs inside a container, and nothing more
+(each setting is justified in `compose.yaml` by the spec's jailer experiments): `/dev/kvm`;
+`CAP_SYS_ADMIN` (mount namespace, `pivot_root`, the cgroup remount);
+`scripts/kvm-entrypoint.sh`, which remounts the container's cgroup tree read-write, moves
+every process into a leaf `init/` and delegates `+cpu +memory +pids`; `apparmor=unconfined`;
+and the seccomp profile `scripts/kvm-seccomp.json`. Docker's default profile is an allow-list
+without `pivot_root`, so the jailer cannot run under it. `kvm-seccomp.json` is the reverse:
+it allows every call except 46 host-dangerous ones, which it fails with `EPERM`. Docker's
+default profile also refuses these unless an extra capability enables them; here they stay
+refused even though the container has `CAP_SYS_ADMIN`. They cover kernel module and
+kexec loading, clock and hostname setting, keyrings, `bpf`, `perf_event_open`,
+`process_vm_*`, `setns`, `reboot`, swap, `userfaultfd`, NUMA policy and the obsolete
+`vm86`/`uselib`/`ustat` calls. `pivot_root`, `mount`, `umount2` and `unshare` stay allowed.
+
 ## Demo: kill the controller, restart it, recover the task
 
 The fixtures contain a small Python repository with a buggy `parse_kv`

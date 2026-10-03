@@ -5,9 +5,11 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: agentos-guest --fake UDS ROOT\n       \
-                     agentos-guest exec-check --nproc N --nofile N --oom N -- PROGRAM [ARGS...]\n       \
-                     agentos-guest   (as PID 1 in the guest VM only)";
+/// The top-level usage; the `exec-check` line is the trampoline's own, so the two cannot drift.
+fn usage() -> String {
+    let exec_check = agentos_guest::trampoline::USAGE.trim_start_matches("usage: ");
+    format!("usage: agentos-guest --fake UDS ROOT\n       {exec_check}\n       agentos-guest   (as PID 1 in the guest VM only)")
+}
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -28,7 +30,7 @@ fn main() -> ExitCode {
             }
         },
         _ => {
-            eprintln!("{USAGE}");
+            eprintln!("{}", usage());
             ExitCode::from(2)
         }
     }

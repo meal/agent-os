@@ -4,4 +4,32 @@ services:
     volumes: [".:/work", "cargo-cache:/usr/local/cargo/registry", "target:/work/target"]
     init: true
     command: cargo test --workspace
-volumes: { cargo-cache: {}, target: {} }
+  # The KVM tier: `docker compose run --rm test-kvm …`. The `test` service above is unchanged;
+  # each setting below is the one the "Jailer experiments" (E1-E12) in
+  # docs/superpowers/specs/2026-10-02-phase-3b-firecracker-worker-design.md found necessary.
+  test-kvm:
+    # E12: the same image, volumes, `init: true` and command as `test`.
+    extends: test
+    # E1: Firecracker needs /dev/kvm (not visible in `test`).
+    devices: ["/dev/kvm:/dev/kvm"]
+    # E2b/E3: the jailer's unshare(CLONE_NEWNS), mount and pivot_root, and the entrypoint's
+    # cgroup remount, need CAP_SYS_ADMIN. Nothing else is added (E5: not `privileged`).
+    cap_add: [SYS_ADMIN]
+    security_opt:
+      # E3/E11: Docker's default profile does not allow pivot_root. kvm-seccomp.json allows
+      # everything but 46 host-dangerous calls (module and kexec loading, clock setting,
+      # keyrings, bpf, perf, process_vm_*, setns, reboot, swap, …), which stay refused even
+      # with CAP_SYS_ADMIN; pivot_root is not among them. README "The KVM tier" lists them.
+      - "seccomp=./scripts/kvm-seccomp.json"
+      # E12: accepted on a host without AppArmor; elsewhere docker-default denies the mounts.
+      - "apparmor=unconfined"
+    # E4: remount the cgroup tree rw, move every process to init/, delegate +cpu +memory +pids.
+    entrypoint: ["sh", "scripts/kvm-entrypoint.sh"]
+    environment:
+      - AGENTOS_KVM_TESTS=1
+      - AGENTOS_FIRECRACKER=/work/build/firecracker/v1.17.0/firecracker
+      - AGENTOS_JAILER=/work/build/firecracker/v1.17.0/jailer
+      - AGENTOS_GUEST_IMAGE=/work/build/guest-images/python-stdlib-v1
+    # The built guest image (scripts/build-guest-image.sh) persists here between runs.
+    volumes: ["guest-images:/work/build/guest-images"]
+volumes: { cargo-cache: {}, target: {}, guest-images: {} }

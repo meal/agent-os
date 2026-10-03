@@ -1,0 +1,1 @@
+{"id":"python-stdlib-v1","protocol":1,"kernel":"vmlinux","rootfs":"rootfs.squashfs","agent_version":"@AGENT_VERSION@","kernel_sha256":"@KERNEL_SHA256@","built_from":"guest/python-stdlib-v1@@GIT_SHA@"}
