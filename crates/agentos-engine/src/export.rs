@@ -118,6 +118,10 @@ pub struct Manifest {
     /// leaves the database).
     #[serde(default)]
     pub capabilities: Vec<CapabilityEntry>,
+    /// The guest image a Firecracker task ran on (`Submitted.guest_image_digest`); absent for
+    /// host tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_image_digest: Option<Digest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,15 +210,19 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
     let created = events.iter().find(|e| e.event_type == "TaskCreated").ok_or_else(|| inconsistent("no TaskCreated event"))?;
     let contract_digest = digest_field(&created.payload, "contract_digest", "TaskCreated")?;
     let submitted = events.iter().find(|e| e.event_type == "Submitted").map(|e| &e.payload);
-    let (submitted_repo, submitted_profile) = match submitted {
+    let (submitted_repo, submitted_profile, guest_image_digest) = match submitted {
         Some(s) => {
             // Submission digests the stored contract serialization, so it can be re-checked.
             if Digest::of(&serde_json::to_vec(&contract).map_err(DbError::from)?) != contract_digest {
                 return Err(inconsistent(format!("contract digest {contract_digest} does not match the stored contract")));
             }
-            (Some(digest_field(s, "repository_digest", "Submitted")?), optional_digest(s, "profile_digest", "Submitted")?)
+            (
+                Some(digest_field(s, "repository_digest", "Submitted")?),
+                optional_digest(s, "profile_digest", "Submitted")?,
+                optional_digest(s, "guest_image_digest", "Submitted")?,
+            )
         }
-        None => (None, None),
+        None => (None, None, None),
     };
 
     let mut evidence = BTreeMap::new();
@@ -325,6 +333,7 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
                 revoked: g.revoked,
             })
             .collect(),
+        guest_image_digest,
     };
     Ok(Contents { manifest, patch_diff, patches, evidence })
 }
@@ -453,6 +462,7 @@ mod tests {
             model: None,
             generated_events: 1,
             capabilities: Vec::new(),
+            guest_image_digest: None,
         };
         let evidence = [b"{\"a\":1}".to_vec(), b"{\"b\":2}".to_vec()].into_iter().map(|b| (Digest::of(&b), b)).collect();
         Contents { manifest, patch_diff: b"diff".to_vec(), patches: vec![("patches/0001-x.patch".into(), b"p".to_vec())], evidence }

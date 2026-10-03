@@ -286,6 +286,9 @@ pub struct ProbeFacts {
     pub euid: u32,
     /// The first line of a successful `jailer --version`, or why there is none.
     pub jailer_version: Result<String, String>,
+    /// `JailConfig.cgroup_root`: where `plan` puts the VM's cgroup and `collect` removes it.
+    pub configured_cgroup_root: PathBuf,
+    /// The cgroup v2 mount point in `/proc/mounts`, which the real jailer uses.
     pub cgroup_root: Option<PathBuf>,
     /// `<cgroup_root>/cgroup.controllers`.
     pub controllers: Vec<String>,
@@ -315,6 +318,14 @@ pub fn probe_with(f: &ProbeFacts) -> Result<(), String> {
     let Some(root) = &f.cgroup_root else {
         return Err("no cgroup v2 hierarchy in /proc/mounts".into());
     };
+    // The probe, `collect` and the real jailer must name the same cgroup tree.
+    if *root != f.configured_cgroup_root {
+        return Err(format!(
+            "the jail is configured for cgroup root {}, but the cgroup v2 hierarchy in /proc/mounts is {}",
+            f.configured_cgroup_root.display(),
+            root.display()
+        ));
+    }
     let missing: Vec<&str> = CONTROLLERS.into_iter().filter(|c| !f.controllers.iter().any(|have| have == c)).collect();
     if !missing.is_empty() {
         return Err(format!("controllers missing in {}: {}", root.join("cgroup.controllers").display(), missing.join(", ")));
@@ -405,6 +416,7 @@ pub fn probe(cfg: &JailConfig, jobs: &Path, inspect: &Path, work: &Path, image_d
     let mut facts = ProbeFacts {
         euid,
         jailer_version,
+        configured_cgroup_root: cfg.cgroup_root.clone(),
         cgroup_root,
         controllers,
         delegation: Ok(()),
@@ -413,7 +425,8 @@ pub fn probe(cfg: &JailConfig, jobs: &Path, inspect: &Path, work: &Path, image_d
         noexec: false,
         same_device: None,
     };
-    // With the later facts still at their passing defaults, this is steps 1-3.
+    // With the later facts still at their passing defaults, this is steps 1-3 (the root
+    // agreement included: a disagreeing configuration never writes to the root found).
     if probe_with(&facts).is_ok()
         && let Some(root) = &facts.cgroup_root
     {
@@ -672,6 +685,7 @@ mod tests {
         ProbeFacts {
             euid: 0,
             jailer_version: Ok("Jailer v1.17.0".into()),
+            configured_cgroup_root: "/sys/fs/cgroup".into(),
             cgroup_root: Some("/sys/fs/cgroup".into()),
             controllers: ["cpuset", "cpu", "io", "memory", "hugetlb", "pids", "rdma"].map(String::from).to_vec(),
             delegation: Ok(()),
@@ -717,6 +731,10 @@ mod tests {
             ),
             (failing_from(2), Err("jailer --version: expected Jailer v1.17., got Jailer v1.16.0".into())),
             (failing_from(3), Err("no cgroup v2 hierarchy in /proc/mounts".into())),
+            (
+                ProbeFacts { configured_cgroup_root: "/elsewhere".into(), ..failing_from(4) },
+                Err("the jail is configured for cgroup root /elsewhere, but the cgroup v2 hierarchy in /proc/mounts is /sys/fs/cgroup".into()),
+            ),
             (
                 ProbeFacts { controllers: ["cpu", "memory"].map(String::from).to_vec(), ..failing_from(4) },
                 Err("controllers missing in /sys/fs/cgroup/cgroup.controllers: pids".into()),

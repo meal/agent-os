@@ -12,6 +12,7 @@ agentos-core = { path = "../agentos-core" }
 agentos-store = { path = "../agentos-store" }
 agentos-engine = { path = "../agentos-engine" }
 clap.workspace = true
+rustix = { workspace = true, features = ["system"] }
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

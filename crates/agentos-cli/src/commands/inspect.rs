@@ -26,7 +26,8 @@ pub fn status(home: &Home, task: &TaskId) -> Result<(), CliError> {
         .into_iter()
         .map(|g| json!({ "operation": g.operation, "handle_prefix": g.handle.prefix(), "revoked": g.revoked, "expires_ts": g.expires_ts }))
         .collect();
-    print(&json!({
+    let worker = home.recorded_worker(&store, task)?;
+    let mut shown = json!({
         "task_id": t.id,
         "state": t.state.label(),
         "step": t.step,
@@ -38,7 +39,15 @@ pub fn status(home: &Home, task: &TaskId) -> Result<(), CliError> {
         "outstanding_effects": outstanding,
         "jobs": jobs,
         "capabilities": capabilities,
-    }));
+        "worker": worker.kind.as_str(),
+    });
+    if let Some((id, digest)) = &worker.image {
+        shown["guest_image"] = json!({ "id": id, "digest": digest });
+    }
+    if let Some(jailed) = worker.jailed {
+        shown["jailed"] = json!(jailed);
+    }
+    print(&shown);
     Ok(())
 }
 

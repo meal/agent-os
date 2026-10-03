@@ -29,14 +29,89 @@ const COMMENT_PATCH: &str = "--- a/src/parser.py\n+++ b/src/parser.py\n@@ -1,2 +
 
 const TERMINAL: [&str; 3] = ["SUCCEEDED", "FAILED", "CANCELLED"];
 
+/// Which worker `Cli::cmd` runs the tasks on: `AGENTOS_TEST_WORKER` = `host` (default) |
+/// `firecracker-fake` (the Firecracker worker over the fake guest, the CLI's own
+/// `supervise fake-guest`). Any other value panics, so a typo never runs the host tier under
+/// the name of another.
+fn test_worker() -> &'static str {
+    let worker = match std::env::var("AGENTOS_TEST_WORKER").as_deref() {
+        Err(_) | Ok("") | Ok("host") => "host",
+        Ok("firecracker-fake") => "firecracker-fake",
+        Ok(other) => panic!("AGENTOS_TEST_WORKER={other:?}: the CLI tier knows host and firecracker-fake"),
+    };
+    if test_jail_fake() && worker != "firecracker-fake" {
+        panic!("AGENTOS_TEST_JAIL=fake needs AGENTOS_TEST_WORKER=firecracker-fake");
+    }
+    worker
+}
+
+/// `AGENTOS_TEST_JAIL=fake` (any other non-empty value panics). In the CLI tier it makes
+/// every command's jail probe answer `ok` (`AGENTOS_TEST_JAIL_PROBE=ok`): the decision is
+/// `Jailed` and `Submitted` records `jailed: true`, while the launcher stays the fake guest.
+fn test_jail_fake() -> bool {
+    match std::env::var("AGENTOS_TEST_JAIL").as_deref() {
+        Err(_) | Ok("") => false,
+        Ok("fake") => true,
+        Ok(other) => panic!("AGENTOS_TEST_JAIL={other:?}: this tier knows only fake"),
+    }
+}
+
+fn fake_mode() -> bool {
+    test_worker() == "firecracker-fake"
+}
+
+/// The CLI's own configuration and test switches: never inherited from the test's
+/// environment, so every command runs exactly the worker its helper chose.
+const SCRUBBED_ENV: [&str; 10] = [
+    "AGENTOS_WORKER",
+    "AGENTOS_FIRECRACKER",
+    "AGENTOS_JAILER",
+    "AGENTOS_JAIL_UID",
+    "AGENTOS_JAIL_GID",
+    "AGENTOS_ALLOW_UNJAILED",
+    "AGENTOS_TEST_WORKERS",
+    "AGENTOS_TEST_FAKE_GUEST",
+    "AGENTOS_TEST_JAIL_PROBE",
+    "AGENTOS_GUEST_IMAGE",
+];
+
+/// How a command reaches its worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// No `--worker` flag, no test switches: what a user types.
+    Plain,
+    /// No `--worker` flag, but the fake-guest switches (`AGENTOS_TEST_WORKERS=1`,
+    /// `AGENTOS_TEST_FAKE_GUEST=1`): later commands on a Firecracker task.
+    PlainFake,
+    /// `--worker firecracker` over the fake guest.
+    Fake,
+}
+
 /// A scratch directory holding an agentos home (created on demand by the CLI) and inputs.
 struct Cli {
     dir: TempDir,
 }
 
 impl Cli {
+    /// A scratch home; under `AGENTOS_TEST_WORKER=firecracker-fake` the dummy guest image is
+    /// registered once, so `cmd` can submit to the Firecracker worker.
     fn new() -> Cli {
+        let cli = Cli::bare();
+        if fake_mode() {
+            cli.register_guest_image();
+        }
+        cli
+    }
+
+    /// A scratch home with nothing registered, whatever the tier.
+    fn bare() -> Cli {
         Cli { dir: tempfile::tempdir().unwrap() }
+    }
+
+    /// Registers the dummy `python-stdlib-v1` image (the contracts' `profile`); returns its digest.
+    fn register_guest_image(&self) -> String {
+        let dir = fake_image_dir(self, "guest-image", "python-stdlib-v1", 0x68);
+        self.json_as(Mode::Plain, &["image", "register", dir.to_str().unwrap()])["digest"].as_str().unwrap().to_string()
     }
 
     fn home(&self) -> PathBuf {
@@ -47,14 +122,48 @@ impl Cli {
         self.dir.path().join(rel)
     }
 
+    /// The tier's mode: `Fake` under `AGENTOS_TEST_WORKER=firecracker-fake`, else `Plain`.
+    fn mode() -> Mode {
+        if fake_mode() { Mode::Fake } else { Mode::Plain }
+    }
+
     fn cmd(&self, args: &[&str]) -> Command {
         self.cmd_with_profiles(&fixtures().join("profiles"), args)
     }
 
     fn cmd_with_profiles(&self, profiles: &Path, args: &[&str]) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_agentos"));
-        cmd.arg("--home").arg(self.home()).arg("--profiles").arg(profiles).args(args);
+        Command::from_std(self.std_cmd(Cli::mode(), true, profiles, args))
+    }
+
+    /// A command in `mode`, whatever the tier.
+    fn cmd_as(&self, mode: Mode, args: &[&str]) -> Command {
+        Command::from_std(self.std_cmd(mode, false, &fixtures().join("profiles"), args))
+    }
+
+    /// `tier`: the command is the tier's own (`cmd`), not one a test chose explicitly.
+    fn std_cmd(&self, mode: Mode, tier: bool, profiles: &Path, args: &[&str]) -> StdCommand {
+        let mut cmd = StdCommand::new(env!("CARGO_BIN_EXE_agentos"));
+        for var in SCRUBBED_ENV {
+            cmd.env_remove(var);
+        }
+        cmd.arg("--home").arg(self.home()).arg("--profiles").arg(profiles);
+        if mode == Mode::Fake {
+            cmd.args(["--worker", "firecracker"]);
+        }
+        if mode != Mode::Plain {
+            cmd.env("AGENTOS_TEST_WORKERS", "1").env("AGENTOS_TEST_FAKE_GUEST", "1");
+        }
+        // The tier's jail setting applies to the tier's own commands only.
+        if tier && mode == Mode::Fake && test_jail_fake() {
+            cmd.env("AGENTOS_TEST_JAIL_PROBE", "ok");
+        }
+        cmd.args(args);
         cmd
+    }
+
+    fn json_as(&self, mode: Mode, args: &[&str]) -> Value {
+        let out = self.cmd_as(mode, args).assert().success().get_output().stdout.clone();
+        serde_json::from_slice(&out).unwrap_or_else(|e| panic!("stdout of {args:?} is not JSON ({e}): {}", String::from_utf8_lossy(&out)))
     }
 
     /// Runs a command that must succeed; returns its stdout parsed as one JSON value.
@@ -173,6 +282,26 @@ fn normalized(manifest: &Value) -> Value {
     m
 }
 
+/// Task `id` ran on the tier's worker: never a silent fallback to the host worker.
+fn assert_tier_worker(cli: &Cli, id: &str) {
+    let submitted = cli.submitted(id);
+    if fake_mode() {
+        assert_eq!(submitted["worker"], "firecracker", "{submitted}");
+        assert_eq!(submitted["firecracker_version"], "fake", "{submitted}");
+        assert_eq!(submitted["jailed"], test_jail_fake(), "{submitted}");
+    } else {
+        assert_eq!(submitted["worker"], "host", "{submitted}");
+    }
+}
+
+/// Nothing of a task was written: no home at all or, when the tier registered its guest
+/// image up front, a home holding only that registry.
+fn assert_nothing_recorded(cli: &Cli) {
+    let Ok(entries) = fs::read_dir(cli.home()) else { return };
+    let names: Vec<String> = entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert!(fake_mode() && names == ["registry"], "the home holds {names:?}");
+}
+
 fn digest_of_file(path: &Path) -> String {
     Digest::of(&fs::read(path).unwrap()).to_string()
 }
@@ -194,7 +323,7 @@ fn invalid_contract_exits_2_with_the_validation_message_and_writes_nothing() {
     let bad = cli.contract_with(&repo, 0, "recorded-at-submission");
 
     cli.cmd(&["submit", &bad]).assert().code(2).stdout("").stderr(predicate::str::contains("limit tool_actions must be > 0"));
-    assert!(!cli.home().exists(), "no home, no database");
+    assert_nothing_recorded(&cli);
 
     let garbage = cli.write("garbage.json", "{ not json");
     cli.cmd(&["submit", &garbage]).assert().code(2).stderr(predicate::str::contains("invalid contract json"));
@@ -215,7 +344,7 @@ fn invalid_contract_exits_2_with_the_validation_message_and_writes_nothing() {
     cli.cmd(&["submit", &wrong_rev]).assert().code(2).stderr(predicate::str::contains("revision"));
     let contract = cli.contract(&repo);
     cli.cmd(&["submit", &contract, "--yes"]).assert().code(2).stderr(predicate::str::contains("--fake-agent-patch"));
-    assert!(!cli.home().exists(), "nothing written by any rejected submission");
+    assert_nothing_recorded(&cli);
 }
 
 #[test]
@@ -249,7 +378,13 @@ fn full_flow_submit_status_events_export_and_the_patch_reproduces_the_fix() {
     assert_eq!(submitted_event["payload"]["repository_digest"], repo_digest);
     assert_eq!(submitted_event["payload"]["profile_id"], "parser-checks-v1");
     assert_eq!(submitted_event["payload"]["profile_digest"], profile_digest);
-    assert_eq!(submitted_event["payload"]["guest_image"], "fixture-executor-v0");
+    if fake_mode() {
+        // The Firecracker worker records the registered image instead of the host's label.
+        assert_eq!(submitted_event["payload"]["guest_image_id"], "python-stdlib-v1");
+        assert!(submitted_event["payload"].get("guest_image").is_none());
+    } else {
+        assert_eq!(submitted_event["payload"]["guest_image"], "fixture-executor-v0");
+    }
     assert_eq!(submitted_event["payload"]["contract_digest"], events[0]["payload"]["contract_digest"]);
 
     let (bundle, manifest) = cli.export(id, "bundle");
@@ -375,6 +510,7 @@ fn crash_restart_recover_export(spec: &str) {
     let (_, expected) = cli.export(clean["task_id"].as_str().unwrap(), "clean");
 
     let id = cli.crash(&contract, spec);
+    assert_tier_worker(&cli, &id);
     let stuck = cli.status(&id);
     assert!(!TERMINAL.contains(&stuck["state"].as_str().unwrap()), "{spec}: crashed task is unfinished: {stuck}");
     assert_crashed_on_kind(&cli, &id, spec, &stuck);
@@ -644,7 +780,7 @@ fn a_registry_entry_that_links_outside_the_registry_is_refused() {
     let evil = cli.write("evil.json", &fs::read_to_string(&contract).unwrap().replace("\"parser-checks-v1\"", "\"evil\""));
 
     cli.cmd_with_profiles(&registry, &["submit", &evil]).assert().code(2).stderr(predicate::str::contains("outside the profile registry"));
-    assert!(!cli.home().exists());
+    assert_nothing_recorded(&cli);
     // A real registry entry still works.
     let out = cli.cmd_with_profiles(&registry, &["submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()]).assert().success();
     let out: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
@@ -818,6 +954,7 @@ fn during_execute_rows_resume_by_publishing_the_receipt_with_one_job_per_effect(
         let before = job_dirs(&cli).len();
 
         let id = cli.crash(&contract, spec);
+        assert_tier_worker(&cli, &id);
         assert!(job_dirs(&cli).len() > before, "{spec}: the crashed run launched its job");
         assert_eq!(cli.json(&["resume", &id]), json!({ "task_id": id, "state": "SUCCEEDED" }), "{spec}");
         // Resume published the crashed effect's receipt instead of launching it again: the
@@ -864,12 +1001,7 @@ fn slow_world(cli: &Cli) -> (PathBuf, String) {
 
 /// `submit --yes` as a background process.
 fn spawn_submit(cli: &Cli, profiles: &Path, contract: &str) -> std::process::Child {
-    StdCommand::new(env!("CARGO_BIN_EXE_agentos"))
-        .arg("--home")
-        .arg(cli.home())
-        .arg("--profiles")
-        .arg(profiles)
-        .args(["submit", contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()])
+    cli.std_cmd(Cli::mode(), true, profiles, &["submit", contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -893,9 +1025,10 @@ fn wait_for_verification_job(cli: &Cli) {
     }
 }
 
+/// No supervisor, worker, check or (fake) guest is left: each names the home on its command
+/// line (`<home>/jobs/…`, or the fake guest's `<home>/work/<task>`).
 fn assert_no_job_processes(cli: &Cli) {
-    let jobs = cli.home().join("jobs");
-    assert_eq!(processes_mentioning(jobs.to_str().unwrap()), Vec::<String>::new(), "no supervisor or worker left");
+    assert_eq!(processes_mentioning(cli.home().to_str().unwrap()), Vec::<String>::new(), "no supervisor, worker or guest left");
 }
 
 #[test]
@@ -911,6 +1044,7 @@ fn controller_sigkill_while_a_slow_verification_runs_then_resume_publishes_the_r
     child.wait().unwrap();
 
     let id = first_task(&cli);
+    assert_tier_worker(&cli, &id);
     let resumed = cli.cmd_with_profiles(&profiles, &["resume", &id]).assert().success().get_output().stdout.clone();
     assert_eq!(serde_json::from_slice::<Value>(&resumed).unwrap(), json!({ "task_id": id, "state": "SUCCEEDED" }));
     let verifications = job_dirs(&cli)
@@ -954,6 +1088,7 @@ fn revoke_verification_run_stops_the_running_check_from_another_process() {
     let mut child = spawn_submit(&cli, &profiles, &contract);
     wait_for_verification_job(&cli);
     let id = first_task(&cli);
+    assert_tier_worker(&cli, &id);
     let out = cli.cmd_with_profiles(&profiles, &["revoke", &id, "--capability", "verification.run"]).assert().success().get_output().stdout.clone();
     assert_eq!(serde_json::from_slice::<Value>(&out).unwrap(), json!({ "task_id": id, "revoked": ["verification.run"], "cancelled_jobs": 1 }));
     assert!(child.wait().unwrap().success(), "the driver finished the task");
@@ -973,6 +1108,7 @@ fn cancel_drops_markers_for_running_jobs_and_ends_cancelled_with_no_live_process
     let mut child = spawn_submit(&cli, &profiles, &contract);
     wait_for_verification_job(&cli);
     let id = first_task(&cli);
+    assert_tier_worker(&cli, &id);
     // Another process drives the task: the cancel is only requested, but the running job is
     // told to stop at once, so the driver does not wait out the check.
     let out = cli.cmd_with_profiles(&profiles, &["cancel", &id]).assert().success().get_output().stdout.clone();
@@ -999,6 +1135,13 @@ fn profile_variant(cli: &Cli, name: &str, id: &str, check_prefix: &str) -> PathB
     fs::write(dir.join("check_parser.py"), format!("{check_prefix}{script}")).unwrap();
     fs::write(dir.join("profile.json"), json!({ "id": id, "command": ["python3", "check_parser.py"], "protected": true }).to_string()).unwrap();
     dir
+}
+
+/// The profile registry's entries (`<home>/registry/*`; the image registry `images/` beside
+/// them is not one).
+fn profile_registry_entries(cli: &Cli) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(cli.home().join("registry")) else { return Vec::new() };
+    entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n != "images").collect()
 }
 
 fn register(cli: &Cli, dir: &Path) -> Value {
@@ -1063,7 +1206,7 @@ fn ids_with_at_sign_or_traversal_are_rejected_at_register() {
         let dir = profile_variant(&cli, &format!("bad-{i}"), id, "");
         cli.cmd(&["profile", "register", dir.to_str().unwrap()]).assert().code(2).stderr(predicate::str::contains("plain name"));
     }
-    assert!(!cli.home().join("registry").exists() || fs::read_dir(cli.home().join("registry")).unwrap().next().is_none());
+    assert_eq!(profile_registry_entries(&cli), Vec::<String>::new());
     let empty = cli.path("empty-command");
     fs::create_dir_all(&empty).unwrap();
     fs::write(empty.join("profile.json"), r#"{"id":"e-v1","command":[]}"#).unwrap();
@@ -1112,7 +1255,7 @@ fn submit_with_the_pin_uses_exactly_that_digest_even_if_a_newer_entry_exists() {
 fn legacy_profiles_dir_still_works_with_the_profiles_flag() {
     let cli = Cli::new();
     let contract = cli.contract(&cli.repo_copy());
-    assert!(!cli.home().join("registry").exists());
+    assert_eq!(profile_registry_entries(&cli), Vec::<String>::new(), "no registered profile");
     assert_eq!(cli.submit_yes(&contract, &fix_patch())["state"], "SUCCEEDED");
 }
 
@@ -1298,7 +1441,7 @@ fn register_image(cli: &Cli, dir: &Path) -> Value {
 
 #[test]
 fn image_register_twice_is_a_noop_and_changed_bytes_are_a_new_entry() {
-    let cli = Cli::new();
+    let cli = Cli::bare();
     let dir = fake_image_dir(&cli, "i1", "img-v1", 0x68);
     let first = register_image(&cli, &dir);
     assert_eq!(first["id"], "img-v1");
@@ -1314,7 +1457,7 @@ fn image_register_twice_is_a_noop_and_changed_bytes_are_a_new_entry() {
 
 #[test]
 fn image_register_refuses_a_bad_manifest() {
-    let cli = Cli::new();
+    let cli = Cli::bare();
     let dir = fake_image_dir(&cli, "i1", "img-v1", 0x68);
     let manifest = fs::read_to_string(dir.join("image.json")).unwrap();
     fs::write(dir.join("image.json"), manifest.replace("\"protocol\":1", "\"protocol\":2")).unwrap();
@@ -1330,7 +1473,7 @@ fn image_register_refuses_a_bad_manifest() {
 
 #[test]
 fn image_ids_with_at_sign_or_traversal_are_rejected_at_register() {
-    let cli = Cli::new();
+    let cli = Cli::bare();
     for (i, id) in ["a@b", "../x", "a/b", "..", "", "-x"].into_iter().enumerate() {
         let dir = fake_image_dir(&cli, &format!("bad-{i}"), id, 0x68);
         cli.cmd(&["image", "register", dir.to_str().unwrap()]).assert().code(2).stderr(predicate::str::contains("plain name"));
@@ -1341,7 +1484,7 @@ fn image_ids_with_at_sign_or_traversal_are_rejected_at_register() {
 #[test]
 fn registered_images_have_no_write_bits() {
     use std::os::unix::fs::PermissionsExt;
-    let cli = Cli::new();
+    let cli = Cli::bare();
     let digest = register_image(&cli, &fake_image_dir(&cli, "i1", "ro-v1", 0x68))["digest"].as_str().unwrap().to_string();
     let entry = cli.home().join("registry/images").join(format!("ro-v1@{digest}"));
     let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
@@ -1354,7 +1497,7 @@ fn registered_images_have_no_write_bits() {
 
 #[test]
 fn image_list_shows_entries_sorted() {
-    let cli = Cli::new();
+    let cli = Cli::bare();
     register_image(&cli, &fake_image_dir(&cli, "i1", "zeta-v1", 0x68));
     register_image(&cli, &fake_image_dir(&cli, "i2", "alpha-v1", 0x68));
     let listed = cli.json(&["image", "list"]);
@@ -1369,7 +1512,7 @@ fn image_list_shows_entries_sorted() {
 
 #[test]
 fn images_do_not_leak_into_the_profile_list_and_back() {
-    let cli = Cli::new();
+    let cli = Cli::bare();
     register_image(&cli, &fake_image_dir(&cli, "i1", "img-v1", 0x68));
     register(&cli, &profile_variant(&cli, "p1", "reg-v1", ""));
     let profiles = cli.json(&["profile", "list"]);
@@ -1395,4 +1538,496 @@ fn image_help_lists_register_and_list() {
     let cli = Cli::new();
     cli.cmd(&["image", "--help"]).assert().success().stdout(predicate::str::contains("register")).stdout(predicate::str::contains("list"));
     cli.cmd(&["--help"]).assert().success().stdout(predicate::str::contains("image"));
+}
+
+// ---- the Firecracker worker over the fake guest: selection, preflight, jail, records ----
+
+const NEEDS_ROOT: &str = "needs root (euid 0), running as uid 1000";
+
+impl Cli {
+    fn submit_fc(&self, contract: &str, extra: &[&str]) -> Value {
+        let patch = fix_patch();
+        let mut args = vec!["submit", contract, "--yes", "--fake-agent-patch", patch.to_str().unwrap()];
+        args.extend_from_slice(extra);
+        self.json_as(Mode::Fake, &args)
+    }
+
+    /// The `Submitted` payload of task `id`, whatever its worker (no `--worker` flag).
+    fn submitted(&self, id: &str) -> Value {
+        let out = self.cmd_as(Mode::Plain, &["events", id]).assert().success().get_output().stdout.clone();
+        let events: Vec<Value> = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        events.into_iter().find(|e| e["type"] == "Submitted").unwrap()["payload"].clone()
+    }
+
+    /// `<home>/registry/images/python-stdlib-v1@<digest>/`.
+    fn image_entry(&self, digest: &str) -> PathBuf {
+        self.home().join("registry/images").join(format!("python-stdlib-v1@{digest}"))
+    }
+
+    /// Changes one byte of the registered `rootfs.squashfs` (the registry is read-only: the
+    /// test lifts that first, as an attacker with the owner's rights would).
+    fn tamper_image(&self, digest: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let entry = self.image_entry(digest);
+        let rootfs = entry.join("rootfs.squashfs");
+        fs::set_permissions(&entry, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&rootfs, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut bytes = fs::read(&rootfs).unwrap();
+        bytes[0] ^= 0xff;
+        fs::write(&rootfs, bytes).unwrap();
+    }
+
+    /// Task directories under `<home>/tasks` (staging leftovers included) and `TaskCreated`
+    /// rows in the journal, read straight from the database.
+    fn task_footprint(&self) -> (Vec<String>, i64) {
+        let dirs = fs::read_dir(self.home().join("tasks"))
+            .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+            .unwrap_or_default();
+        let db = self.home().join("agentos.db");
+        let rows = if db.exists() {
+            let conn = rusqlite::Connection::open(db).unwrap();
+            conn.query_row("SELECT COUNT(*) FROM events WHERE type = 'TaskCreated'", [], |r| r.get(0)).unwrap()
+        } else {
+            0
+        };
+        (dirs, rows)
+    }
+
+    fn assert_no_task(&self) {
+        assert_eq!(self.task_footprint(), (Vec::new(), 0), "a refused submission left a task behind");
+    }
+}
+
+fn stderr_of(assert: &assert_cmd::assert::Assert) -> String {
+    String::from_utf8_lossy(&assert.get_output().stderr).into_owned()
+}
+
+#[test]
+fn submit_with_worker_firecracker_records_the_worker_image_version_and_host_kernel() {
+    let cli = Cli::bare();
+    let digest = cli.register_guest_image();
+    let out = cli.submit_fc(&cli.contract(&cli.repo_copy()), &[]);
+    assert_eq!(out["state"], "SUCCEEDED");
+    let s = cli.submitted(out["task_id"].as_str().unwrap());
+    assert_eq!(s["worker"], "firecracker");
+    assert_eq!(s["guest_image_id"], "python-stdlib-v1");
+    assert_eq!(s["guest_image_digest"], digest.as_str());
+    assert_eq!(s["firecracker_version"], "fake");
+    assert!(!s["host_kernel"].as_str().unwrap().is_empty(), "{s}");
+    assert_eq!(s["jailed"], false);
+    assert!(s.get("guest_image").is_none(), "the host worker's label is not recorded for a VM: {s}");
+}
+
+#[test]
+fn fake_launcher_records_jailed_false() {
+    let cli = Cli::bare();
+    cli.register_guest_image();
+    let contract = cli.contract(&cli.repo_copy());
+    let assert = cli.cmd_as(Mode::Fake, &["submit", &contract, "--fake-agent-patch", fix_patch().to_str().unwrap()]).assert().success();
+    let stderr = stderr_of(&assert);
+    assert!(!stderr.contains("warning"), "no probe, no warning: {stderr}");
+    let id = serde_json::from_slice::<Value>(&assert.get_output().stdout).unwrap()["task_id"].as_str().unwrap().to_string();
+    assert_eq!(cli.submitted(&id)["jailed"], false);
+    let assert = cli.cmd_as(Mode::PlainFake, &["resume", &id]).assert().success();
+    assert!(!stderr_of(&assert).contains("warning"));
+    assert_eq!(cli.status(&id)["state"], "SUCCEEDED");
+}
+
+#[test]
+fn submit_refuses_when_the_jailer_is_unavailable_and_the_task_is_untouched() {
+    let cli = Cli::bare();
+    cli.register_guest_image();
+    let contract = cli.contract(&cli.repo_copy());
+    // A first task makes the journal exist, so "no TaskCreated row" is read from a real database.
+    cli.submit_fc(&contract, &[]);
+    let before = cli.task_footprint();
+    cli.cmd_as(Mode::Fake, &["submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()])
+        .env("AGENTOS_TEST_JAIL_PROBE", format!("fail:{NEEDS_ROOT}"))
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr(predicate::str::contains(format!(
+            "firecracker worker unavailable: jailer unavailable: {NEEDS_ROOT}; pass --allow-unjailed to run Firecracker without a jail as the current user"
+        )));
+    assert_eq!(cli.task_footprint(), before, "no task directory, no TaskCreated row");
+    // On a fresh home: no task at all.
+    let fresh = Cli::bare();
+    fresh.register_guest_image();
+    let contract = fresh.contract(&fresh.repo_copy());
+    fresh.cmd_as(Mode::Fake, &["submit", &contract]).env("AGENTOS_TEST_JAIL_PROBE", format!("fail:{NEEDS_ROOT}")).assert().code(1);
+    fresh.assert_no_task();
+}
+
+#[test]
+fn allow_unjailed_records_jailed_false_and_warns() {
+    let cli = Cli::bare();
+    cli.register_guest_image();
+    let contract = cli.contract(&cli.repo_copy());
+    let assert = cli
+        .cmd_as(Mode::Fake, &["submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap(), "--allow-unjailed"])
+        .env("AGENTOS_TEST_JAIL_PROBE", format!("fail:{NEEDS_ROOT}"))
+        .assert()
+        .success();
+    let warnings: Vec<String> = stderr_of(&assert).lines().filter(|l| l.starts_with("warning:")).map(str::to_string).collect();
+    assert_eq!(warnings, [format!("warning: running Firecracker unjailed: {NEEDS_ROOT}")]);
+    let out: Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+    assert_eq!(out["state"], "SUCCEEDED");
+    assert_eq!(cli.submitted(out["task_id"].as_str().unwrap())["jailed"], false);
+}
+
+#[test]
+fn agentos_allow_unjailed_env_is_the_flag() {
+    let cli = Cli::bare();
+    cli.register_guest_image();
+    let contract = cli.contract(&cli.repo_copy());
+    let probe = format!("fail:{NEEDS_ROOT}");
+    let assert = cli.cmd_as(Mode::Fake, &["submit", &contract]).env("AGENTOS_TEST_JAIL_PROBE", &probe).env("AGENTOS_ALLOW_UNJAILED", "1").assert().success();
+    assert!(stderr_of(&assert).contains("warning: running Firecracker unjailed"));
+    let id = serde_json::from_slice::<Value>(&assert.get_output().stdout).unwrap()["task_id"].as_str().unwrap().to_string();
+    assert_eq!(cli.submitted(&id)["jailed"], false);
+    // `0` is not the flag.
+    cli.cmd_as(Mode::Fake, &["submit", &contract]).env("AGENTOS_TEST_JAIL_PROBE", &probe).env("AGENTOS_ALLOW_UNJAILED", "0").assert().code(1);
+}
+
+#[test]
+fn a_probe_that_passes_records_jailed_true() {
+    let cli = Cli::bare();
+    cli.register_guest_image();
+    let contract = cli.contract(&cli.repo_copy());
+    // The launcher is still the fake guest (nothing is really jailed): the record reflects the
+    // decision, which is what this pins.
+    let assert = cli
+        .cmd_as(Mode::Fake, &["submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()])
+        .env("AGENTOS_TEST_JAIL_PROBE", "ok")
+        .assert()
+        .success();
+    assert!(!stderr_of(&assert).contains("warning"));
+    let out: Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+    assert_eq!(out["state"], "SUCCEEDED");
+    assert_eq!(cli.submitted(out["task_id"].as_str().unwrap())["jailed"], true);
+}
+
+#[test]
+fn a_task_submitted_jailed_refuses_to_run_unjailed_later() {
+    let cli = Cli::bare();
+    cli.register_guest_image();
+    let contract = cli.contract(&cli.repo_copy());
+    let out = cli.cmd_as(Mode::Fake, &["submit", &contract, "--fake-agent-patch", fix_patch().to_str().unwrap()]).env("AGENTOS_TEST_JAIL_PROBE", "ok").assert().success();
+    let id = serde_json::from_slice::<Value>(&out.get_output().stdout).unwrap()["task_id"].as_str().unwrap().to_string();
+    assert_eq!(cli.submitted(&id)["jailed"], true);
+    let events = cli.events(&id);
+
+    for probe in [Some("fail:jailer gone"), None] {
+        let mut cmd = cli.cmd_as(Mode::PlainFake, &["resume", &id, "--allow-unjailed"]);
+        if let Some(p) = probe {
+            cmd.env("AGENTOS_TEST_JAIL_PROBE", p);
+        }
+        let assert = cmd.assert().code(1).stdout("");
+        let stderr = stderr_of(&assert);
+        assert!(stderr.contains("task was submitted jailed: jailer unavailable: "), "{stderr}");
+        if probe.is_some() {
+            assert!(stderr.contains("task was submitted jailed: jailer unavailable: jailer gone"), "{stderr}");
+        }
+        assert_eq!(cli.events(&id), events, "the task is untouched");
+        assert_eq!(cli.status(&id)["state"], "READY");
+        assert!(job_dirs(&cli).is_empty());
+    }
+    cli.cmd_as(Mode::PlainFake, &["cancel", &id]).env("AGENTOS_TEST_JAIL_PROBE", "fail:jailer gone").assert().success();
+    // Cancelling a READY task needs no worker; the refusal is about running.
+    let ok = cli.cmd_as(Mode::PlainFake, &["resume", &id]).env("AGENTOS_TEST_JAIL_PROBE", "ok").assert().success();
+    assert_eq!(serde_json::from_slice::<Value>(&ok.get_output().stdout).unwrap()["state"], "CANCELLED");
+}
+
+#[test]
+fn a_task_submitted_unjailed_resumes_without_the_flag() {
+    let cli = Cli::bare();
+    cli.register_guest_image();
+    let contract = cli.contract(&cli.repo_copy());
+    let probe = format!("fail:{NEEDS_ROOT}");
+    let out = cli
+        .cmd_as(Mode::Fake, &["submit", &contract, "--fake-agent-patch", fix_patch().to_str().unwrap(), "--allow-unjailed"])
+        .env("AGENTOS_TEST_JAIL_PROBE", &probe)
+        .assert()
+        .success();
+    let id = serde_json::from_slice::<Value>(&out.get_output().stdout).unwrap()["task_id"].as_str().unwrap().to_string();
+    assert_eq!(cli.submitted(&id)["jailed"], false);
+    let assert = cli.cmd_as(Mode::PlainFake, &["resume", &id]).env("AGENTOS_TEST_JAIL_PROBE", &probe).assert().success();
+    assert!(!stderr_of(&assert).contains("warning"), "the acknowledgement was given at submit");
+    assert_eq!(serde_json::from_slice::<Value>(&assert.get_output().stdout).unwrap()["state"], "SUCCEEDED");
+}
+
+#[test]
+fn status_prints_jailed() {
+    let cli = Cli::bare();
+    cli.register_guest_image();
+    let contract = cli.contract(&cli.repo_copy());
+    for (probe, flag, jailed) in [("ok", None, true), ("fail:no jailer", Some("--allow-unjailed"), false)] {
+        let mut args = vec!["submit", contract.as_str()];
+        args.extend(flag);
+        let out = cli.cmd_as(Mode::Fake, &args).env("AGENTOS_TEST_JAIL_PROBE", probe).assert().success();
+        let id = serde_json::from_slice::<Value>(&out.get_output().stdout).unwrap()["task_id"].as_str().unwrap().to_string();
+        assert_eq!(cli.json_as(Mode::Plain, &["status", &id])["jailed"], jailed);
+    }
+}
+
+#[test]
+fn submit_without_the_flag_records_worker_host_and_no_image_fields() {
+    let cli = Cli::bare();
+    let out = cli.json_as(Mode::Plain, &["submit", &cli.contract(&cli.repo_copy())]);
+    let s = cli.submitted(out["task_id"].as_str().unwrap());
+    let keys: BTreeSet<&str> = s.as_object().unwrap().keys().map(String::as_str).collect();
+    let three_a = [
+        "contract_digest", "repository_source", "repository_digest", "profile_id", "profile_digest", "guest_image", "model", "fake_agent_patch_digest",
+    ];
+    let expected: BTreeSet<&str> = three_a.into_iter().chain(["worker"]).collect();
+    assert_eq!(keys, expected, "the 3a keys plus `worker`, no image fields");
+    assert_eq!(s["worker"], "host");
+    assert_eq!(s["guest_image"], "fixture-executor-v0");
+}
+
+#[test]
+fn agentos_worker_env_selects_the_worker() {
+    let cli = Cli::bare();
+    cli.register_guest_image();
+    let contract = cli.contract(&cli.repo_copy());
+    for (worker, expected) in [("firecracker", "firecracker"), ("host", "host")] {
+        let out = cli.cmd_as(Mode::PlainFake, &["submit", &contract]).env("AGENTOS_WORKER", worker).assert().success();
+        let id = serde_json::from_slice::<Value>(&out.get_output().stdout).unwrap()["task_id"].as_str().unwrap().to_string();
+        assert_eq!(cli.submitted(&id)["worker"], expected);
+    }
+    cli.cmd_as(Mode::Plain, &["submit", &contract]).env("AGENTOS_WORKER", "qemu").assert().code(2);
+}
+
+#[test]
+fn later_commands_use_the_recorded_worker_and_a_disagreeing_flag_exits_2() {
+    let cli = Cli::bare();
+    cli.register_guest_image();
+    let contract = cli.contract(&cli.repo_copy());
+    let ready = cli.json_as(Mode::Fake, &["submit", &contract, "--fake-agent-patch", fix_patch().to_str().unwrap()]);
+    let id = ready["task_id"].as_str().unwrap().to_string();
+    let events = cli.events(&id);
+    for args in [vec!["resume", id.as_str()], vec!["status", id.as_str()], vec!["cancel", id.as_str()]] {
+        let mut args: Vec<&str> = args;
+        args.extend(["--worker", "host"]);
+        cli.cmd_as(Mode::PlainFake, &args).assert().code(2).stdout("").stderr(predicate::str::contains("task was submitted with worker firecracker"));
+    }
+    assert_eq!(cli.events(&id), events, "the task is untouched");
+    // Without the flag every command uses the record.
+    assert_eq!(cli.json_as(Mode::PlainFake, &["resume", &id])["state"], "SUCCEEDED");
+    assert_eq!(cli.json_as(Mode::Plain, &["status", &id])["worker"], "firecracker");
+    assert!(!cli.cmd_as(Mode::Plain, &["events", &id]).assert().success().get_output().stdout.is_empty());
+    assert_eq!(cli.json_as(Mode::Fake, &["status", &id])["state"], "SUCCEEDED", "an agreeing flag is fine");
+    let dir = cli.path("bundle");
+    assert_eq!(cli.json_as(Mode::Plain, &["export", &id, dir.to_str().unwrap()])["state"], "SUCCEEDED");
+    // And the other way round.
+    let host = cli.json_as(Mode::Plain, &["submit", &contract])["task_id"].as_str().unwrap().to_string();
+    cli.cmd_as(Mode::Fake, &["resume", &host]).assert().code(2).stderr(predicate::str::contains("task was submitted with worker host"));
+}
+
+fn contract_with_limits(cli: &Cli, vcpus: u32, memory: u32) -> String {
+    let mut contract: Value = serde_json::from_str(&fs::read_to_string(cli.contract(&cli.repo_copy())).unwrap()).unwrap();
+    contract["limits"]["worker_vcpus"] = json!(vcpus);
+    contract["limits"]["worker_memory_mib"] = json!(memory);
+    cli.write(&format!("limits-{vcpus}-{memory}.json"), &contract.to_string())
+}
+
+#[test]
+fn firecracker_limits_are_validated_at_submit() {
+    let cli = Cli::bare();
+    cli.register_guest_image();
+    for (vcpus, memory, message) in [
+        (33, 256, "limit worker_vcpus must be at most 32 for the firecracker worker"),
+        (1, 127, "limit worker_memory_mib must be at least 128 for the firecracker worker"),
+    ] {
+        let contract = contract_with_limits(&cli, vcpus, memory);
+        let before = cli.task_footprint();
+        cli.cmd_as(Mode::Fake, &["submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()])
+            .assert()
+            .code(2)
+            .stdout("")
+            .stderr(predicate::str::contains(message));
+        // Even where the preflight itself cannot pass (no /dev/kvm), a limit is a usage error.
+        cli.cmd_as(Mode::Plain, &["--worker", "firecracker", "submit", &contract]).assert().code(2).stderr(predicate::str::contains(message));
+        assert_eq!(cli.task_footprint(), before, "no task left behind");
+        // The host worker accepts both.
+        assert_eq!(cli.json_as(Mode::Plain, &["submit", &contract])["state"], "READY");
+    }
+    assert_eq!(cli.json_as(Mode::Fake, &["submit", &contract_with_limits(&cli, 32, 128)])["state"], "READY");
+}
+
+#[test]
+fn submit_without_a_registered_image_exits_2() {
+    let cli = Cli::bare();
+    let contract = cli.contract(&cli.repo_copy());
+    cli.cmd_as(Mode::Fake, &["submit", &contract])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("guest image python-stdlib-v1 not found in the registry"))
+        .stderr(predicate::str::contains("build and register it first"));
+    cli.assert_no_task();
+}
+
+/// A contract over a repository copy pinning the guest image to `pin`.
+fn contract_pinning_image(cli: &Cli, pin: &str) -> String {
+    let mut contract: Value = serde_json::from_str(&fs::read_to_string(cli.contract(&cli.repo_copy())).unwrap()).unwrap();
+    contract["guest_image_digest"] = json!(pin);
+    cli.write(&format!("image-pin-{pin}.json"), &contract.to_string())
+}
+
+#[test]
+fn a_pinned_guest_image_digest_must_be_registered() {
+    let cli = Cli::bare();
+    let digest = cli.register_guest_image();
+    let missing = contract_pinning_image(&cli, &"0".repeat(64));
+    cli.cmd_as(Mode::Fake, &["submit", &missing]).assert().code(2).stderr(predicate::str::contains("is not in the registry"));
+    cli.assert_no_task();
+    let out = cli.submit_fc(&contract_pinning_image(&cli, &digest), &[]);
+    assert_eq!(out["state"], "SUCCEEDED");
+    assert_eq!(cli.submitted(out["task_id"].as_str().unwrap())["guest_image_digest"], digest.as_str());
+}
+
+#[test]
+fn submit_with_a_pin_uses_exactly_that_image_even_if_a_newer_entry_exists() {
+    let cli = Cli::bare();
+    let older = cli.register_guest_image();
+    // Registration times are milliseconds: make sure the second entry is strictly newer.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let newer_dir = fake_image_dir(&cli, "guest-image-2", "python-stdlib-v1", 0x69);
+    let newer = register_image(&cli, &newer_dir)["digest"].as_str().unwrap().to_string();
+    assert_ne!(older, newer);
+
+    let pinned = cli.submit_fc(&contract_pinning_image(&cli, &older), &[]);
+    assert_eq!(pinned["state"], "SUCCEEDED");
+    assert_eq!(cli.submitted(pinned["task_id"].as_str().unwrap())["guest_image_digest"], older.as_str());
+    let unpinned = cli.json_as(Mode::Fake, &["submit", &cli.contract(&cli.repo_copy())]);
+    assert_eq!(cli.submitted(unpinned["task_id"].as_str().unwrap())["guest_image_digest"], newer.as_str(), "no pin: the newest entry");
+}
+
+#[test]
+fn preflight_failure_exits_1_before_the_task_is_touched() {
+    let cli = Cli::bare();
+    let digest = cli.register_guest_image();
+    cli.tamper_image(&digest);
+    let contract = cli.contract(&cli.repo_copy());
+    cli.cmd_as(Mode::Fake, &["submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()])
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr(predicate::str::contains("firecracker worker unavailable: guest image digest mismatch"));
+    cli.assert_no_task();
+
+    // The real launcher, without /dev/kvm.
+    if fs::File::options().read(true).write(true).open("/dev/kvm").is_ok() {
+        println!("SKIPPED the /dev/kvm variant: /dev/kvm is usable here");
+        return;
+    }
+    let fresh = Cli::bare();
+    fresh.register_guest_image();
+    let contract = fresh.contract(&fresh.repo_copy());
+    fresh
+        .cmd_as(Mode::Plain, &["--worker", "firecracker", "submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()])
+        .env("AGENTOS_TEST_WORKERS", "1")
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr(predicate::str::contains("firecracker worker unavailable: /dev/kvm: "));
+    fresh.assert_no_task();
+}
+
+#[test]
+fn a_tampered_registered_image_fails_the_preflight_before_the_task_is_touched() {
+    let cli = Cli::bare();
+    let digest = cli.register_guest_image();
+    let contract = cli.contract(&cli.repo_copy());
+    let id = cli.json_as(Mode::Fake, &["submit", &contract, "--fake-agent-patch", fix_patch().to_str().unwrap()])["task_id"].as_str().unwrap().to_string();
+    let events = cli.events(&id);
+    cli.tamper_image(&digest);
+
+    cli.cmd_as(Mode::PlainFake, &["resume", &id])
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr(predicate::str::contains(format!("firecracker worker unavailable: guest image digest mismatch: pinned {digest}")));
+    assert_eq!(cli.status(&id)["state"], "READY");
+    assert_eq!(cli.events(&id), events, "no new events");
+    assert!(cli.grants(&id).is_empty(), "not even approved");
+    assert!(job_dirs(&cli).is_empty());
+}
+
+#[test]
+fn a_recorded_image_that_is_no_longer_registered_fails_before_the_task_is_touched() {
+    use std::os::unix::fs::PermissionsExt;
+    let cli = Cli::bare();
+    let digest = cli.register_guest_image();
+    let contract = cli.contract(&cli.repo_copy());
+    let id = cli.json_as(Mode::Fake, &["submit", &contract, "--fake-agent-patch", fix_patch().to_str().unwrap()])["task_id"].as_str().unwrap().to_string();
+    let events = cli.events(&id);
+    let entry = cli.image_entry(&digest);
+    fs::set_permissions(&entry, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::remove_dir_all(&entry).unwrap();
+    cli.cmd_as(Mode::PlainFake, &["resume", &id])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(format!("recorded guest image python-stdlib-v1@{digest} is no longer registered")));
+    assert_eq!(cli.events(&id), events);
+}
+
+#[test]
+fn status_prints_worker_and_guest_image() {
+    let cli = Cli::bare();
+    let digest = cli.register_guest_image();
+    let contract = cli.contract(&cli.repo_copy());
+    let fc = cli.submit_fc(&contract, &[])["task_id"].as_str().unwrap().to_string();
+    let status = cli.json_as(Mode::Plain, &["status", &fc]);
+    assert_eq!(status["worker"], "firecracker");
+    assert_eq!(status["guest_image"], json!({ "id": "python-stdlib-v1", "digest": digest }));
+    assert_eq!(status["jailed"], false);
+    let host = cli.json_as(Mode::Plain, &["submit", &contract])["task_id"].as_str().unwrap().to_string();
+    let status = cli.json_as(Mode::Plain, &["status", &host]);
+    assert_eq!(status["worker"], "host");
+    assert!(status.get("guest_image").is_none() && status.get("jailed").is_none(), "{status}");
+}
+
+#[test]
+fn manifest_names_the_guest_image_for_firecracker_tasks_and_omits_it_for_host_tasks() {
+    let cli = Cli::bare();
+    let digest = cli.register_guest_image();
+    let contract = cli.contract(&cli.repo_copy());
+    let fc = cli.submit_fc(&contract, &[])["task_id"].as_str().unwrap().to_string();
+    let dir = cli.path("fc-bundle");
+    let manifest = cli.json_as(Mode::Plain, &["export", &fc, dir.to_str().unwrap()]);
+    assert_eq!(manifest["guest_image_digest"], digest.as_str());
+    let host = cli.json_as(Mode::Plain, &["submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()])["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let dir = cli.path("host-bundle");
+    let manifest = cli.json_as(Mode::Plain, &["export", &host, dir.to_str().unwrap()]);
+    assert!(manifest.get("guest_image_digest").is_none(), "{manifest}");
+    assert!(!fs::read_to_string(dir.join("manifest.json")).unwrap().contains("guest_image_digest"));
+}
+
+#[test]
+fn firecracker_task_runs_to_succeeded_with_the_fake_guest_and_host_paths_do_not_appear_in_evidence() {
+    let cli = Cli::bare();
+    cli.register_guest_image();
+    let out = cli.submit_fc(&cli.contract(&cli.repo_copy()), &[]);
+    assert_eq!(out["state"], "SUCCEEDED");
+    let id = out["task_id"].as_str().unwrap();
+    let dir = cli.path("bundle");
+    let manifest = cli.json_as(Mode::Plain, &["export", id, dir.to_str().unwrap()]);
+    assert_eq!(manifest["verification_results"][0]["passed"], true);
+    let home = cli.home().to_str().unwrap().to_string();
+    let mut checked = 0;
+    for file in walk(&dir.join("evidence")) {
+        let evidence: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        for stream in ["stdout", "stderr"] {
+            if let Some(text) = evidence.get(stream).and_then(Value::as_str) {
+                assert!(!text.contains(&home), "{stream} of {} names the home: {text}", file.display());
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked >= 2, "the verification evidence was checked");
+    assert_no_job_processes(&cli);
 }

@@ -1,8 +1,30 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use agentos_engine::jail::{JAIL_GID, JAIL_UID};
+use clap::builder::FalseyValueParser;
+use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::crash::CrashSpec;
+
+/// Where a task's effects run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum WorkerKind {
+    /// The fixture worker on the host (not sandboxed).
+    Host,
+    /// One Firecracker microVM per job, booted from a registered guest image.
+    Firecracker,
+}
+
+impl WorkerKind {
+    /// The name recorded in `Submitted.worker`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkerKind::Host => "host",
+            WorkerKind::Firecracker => "firecracker",
+        }
+    }
+}
 
 /// Agent OS controller. Every command prints JSON on stdout; errors go to stderr.
 #[derive(Debug, Parser)]
@@ -14,6 +36,26 @@ pub struct Args {
     /// Verification profile registry, one profile per `<id>/` directory [default: <home>/profiles].
     #[arg(long, global = true, value_name = "DIR")]
     pub profiles: Option<PathBuf>,
+    /// The worker `submit` runs the task on [default: host]; later commands use the one
+    /// recorded at submission and refuse a different one.
+    #[arg(long, global = true, env = "AGENTOS_WORKER", value_enum)]
+    pub worker: Option<WorkerKind>,
+    /// The Firecracker binary [default: <home>/bin/firecracker].
+    #[arg(long, global = true, env = "AGENTOS_FIRECRACKER", value_name = "PATH")]
+    pub firecracker: Option<PathBuf>,
+    /// The jailer binary [default: `jailer` next to the Firecracker binary].
+    #[arg(long, global = true, env = "AGENTOS_JAILER", value_name = "PATH")]
+    pub jailer: Option<PathBuf>,
+    /// The uid the jailed Firecracker runs as.
+    #[arg(long, global = true, env = "AGENTOS_JAIL_UID", default_value_t = JAIL_UID)]
+    pub jail_uid: u32,
+    /// The gid the jailed Firecracker runs as.
+    #[arg(long, global = true, env = "AGENTOS_JAIL_GID", default_value_t = JAIL_GID)]
+    pub jail_gid: u32,
+    /// Run Firecracker without the jailer, as the current user, when the jail is unavailable
+    /// (recorded as `jailed: false`).
+    #[arg(long, global = true, env = "AGENTOS_ALLOW_UNJAILED", value_parser = FalseyValueParser::new())]
+    pub allow_unjailed: bool,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -71,11 +113,13 @@ pub enum Command {
     },
     /// Write the export bundle of a finished task to DIR.
     Export { id: String, dir: PathBuf },
-    /// Internal: the per-job supervisor and its worker (`run|worker JOB_DIR`).
+    /// Internal: the per-job supervisor and its worker (`run|worker JOB_DIR`), and the fake
+    /// guest of the test tier (`fake-guest UDS ROOT`, only with `AGENTOS_TEST_WORKERS=1`).
     #[command(hide = true)]
     Supervise {
         verb: String,
-        job_dir: PathBuf,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
     },
 }
 

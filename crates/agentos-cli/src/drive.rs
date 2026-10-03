@@ -10,6 +10,7 @@ use agentos_engine::agent::FakeAgent;
 use agentos_engine::crash::{CrashPoint, RunOptions};
 use agentos_engine::recover::recover_with;
 use agentos_engine::runner::{run_task_with, EngineError};
+use agentos_engine::supervised::SupervisedExecutor;
 use agentos_engine::workspace::workspace_digest;
 use serde_json::json;
 
@@ -70,11 +71,21 @@ fn check_inputs(home: &Home, store: &Store, task: &TaskId) -> Result<Option<Task
     Ok(None)
 }
 
-/// Recovers `task` and runs it with a fresh fake agent. The caller holds the driver lock.
-pub async fn drive(home: &Home, store: &Store, lock: &DriverLock, task: &TaskId, patch: String, crash: Option<&CrashSpec>) -> Result<TaskState, CliError> {
+/// Recovers `task` and runs it with a fresh fake agent on `exec` (built by the caller before
+/// it changed anything, so a worker that cannot run leaves the task untouched). The caller
+/// holds the driver lock.
+pub async fn drive(
+    home: &Home,
+    store: &Store,
+    lock: &DriverLock,
+    task: &TaskId,
+    patch: String,
+    crash: Option<&CrashSpec>,
+    exec: SupervisedExecutor,
+) -> Result<TaskState, CliError> {
     lock.driving(task)?;
     let hook = crash.map(CrashSpec::hook);
-    let exec = home.executor(store, task)?.with_crash(hook.clone());
+    let exec = exec.with_crash(hook.clone());
     let opts = RunOptions { crash: hook };
     if let Some(state) = check_inputs(home, store, task)? {
         // The task is failed before anything runs on the changed inputs, but what the dead

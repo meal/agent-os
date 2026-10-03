@@ -1,10 +1,29 @@
 #!/bin/sh
 # The README demo: docker compose run --rm test sh scripts/demo.sh
+# On the Firecracker worker (KVM tier: AGENTOS_FIRECRACKER and AGENTOS_GUEST_IMAGE set):
+#   docker compose run --rm test-kvm sh scripts/demo.sh --worker firecracker
 set -u
+WORKER=host
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --worker) WORKER=${2:?--worker needs host or firecracker}; shift 2 ;;
+    --worker=*) WORKER=${1#--worker=}; shift ;;
+    *) echo "usage: scripts/demo.sh [--worker host|firecracker]" >&2; exit 2 ;;
+  esac
+done
+case "$WORKER" in
+  host) WORKER_ARGS= ;;
+  firecracker)
+    : "${AGENTOS_FIRECRACKER:?set AGENTOS_FIRECRACKER to the Firecracker binary}"
+    : "${AGENTOS_GUEST_IMAGE:?set AGENTOS_GUEST_IMAGE to the built guest image directory}"
+    WORKER_ARGS="--worker firecracker --firecracker $AGENTOS_FIRECRACKER" ;;
+  *) echo "unknown worker $WORKER (host or firecracker)" >&2; exit 2 ;;
+esac
 cargo build -q -p agentos-cli
 BIN=/work/target/debug/agentos
 rm -rf /tmp/demo && mkdir -p /tmp/demo && cd /tmp/demo
-agentos() { "$BIN" --home /tmp/demo/home "$@"; }
+# shellcheck disable=SC2086 # WORKER_ARGS is a list of words
+agentos() { "$BIN" --home /tmp/demo/home $WORKER_ARGS "$@"; }
 run() { echo "\$ agentos $*"; agentos "$@"; code=$?; [ $code -eq 0 ] || echo "(exit code $code)"; echo; }
 cat > task.json <<'JSON'
 {
@@ -20,6 +39,9 @@ cat > task.json <<'JSON'
 JSON
 cp /work/fixtures/parser-repo.fix.patch fix.patch
 run profile register /work/fixtures/profiles/parser-checks-v1
+if [ "$WORKER" = firecracker ]; then
+  run image register "$AGENTOS_GUEST_IMAGE"
+fi
 # The patch job is launched under its own supervisor, then the controller is killed (exit 75).
 run submit task.json --yes --fake-agent-patch fix.patch --crash-at during-execute:apply_patch 2>&1
 ID=$(ls /tmp/demo/home/tasks | grep -v '^\.' | head -1)

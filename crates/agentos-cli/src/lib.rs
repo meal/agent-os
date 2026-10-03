@@ -19,8 +19,8 @@ pub fn run() -> i32 {
     let args = args::Args::parse();
     // The supervisor and its worker are plain synchronous processes (the worker builds its
     // own runtime), so they are entered before ours exists.
-    if let args::Command::Supervise { verb, job_dir } = &args.command {
-        return commands::supervise::run(verb, job_dir);
+    if let args::Command::Supervise { verb, args } = &args.command {
+        return commands::supervise::run(verb, args);
     }
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt,

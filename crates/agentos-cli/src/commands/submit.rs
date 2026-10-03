@@ -5,11 +5,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use agentos_core::contract::Contract;
+use agentos_core::guest::{GUEST_MIN_MEMORY_MIB, MAX_VCPUS};
 use agentos_core::ids::{Digest, TaskId};
+use agentos_engine::firecracker::firecracker_version;
+use agentos_engine::guestlink::GuestLauncher;
 use agentos_engine::workspace::{copy_tree, workspace_digest};
 use serde_json::json;
 
 use super::{print, print_state};
+use crate::args::WorkerKind;
 use crate::crash::CrashSpec;
 use crate::drive::{drive, AGENT_PATCH};
 use crate::error::CliError;
@@ -17,8 +21,10 @@ use crate::home::Home;
 
 /// A `repository.revision` asking submission to record the source's workspace digest.
 pub const RECORDED_AT_SUBMISSION: &str = "recorded-at-submission";
-/// The execution environment recorded for this milestone's executor.
+/// The execution environment recorded for the host worker.
 const GUEST_IMAGE: &str = "fixture-executor-v0";
+/// `Submitted.firecracker_version` when the fake guest stands in for Firecracker.
+const FAKE_FIRECRACKER_VERSION: &str = "fake";
 const MODEL: &str = "fake-agent";
 
 /// The contract and inputs, checked before anything is written.
@@ -29,6 +35,50 @@ struct Request {
     /// Set when the contract names a digest instead of `recorded-at-submission`.
     expected_revision: Option<Digest>,
     patch: Option<String>,
+    /// `None` for the host worker.
+    firecracker: Option<FirecrackerRecord>,
+}
+
+/// What `Submitted` records about a Firecracker task, decided before anything is written.
+struct FirecrackerRecord {
+    image_id: String,
+    image_digest: Digest,
+    version: String,
+    jailed: bool,
+}
+
+/// The Firecracker worker's checks, in order: the contract's limits (exit 2), the guest image
+/// from `contract.profile` and its optional pin (exit 2), the preflight over the registry
+/// entry and the jail decision (exit 1).
+fn check_firecracker(home: &Home, contract: &Contract) -> Result<FirecrackerRecord, CliError> {
+    let l = &contract.limits;
+    if l.worker_vcpus > MAX_VCPUS {
+        return Err(CliError::usage(format!("limit worker_vcpus must be at most {MAX_VCPUS} for the firecracker worker")));
+    }
+    if l.worker_memory_mib < GUEST_MIN_MEMORY_MIB {
+        return Err(CliError::usage(format!("limit worker_memory_mib must be at least {GUEST_MIN_MEMORY_MIB} for the firecracker worker")));
+    }
+    let image = home.resolve_image(&contract.profile, contract.guest_image_digest.as_deref())?.ok_or_else(|| {
+        CliError::usage(format!(
+            "guest image {} not found in the registry {}; build and register it first",
+            contract.profile,
+            home.images_dir().display()
+        ))
+    })?;
+    // The preflight reads only the launcher and the image: the task's own paths do not exist yet.
+    let placeholder = std::path::absolute(home.tasks_dir())?;
+    let prepared = home.prepare_firecracker(&image, l, &placeholder, None, None)?;
+    let version = match &prepared.cfg.launcher {
+        GuestLauncher::Fake { .. } => FAKE_FIRECRACKER_VERSION.to_string(),
+        GuestLauncher::Real { .. } => firecracker_version(&prepared.cfg.firecracker_bin)
+            .map_err(|e| CliError::other(format!("firecracker worker unavailable: firecracker --version: {e}")))?,
+    };
+    Ok(FirecrackerRecord { image_id: image.id, image_digest: prepared.cfg.image_digest, version, jailed: prepared.jailed })
+}
+
+/// The host kernel release (`uname -r`), recorded for attribution.
+fn host_kernel() -> String {
+    rustix::system::uname().release().to_string_lossy().into_owned()
 }
 
 fn validate(home: &Home, task: &Path, yes: bool, patch: Option<&Path>) -> Result<Request, CliError> {
@@ -71,7 +121,11 @@ fn validate(home: &Home, task: &Path, yes: bool, patch: Option<&Path>) -> Result
         (_, Some(p)) => Some(fs::read_to_string(p).map_err(|e| CliError::usage(format!("cannot read {}: {e}", p.display())))?),
         (false, None) => None,
     };
-    Ok(Request { contract, source, profile, expected_revision, patch })
+    let firecracker = match home.worker.unwrap_or(WorkerKind::Host) {
+        WorkerKind::Host => None,
+        WorkerKind::Firecracker => Some(check_firecracker(home, &contract)?),
+    };
+    Ok(Request { contract, source, profile, expected_revision, patch, firecracker })
 }
 
 fn capability_names(contract: &Contract) -> Vec<String> {
@@ -79,7 +133,7 @@ fn capability_names(contract: &Contract) -> Vec<String> {
 }
 
 /// What the owner approves, on stderr.
-fn summarize(task: &TaskId, contract: &Contract, repo: &Digest, profile: &Digest, patch: Option<&str>) {
+fn summarize(task: &TaskId, contract: &Contract, repo: &Digest, profile: &Digest, patch: Option<&str>, fc: Option<&FirecrackerRecord>) {
     let l = &contract.limits;
     eprintln!("task {task} submitted; approve these permissions before it runs:");
     eprintln!("  goal:                 {}", contract.goal);
@@ -93,10 +147,19 @@ fn summarize(task: &TaskId, contract: &Contract, repo: &Digest, profile: &Digest
     );
     let agent = patch.map_or_else(|| "none yet".to_string(), |p| format!("{MODEL} (patch {})", Digest::of(p.as_bytes())));
     eprintln!("  agent:                {agent}");
+    match fc {
+        None => eprintln!("  worker:               host (not sandboxed)"),
+        Some(fc) => eprintln!(
+            "  worker:               firecracker, guest image {}@{}, {}",
+            fc.image_id,
+            fc.image_digest,
+            if fc.jailed { "jailed" } else { "unjailed" }
+        ),
+    }
 }
 
 pub async fn submit(home: &Home, task_file: &Path, yes: bool, patch: Option<&Path>, crash: Option<&CrashSpec>) -> Result<(), CliError> {
-    let Request { mut contract, source, profile, expected_revision, patch } = validate(home, task_file, yes, patch)?;
+    let Request { mut contract, source, profile, expected_revision, patch, firecracker } = validate(home, task_file, yes, patch)?;
 
     let store = home.open()?;
     let lock = if yes { Some(home.lock()?) } else { None };
@@ -122,25 +185,42 @@ pub async fn submit(home: &Home, task_file: &Path, yes: bool, patch: Option<&Pat
 
     let task = store.db.create_task(&contract, &contract_digest)?;
     fs::rename(staging.keep(), home.task_dir(&task))?;
-    let submitted = json!({
+    let mut submitted = json!({
         "contract_digest": contract_digest,
         "repository_source": contract.repository.source,
         "repository_digest": repo_digest,
         "profile_id": contract.verification_profile,
         "profile_digest": profile_digest,
-        "guest_image": GUEST_IMAGE,
         "model": MODEL,
         "fake_agent_patch_digest": patch.as_ref().map(|p| Digest::of(p.as_bytes())),
     });
+    let fields = submitted.as_object_mut().expect("an object");
+    match &firecracker {
+        None => {
+            fields.insert("worker".into(), json!(WorkerKind::Host.as_str()));
+            fields.insert("guest_image".into(), json!(GUEST_IMAGE));
+        }
+        Some(fc) => {
+            fields.insert("worker".into(), json!(WorkerKind::Firecracker.as_str()));
+            fields.insert("guest_image_id".into(), json!(fc.image_id));
+            fields.insert("guest_image_digest".into(), json!(fc.image_digest));
+            fields.insert("firecracker_version".into(), json!(fc.version));
+            fields.insert("host_kernel".into(), json!(host_kernel()));
+            fields.insert("jailed".into(), json!(fc.jailed));
+        }
+    }
     store.db.append_audit(&task, "Submitted", &submitted)?;
     tracing::info!(task_id = %task, %contract_digest, %repo_digest, %profile_digest, "task submitted");
-    summarize(&task, &contract, &repo_digest, &profile_digest, patch.as_deref());
+    summarize(&task, &contract, &repo_digest, &profile_digest, patch.as_deref(), firecracker.as_ref());
 
     match (lock, patch) {
         (Some(lock), Some(patch)) => {
+            // The executor (preflight and jail included) before the approval: a host that
+            // changed since the checks above leaves the task READY, not approved.
+            let exec = home.executor(&store, &task)?;
             // `--yes` is the owner's approval: issue the task's capability handles.
             store.db.approve_task(&task)?;
-            let state = drive(home, &store, &lock, &task, patch, crash).await?;
+            let state = drive(home, &store, &lock, &task, patch, crash, exec).await?;
             print_state(&task, state);
         }
         _ => print(&json!({

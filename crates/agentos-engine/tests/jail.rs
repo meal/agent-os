@@ -687,7 +687,9 @@ fn probe_result_is_consistent_with_the_environment() {
     let jailer = dir.path().join("jailer");
     fs::write(&jailer, "#!/bin/sh\necho 'Jailer v1.17.0'\n").unwrap();
     fs::set_permissions(&jailer, fs::Permissions::from_mode(0o755)).unwrap();
-    let cfg = JailConfig { jailer_bin: jailer, uid: 61000, gid: 61000, cgroup_root: "/sys/fs/cgroup".into() };
+    // The root the controller configures is the one /proc/mounts names (as the CLI builds it).
+    let cgroup_root = jail::find_cgroup2_root(&fs::read_to_string("/proc/mounts").unwrap()).unwrap_or_else(|| "/sys/fs/cgroup".into());
+    let cfg = JailConfig { jailer_bin: jailer, uid: 61000, gid: 61000, cgroup_root };
     let [jobs, inspect, work, image] = ["jobs", "inspect", "work", "image"].map(|n| dir.path().join(n));
     for d in [&jobs, &work, &image] {
         fs::create_dir_all(d).unwrap();
@@ -709,6 +711,37 @@ fn probe_result_is_consistent_with_the_environment() {
     } else {
         println!("probe branch: root with a writable cgroup tree => {result:?}");
         assert_eq!(result, Ok(()));
+    }
+}
+
+/// The probe, `collect` and the real jailer must agree on the cgroup root: a configured root
+/// other than the one /proc/mounts names fails the probe, before any delegation write.
+#[test]
+fn probe_refuses_a_cgroup_root_that_disagrees_with_proc_mounts() {
+    let dir = tempfile::tempdir().unwrap();
+    let jailer = dir.path().join("jailer");
+    fs::write(&jailer, "#!/bin/sh\necho 'Jailer v1.17.0'\n").unwrap();
+    fs::set_permissions(&jailer, fs::Permissions::from_mode(0o755)).unwrap();
+    let elsewhere = dir.path().join("not-the-cgroup-root");
+    let cfg = JailConfig { jailer_bin: jailer, uid: 61000, gid: 61000, cgroup_root: elsewhere.clone() };
+    let [jobs, inspect, work, image] = ["jobs", "inspect", "work", "image"].map(|n| dir.path().join(n));
+    for d in [&jobs, &work, &image] {
+        fs::create_dir_all(d).unwrap();
+    }
+    let result = jail::probe(&cfg, &jobs, &inspect, &work, &image);
+    let found = jail::find_cgroup2_root(&fs::read_to_string("/proc/mounts").unwrap());
+    let euid = rustix::process::geteuid().as_raw();
+    match (euid, found) {
+        (0, Some(found)) => {
+            let expected = format!("the jail is configured for cgroup root {}, but the cgroup v2 hierarchy in /proc/mounts is {}", elsewhere.display(), found.display());
+            assert_eq!(result, Err(expected));
+            assert!(!elsewhere.exists(), "nothing was written under the configured root");
+        }
+        (0, None) => assert_eq!(result, Err("no cgroup v2 hierarchy in /proc/mounts".into())),
+        _ => {
+            println!("probe branch: not root (uid {euid}) => {result:?}");
+            assert!(result.unwrap_err().contains("needs root"));
+        }
     }
 }
 

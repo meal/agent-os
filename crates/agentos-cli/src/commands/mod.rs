@@ -17,7 +17,22 @@ use crate::error::CliError;
 use crate::home::Home;
 
 pub async fn dispatch(args: Args) -> Result<(), CliError> {
-    let home = Home::new(args.home, args.profiles)?;
+    let home = Home {
+        worker: args.worker,
+        firecracker: args.firecracker,
+        jailer: args.jailer,
+        jail_uid: args.jail_uid,
+        jail_gid: args.jail_gid,
+        allow_unjailed: args.allow_unjailed,
+        ..Home::new(args.home, args.profiles)?
+    };
+    // Every command on an existing task follows the worker recorded at its submission; a
+    // `--worker` naming another one is refused before anything else happens.
+    if home.worker.is_some()
+        && let Some(id) = task_arg(&args.command)
+    {
+        home.task_worker(&home.open()?, &task_id(id)?)?;
+    }
     match args.command {
         Command::Submit { task, yes, fake_agent_patch, crash_at } => {
             submit::submit(&home, &task, yes, fake_agent_patch.as_deref(), crash_at.as_ref()).await
@@ -36,6 +51,20 @@ pub async fn dispatch(args: Args) -> Result<(), CliError> {
         Command::Revoke { id, capability } => revoke::revoke(&home, &task_id(&id)?, capability.as_deref()),
         Command::Export { id, dir } => export::export(&home, &task_id(&id)?, &dir),
         Command::Supervise { .. } => unreachable!("handled before the runtime starts"),
+    }
+}
+
+/// The task id a command acts on, if any.
+fn task_arg(command: &Command) -> Option<&str> {
+    match command {
+        Command::Status { id }
+        | Command::Events { id }
+        | Command::Pause { id }
+        | Command::Resume { id, .. }
+        | Command::Cancel { id }
+        | Command::Revoke { id, .. }
+        | Command::Export { id, .. } => Some(id),
+        _ => None,
     }
 }
 

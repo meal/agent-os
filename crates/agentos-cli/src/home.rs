@@ -11,24 +11,41 @@
 //! <home>/registry/<id>@<digest>.meta.json   registration time (outside the digest)
 //! <home>/registry/images/<id>@<digest>/   registered guest images, read-only, content-addressed
 //! <home>/profiles/<id>/      legacy profile directories (default for --profiles)
+//! <home>/inspect/<task>/     the Firecracker inspector's per-boot directories
+//! <home>/bin/firecracker     default Firecracker binary (`jailer` next to it)
 //! ```
 
 use std::fs::{self, File, TryLockError};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
+use agentos_core::contract::Limits;
 use agentos_core::ids::{Digest, TaskId};
+use agentos_engine::firecracker::{preflight, FirecrackerConfig};
+use agentos_engine::guestlink::GuestLauncher;
+use agentos_engine::jail::{self, JailConfig, JailDecision, JailMode, JAIL_GID, JAIL_UID};
 use agentos_engine::job::{HostConfig, WorkerConfig};
 use agentos_engine::supervised::{ExecCounts, SupervisedExecutor};
 use agentos_store::blob::BlobStore;
 use agentos_store::db::Db;
+use serde_json::Value;
 
+use crate::args::WorkerKind;
 use crate::commands::registry::{check_id, list_entries};
 use crate::commands::supervise::supervisor_cmd;
 use crate::error::CliError;
 
 /// How long a verification check may run (the fixture executor's default).
 const VERIFY_TIMEOUT_SECS: u64 = 60;
+/// Test switches, each honoured only together with `AGENTOS_TEST_WORKERS=1`.
+const TEST_WORKERS_ENV: &str = "AGENTOS_TEST_WORKERS";
+/// The Firecracker worker launches the fake guest (`agentos supervise fake-guest`) instead of
+/// Firecracker.
+const FAKE_GUEST_ENV: &str = "AGENTOS_TEST_FAKE_GUEST";
+/// `ok` | `fail:<reason>`: the jail probe's answer, instead of looking at the host.
+const JAIL_PROBE_ENV: &str = "AGENTOS_TEST_JAIL_PROBE";
+/// Where the cgroup v2 hierarchy is when `/proc/mounts` names none (the probe then refuses).
+const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
 /// A profile registered with `agentos profile register`.
 #[derive(Debug, Clone)]
@@ -42,6 +59,65 @@ pub struct RegistryEntry {
 pub struct Home {
     pub root: PathBuf,
     pub profiles: PathBuf,
+    /// `--worker`: `submit` uses it (host when absent); every other command checks it
+    /// against the recorded worker.
+    pub worker: Option<WorkerKind>,
+    /// `--firecracker` [default: `<home>/bin/firecracker`].
+    pub firecracker: Option<PathBuf>,
+    /// `--jailer` [default: `jailer` next to the Firecracker binary].
+    pub jailer: Option<PathBuf>,
+    pub jail_uid: u32,
+    pub jail_gid: u32,
+    /// `--allow-unjailed`: consulted at `submit` only; later commands follow the record.
+    pub allow_unjailed: bool,
+}
+
+/// The worker recorded in a task's `Submitted` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedWorker {
+    pub kind: WorkerKind,
+    /// `(guest_image_id, guest_image_digest)`; `None` for host (and 3a) tasks.
+    pub image: Option<(String, Digest)>,
+    /// `None` for host (and 3a) tasks.
+    pub jailed: Option<bool>,
+}
+
+/// A Firecracker worker configuration that passed the preflight and the jail decision.
+pub struct PreparedFirecracker {
+    pub cfg: FirecrackerConfig,
+    /// The decision: true only when the probe passed.
+    pub jailed: bool,
+}
+
+fn env_on(name: &str) -> bool {
+    std::env::var(name).as_deref() == Ok("1")
+}
+
+/// The jail probe test hook: `Ok(None)` unless `AGENTOS_TEST_WORKERS=1` and
+/// `AGENTOS_TEST_JAIL_PROBE` are both set; then `ok` ⇒ `Ok(())`, `fail:<reason>` ⇒
+/// `Err(reason)`, anything else is a usage error. `get` reads the environment.
+pub fn probe_hook(get: impl Fn(&str) -> Option<String>) -> Result<Option<Result<(), String>>, CliError> {
+    if get(TEST_WORKERS_ENV).as_deref() != Some("1") {
+        return Ok(None);
+    }
+    match get(JAIL_PROBE_ENV).as_deref() {
+        None => Ok(None),
+        Some("ok") => Ok(Some(Ok(()))),
+        Some(v) => match v.strip_prefix("fail:") {
+            Some(reason) => Ok(Some(Err(reason.to_string()))),
+            None => Err(CliError::usage(format!("{JAIL_PROBE_ENV}={v:?}: expected ok or fail:<reason>"))),
+        },
+    }
+}
+
+/// The cgroup v2 mount point `/proc/mounts` names: the one root the probe checks, the
+/// worker's `collect` cleans and the real jailer writes to.
+fn cgroup_root() -> PathBuf {
+    fs::read_to_string("/proc/mounts")
+        .ok()
+        .as_deref()
+        .and_then(jail::find_cgroup2_root)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CGROUP_ROOT))
 }
 
 pub struct Store {
@@ -78,7 +154,26 @@ impl Home {
             }
         };
         let profiles = profiles.unwrap_or_else(|| root.join("profiles"));
-        Ok(Home { root, profiles })
+        Ok(Home {
+            root,
+            profiles,
+            worker: None,
+            firecracker: None,
+            jailer: None,
+            jail_uid: JAIL_UID,
+            jail_gid: JAIL_GID,
+            allow_unjailed: false,
+        })
+    }
+
+    /// The Firecracker binary: `--firecracker`, else `<home>/bin/firecracker`.
+    pub fn firecracker_bin(&self) -> PathBuf {
+        self.firecracker.clone().unwrap_or_else(|| self.root.join("bin/firecracker"))
+    }
+
+    /// The jailer: `--jailer`, else the file `jailer` next to the Firecracker binary.
+    pub fn jailer_bin(&self) -> PathBuf {
+        self.jailer.clone().unwrap_or_else(|| self.firecracker_bin().with_file_name("jailer"))
     }
 
     /// The registry directory of profile `id`, which must be one plain name naming a
@@ -124,8 +219,6 @@ impl Home {
         list_entries(&self.images_dir(), |dir| dir.join("image.json").is_file())
     }
 
-    // Consumed by the submit preflight (the next task).
-    #[allow(dead_code)]
     /// Registered entries of guest image `id`, oldest registration first.
     pub fn image_entries(&self, id: &str) -> Vec<RegistryEntry> {
         let mut found: Vec<RegistryEntry> = self.image_list().into_iter().filter(|e| e.id == id).collect();
@@ -133,8 +226,6 @@ impl Home {
         found
     }
 
-    // Consumed by the submit preflight (the next task).
-    #[allow(dead_code)]
     /// Where guest image `id` comes from: the registry entry with exactly the digest `pin`
     /// (none is an error: a pin never falls back to anything else); else the newest entry;
     /// there is no legacy location. `Ok(None)` when there is none.
@@ -214,8 +305,134 @@ impl Home {
             .ok_or_else(|| CliError::other(format!("task {task} has no recorded profile digest; it was not completely submitted")))
     }
 
-    /// The executor for `task`, over the inputs recorded at its submission.
+    /// The worker recorded at `task`'s submission. No `worker` field (a 3a task, or no
+    /// `Submitted` event at all) is the host worker.
+    pub fn recorded_worker(&self, store: &Store, task: &TaskId) -> Result<RecordedWorker, CliError> {
+        let events = store.db.events(task)?;
+        let host = RecordedWorker { kind: WorkerKind::Host, image: None, jailed: None };
+        let Some(submitted) = events.iter().find(|e| e.event_type == "Submitted") else { return Ok(host) };
+        let p = &submitted.payload;
+        match p.get("worker").and_then(Value::as_str) {
+            None | Some("host") => Ok(host),
+            Some("firecracker") => {
+                let broken = |what: &str| CliError::other(format!("task {task} was submitted to the firecracker worker without a valid recorded {what}"));
+                let id = p["guest_image_id"].as_str().ok_or_else(|| broken("guest_image_id"))?.to_string();
+                let digest = p["guest_image_digest"].as_str().and_then(|d| Digest::from_hex(d).ok()).ok_or_else(|| broken("guest_image_digest"))?;
+                let jailed = p["jailed"].as_bool().ok_or_else(|| broken("jailed"))?;
+                Ok(RecordedWorker { kind: WorkerKind::Firecracker, image: Some((id, digest)), jailed: Some(jailed) })
+            }
+            Some(other) => Err(CliError::other(format!("task {task} was submitted with an unknown worker {:?}", other))),
+        }
+    }
+
+    /// `task`'s recorded worker, checked against `--worker`: a flag naming another worker
+    /// exits 2 (an unknown task is reported as such first).
+    pub fn task_worker(&self, store: &Store, task: &TaskId) -> Result<RecordedWorker, CliError> {
+        store.db.task(task)?;
+        let recorded = self.recorded_worker(store, task)?;
+        match self.worker {
+            Some(flag) if flag != recorded.kind => Err(CliError::usage(format!("task was submitted with worker {}", recorded.kind.as_str()))),
+            _ => Ok(recorded),
+        }
+    }
+
+    /// The guest launcher: the fake guest (this executable, `supervise fake-guest`) with
+    /// `AGENTOS_TEST_WORKERS=1` and `AGENTOS_TEST_FAKE_GUEST=1`, else Firecracker.
+    fn launcher(&self) -> Result<GuestLauncher, CliError> {
+        if env_on(TEST_WORKERS_ENV) && env_on(FAKE_GUEST_ENV) {
+            return Ok(GuestLauncher::Fake { program: std::env::current_exe()?, prefix_args: vec!["supervise".into()] });
+        }
+        Ok(GuestLauncher::Real { firecracker_bin: std::path::absolute(self.firecracker_bin())? })
+    }
+
+    /// The Firecracker worker configuration for a task whose recorded inputs are (or will be)
+    /// in `task_dir`, on the registered `image` with the contract's `limits`: the preflight
+    /// (`firecracker worker unavailable: …`, exit 1) and then the jail. `recorded_jailed` is
+    /// `None` at `submit` (decided here from the probe and `--allow-unjailed`) and the
+    /// recorded value for every later command, which it binds: a task submitted jailed never
+    /// runs unjailed, one submitted unjailed stays so without the flag or the warning.
+    pub fn prepare_firecracker(
+        &self,
+        image: &RegistryEntry,
+        limits: &Limits,
+        task_dir: &Path,
+        profile_digest: Option<Digest>,
+        recorded_jailed: Option<bool>,
+    ) -> Result<PreparedFirecracker, CliError> {
+        let root = std::path::absolute(&self.root)?;
+        let image_digest = Digest::from_hex(&image.digest).map_err(|e| CliError::other(format!("guest image {}@{}: {e}", image.id, image.digest)))?;
+        let launcher = self.launcher()?;
+        let mut cfg = FirecrackerConfig {
+            firecracker_bin: std::path::absolute(self.firecracker_bin())?,
+            image_dir: std::path::absolute(&image.dir)?,
+            image_digest,
+            snapshot_dir: task_dir.join("snapshot"),
+            profile_dir: task_dir.join("profile"),
+            profile_digest,
+            work_root: root.join("work"),
+            verify_timeout_secs: VERIFY_TIMEOUT_SECS,
+            vcpus: limits.worker_vcpus,
+            memory_mib: limits.worker_memory_mib,
+            // Minted per job by the executor (and per boot by the inspector).
+            attempt_token: String::new(),
+            launcher,
+            jail: JailMode::Unjailed,
+        };
+        // The registry entry itself is validated: manifest, files, and its digest now.
+        preflight(&cfg).map_err(|e| CliError::other(format!("firecracker worker unavailable: {e}")))?;
+        let (mode, jailed) = self.decide_jail(&cfg, &root, recorded_jailed)?;
+        cfg.jail = mode;
+        Ok(PreparedFirecracker { cfg, jailed })
+    }
+
+    /// The jail of `cfg`'s VMs and whether it counts as jailed (what `Submitted.jailed`
+    /// records). The `Fake` launcher is never probed and never really jailed: without the
+    /// probe hook it is unjailed; with it, the hook's answer drives the decision and the record
+    /// exactly as a real probe would, while the configuration stays unjailed.
+    fn decide_jail(&self, cfg: &FirecrackerConfig, root: &Path, recorded: Option<bool>) -> Result<(JailMode, bool), CliError> {
+        if recorded == Some(false) {
+            return Ok((JailMode::Unjailed, false));
+        }
+        let jail_cfg = JailConfig {
+            jailer_bin: std::path::absolute(self.jailer_bin())?,
+            uid: self.jail_uid,
+            gid: self.jail_gid,
+            cgroup_root: cgroup_root(),
+        };
+        let probe = match (probe_hook(|k| std::env::var(k).ok())?, &cfg.launcher) {
+            (Some(answer), _) => Some(answer),
+            (None, GuestLauncher::Fake { .. }) => None,
+            (None, GuestLauncher::Real { .. }) => {
+                Some(jail::probe(&jail_cfg, &root.join("jobs"), &root.join("inspect"), &root.join("work"), &cfg.image_dir))
+            }
+        };
+        let jailed_mode = || match cfg.launcher {
+            GuestLauncher::Real { .. } => JailMode::Jailed(jail_cfg.clone()),
+            GuestLauncher::Fake { .. } => JailMode::Unjailed,
+        };
+        if recorded == Some(true) {
+            return match probe {
+                Some(Ok(())) => Ok((jailed_mode(), true)),
+                Some(Err(reason)) => Err(CliError::other(format!("task was submitted jailed: jailer unavailable: {reason}"))),
+                None => Err(CliError::other("task was submitted jailed: jailer unavailable: the fake guest launcher is never jailed")),
+            };
+        }
+        let Some(probe) = probe else { return Ok((JailMode::Unjailed, false)) };
+        match jail::decide(probe, self.allow_unjailed) {
+            Err(refusal) => Err(CliError::other(format!("firecracker worker unavailable: {refusal}"))),
+            Ok(JailDecision::Unjailed { reason }) => {
+                eprintln!("warning: running Firecracker unjailed: {reason}");
+                Ok((JailMode::Unjailed, false))
+            }
+            Ok(JailDecision::Jailed) => Ok((jailed_mode(), true)),
+        }
+    }
+
+    /// The executor for `task`, over the inputs and the worker recorded at its submission.
+    /// For the Firecracker worker the preflight and the jail are checked here, before the
+    /// caller touches the task.
     pub fn executor(&self, store: &Store, task: &TaskId) -> Result<SupervisedExecutor, CliError> {
+        let recorded = self.task_worker(store, task)?;
         let dir = self.task_dir(task);
         if !dir.join("snapshot").is_dir() || !dir.join("profile").is_dir() {
             return Err(CliError::other(format!("task {task} has no recorded inputs in {}; it was not completely submitted", dir.display())));
@@ -223,14 +440,27 @@ impl Home {
         // The supervisor runs in its own working directory: every path is absolute.
         let root = std::path::absolute(&self.root)?;
         let task_dir = root.join("tasks").join(task.as_str());
-        let host = HostConfig {
-            snapshot_dir: task_dir.join("snapshot"),
-            profile_dir: task_dir.join("profile"),
-            work_root: root.join("work"),
-            verify_timeout_secs: VERIFY_TIMEOUT_SECS,
-            profile_digest: Some(self.pinned_profile(store, task)?),
+        let profile_digest = Some(self.pinned_profile(store, task)?);
+        let worker = match recorded.kind {
+            WorkerKind::Firecracker => {
+                let (id, digest) = recorded.image.ok_or_else(|| CliError::other(format!("task {task} has no recorded guest image")))?;
+                let entry = self
+                    .image_entries(&id)
+                    .into_iter()
+                    .find(|e| e.digest == digest.to_string())
+                    .ok_or_else(|| CliError::other(format!("recorded guest image {id}@{digest} is no longer registered")))?;
+                let limits = store.db.contract(task)?.limits;
+                WorkerConfig::Firecracker(self.prepare_firecracker(&entry, &limits, &task_dir, profile_digest, recorded.jailed)?.cfg)
+            }
+            WorkerKind::Host => WorkerConfig::Host(HostConfig {
+                snapshot_dir: task_dir.join("snapshot"),
+                profile_dir: task_dir.join("profile"),
+                work_root: root.join("work"),
+                verify_timeout_secs: VERIFY_TIMEOUT_SECS,
+                profile_digest,
+            }),
         };
-        Ok(SupervisedExecutor::new(root.join("jobs"), supervisor_cmd()?, WorkerConfig::Host(host), ExecCounts::default())?)
+        Ok(SupervisedExecutor::new(root.join("jobs"), supervisor_cmd()?, worker, ExecCounts::default())?)
     }
 }
 
@@ -262,5 +492,30 @@ mod tests {
         assert_eq!(home.resolve_image("a@b", None).unwrap_err().code, 2);
         // Profiles and images do not see each other.
         assert!(home.registry_list().is_empty());
+    }
+
+    #[test]
+    fn jailer_defaults_to_the_sibling_of_the_firecracker_binary() {
+        let home = Home { firecracker: Some("/x/firecracker".into()), jailer: None, ..Home::new(Some("/h".into()), None).unwrap() };
+        assert_eq!(home.jailer_bin(), Path::new("/x/jailer"));
+        let home = Home { firecracker: None, jailer: None, ..Home::new(Some("/h".into()), None).unwrap() };
+        assert_eq!(home.firecracker_bin(), Path::new("/h/bin/firecracker"));
+        assert_eq!(home.jailer_bin(), Path::new("/h/bin/jailer"));
+        let home = Home { firecracker: Some("/x/firecracker".into()), jailer: Some("/y/my-jailer".into()), ..Home::new(Some("/h".into()), None).unwrap() };
+        assert_eq!(home.jailer_bin(), Path::new("/y/my-jailer"));
+    }
+
+    #[test]
+    fn the_jail_probe_hook_answers_only_with_test_workers() {
+        let env = |pairs: &[(&str, &str)]| {
+            let pairs: Vec<(String, String)> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            move |k: &str| pairs.iter().find(|(name, _)| name == k).map(|(_, v)| v.clone())
+        };
+        assert_eq!(probe_hook(env(&[("AGENTOS_TEST_JAIL_PROBE", "ok")])).unwrap(), None, "ignored without AGENTOS_TEST_WORKERS=1");
+        let on = |v: &str| probe_hook(env(&[("AGENTOS_TEST_WORKERS", "1"), ("AGENTOS_TEST_JAIL_PROBE", v)]));
+        assert_eq!(on("ok").unwrap(), Some(Ok(())));
+        assert_eq!(on("fail:needs root").unwrap(), Some(Err("needs root".into())));
+        assert_eq!(on("maybe").unwrap_err().code, 2);
+        assert_eq!(probe_hook(env(&[("AGENTOS_TEST_WORKERS", "1")])).unwrap(), None);
     }
 }
