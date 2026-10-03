@@ -1,0 +1,595 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="An interactive walkthrough of Agent OS: kill the controller and watch the task recover, revoke permissions, and run hostile code in the sandbox.">
+<style>:root{color-scheme:light}body{margin:0}[hidden]{display:none!important}</style>
+<title>Agent OS Walkthrough</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;700&family=Instrument+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one reading column; three interactive stations (crash, authority, sandbox) separated by plain prose. */
+:root{
+  --paper:#eceff1; --panel:#f7f9fa; --ink:#14212b; --muted:#56656f; --rule:#cfd7dc;
+  --signal:#1d5fd1;      /* journal / controller */
+  --kill:#c4381f;        /* crash, denial */
+  --ok:#17794a;          /* verified, allowed */
+  --warn:#a56a00;
+  --tint-signal:#dce8fb; --tint-kill:#f9dfd8; --tint-ok:#d9efe3; --tint-warn:#f6e8c8;
+  --display:"Familjen Grotesk","Helvetica Neue",Arial,sans-serif;
+  --body:"Instrument Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,"SFMono-Regular",Menlo,monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --paper:#0e161c; --panel:#152029; --ink:#e4ebef; --muted:#93a4af; --rule:#2a3a46;
+  --signal:#6da2ff; --kill:#ff7a60; --ok:#4cc88a; --warn:#e3a93c;
+  --tint-signal:#162a4a; --tint-kill:#3a1c15; --tint-ok:#123222; --tint-warn:#3a2c0e; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --paper:#0e161c; --panel:#152029; --ink:#e4ebef; --muted:#93a4af; --rule:#2a3a46;
+  --signal:#6da2ff; --kill:#ff7a60; --ok:#4cc88a; --warn:#e3a93c;
+  --tint-signal:#162a4a; --tint-kill:#3a1c15; --tint-ok:#123222; --tint-warn:#3a2c0e; color-scheme:dark}
+*{box-sizing:border-box}
+body{background:var(--paper);color:var(--ink);font:16px/1.55 var(--body);padding-inline:max(16px,4vw);padding-block:32px 72px}
+.wrap{max-width:1040px;margin-inline:auto;display:flex;flex-direction:column;gap:64px}
+h1,h2,h3{font-family:var(--display);line-height:1.1;margin:0;text-wrap:balance;letter-spacing:-.01em}
+h1{font-size:clamp(2.4rem,6vw,4rem);font-weight:700}
+h2{font-size:clamp(1.6rem,3.4vw,2.2rem);font-weight:700}
+h3{font-size:1.1rem;font-weight:700}
+p{margin:0;max-width:65ch}
+code,.mono{font-family:var(--mono);font-size:.86em}
+.eyebrow{font:500 .72rem/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+a{color:var(--signal)}
+button{font:inherit;cursor:pointer}
+:focus-visible{outline:2px solid var(--signal);outline-offset:2px}
+.top{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}
+.theme{border:1px solid var(--rule);background:var(--panel);color:var(--ink);padding:6px 12px;border-radius:6px;font-size:.85rem}
+.hero{display:flex;flex-direction:column;gap:20px}
+.hero .lede{font-size:1.2rem;max-width:58ch}
+.facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:16px;margin-top:8px}
+.fact{border-top:2px solid var(--ink);padding-top:10px;display:flex;flex-direction:column;gap:6px}
+.fact b{font-family:var(--display);font-size:1.05rem}
+.fact span{color:var(--muted);font-size:.93rem}
+section{display:flex;flex-direction:column;gap:20px;min-width:0}
+.panel{background:var(--panel);border:1px solid var(--rule);border-radius:8px;padding:20px;min-width:0}
+.cols{display:grid;grid-template-columns:minmax(0,5fr) minmax(0,6fr);gap:20px}
+@media(max-width:820px){.cols{grid-template-columns:minmax(0,1fr)}}
+.pill{display:inline-block;font:500 .72rem/1 var(--mono);padding:5px 8px;border-radius:99px;letter-spacing:.04em}
+.pill.live{background:var(--tint-ok);color:var(--ok)}
+.pill.dead{background:var(--tint-kill);color:var(--kill)}
+.pill.idle{background:var(--tint-signal);color:var(--signal)}
+.pill.warn{background:var(--tint-warn);color:var(--warn)}
+.btns{display:flex;gap:8px;flex-wrap:wrap}
+.btn{border:1px solid var(--ink);background:var(--ink);color:var(--paper);padding:9px 14px;border-radius:6px;font-weight:600;font-size:.92rem}
+.btn.ghost{background:transparent;color:var(--ink)}
+.btn.kill{background:var(--kill);border-color:var(--kill);color:#fff}
+.btn[disabled]{opacity:.38;cursor:not-allowed}
+input[type=range]:disabled{opacity:.4}
+.small-btn[disabled]{opacity:.5;cursor:default}
+/* actors */
+.actors{display:flex;flex-direction:column;gap:10px}
+.actor{border:1px solid var(--rule);border-radius:6px;padding:12px 14px;display:flex;flex-direction:column;gap:6px;background:var(--paper)}
+.actor header{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.actor b{font-family:var(--display)}
+.actor small{color:var(--muted)}
+.counter{display:flex;align-items:baseline;gap:10px}
+.counter .n{font:700 2rem/1 var(--display);font-variant-numeric:tabular-nums}
+/* journal */
+.journal{font:400 .82rem/1.45 var(--mono);height:420px;overflow:auto;border:1px solid var(--rule);border-radius:6px;background:var(--paper);padding:6px 0;scroll-behavior:smooth}
+.jrow{display:grid;grid-template-columns:2.6em 1fr auto;gap:8px;padding:2px 12px;align-items:baseline}
+.jrow .s{color:var(--muted);text-align:right;font-variant-numeric:tabular-nums}
+.jrow .t{min-width:0;overflow-wrap:anywhere}
+.jrow .e{color:var(--muted);font-size:.74rem}
+.jrow.recovery{background:var(--tint-signal);color:var(--signal);font-weight:500}
+.jrow.verify{color:var(--ok);font-weight:500}
+.jrow.newrow{animation:flash .9s ease-out}
+@keyframes flash{from{background:var(--tint-warn)}to{background:transparent}}
+.jmark{padding:6px 12px;color:var(--kill);font:500 .75rem/1.3 var(--mono);background:var(--tint-kill);display:flex;justify-content:space-between;gap:8px}
+.slider{display:flex;flex-direction:column;gap:6px}
+input[type=range]{width:100%;accent-color:var(--kill)}
+.story{font-size:.95rem;min-height:4.6em}
+.story strong{font-weight:600}
+.note{font-size:.82rem;color:var(--muted);max-width:70ch}
+/* contract */
+pre.block{margin:0;overflow-x:auto;background:var(--paper);border:1px solid var(--rule);border-radius:6px;padding:14px;font:400 .8rem/1.55 var(--mono);color:var(--ink)}
+pre.block .k{color:var(--muted)}
+/* capabilities */
+.caps{display:flex;flex-direction:column;gap:8px}
+.cap{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:10px;align-items:center;padding:10px 12px;border:1px solid var(--rule);border-radius:6px;background:var(--paper)}
+.cap .nm{display:flex;flex-direction:column;min-width:0}
+.cap .nm b{font:500 .88rem var(--mono)}
+.cap .nm span{font-size:.8rem;color:var(--muted)}
+.cap .h{font:400 .78rem var(--mono);color:var(--muted)}
+@media(max-width:560px){.cap{grid-template-columns:minmax(0,1fr) auto}.cap .h{display:none}}
+.small-btn{border:1px solid var(--rule);background:var(--panel);color:var(--ink);padding:5px 10px;border-radius:5px;font-size:.82rem;font-weight:500}
+.small-btn.on{border-color:var(--kill);color:var(--kill)}
+.log{font:400 .8rem/1.5 var(--mono);display:flex;flex-direction:column;gap:2px;min-height:170px;max-height:260px;overflow:auto;background:var(--paper);border:1px solid var(--rule);border-radius:6px;padding:10px 12px}
+.log .ok{color:var(--ok)} .log .no{color:var(--kill)} .log .dim{color:var(--muted)}
+.try{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}
+/* sandbox */
+figure{margin:0;display:flex;flex-direction:column;gap:10px}
+figcaption{font-size:.88rem;color:var(--muted);max-width:70ch}
+figure{overflow-x:auto}
+svg{width:100%;min-width:640px;height:auto;display:block}
+svg text{font-family:var(--mono);font-size:12px;fill:currentColor}
+svg .lbl{font-family:var(--body);font-size:12px}
+.probes{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
+.probe{text-align:left;border:1px solid var(--rule);background:var(--paper);color:var(--ink);padding:10px 12px;border-radius:6px;display:flex;flex-direction:column;gap:2px}
+.probe b{font:500 .85rem var(--mono)}
+.probe span{font-size:.78rem;color:var(--muted)}
+.probe[aria-pressed=true]{border-color:var(--signal);background:var(--tint-signal)}
+.verdict{display:flex;flex-direction:column;gap:10px}
+.verdict .row{display:grid;grid-template-columns:7.5em minmax(0,1fr);gap:12px;font-size:.93rem}
+.verdict .row dt{font:500 .72rem/1.9 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.verdict .row dd{margin:0}
+dl{margin:0}
+/* limits */
+.limits{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}
+.limits div{border-left:3px solid var(--warn);padding-left:12px;font-size:.93rem}
+.limits b{display:block;font-family:var(--display)}
+.road{display:grid;grid-template-columns:repeat(auto-fit,minmax(125px,1fr));gap:8px}
+.road div{border:1px solid var(--rule);border-radius:6px;padding:10px 12px;background:var(--panel);font-size:.85rem;display:flex;flex-direction:column;gap:4px}
+.road .done{border-color:var(--ok)}
+.road b{font-family:var(--display)}
+footer{color:var(--muted);font-size:.88rem;border-top:1px solid var(--rule);padding-top:16px;display:flex;flex-direction:column;gap:6px}
+@media(prefers-reduced-motion:reduce){.jrow.newrow{animation:none}.journal{scroll-behavior:auto}}
+</style>
+</head>
+<body>
+
+
+<div class="wrap">
+
+<div class="top">
+  <span class="eyebrow">Agent OS · v0.1 · Phases 1 to 3b-1</span>
+  <button class="theme" id="theme" type="button">Switch theme</button>
+</div>
+
+<header class="hero">
+  <h1>Let an AI agent change your code without trusting it.</h1>
+  <p class="lede">Agent OS runs a coding agent against a repository under a contract you sign off on first. Every side effect goes through a journal, every permission is a revocable handle, and, with the Firecracker worker, the code it touches runs inside a locked-down microVM. A task only counts as done when an independent check passes on exactly the final files.</p>
+  <div class="facts">
+    <div class="fact"><b>It survives crashes</b><span>Kill the controller at any point. A restart recovers the same task and never repeats a step that already finished.</span></div>
+    <div class="fact"><b>It checks permissions every time</b><span>The agent holds no authority itself. A broker checks a handle before each action and records the answer.</span></div>
+    <div class="fact"><b>It contains the code it runs</b><span>With <code>--worker firecracker</code>, each step runs in its own microVM with no network, fixed-size disks and a jailed host process. The default host worker is not sandboxed.</span></div>
+  </div>
+  <p class="note">The agent in this release is a deterministic stand-in that applies a given patch. The real model arrives in Phase 4. Everything around it is real. The event sequence is from a real run, and the sandbox figures are the bounds the KVM test tier asserts.</p>
+</header>
+
+<!-- ============ THE CONTRACT ============ -->
+<section id="contract">
+  <span class="eyebrow">Before anything runs</span>
+  <h2>You approve a contract, not a prompt</h2>
+  <p>The task is a small JSON document. <code>submit</code> prints what it grants and waits for approval. Nothing runs until you approve it with <code>--yes</code> (or later with <code>resume</code>), and the capabilities it lists become the only authority the task ever has.</p>
+  <div class="cols">
+    <pre class="block" aria-label="task.json"><span class="k">{</span>
+  "goal": "fix the parser",
+  "repository": {
+    "source": "fixtures/parser-repo",
+    "revision": "recorded-at-submission"
+  },
+  "profile": "python-stdlib-v1",
+  "editable_paths": ["src/**"],
+  "verification_profile": "parser-checks-v1",
+  "capabilities": [
+    "snapshot.read",
+    "workspace.apply_patch",
+    "verification.run",
+    "artifact.export"
+  ],
+  "limits": {
+    "model_requests": 1,
+    "max_output_tokens_per_request": 1000,
+    "tool_actions": 10,
+    "deadline_seconds": 600,
+    "worker_vcpus": 1,
+    "worker_memory_mib": 256
+  }
+<span class="k">}</span></pre>
+    <pre class="block" aria-label="approval prompt">$ agentos submit task.json --yes …
+task 01a10214-… submitted; approve these
+permissions before it runs:
+  goal:         fix the parser
+  repository:   fixtures/parser-repo
+                at be77aa19c032…
+  capabilities: snapshot.read,
+                workspace.apply_patch,
+                verification.run,
+                artifact.export
+  editable:     src/**
+  acceptance:   protected verification
+                profile parser-checks-v1
+                (9ff584f31b7f…)
+  limits:       model_requests=1
+                max_output_tokens_per_request=1000
+                tool_actions=10
+                deadline_seconds=600
+                worker_vcpus=1
+                worker_memory_mib=256
+  agent:        fake-agent (patch 5128fe0b…)
+  worker:       firecracker, guest image
+                python-stdlib-v1@f231e3ea…,
+                jailed</pre>
+  </div>
+  <p class="note">The repository is pinned by digest, and the check that decides success is a registered profile pinned by digest too. The agent cannot edit the check, and a patch that touches a path outside <code>src/**</code> is refused.</p>
+</section>
+
+<!-- ============ CRASH STATION ============ -->
+<section id="crash">
+  <span class="eyebrow">Station 1 · durability</span>
+  <h2>Kill the controller. Watch it recover.</h2>
+  <p>Every effect (read the snapshot, apply the patch, run the check) is written to the journal as separate steps: intended, dispatched, executed, published, completed. Each effect runs as a job under its own supervisor process, so the job keeps going when the controller dies. A job ends by writing a <em>receipt</em> (its result) into its own directory, and a <em>lease</em> is the time the supervisor allows it before killing it. Pick a moment and kill the controller there.</p>
+
+  <div class="panel">
+    <div class="cols">
+      <div class="actors">
+        <div class="slider">
+          <label for="at"><span class="eyebrow">Kill the controller after event</span></label>
+          <input id="at" type="range" min="0" max="18" value="0" step="1" aria-describedby="atlabel">
+          <div class="mono" id="atlabel"></div>
+        </div>
+        <div class="btns">
+          <button class="btn kill" id="runkill" type="button">Run and kill here</button>
+          <button class="btn" id="resume" type="button" disabled>Resume</button>
+          <button class="btn ghost" id="clean" type="button">Run with no crash</button>
+          <button class="btn ghost" id="reset" type="button">Reset</button>
+        </div>
+        <div class="actor"><header><b>Controller</b><span class="pill idle" id="ctlpill">NOT STARTED</span></header><small>One short-lived process per command. It drives the task and writes the journal.</small></div>
+        <div class="actor"><header><b>Supervisor and job</b><span class="pill idle" id="jobpill">NO JOB</span></header><small id="jobtext">Launched detached, so it outlives the controller. It enforces the lease and writes a receipt.</small></div>
+        <div class="actor"><header><b>Patch applied to the workspace</b></header>
+          <div class="counter"><span class="n" id="applied">0</span><span id="appliedtxt" class="note">times</span></div></div>
+        <p class="story" id="story" aria-live="polite">Choose a moment, then press <strong>Run and kill here</strong>. The default is the exact moment recorded in the real demo: the patch job is dispatched and the controller dies.</p>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:8px;min-width:0">
+        <div class="eyebrow">Journal (SQLite, append-only)</div>
+        <div class="journal" id="journal" role="log" aria-label="journal events"></div>
+        <p class="note" id="jnote">The sequence matches the real run of <code>scripts/demo.sh</code>. Crash points other than the recorded one are modelled from the recovery rules.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ ARCHITECTURE ============ -->
+<section id="how">
+  <span class="eyebrow">How the pieces fit</span>
+  <h2>What the sandboxed worker keeps away from the host</h2>
+  <figure>
+    <svg viewBox="0 0 880 330" role="img" aria-label="The controller launches a supervisor per effect; the supervisor runs a jailed Firecracker microVM; the host and the guest talk only over vsock; the broker checks every action and the journal records it.">
+      <defs>
+        <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker>
+      </defs>
+      <!-- host -->
+      <rect x="10" y="10" width="560" height="310" rx="8" fill="none" stroke="currentColor" stroke-opacity=".35" stroke-dasharray="5 4"/>
+      <text x="24" y="32" fill-opacity=".6">host</text>
+      <rect x="30" y="60" width="130" height="64" rx="6" fill="var(--tint-signal)" stroke="var(--signal)"/>
+      <text x="95" y="88" text-anchor="middle">controller</text><text x="95" y="106" text-anchor="middle" class="lbl" fill-opacity=".7">run loop</text>
+      <rect x="30" y="206" width="130" height="64" rx="6" fill="var(--panel)" stroke="currentColor"/>
+      <text x="95" y="234" text-anchor="middle">journal</text><text x="95" y="252" text-anchor="middle" class="lbl" fill-opacity=".7">SQLite, blobs</text>
+      <rect x="215" y="60" width="130" height="64" rx="6" fill="var(--panel)" stroke="currentColor"/>
+      <text x="280" y="88" text-anchor="middle">broker</text><text x="280" y="106" text-anchor="middle" class="lbl" fill-opacity=".7">handles, scopes</text>
+      <rect x="215" y="206" width="130" height="64" rx="6" fill="var(--panel)" stroke="currentColor"/>
+      <text x="280" y="234" text-anchor="middle">supervisor</text><text x="280" y="252" text-anchor="middle" class="lbl" fill-opacity=".7">one per effect</text>
+      <!-- jail -->
+      <rect x="395" y="150" width="160" height="160" rx="8" fill="var(--tint-warn)" stroke="var(--warn)"/>
+      <text x="475" y="170" text-anchor="middle" class="lbl">jail: uid 61000, chroot, cgroup</text>
+      <rect x="410" y="184" width="130" height="112" rx="6" fill="var(--panel)" stroke="currentColor"/>
+      <text x="475" y="210" text-anchor="middle">Firecracker</text>
+      <rect x="422" y="224" width="106" height="60" rx="5" fill="var(--tint-ok)" stroke="var(--ok)"/>
+      <text x="475" y="248" text-anchor="middle">guest agent</text><text x="475" y="266" text-anchor="middle" class="lbl" fill-opacity=".7">git, python</text>
+      <!-- arrows -->
+      <line x1="160" y1="80" x2="213" y2="80" stroke="currentColor" marker-end="url(#ar)"/>
+      <text x="187" y="72" text-anchor="middle" class="lbl">authorize</text>
+      <line x1="95" y1="124" x2="95" y2="204" stroke="currentColor" marker-end="url(#ar)"/>
+      <text x="103" y="168" class="lbl">append</text>
+      <line x1="130" y1="124" x2="250" y2="204" stroke="currentColor" marker-end="url(#ar)"/>
+      <text x="205" y="150" class="lbl">launch job</text>
+      <line x1="345" y1="238" x2="408" y2="238" stroke="currentColor" marker-end="url(#ar)" marker-start="url(#ar)"/>
+      <text x="376" y="228" text-anchor="middle" class="lbl">vsock</text>
+      <!-- guest-side note -->
+      <rect x="600" y="60" width="270" height="200" rx="8" fill="none" stroke="var(--kill)" stroke-opacity=".7"/>
+      <text x="615" y="86" fill="var(--kill)">what the guest never gets</text>
+      <text x="615" y="116" class="lbl">no network device (only lo)</text>
+      <text x="615" y="140" class="lbl">no host secrets, no env</text>
+      <text x="615" y="164" class="lbl">no capability handle</text>
+      <text x="615" y="188" class="lbl">no writable root filesystem</text>
+      <text x="615" y="212" class="lbl">no say over the verdict</text>
+      <text x="615" y="240" class="lbl" fill-opacity=".7">outcomes are built on the host</text>
+    </svg>
+    <figcaption>The controller asks the broker before it launches each job. The job's supervisor boots one microVM, talks to the guest only over vsock, and writes a receipt. The journal records every step on the host.</figcaption>
+  </figure>
+</section>
+
+<!-- ============ AUTHORITY STATION ============ -->
+<section id="authority">
+  <span class="eyebrow">Station 2 · authority</span>
+  <h2>Revoke a permission. Try to use it.</h2>
+  <p>Capabilities are opaque handles issued when you approve the task. The broker checks one at intent, again at dispatch, and again at export. Every decision, allowed or denied, lands in the journal. Revoking a handle also stops any job that needs it.</p>
+  <div class="panel">
+    <div class="cols">
+      <div style="display:flex;flex-direction:column;gap:14px;min-width:0">
+        <div class="eyebrow">Handles for this task</div>
+        <div class="caps" id="caps"></div>
+        <div class="eyebrow">Try an action</div>
+        <div class="try" id="try"></div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:8px;min-width:0">
+        <div class="eyebrow">Journal and broker decisions</div>
+        <div class="log" id="log" role="log" aria-live="polite"><span class="dim">Nothing yet. Try an action.</span></div>
+        <p class="note">Same behaviour as <code>agentos revoke &lt;id&gt; --capability artifact.export</code>, which the README demo runs: the next export fails with <code>export denied: capability artifact.export is not usable (revoked)</code>.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ SANDBOX STATION ============ -->
+<section id="sandbox">
+  <span class="eyebrow">Station 3 · containment</span>
+  <h2>Run hostile code. See what stops it.</h2>
+  <p>The check that verifies a task is code from the registered verification profile, and it runs as untrusted. The test suite includes hostile profiles that try to burn CPU, eat memory, fork without limit, fill the disk, reach the network and find a host secret. Pick one.</p>
+  <div class="panel" style="display:flex;flex-direction:column;gap:18px">
+    <div class="probes" id="probes" role="group" aria-label="hostile profiles"></div>
+    <dl class="verdict" id="verdict"></dl>
+  </div>
+  <p class="note">One honest boundary: a bug in Firecracker or KVM could let code escape the VM. It would land in the jail (an unprivileged uid inside a chroot and cgroup, under Firecracker's own seccomp filter), and a second kernel-level bug would be needed to reach the host. With <code>--allow-unjailed</code> the escape lands as the controller's own user instead.</p>
+</section>
+
+<!-- ============ STATUS ============ -->
+<section id="status">
+  <span class="eyebrow">Where it stands</span>
+  <h2>Built, tested, and what is next</h2>
+  <div class="road">
+    <div class="done"><span class="pill live">DONE</span><b>1 Contracts</b>Task state machine, effects, CLI, fixture repo.</div>
+    <div class="done"><span class="pill live">DONE</span><b>2 Durability</b>SQLite journal, receipts, recovery after a kill.</div>
+    <div class="done"><span class="pill live">DONE</span><b>3 Authority</b>Broker, leases, supervisors, cancel and revoke.</div>
+    <div class="done"><span class="pill live">DONE</span><b>3b-1 Isolation</b>Jailed Firecracker worker and guest image.</div>
+    <div><span class="pill idle">NEXT</span><b>4 Real model</b>Model broker, typed tool requests, repair loop.</div>
+    <div><span class="pill warn">LATER</span><b>5 Wasm ABI</b>Component interfaces and a repository analyzer.</div>
+    <div><span class="pill warn">LATER</span><b>6 Release</b>Fault-injection suite, installer, reproducible image.</div>
+  </div>
+  <h3>Known limits in v0.1</h3>
+  <div class="limits">
+    <div><b>No real model yet</b>Only the fake agent exists. The model adapter is Phase 4.</div>
+    <div><b>Host worker is not sandboxed</b>The VM sandbox is opt-in with <code>--worker firecracker</code>.</div>
+    <div><b>Jailing needs root</b>It also needs a delegated cgroup v2 tree and <code>/dev/kvm</code>. x86_64 only.</div>
+    <div><b>Nothing is garbage collected</b>Job directories and disk images grow with every attempt.</div>
+    <div><b>One driver per home</b>Only one process drives a home at a time.</div>
+    <div><b>Export is not a journaled effect</b>It is authorized and audited, but outside the effect model.</div>
+  </div>
+</section>
+
+<footer>
+  <span>Source: github.com/meal/agent-os. The README has the full transcripts, the home layout and the security model.</span>
+  <span>Run it yourself: <code>docker compose run --rm test sh scripts/demo.sh</code></span>
+</footer>
+</div>
+
+<script>
+(function(){
+  // ---------- theme toggle ----------
+  var root=document.documentElement,tb=document.getElementById('theme');
+  tb.addEventListener('click',function(){
+    var dark=root.getAttribute('data-theme')==='dark'||(root.getAttribute('data-theme')!=='light'&&matchMedia('(prefers-color-scheme: dark)').matches);
+    root.setAttribute('data-theme',dark?'light':'dark');
+  });
+
+  // ---------- Station 1: crash and recover ----------
+  // Uncrashed run: the 31 events of the real run, minus the RecoveryDecision a crash adds.
+  // eff = which effect the event belongs to; st = that effect's state after the event.
+  var E=[
+   ['TaskCreated'],['Submitted'],['CapabilitiesIssued'],['Started'],
+   ['CapabilityGranted','read'],['EffectIntended','read','intended'],['ActionUsed','read'],['CapabilityGranted','read'],['EffectDispatched','read','dispatched'],['ArtifactRegistered','read'],['EffectCompleted','read','done'],['WorkspaceUpdated'],['AgentTurn'],
+   ['CapabilityGranted','patch'],['EffectIntended','patch','intended'],['ActionUsed','patch'],['ArtifactRegistered','patch'],['CapabilityGranted','patch'],['EffectDispatched','patch','dispatched'],['ArtifactRegistered','patch'],['EffectCompleted','patch','done'],['WorkspaceUpdated'],['AgentTurn'],
+   ['VerifyStarted'],['CapabilityGranted','verify'],['EffectIntended','verify','intended'],['CapabilityGranted','verify'],['EffectDispatched','verify','dispatched'],['ArtifactRegistered','verify'],['EffectCompleted','verify','done'],['VerifyPassed']
+  ];
+  var NAMES={read:'read the snapshot',patch:'apply the patch',verify:'run the verification'};
+  var at=document.getElementById('at'),atl=document.getElementById('atlabel'),jr=document.getElementById('journal'),
+      ctl=document.getElementById('ctlpill'),jobp=document.getElementById('jobpill'),jobt=document.getElementById('jobtext'),
+      applied=document.getElementById('applied'),appliedtxt=document.getElementById('appliedtxt'),story=document.getElementById('story'),
+      bRun=document.getElementById('runkill'),bRes=document.getElementById('resume'),bClean=document.getElementById('clean'),bReset=document.getElementById('reset');
+  var timer=null,pending=null;
+
+  function state(k){ // effect outstanding after k events (1-based count)
+    var cur=null;
+    for(var i=0;i<k;i++){var e=E[i];if(e[1]&&e[2]){cur=e[2]==='done'?null:{eff:e[1],st:e[2]};}}
+    return cur;
+  }
+  function describe(k){
+    var e=E[k-1],o=state(k);
+    return 'after event '+k+' ('+e[0]+')'+(o?', while the job to '+NAMES[o.eff]+' is '+(o.st==='intended'?'only intended':'dispatched'):', between effects');
+  }
+  // Only states the store can actually commit: CapabilityGranted + EffectIntended + ActionUsed, and CapabilityGranted + EffectDispatched, are each one transaction.
+  var KS=[4,7,9,10,11,12,13,16,17,19,20,21,22,23,24,26,28,29,30];
+  at.value=KS.indexOf(19);
+  function K(){return KS[+at.value];}
+  function label(){atl.textContent=describe(K());}
+  at.addEventListener('input',label);label();
+
+  function clearJ(){jr.innerHTML='';}
+  function row(seq,type,cls,extra){
+    var d=document.createElement('div');d.className='jrow newrow '+(cls||'');
+    d.innerHTML='<span class="s">'+seq+'</span><span class="t"></span><span class="e"></span>';
+    d.children[1].textContent=type;d.children[2].textContent=extra||'';
+    jr.appendChild(d);jr.scrollTop=jr.scrollHeight;return d;
+  }
+  function mark(text){var d=document.createElement('div');d.className='jmark';d.textContent=text;jr.appendChild(d);jr.scrollTop=jr.scrollHeight;}
+  function setCtl(t,c){ctl.textContent=t;ctl.className='pill '+c;}
+  function setJob(t,c,txt){jobp.textContent=t;jobp.className='pill '+c;if(txt)jobt.textContent=txt;}
+  function lock(on){[bRun,bClean,bReset,at].forEach(function(b){b.disabled=on;});}
+  function cls(t){return t==='VerifyPassed'?'verify':'';}
+
+  var patchRuns=0;
+  function reset(){
+    clearInterval(timer);timer=null;pending=null;patchRuns=0;
+    clearJ();applied.textContent='0';appliedtxt.textContent='times';
+    setCtl('NOT STARTED','idle');setJob('NO JOB','idle','Launched detached, so it outlives the controller. It enforces the lease and writes a receipt.');
+    bRes.disabled=true;lock(false);
+    story.innerHTML='Choose a moment, then press <strong>Run and kill here</strong>. The default is the exact moment recorded in the real demo: the patch job is dispatched and the controller dies.';
+  }
+  function play(list,done,delay){
+    var i=0;
+    timer=setInterval(function(){
+      if(i>=list.length){clearInterval(timer);timer=null;done();return;}
+      list[i]();i++;
+    },delay||110);
+  }
+  function jobEffects(ev,seqRef){ // update job + counter display from an event
+    var e=ev;
+    if(e[0]==='EffectDispatched'){setJob('RUNNING','live','Job to '+NAMES[e[1]]+' is running under its own supervisor.');}
+    if(e[0]==='EffectCompleted'){setJob('NO JOB','idle','Receipt published, job directory kept. One directory per effect.');}
+    if(e[0]==='EffectDispatched'&&e[1]==='patch'){patchRuns++;applied.textContent=patchRuns;appliedtxt.textContent=patchRuns===1?'time':'times';}
+  }
+
+  function runTo(k,killed){
+    reset();lock(true);setCtl('RUNNING','live');
+    var steps=[];
+    for(var i=0;i<k;i++)(function(i){steps.push(function(){row(i+1,E[i][0],cls(E[i][0]),E[i][1]?E[i][1]:'');jobEffects(E[i]);});})(i);
+    play(steps,function(){
+      if(!killed){setCtl('EXITED OK','idle');story.innerHTML='<strong>Task SUCCEEDED</strong> in 31 events with no crash. The patch was applied once, and the check passed on exactly the final workspace.';lock(false);return;}
+      var o=state(k);
+      mark('controller killed (exit code 75) · journal ends at '+k);
+      setCtl('DEAD','dead');
+      var alive=o&&o.st==='dispatched';
+      if(alive){setJob('RUNNING','live','The supervisor is a separate process. It keeps the job going and will write a receipt.');}
+      else if(o){setJob('NO JOB','idle','Nothing was launched yet: the journal only holds the intent.');}
+      else setJob('NO JOB','idle','No effect was in flight.');
+      var s;
+      if(o&&o.st==='dispatched')s='The controller died with the job to <strong>'+NAMES[o.eff]+'</strong> dispatched. The job survived. On <strong>Resume</strong>, recovery waits for it, finds its receipt and publishes it. It does not run the job again.';
+      else if(o)s='The controller died after recording the <strong>intent</strong> to '+NAMES[o.eff]+' but before dispatch. Nothing ran, so recovery will <strong>dispatch it</strong> now. It still runs exactly once.';
+      else s='The controller died between effects. Nothing is outstanding, so recovery just <strong>replays the journal</strong> and carries on with the next step.';
+      story.innerHTML=s;
+      pending={k:k,o:o};bRes.disabled=false;bReset.disabled=false;
+    },100);
+  }
+
+  bRun.addEventListener('click',function(){runTo(K(),true);});
+  bClean.addEventListener('click',function(){runTo(31,false);});
+  bReset.addEventListener('click',reset);
+
+  bRes.addEventListener('click',function(){
+    if(!pending)return;
+    var k=pending.k,o=pending.o;bRes.disabled=true;lock(true);
+    mark('$ agentos resume <id>');setCtl('RESUMING','live');
+    var seq=k,steps=[],i=k;
+    if(o){
+      steps.push(function(){seq++;
+        row(seq,'RecoveryDecision','recovery',o.st==='dispatched'?'PublishRetained':'Dispatch');
+        if(o.st==='dispatched')setJob('RECEIPT FOUND','live','The receipt was in the job directory. It is published as is.');
+      });
+    }
+    // remaining events
+    var start=i;
+    // when resuming a dispatched effect, the dispatch event is already in the journal
+    for(var j=start;j<E.length;j++)(function(j){steps.push(function(){seq++;row(seq,E[j][0],cls(E[j][0]),E[j][1]||'');jobEffects(E[j]);});})(j);
+    play(steps,function(){
+      setCtl('EXITED OK','idle');
+      var cnt=patchRuns;
+      var extra=o?(o.st==='intended'?'Recovery added one RecoveryDecision (Dispatch, because the job had only been intended), so the journal has '+seq+' events instead of 31.':'Recovery added one RecoveryDecision, so the journal has '+seq+' events instead of 31.'):'Nothing was outstanding, so recovery journaled nothing of its own and the journal has the same '+seq+' events as a clean run.';
+      story.innerHTML='<strong>Task SUCCEEDED.</strong> '+extra+' The patch was applied <strong>'+cnt+' time</strong>, never twice.';
+      bRes.disabled=true;lock(false);pending=null;
+    },100);
+  });
+  reset();
+
+  // ---------- Station 2: capabilities ----------
+  var CAPS=[
+    {op:'snapshot.read',h:'f38430d1',d:'Read the workspace'},
+    {op:'workspace.apply_patch',h:'795b67f2',d:'Apply a patch to editable paths'},
+    {op:'verification.run',h:'51d25726',d:'Run the protected check'},
+    {op:'artifact.export',h:'1f11b996',d:'Write the result bundle'}
+  ];
+  var revoked={},capsEl=document.getElementById('caps'),tryEl=document.getElementById('try'),logEl=document.getElementById('log'),jseq=33;
+  function log(t,c){
+    if(logEl.querySelector('.dim'))logEl.innerHTML='';
+    var d=document.createElement('div');d.className=c||'';d.textContent=t;logEl.appendChild(d);logEl.scrollTop=logEl.scrollHeight;
+  }
+  function drawCaps(){
+    capsEl.innerHTML='';
+    CAPS.forEach(function(c){
+      var r=document.createElement('div');r.className='cap';
+      r.innerHTML='<div class="nm"><b></b><span></span></div><span class="h"></span>';
+      r.querySelector('b').textContent=c.op;r.querySelector('span').textContent=c.d;r.querySelector('.h').textContent='handle '+c.h;
+      var b=document.createElement('button');b.type='button';b.className='small-btn'+(revoked[c.op]?' on':'');
+      b.textContent=revoked[c.op]?'Revoked':'Revoke';b.disabled=!!revoked[c.op];
+      b.addEventListener('click',function(){
+        if(revoked[c.op])return;
+        revoked[c.op]=true;jseq++;
+        log(jseq+' CapabilityRevoked '+c.op,'no');
+        if(c.op!=='artifact.export')log('   a running job that needs it is killed; the task ends FAILED "capability revoked: '+c.op+'"','dim');
+        drawCaps();
+      });
+      r.appendChild(b);capsEl.appendChild(r);
+    });
+    var rs=document.createElement('button');rs.type='button';rs.className='small-btn';rs.textContent='Restore all';
+    rs.addEventListener('click',function(){revoked={};log('(demo reset: handles reissued)','dim');drawCaps();});
+    capsEl.appendChild(rs);
+  }
+  var ACTS=[
+    {n:'Read the workspace',op:'snapshot.read'},
+    {n:'Apply a patch to src/parser.py',op:'workspace.apply_patch'},
+    {n:'Apply a patch to tests/check.py',op:'workspace.apply_patch',path:'tests/check.py'},
+    {n:'Run the verification',op:'verification.run'},
+    {n:'Export the bundle',op:'artifact.export'},
+    {n:'Open a network connection',op:null}
+  ];
+  ACTS.forEach(function(a){
+    var b=document.createElement('button');b.type='button';b.className='small-btn';b.textContent=a.n;
+    b.addEventListener('click',function(){
+      jseq++;
+      if(!a.op){jseq--;log('(not journaled) no capability exists for this, and the guest has no network device','no');return;}
+      if(revoked[a.op]){log(jseq+' CapabilityDenied '+a.op+' reason=revoked','no');return;}
+      if(a.path){log(jseq+' Denied reason=PathNotEditable paths=['+a.path+']','no');log('   refused before any effect exists: nothing is granted, no action is used. The guest checks the same rule again.','dim');return;}
+      log(jseq+' CapabilityGranted '+a.op,'ok');
+    });
+    tryEl.appendChild(b);
+  });
+  drawCaps();
+
+  // ---------- Station 3: hostile profiles ----------
+  var P=[
+    {id:'cpu-burn',s:'spin on every core',
+     what:'Spins in a tight loop to use all the CPU it can get.',
+     stop:'One vCPU per VM, plus a cgroup CPU quota (cpu.max) on the Firecracker process.',
+     result:'Firecracker\'s CPU time stays within 1.25 times the wall clock. The check finishes on its own and the task carries on.'},
+    {id:'mem-hog',s:'allocate 2x its memory',
+     what:'Allocates twice the memory the contract gave the worker.',
+     stop:'The VM has a fixed memory size. Inside it the check is the first thing the guest OOM killer picks, and the agent is protected.',
+     result:'The check dies (exit_code null, passed false). The agent survives and reports. Firecracker\'s resident memory stays under 256 + 96 MiB.'},
+    {id:'fork-bomb',s:'fork without limit',
+     what:'Forks processes until something gives.',
+     stop:'RLIMIT_NPROC in the guest, a group kill when the check ends, VM teardown, and pids.max=64 on the host cgroup.',
+     result:'The check fails or times out and leaves no process behind. The host never gains a process: pids.current stays at or below 1 + vcpus + 4.'},
+    {id:'disk-fill',s:'write until full',
+     what:'Writes data until the disk is full and tries to remount the root.',
+     stop:'Fixed-size images (1 GiB workspace, 512 MiB scratch), a read-only root, 64 MiB tmpfs mounts.',
+     result:'The images stay 1 GiB and 512 MiB, and what the check writes lands inside them. A write to /workspace fails with EACCES and the remount fails.'},
+    {id:'net-probe',s:'reach anything',
+     what:'Tries to open connections and lists the network interfaces.',
+     stop:'The VM is created without a network device. There is no host-only tap either.',
+     result:'It sees only lo, and every connection fails. The host\'s listening sockets are unchanged afterward.'},
+    {id:'secret-probe',s:'find a host secret',
+     what:'Searches the guest, its environment, its devices and the vsock for a planted host secret.',
+     stop:'Firecracker starts with a cleared environment, the kernel command line is constant, and no token or handle ever reaches the check\'s uid.',
+     result:'The secret is not in the evidence, the console log, the Firecracker log or an exported bundle. vsock and block devices answer EACCES.'}
+  ];
+  var pbEl=document.getElementById('probes'),vd=document.getElementById('verdict');
+  function pick(i){
+    var p=P[i];
+    [].forEach.call(pbEl.children,function(b,j){b.setAttribute('aria-pressed',j===i);});
+    vd.innerHTML='';
+    [['It tries',p.what],['What stops it',p.stop],['What the test sees',p.result]].forEach(function(r){
+      var row=document.createElement('div');row.className='row';
+      var dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=r[0];dd.textContent=r[1];
+      row.appendChild(dt);row.appendChild(dd);vd.appendChild(row);
+    });
+  }
+  P.forEach(function(p,i){
+    var b=document.createElement('button');b.type='button';b.className='probe';b.setAttribute('aria-pressed','false');
+    b.innerHTML='<b></b><span></span>';b.children[0].textContent=p.id;b.children[1].textContent=p.s;
+    b.addEventListener('click',function(){pick(i);});pbEl.appendChild(b);
+  });
+  pick(4);
+})();
+</script>
+
+</body>
+</html>
