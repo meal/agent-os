@@ -22,7 +22,8 @@
 //! new effect.
 //!
 //! Usage: one row per effect. Status `Reserved` -> `Settled` on a receipt, or `Reserved` ->
-//! `Uncertain` when the effect becomes unknown; an uncertain reservation is never released
+//! `Uncertain` when the effect becomes unknown, or `Reserved`/`Uncertain` -> `Uncertain` when the
+//! effect is forfeited (FAILED without a result; it may have run); an uncertain reservation is never released
 //! because the effect may have run. It stays `Uncertain` across a re-dispatch and settles
 //! when a receipt finally arrives. `Released` is reached only by abandoning an effect the
 //! task can no longer dispatch, which the caller knows never took effect; it counts nowhere.
@@ -642,6 +643,39 @@ impl Db {
             &rec.task_id,
             "EffectUnknown",
             &json!({ "effect_id": effect, "lease_generation": rec.lease_generation }),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// DISPATCHED/UNKNOWN -> FAILED without a result: the attempt may have run (a model call whose
+    /// response was lost may have been billed), so the reservation becomes `Uncertain` and keeps
+    /// counting; the agent asks again under a new effect. Journals `EffectForfeited`.
+    pub fn forfeit_effect(&self, effect: &EffectId, reason: &str) -> Result<()> {
+        let tx = self.immediate()?;
+        let rec = load_effect(&tx, effect)?;
+        if !matches!(rec.state, EffectState::Dispatched | EffectState::Unknown) {
+            return Err(DbError::InvalidEffectTransition { effect: effect.clone(), from: rec.state, to: EffectState::Failed });
+        }
+        let now = now_ts();
+        tx.execute(
+            "UPDATE effects SET state = ?2, updated_ts = ?3 WHERE effect_id = ?1",
+            params![effect.as_str(), effect_state_str(EffectState::Failed), now],
+        )?;
+        tx.execute(
+            "UPDATE attempts SET finished_ts = ?2 WHERE effect_id = ?1 AND finished_ts IS NULL",
+            params![effect.as_str(), now],
+        )?;
+        let n = tx.execute(
+            "UPDATE usage SET status = 'Uncertain' WHERE effect_id = ?1 AND status IN ('Reserved', 'Uncertain')",
+            [effect.as_str()],
+        )?;
+        expect_one(n, "usage forfeit", effect)?;
+        insert_event(
+            &tx,
+            &rec.task_id,
+            "EffectForfeited",
+            &json!({ "effect_id": effect, "previous_state": rec.state, "lease_generation": rec.lease_generation, "reason": reason }),
         )?;
         tx.commit()?;
         Ok(())

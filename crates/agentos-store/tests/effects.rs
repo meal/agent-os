@@ -19,6 +19,12 @@ use serde_json::json;
 
 const SAME_OUTPUT: &[u8] = b"ok\n";
 
+const MODEL_CAPS: &[&str] = &["snapshot.read", "workspace.apply_patch", "verification.run", "artifact.export", "model.request"];
+
+fn call(turn: u32) -> EffectKind {
+    EffectKind::ModelCall { model: "fake".into(), turn }
+}
+
 const ALL_CAPS: &[&str] = &["snapshot.read", "workspace.apply_patch", "verification.run", "artifact.export"];
 
 fn contract(caps: &[&str], model_requests: u32, tool_actions: u32) -> (Contract, Digest) {
@@ -1305,4 +1311,52 @@ fn verify_passed_follow_up_needs_a_successful_verification_of_this_workspace() {
     assert_eq!(fx.db.complete_effect(&bound.effect_id, &r, Some(&art), passed()).unwrap(), ReceiptVerdict::Apply);
     assert_eq!(fx.task().state, TaskState::Succeeded);
     assert_eq!(fx.task().verified_digest, Some(ws));
+}
+
+#[test]
+fn forfeited_model_request_stays_counted_as_uncertain() {
+    let fx = setup_with(MODEL_CAPS, 2, 100);
+    let one = |turn: u32, req: &[u8]| fx.db.record_intent(&fx.id, call(turn), Digest::of(req), &fx.base(), Reservation::for_kind(&call(turn), 1), &Resource::Task);
+    let a = one(1, b"req-1").unwrap();
+    let attempt = AttemptId::new();
+    fx.db.mark_dispatched(&a.effect_id, &attempt, "model", 1).unwrap();
+    fx.db.forfeit_effect(&a.effect_id, "transport failure: timed out").unwrap();
+    let a2 = fx.db.effect(&a.effect_id).unwrap();
+    assert_eq!((a2.state, a2.result_digest, a2.lease_generation), (EffectState::Failed, None, 1));
+    let u = fx.usage();
+    assert_eq!((u.reserved_model_requests, u.settled_model_requests, u.uncertain_model_requests), (0, 0, 1));
+    assert!(fx.db.outstanding_effects(&fx.id).unwrap().is_empty());
+    assert_eq!(fx.count_events("EffectForfeited"), 1);
+    let ev = fx.events().into_iter().find(|e| e.event_type == "EffectForfeited").unwrap();
+    assert_eq!(ev.payload["previous_state"], json!("Dispatched"));
+    assert_eq!(ev.payload["reason"], "transport failure: timed out");
+    assert_eq!(fx.count("SELECT COUNT(*) FROM attempts WHERE finished_ts IS NULL"), 0);
+    // The task goes on: a second call settles as a failure (a 4xx), one reservation each.
+    let b = one(2, b"req-2").unwrap();
+    let attempt_b = AttemptId::new();
+    fx.db.mark_dispatched(&b.effect_id, &attempt_b, "model", 1).unwrap();
+    let r = receipt(&b, &attempt_b, 1, Outcome::Failure("http 400: bad request".into()));
+    assert_eq!(fx.db.complete_effect(&b.effect_id, &r, None, None).unwrap(), ReceiptVerdict::Apply);
+    assert_eq!(fx.usage().model_totals().committed(), 2);
+    // Limit 2: uncertain + settled fill it; a third is refused and journals nothing but the refusal.
+    let err = one(3, b"req-3").unwrap_err();
+    assert!(matches!(err, DbError::BudgetExceeded(BudgetError::ModelRequests { limit: 2, committed: 2, requested: 1 })), "{err}");
+    // A late receipt for the forfeited call can never be applied.
+    let late = receipt(&a, &attempt, 1, Outcome::Success);
+    assert_eq!(fx.db.complete_effect(&a.effect_id, &late, None, None).unwrap(), ReceiptVerdict::DuplicateIgnored);
+    assert_eq!(fx.usage().uncertain_model_requests, 1);
+}
+
+#[test]
+fn forfeit_is_only_for_dispatched_or_unknown_effects_and_its_event_is_reserved() {
+    let fx = setup_with(MODEL_CAPS, 5, 100);
+    let a = fx.db.record_intent(&fx.id, call(1), Digest::of(b"r"), &fx.base(), Reservation::for_kind(&call(1), 1), &Resource::Task).unwrap();
+    assert!(matches!(fx.db.forfeit_effect(&a.effect_id, "x"), Err(DbError::InvalidEffectTransition { from: EffectState::Intended, to: EffectState::Failed, .. })));
+    let attempt = AttemptId::new();
+    fx.db.mark_dispatched(&a.effect_id, &attempt, "model", 1).unwrap();
+    fx.db.mark_unknown(&a.effect_id).unwrap();
+    fx.db.forfeit_effect(&a.effect_id, "from unknown").unwrap();
+    assert_eq!(fx.db.effect(&a.effect_id).unwrap().state, EffectState::Failed);
+    assert!(matches!(fx.db.forfeit_effect(&a.effect_id, "twice"), Err(DbError::InvalidEffectTransition { from: EffectState::Failed, .. })));
+    assert!(matches!(fx.db.append_audit(&fx.id, "EffectForfeited", &json!({})), Err(DbError::ReservedEventType(_))));
 }

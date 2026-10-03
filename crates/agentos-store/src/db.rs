@@ -22,7 +22,7 @@ pub const SCHEMA_VERSION: i64 = 2;
 const RESERVED_EVENT_TYPES: &[&str] = &[
     "TaskCreated", "Started", "Waiting", "Woken", "Paused", "Resumed", "VerifyStarted", "VerifyPassed",
     "VerifyFailed", "WorkspaceUpdated", "ActionUsed", "CancelRequested", "CancelCompleted", "Failed",
-    "EffectIntended", "EffectDispatched", "EffectCompleted", "EffectFailed", "EffectUnknown", "EffectAbandoned",
+    "EffectIntended", "EffectDispatched", "EffectCompleted", "EffectFailed", "EffectUnknown", "EffectAbandoned", "EffectForfeited",
     "ArtifactRegistered", "TaskEventRejected", "ReceiptIgnored", "ReceiptRejected",
     "CapabilitiesIssued", "CapabilityGranted", "CapabilityDenied", "CapabilityRevoked",
 ];
