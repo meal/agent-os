@@ -19,6 +19,9 @@ use tempfile::TempDir;
 /// The KVM gate, shared with the engine's tests.
 #[path = "../../agentos-engine/tests/common/kvm.rs"]
 mod kvm;
+/// The Firecracker process scan, shared with the engine's tests.
+#[path = "../../agentos-engine/tests/common/procs.rs"]
+mod procs;
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures").canonicalize().unwrap()
@@ -1071,35 +1074,10 @@ fn assert_no_job_processes(cli: &Cli) {
     assert_eq!(home_vms(cli), Vec::<String>::new(), "no Firecracker of this home left");
 }
 
-/// Live `firecracker` processes of this home. A jailed one's command line names no host
-/// path (`/firecracker --id <id> … --config-file /vm.json`): it is told by its `--id`, the
-/// attempt id of a job under `<home>/jobs` or `inspect-<uuid>` of `<home>/inspect/<task>/<uuid>`.
+/// Live `firecracker` processes of this home (matched by `--id`: a jailed one's command
+/// line names no host path).
 fn home_vms(cli: &Cli) -> Vec<String> {
-    let names = |dir: PathBuf| -> Vec<String> {
-        fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()
-    };
-    let mut ids: Vec<String> = names(cli.home().join("jobs")).into_iter().filter_map(|n| n.get(65..).map(str::to_string)).collect();
-    for task in names(cli.home().join("inspect")) {
-        ids.extend(names(cli.home().join("inspect").join(task)).into_iter().map(|u| format!("inspect-{u}")));
-    }
-    let mut found = Vec::new();
-    for entry in fs::read_dir("/proc").unwrap().flatten() {
-        let path = entry.path();
-        let comm = fs::read_to_string(path.join("comm")).unwrap_or_default();
-        let stat = fs::read_to_string(path.join("stat")).unwrap_or_default();
-        let zombie = stat.rsplit_once(") ").is_some_and(|(_, rest)| rest.starts_with('Z'));
-        if comm.trim_end() != "firecracker" || zombie {
-            continue;
-        }
-        let cmdline = fs::read(path.join("cmdline")).unwrap_or_default();
-        let args: Vec<String> = cmdline.split(|b| *b == 0).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
-        if let Some(id) = args.iter().position(|a| a == "--id").and_then(|i| args.get(i + 1))
-            && ids.contains(id)
-        {
-            found.push(args.join(" "));
-        }
-    }
-    found
+    procs::home_firecrackers(&cli.home()).into_iter().map(|p| p.cmdline.join(" ")).collect()
 }
 
 #[test]

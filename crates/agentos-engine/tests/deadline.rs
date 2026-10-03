@@ -192,7 +192,11 @@ async fn deadline_between_turns_fails_the_task_without_new_effects() {
 
 #[tokio::test]
 async fn deadline_during_a_verification_kills_the_job_and_fails_the_task() {
-    let w = World::with_profile(4, Some("import time\ntime.sleep(30)"));
+    // The deadline (whole seconds) must fall inside the verification: after the snapshot's
+    // and the patch's jobs. Real VMs boot in about 0.7 s each, so the real worker gets more
+    // headroom before the 30 s check than the 4 s the fast workers need.
+    let deadline = if common::real_mode() { 8 } else { 4 };
+    let w = World::with_profile(deadline, Some("import time\ntime.sleep(30)"));
     // The supervisor enforces the deadline on its own, by the real clock.
     let exec = w.exec(None, &[]);
     let mut agent = FakeAgent::from_fixture_patch(fix_patch());

@@ -160,7 +160,8 @@ held = (
     not hits
     and findings["blockdev"] == "EACCES"
     and findings["vsock"] == "EACCES"
-    and findings["vsock_connect"] != "connected"
+    # Firecracker resets a guest-initiated connection to a host port nobody listens on.
+    and findings["vsock_connect"] == "ECONNRESET"
     and findings["fds"] == [0, 1, 2]
     and (findings["uid"], findings["euid"], findings["gid"], findings["egid"]) == (1001, 1001, 1001, 1001)
     and findings["groups"] == []

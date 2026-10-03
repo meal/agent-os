@@ -64,7 +64,7 @@ held = (
     findings["tmp"] == "ENOSPC" and 0 < findings["tmp_bytes"] <= 64 * MIB
     and findings["scratch"] == "ENOSPC" and 0 < findings["scratch_bytes"] <= 512 * MIB
     and findings["workspace"] == "EACCES"
-    and findings["root"] in ("EROFS", "EACCES")
+    and findings["root"] == "EROFS"
     and findings["root_ro"] and findings["root_ro_after"]
     # The image may carry no `mount` binary (ENOENT); the syscall is tried either way.
     and findings["remount_rc"] != 0
