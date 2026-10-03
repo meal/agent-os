@@ -18,6 +18,10 @@ use agentos_engine::firecracker::FirecrackerConfig;
 use agentos_engine::fixture::FixtureExecutor;
 use agentos_engine::guestlink::GuestLauncher;
 use agentos_engine::jail::{JailConfig, JailMode};
+use agentos_engine::model::executor::ModelExecutor;
+use agentos_engine::model::provider::ModelProvider;
+use agentos_engine::routing::RoutingExecutor;
+use agentos_engine::shadow::ShadowReader;
 use agentos_engine::job::{HostConfig, WorkerConfig};
 use agentos_engine::supervised::{ExecCounts, SupervisedExecutor};
 use agentos_engine::supervisor::SupervisorCmd;
@@ -591,4 +595,18 @@ where
 /// `fixtures/transcripts/<name>.json`.
 pub fn transcript(name: &str) -> PathBuf {
     fixtures().join("transcripts").join(format!("{name}.json"))
+}
+
+/// A routing executor over `root`: model calls through `provider`, reads from the shadow
+/// workspace of `root`'s snapshot and database, everything else to `jobs`.
+pub fn routing_over<J: Executor>(
+    root: &Path,
+    jobs: J,
+    provider: Option<Box<dyn ModelProvider>>,
+    counts: &ExecCounts,
+    hook: Option<CrashHook>,
+) -> RoutingExecutor<J> {
+    let model = ModelExecutor::new(root.join("model"), provider, counts.clone()).with_crash(hook.clone());
+    let reads = ShadowReader::new(root.join("agentos.db"), root.join("snapshot"), root.join("shadow")).with_crash(hook);
+    RoutingExecutor::new(jobs, model, reads)
 }

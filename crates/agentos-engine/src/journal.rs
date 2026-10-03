@@ -145,6 +145,29 @@ pub(crate) fn journaled_patch(db: &Db, task: &TaskId, request: &Digest) -> Resul
     Ok(None)
 }
 
+/// The texts of the task's COMPLETED `ApplyPatch` effects, in intent order, each taken from
+/// its journaled `AgentTurn` (the one place every patch is kept; the reader that replays
+/// them holds no blob store). A completed patch whose text is not journaled is an error: the
+/// replay must not guess.
+pub(crate) fn completed_patches(db: &Db, task: &TaskId) -> Result<Vec<Vec<u8>>> {
+    let mut out = Vec::new();
+    for e in db.events(task)?.iter().filter(|e| e.event_type == "EffectIntended") {
+        if kind_name(&e.payload["kind"]) != Some("ApplyPatch") {
+            continue;
+        }
+        let id: EffectId = decode(&e.payload["effect_id"])?;
+        let rec = db.effect(&id)?;
+        if rec.state != EffectState::Completed {
+            continue;
+        }
+        match journaled_patch(db, task, &rec.request_digest)? {
+            Some(text) => out.push(text.into_bytes()),
+            None => return Err(EngineError::Protocol(format!("the patch of effect {id} is not journaled"))),
+        }
+    }
+    Ok(out)
+}
+
 /// Whether a receipt of attempt `attempt` was already journaled as ignored or rejected.
 pub(crate) fn receipt_audited(db: &Db, task: &TaskId, attempt: &Value) -> Result<bool> {
     Ok(db
