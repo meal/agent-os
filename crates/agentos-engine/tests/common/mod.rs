@@ -2,6 +2,7 @@
 
 pub mod http;
 pub mod kvm;
+pub mod live;
 pub mod procs;
 
 use std::fs;
