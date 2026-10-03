@@ -53,6 +53,32 @@ const JAIL_PROBE_ENV: &str = "AGENTOS_TEST_JAIL_PROBE";
 /// Where the cgroup v2 hierarchy is when `/proc/mounts` names none (the probe then refuses).
 const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
+/// The one rule for `--anthropic-base-url`: `https` with any host, or `http` only to the local
+/// machine (`localhost`, 127.0.0.0/8, `::1`); no user info, query or fragment. The message
+/// names the rule and never quotes the URL, which may hold a secret.
+pub fn validate_base_url(raw: &str) -> Result<String, CliError> {
+    use reqwest::Url;
+    use std::net::IpAddr;
+    let refuse = || {
+        CliError::usage(
+            "invalid --anthropic-base-url: it must be https://HOST, or http:// to localhost, 127.0.0.0/8 or [::1] only, \
+             with no user info, query or fragment",
+        )
+    };
+    let url = Url::parse(raw).map_err(|_| refuse())?;
+    if !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
+        return Err(refuse());
+    }
+    let host = url.host_str().unwrap_or_default().trim_start_matches('[').trim_end_matches(']').to_string();
+    let local = host == "localhost" || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    match url.scheme() {
+        "https" => {}
+        "http" if local => {}
+        _ => return Err(refuse()),
+    }
+    Ok(url.to_string())
+}
+
 /// A profile registered with `agentos profile register`.
 #[derive(Debug, Clone)]
 pub struct RegistryEntry {
@@ -478,6 +504,11 @@ impl Home {
         Ok(key)
     }
 
+    /// `--anthropic-base-url`, validated ([`validate_base_url`]); `None` when not given.
+    pub fn checked_base_url(&self) -> Result<Option<String>, CliError> {
+        self.anthropic_base_url.as_deref().map(validate_base_url).transpose()
+    }
+
     /// The provider for `task`'s recorded model: Anthropic (needs the key), the scripted fake
     /// over the task's own copy of the transcript, or none for the fake agent. With `lenient`
     /// (recovery and cancel, which never send) a provider that cannot be built is `None`
@@ -485,13 +516,13 @@ impl Home {
     fn provider(&self, store: &Store, task: &TaskId, lenient: bool) -> Result<Option<Box<dyn ModelProvider>>, CliError> {
         let Some(model) = self.recorded_model(store, task)? else { return Ok(None) };
         let built = if model.starts_with("anthropic:") {
-            self.api_key().map(|key| {
-                let provider = AnthropicProvider::new(key);
-                let provider = match &self.anthropic_base_url {
-                    Some(url) => provider.with_base_url(url.clone()),
+            self.checked_base_url().and_then(|base| {
+                let provider = AnthropicProvider::new(self.api_key()?);
+                let provider = match base {
+                    Some(url) => provider.with_base_url(url),
                     None => provider,
                 };
-                Some(Box::new(provider) as Box<dyn ModelProvider>)
+                Ok(Some(Box::new(provider) as Box<dyn ModelProvider>))
             })
         } else if model.starts_with("fake:") {
             self.fake_provider(store, task).map(Some)
@@ -581,6 +612,32 @@ impl Home {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base_urls_must_be_https_or_loopback_http_without_userinfo_query_or_fragment() {
+        for bad in [
+            "http://example.com",
+            "http://10.0.0.1",
+            "http://127.0.0.1.evil.com",
+            "https://uSeR:pw@api.example/",
+            "https://uSeR@api.example/",
+            "https://api.example/?k=v",
+            "https://api.example/#f",
+            "http://localhost.evil.com:1",
+            "ftp://x",
+            "garbage",
+            "",
+        ] {
+            let err = validate_base_url(bad).unwrap_err();
+            assert_eq!(err.code, 2, "{bad}");
+            for secret in ["pw", "k=v", "uSeR"] {
+                assert!(!err.message.contains(secret), "the message echoes {secret:?}: {}", err.message);
+            }
+        }
+        for good in ["https://api.anthropic.com", "https://proxy.example:8443/prefix", "http://127.0.0.1:8080", "http://127.9.9.9", "http://localhost:9", "http://[::1]:9"] {
+            validate_base_url(good).unwrap_or_else(|e| panic!("{good}: {e}"));
+        }
+    }
 
     fn entry(home: &Home, id: &str, digest: &str, ms: i64) {
         let name = format!("{id}@{digest}");

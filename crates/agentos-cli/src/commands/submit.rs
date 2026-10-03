@@ -135,6 +135,7 @@ fn validate(home: &Home, task: &Path, yes: bool, patch: Option<&Path>, model: Op
                 // The key is resolved before anything is written: a missing one is exit 2
                 // with the task untouched.
                 ModelSpec::Anthropic(_) => {
+                    home.checked_base_url()?;
                     if yes {
                         home.api_key()?;
                     }

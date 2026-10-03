@@ -2763,3 +2763,44 @@ fn there_is_no_flag_that_takes_the_key_itself() {
 fn assert_nothing_recorded_or_bare(cli: &Cli) {
     assert!(!cli.home().join("agentos.db").exists() || cli.task_footprint() == (Vec::new(), 0), "a refused invocation left a task behind");
 }
+
+#[test]
+fn a_cleartext_non_loopback_base_url_is_refused_before_anything_is_written_and_never_leaks_the_key() {
+    let cli = Cli::new();
+    let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
+    for url in ["http://example.com", "https://user:pw@api.example/?k=v"] {
+        let out = cli
+            .cmd(&["submit", &contract, "--yes", "--model", "anthropic:x"])
+            .env("AGENTOS_ANTHROPIC_BASE_URL", url)
+            .env("ANTHROPIC_API_KEY", CANARY)
+            .assert()
+            .code(2)
+            .get_output()
+            .clone();
+        let (o, e) = (String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned());
+        assert!(e.contains("invalid --anthropic-base-url"), "{e}");
+        for text in [&o, &e] {
+            assert!(!text.contains("SECRET") && !text.contains("pw") && !text.contains("k=v"), "{text}");
+        }
+        assert_nothing_recorded(&cli);
+    }
+}
+
+#[test]
+fn resume_refuses_a_bad_base_url_but_cancel_still_works() {
+    let cli = Cli::new();
+    let api = fake_api("parser-fix-direct.json");
+    let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
+    let assert = cli
+        .cmd(&["submit", &contract, "--yes", "--model", "anthropic:claude-opus-5-5", "--anthropic-base-url", &api.url(), "--crash-at", "after-dispatch:model_call"])
+        .env("ANTHROPIC_API_KEY", CANARY)
+        .assert()
+        .code(75);
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    let id = stderr.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).find_map(|v| v["task_id"].as_str().map(str::to_string)).unwrap();
+    cli.cmd(&["resume", &id]).env("AGENTOS_ANTHROPIC_BASE_URL", "http://example.com").env("ANTHROPIC_API_KEY", CANARY).assert().code(2).stderr(predicate::str::contains("invalid --anthropic-base-url"));
+    assert_ne!(cli.status(&id)["state"], "SUCCEEDED");
+    let cancelled = cli.cmd(&["cancel", &id]).env("AGENTOS_ANTHROPIC_BASE_URL", "http://example.com").env("ANTHROPIC_API_KEY", CANARY).assert().success().get_output().stdout.clone();
+    assert_eq!(serde_json::from_slice::<Value>(&cancelled).unwrap()["state"], "CANCELLED");
+    assert_eq!(api.hits(), 0, "the crash came before the send");
+}
