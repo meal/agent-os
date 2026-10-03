@@ -10,6 +10,18 @@ pub enum AgentAction {
     ApplyPatch(String),
     /// Run the protected verification profile against the current workspace.
     Verify,
+    /// Ask the model for the next move. `request` is the digest of `body`, the serialized
+    /// request; the body is not journaled in the turn (it lives in a blob), so a journaled
+    /// action has an empty one and turns are compared by digest.
+    CallModel {
+        request: Digest,
+        #[serde(skip)]
+        body: Vec<u8>,
+    },
+    /// List the files of the workspace.
+    ListFiles,
+    /// Read one file of the workspace.
+    ReadFile(String),
     /// Stop; the task fails unless it already succeeded.
     Finish,
 }
@@ -23,6 +35,17 @@ pub enum Observation {
     VersionConflict { expected: Digest, actual: Digest },
     Verification { passed: bool, summary: String },
     BudgetExhausted,
+    /// The model answered: its content blocks, why it stopped and the tokens it produced.
+    ModelResponse { content: serde_json::Value, stop_reason: String, output_tokens: u64 },
+    /// The model request failed with an answer (an HTTP error, a refusal).
+    ModelCallFailed { reason: String },
+    /// The model request was sent but its outcome was lost; it was forfeited and counts as
+    /// used.
+    ModelCallLost,
+    /// The workspace's files.
+    Files { files: Vec<String> },
+    FileRead { path: String, content: String, truncated: bool },
+    FileReadRejected { reason: String },
 }
 
 pub trait Agent {

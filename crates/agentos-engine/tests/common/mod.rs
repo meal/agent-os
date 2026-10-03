@@ -408,7 +408,19 @@ pub fn contract_with(tool_actions: u32, caps: &[&str]) -> (Contract, Digest) {
     contract_full(tool_actions, caps, 600)
 }
 
+pub const MODEL_CAPS: &[&str] =
+    &["snapshot.read", "workspace.apply_patch", "verification.run", "artifact.export", "model.request"];
+
+/// `contract_full` with `MODEL_CAPS` and the given number of model requests.
+pub fn contract_model(model_requests: u32, tool_actions: u32) -> (Contract, Digest) {
+    contract_limits(model_requests, tool_actions, MODEL_CAPS, 600)
+}
+
 pub fn contract_full(tool_actions: u32, caps: &[&str], deadline_seconds: u32) -> (Contract, Digest) {
+    contract_limits(1, tool_actions, caps, deadline_seconds)
+}
+
+fn contract_limits(model_requests: u32, tool_actions: u32, caps: &[&str], deadline_seconds: u32) -> (Contract, Digest) {
     let caps = serde_json::to_string(caps).unwrap();
     let json = format!(
         r#"{{
@@ -419,7 +431,7 @@ pub fn contract_full(tool_actions: u32, caps: &[&str], deadline_seconds: u32) ->
         "verification_profile": "parser-checks-v1",
         "capabilities": {caps},
         "limits": {{
-            "model_requests": 1,
+            "model_requests": {model_requests},
             "max_output_tokens_per_request": 1000,
             "tool_actions": {tool_actions},
             "deadline_seconds": {deadline_seconds},
@@ -452,8 +464,17 @@ impl Env {
         env
     }
 
+    /// An approved task whose contract grants `MODEL_CAPS` and `model_requests` model requests.
+    pub fn with_model(model_requests: u32, tool_actions: u32) -> Env {
+        Env::build(contract_model(model_requests, tool_actions), true)
+    }
+
     /// A task the owner has not approved yet: no handles, no deadline.
     pub fn unapproved(tool_actions: u32, caps: &[&str]) -> Env {
+        Env::build(contract_with(tool_actions, caps), false)
+    }
+
+    fn build((contract, digest): (Contract, Digest), approve: bool) -> Env {
         let dir = tempfile::tempdir().unwrap();
         copy_dir(&fixtures().join("parser-repo"), &dir.path().join("snapshot"));
         copy_dir(&fixtures().join("profiles/parser-checks-v1"), &dir.path().join("profile"));
@@ -464,8 +485,10 @@ impl Env {
             dir.path().join("profile"),
             dir.path().join("work"),
         );
-        let (contract, digest) = contract_with(tool_actions, caps);
         let task = db.create_task(&contract, &digest).unwrap();
+        if approve {
+            db.approve_task(&task).unwrap();
+        }
         Env { dir, db, blobs, exec, task, contract }
     }
 

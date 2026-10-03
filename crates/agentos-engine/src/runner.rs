@@ -125,6 +125,7 @@ async fn effect_turn<E: Executor>(cx: &Cx<'_, E>, rec: EffectRecord, payload: Ve
             Attempt::Published(ReceiptVerdict::Apply) => cx.db.effect(&rec.effect_id)?,
             Attempt::Published(verdict) => return Err(EngineError::ReceiptNotApplied { effect: rec.effect_id, verdict }),
             Attempt::Ended(state) => return Ok(Next::Stop(state)),
+            Attempt::Forfeited => cx.db.effect(&rec.effect_id)?,
         },
         EffectState::Completed | EffectState::Failed => rec,
         state => return Err(EngineError::UnexpectedEffectState { effect: rec.effect_id, state }),
@@ -156,6 +157,7 @@ async fn ensure_snapshot<E: Executor>(cx: &Cx<'_, E>) -> Result<std::result::Res
                 Attempt::Published(ReceiptVerdict::Apply) => (db.effect(&rec.effect_id)?, false),
                 Attempt::Published(verdict) => return Err(EngineError::ReceiptNotApplied { effect: rec.effect_id, verdict }),
                 Attempt::Ended(state) => return Ok(Err(state)),
+                Attempt::Forfeited => return Err(EngineError::Protocol("a snapshot read cannot be forfeited".into())),
             }
         }
     };
@@ -339,6 +341,10 @@ async fn act<E: Executor>(cx: &Cx<'_, E>, since: u64, base: Digest, action: Agen
         AgentAction::ApplyPatch(patch) => apply_patch(cx, since, base, patch).await,
         AgentAction::Verify => verify(cx, Some(since)).await,
         AgentAction::Finish => Ok(Next::Stop(finish(cx.db, &cx.task)?)),
+        // Until the model workflow is wired in.
+        AgentAction::CallModel { .. } | AgentAction::ListFiles | AgentAction::ReadFile(_) => {
+            Ok(Next::Stop(fail(cx.db, &cx.task, "model actions are not wired yet")?))
+        }
     }
 }
 
@@ -347,6 +353,9 @@ fn action_kind(action: &AgentAction) -> Option<&'static str> {
     match action {
         AgentAction::ApplyPatch(_) => Some("apply_patch"),
         AgentAction::Verify => Some("run_verification"),
+        AgentAction::CallModel { .. } => Some("model_call"),
+        AgentAction::ListFiles => Some("list_files"),
+        AgentAction::ReadFile(_) => Some("read_file"),
         AgentAction::Finish => None,
     }
 }
@@ -354,6 +363,7 @@ fn action_kind(action: &AgentAction) -> Option<&'static str> {
 fn describe(action: &AgentAction) -> String {
     match action {
         AgentAction::ApplyPatch(patch) => format!("ApplyPatch({})", Digest::of(patch.as_bytes())),
+        AgentAction::CallModel { request, .. } => format!("CallModel({request})"),
         other => format!("{other:?}"),
     }
 }

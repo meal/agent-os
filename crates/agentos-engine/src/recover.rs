@@ -72,6 +72,9 @@ pub enum Decision {
     /// No receipt and the executor cannot tell whether it took effect: left UNKNOWN and the
     /// task failed.
     Unreconcilable,
+    /// No receipt and the kind must never be re-sent under the same reservation: FAILED,
+    /// reservation `Uncertain`; the agent asks again.
+    Forfeit,
     /// Provably never took effect and the task can no longer dispatch it: abandoned.
     Abandon,
     /// A job of the effect was still alive past its lease bound and is fenced; journaled
@@ -230,7 +233,7 @@ fn expect_applied(rec: &EffectRecord, verdict: ReceiptVerdict) -> Result<()> {
 fn expect_attempt(rec: &EffectRecord, attempt: Attempt) -> Result<()> {
     match attempt {
         Attempt::Published(verdict) => expect_applied(rec, verdict),
-        Attempt::Ended(_) => Ok(()),
+        Attempt::Ended(_) | Attempt::Forfeited => Ok(()),
     }
 }
 
@@ -239,6 +242,7 @@ fn expect_attempt(rec: &EffectRecord, attempt: Attempt) -> Result<()> {
 fn payload<E>(cx: &Cx<'_, E>, rec: &EffectRecord) -> Result<Option<Vec<u8>>> {
     match rec.kind {
         EffectKind::ApplyPatch { .. } => Ok(recovered_patch(cx, rec)?.map(String::into_bytes)),
+        EffectKind::ModelCall { .. } => journal::model_request_body(cx.blobs, rec),
         _ => Ok(Some(Vec::new())),
     }
 }
@@ -345,10 +349,12 @@ async fn recover_effect<E: Executor>(cx: &Cx<'_, E>, rec: EffectRecord, report: 
         }
         RetryPolicy::ReconcileThenRetry => reconcile_effect(cx, rec, report, can_dispatch).await,
         RetryPolicy::NoRetry => unreconcilable(cx, report, &rec, "no receipt; retry policy NoRetry"),
-        // Temporary: the forfeit decision arrives with `Db::forfeit_effect` (Task 3).
-        RetryPolicy::ForfeitThenRetry => {
-            unreconcilable(cx, report, &rec, "no receipt; retry policy ForfeitThenRetry (forfeit is Task 3)")
-        }
+        RetryPolicy::ForfeitThenRetry => forfeit(
+            cx,
+            report,
+            &rec,
+            "no receipt; retry policy ForfeitThenRetry: the request may have been sent and billed, so it is forfeited and asked again under a new reservation",
+        ),
     }
 }
 
@@ -403,6 +409,17 @@ fn abandon<E>(cx: &Cx<'_, E>, report: &mut RecoveryReport, rec: &EffectRecord, r
     decide(cx, report, rec, Decision::Abandon, reason)?;
     cx.db.abandon_effect(&rec.effect_id, reason)?;
     report.abandoned.push(rec.effect_id.clone());
+    Ok(())
+}
+
+/// FAILED without a result, the reservation `Uncertain`; the task goes on and the agent asks
+/// again. A no-op once the effect is no longer DISPATCHED/UNKNOWN (decided before).
+fn forfeit<E>(cx: &Cx<'_, E>, report: &mut RecoveryReport, rec: &EffectRecord, reason: &str) -> Result<()> {
+    if !matches!(cx.db.effect(&rec.effect_id)?.state, EffectState::Dispatched | EffectState::Unknown) {
+        return Ok(());
+    }
+    decide(cx, report, rec, Decision::Forfeit, reason)?;
+    cx.db.forfeit_effect(&rec.effect_id, reason)?;
     Ok(())
 }
 

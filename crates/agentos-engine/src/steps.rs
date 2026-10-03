@@ -6,7 +6,7 @@
 use agentos_core::broker::Resource;
 use agentos_core::budget::{model_requests_for, Reservation};
 use agentos_core::contract::Contract;
-use agentos_core::effect::{AttemptId, EffectKind, EffectRecord, EffectState, Outcome, ReceiptVerdict};
+use agentos_core::effect::{AttemptId, EffectKind, EffectRecord, EffectState, Outcome, ReceiptVerdict, RetryPolicy};
 use agentos_core::ids::{Digest, TaskId};
 use agentos_core::state::{Task, TaskEvent, TaskState};
 use agentos_store::blob::BlobStore;
@@ -191,6 +191,9 @@ pub(crate) enum Attempt {
     /// took effect (the effect is UNKNOWN and the task failed), or the task's deadline had
     /// passed before dispatch (the task is failed). The task is in this state now.
     Ended(TaskState),
+    /// The attempt's outcome was lost and the effect is FAILED with an uncertain
+    /// reservation; the task goes on.
+    Forfeited,
 }
 
 /// Steps 2-6 for an effect that is INTENDED, or DISPATCHED/UNKNOWN without a usable
@@ -225,10 +228,27 @@ pub(crate) async fn run_attempt<E: Executor>(cx: &Cx<'_, E>, rec: &EffectRecord,
     }
     if out.unresolved {
         tracing::warn!(task_id = %rec.task_id, effect_id = %rec.effect_id, "the executor cannot tell whether the effect took effect");
-        return Ok(Attempt::Ended(mark_unreconcilable(cx.db, &cx.db.effect(&rec.effect_id)?)?));
+        let now = cx.db.effect(&rec.effect_id)?;
+        if rec.kind.retry_policy() == RetryPolicy::ForfeitThenRetry {
+            // The store checks neither task state nor lease: only this attempt's own
+            // DISPATCHED effect is forfeited (anything else was decided elsewhere).
+            if now.state == EffectState::Dispatched && now.lease_generation == ctx.lease_generation {
+                cx.db.forfeit_effect(&rec.effect_id, &reason_of(&out))?;
+            }
+            return Ok(Attempt::Forfeited);
+        }
+        return Ok(Attempt::Ended(mark_unreconcilable(cx.db, &now)?));
     }
     cx.crash(CrashPoint::AfterExecuteBeforePublish, kind)?;
     Ok(Attempt::Published(finish_attempt(cx, rec, &out)?))
+}
+
+/// The failure text of an outcome (what the executor said went wrong).
+fn reason_of(out: &ExecOutcome) -> String {
+    match &out.receipt.outcome {
+        Outcome::Failure(reason) => reason.clone(),
+        Outcome::Success => "the attempt's outcome is unknown".to_string(),
+    }
 }
 
 /// The end of an effect nobody can decide: a DISPATCHED one becomes UNKNOWN (its reservation
