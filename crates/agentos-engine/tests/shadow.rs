@@ -5,7 +5,6 @@ mod common;
 
 use std::fs;
 use std::os::unix::fs::symlink;
-use std::path::Path;
 
 use agentos_core::broker::Resource;
 use agentos_core::budget::Reservation;
@@ -238,6 +237,13 @@ fn check_path_table() {
     assert!(check_path("a\0b").unwrap_err().starts_with("file not in the workspace: "));
     assert_eq!(check_path(".git/config"), Err("path excluded from the workspace digest: .git/config".into()));
     assert_eq!(check_path("x/m.pyc"), Err("path excluded from the workspace digest: x/m.pyc".into()));
+    for p in ["./x", "a//b", "a/./b", "a/", "."] {
+        assert_eq!(check_path(p), Err(format!("file not in the workspace: {p}")), "{p:?}");
+    }
+    let hostile = format!("./\nINJECTED\u{1b}[2J{}", "é".repeat(5000));
+    let e = check_path(&hostile).unwrap_err();
+    assert!(e.starts_with("file not in the workspace: ./\\nINJECTED"), "{e}");
+    assert!(e.len() < 1000 && !e.chars().any(|c| c.is_control()), "bounded and escaped");
     let long = format!("a\n{}", "é".repeat(5000));
     let e = check_path(&format!("../{long}")).unwrap_err();
     assert!(!e.contains('\n') && e.len() < 1000, "model text is escaped and bounded");
@@ -262,5 +268,14 @@ async fn another_kind_is_not_a_read_effect() {
     started(&env);
     let out = reader(&env).run(&req_of(&env.task, EffectKind::RunVerification, &env.contract), &ctx()).await;
     assert_eq!(reason(&out), "not a read effect");
-    let _ = Path::new("");
+}
+
+#[test]
+fn read_from_never_leaks_raw_errors_for_dotted_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    for p in ["./x", "./\nINJECTED", "a//b", "src/"] {
+        let e = read_from(dir.path(), p).unwrap_err();
+        assert!(e.starts_with("file not in the workspace: "), "{e}");
+        assert!(!e.chars().any(|c| c.is_control()) && e.len() < 1000, "{e}");
+    }
 }

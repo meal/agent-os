@@ -11,7 +11,7 @@ use super::provider::{ModelProvider, ProviderResult};
 use crate::crash::{CrashHook, CrashPoint};
 use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor};
 use crate::guestlink::guest_text;
-use crate::job::atomic_write;
+use crate::job::{atomic_write, check_plain_name, sync_dir};
 use crate::supervised::ExecCounts;
 
 /// How much of an unusable response body an error quotes (it is bounded again by
@@ -41,12 +41,28 @@ impl ModelExecutor {
     }
 
     fn retain(&self, req: &EffectRequest, ctx: &AttemptCtx, out: &ExecOutcome) {
-        let dir = self.retention_dir(&req.effect_id, &ctx.attempt_id);
-        let result = std::fs::create_dir_all(&dir)
-            .and_then(|()| atomic_write(&dir.join("response.json"), &serde_json::to_vec(out).expect("an outcome serializes")));
-        if let Err(e) = result {
+        if let Err(e) = self.try_retain(req, ctx, out) {
             tracing::warn!(effect = %req.effect_id, error = %e, "cannot retain the model response");
         }
+    }
+
+    /// Writes the answer durably: the file and its directory are synced by `atomic_write`;
+    /// the directory's entry in `root` (and `root`'s own entry, when this created it) are
+    /// synced here, so a power loss cannot leave a synced file under a vanished directory.
+    fn try_retain(&self, req: &EffectRequest, ctx: &AttemptCtx, out: &ExecOutcome) -> std::io::Result<()> {
+        check_plain_name("effect id", req.effect_id.as_str())?;
+        let attempt = ctx.attempt_id.to_string();
+        check_plain_name("attempt id", &attempt)?;
+        let created_root = !self.root.exists();
+        std::fs::create_dir_all(&self.root)?;
+        let dir = self.retention_dir(&req.effect_id, &ctx.attempt_id);
+        std::fs::create_dir_all(&dir)?;
+        atomic_write(&dir.join("response.json"), &serde_json::to_vec(out).expect("an outcome serializes"))?;
+        sync_dir(&self.root)?;
+        if created_root && let Some(parent) = self.root.parent() {
+            sync_dir(parent)?;
+        }
+        Ok(())
     }
 }
 

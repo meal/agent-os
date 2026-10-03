@@ -160,7 +160,7 @@ fn invalid(msg: String) -> io::Error {
 }
 
 /// Same rule as the contract's plain names: one path component, nothing that escapes.
-fn check_plain_name(field: &str, v: &str) -> io::Result<()> {
+pub(crate) fn check_plain_name(field: &str, v: &str) -> io::Result<()> {
     let plain = !v.is_empty()
         && v != "."
         && v != ".."

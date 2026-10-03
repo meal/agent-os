@@ -33,7 +33,7 @@ pub struct ShadowReader {
 
 /// Why `rel` (chosen by the model) can never name a file of the workspace.
 pub fn check_path(rel: &str) -> Result<(), String> {
-    if rel.is_empty() || rel.starts_with('/') || rel.contains('\0') || rel.split('/').any(|c| c == "..") {
+    if rel.is_empty() || rel.starts_with('/') || rel.contains('\0') || rel.split('/').any(|c| c.is_empty() || c == "." || c == "..") {
         return Err(format!("file not in the workspace: {}", guest_text(rel)));
     }
     if has_excluded_component(rel) {
@@ -46,7 +46,7 @@ pub fn check_path(rel: &str) -> Result<(), String> {
 /// `(content, truncated)`. Refuses a bad path and any symlink on it before touching it.
 pub fn read_from(shadow: &Path, rel: &str) -> Result<(String, bool), String> {
     check_path(rel)?;
-    let crosses = symlink_on_path(shadow, rel).map_err(|e| format!("cannot read {}: {e}", guest_text(rel)))?;
+    let crosses = symlink_on_path(shadow, rel).map_err(|e| format!("cannot read {}: {}", guest_text(rel), guest_text(&e.to_string())))?;
     if let Some(link) = crosses {
         return Err(format!("path {} crosses symlink {}", guest_text(rel), guest_text(&link)));
     }

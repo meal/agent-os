@@ -254,3 +254,28 @@ async fn routing_dispatches_by_kind_and_merges_retained_outcomes() {
     assert_eq!(v["files"], serde_json::json!(want));
     assert_eq!(out.new_workspace, None);
 }
+
+#[tokio::test]
+async fn a_malformed_id_is_never_joined_into_a_retention_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("model");
+    let (ex, _) = exec(&root, vec![ProviderResult::Response(GOOD.to_vec(), Usage::default())], &ExecCounts::default());
+    let mut r = req(model_kind());
+    r.effect_id = serde_json::from_str("\"../../escape\"").unwrap();
+
+    let out = ex.run(&r, &ctx()).await;
+
+    assert_eq!(out.receipt.outcome, Outcome::Success, "the outcome is still returned");
+    assert!(!dir.path().join("escape").exists() && !root.exists(), "nothing written for a bad id");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn retention_creates_a_missing_root_and_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("a").join("model");
+    let (ex, _) = exec(&root, vec![ProviderResult::Response(GOOD.to_vec(), Usage::default())], &ExecCounts::default());
+    let r = req(model_kind());
+    let out = ex.run(&r, &ctx()).await;
+    assert_eq!(ex.retained_outcome(&r.effect_id), Some(out));
+}
