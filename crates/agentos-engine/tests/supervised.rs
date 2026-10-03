@@ -803,3 +803,59 @@ async fn a_missing_jobs_root_holds_no_job() {
     assert!(exec.fence_job(&req.effect_id).await);
     assert_eq!(exec.retained_outcome(&req.effect_id), None);
 }
+
+/// What the scripted worker dumps: its own environment, its parent's (the worker process)
+/// and its grandparent's (the supervisor), each preceded by the process's command line.
+const ENVIRON_DUMP: &str = r#"
+dump() { tr '\0' ' ' < /proc/$1/cmdline; echo; tr '\0' '\n' < /proc/$1/environ; echo ---; }
+P=$PPID
+G=$(sed 's/.*) //' /proc/$P/stat | cut -d' ' -f2)
+dump self; dump $P; dump $G
+"#;
+
+const ORACLE_INNER: &str = "AGENTOS_TEST_ENV_ORACLE_INNER";
+const CANARY: &str = "AGENTOS_CANARY_SECRET";
+
+/// The controller's secrets never reach a child: the controller here is a re-run of this
+/// very test with a canary exported into its environment (`Command::env`, never `set_var`),
+/// so the check does not depend on what the harness happens to export.
+#[tokio::test]
+async fn supervisor_environment_holds_only_path_and_the_explicit_extras() {
+    if std::env::var_os(ORACLE_INNER).is_none() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "supervisor_environment_holds_only_path_and_the_explicit_extras", "--nocapture", "--test-threads=1"])
+            .env(ORACLE_INNER, "1")
+            .env(CANARY, "sk-ant-canary-0123456789")
+            .output()
+            .unwrap();
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "inner run failed:\n{stdout}\n{stderr}");
+        assert!(stdout.contains("1 passed"), "the inner test did not run:\n{stdout}");
+        return;
+    }
+    // Controls: the controller really holds the secret and the harness variables.
+    assert_eq!(std::env::var(CANARY).as_deref(), Ok("sk-ant-canary-0123456789"));
+    assert!(std::env::var("CARGO_MANIFEST_DIR").is_ok());
+    assert!(std::env::var("HOME").is_ok() || std::env::var("PATH").is_ok());
+
+    let fx = Fx::new();
+    let out = fx
+        .scripted(ENVIRON_DUMP)
+        .with_env("AGENTOS_TEST_MARKER", "present")
+        .run(&fx.request(EffectKind::RunVerification, b""), &ctx(1))
+        .await;
+    assert_eq!(out.receipt.outcome, Outcome::Success, "{}", String::from_utf8_lossy(&out.output));
+    let dump = String::from_utf8_lossy(&out.output).into_owned();
+    let sections: Vec<&str> = dump.split("---\n").filter(|s| !s.trim().is_empty()).collect();
+    assert_eq!(sections.len(), 3, "{dump}");
+    // The grandparent is the supervisor itself, not something else.
+    assert!(sections[2].lines().next().unwrap().contains("agentos-supervisor"), "{dump}");
+    for (name, section) in ["worker script", "worker", "supervisor"].iter().zip(&sections) {
+        for want in ["AGENTOS_TEST_WORKERS=1", "AGENTOS_TEST_MARKER=present", "PATH="] {
+            assert!(section.lines().any(|l| l.starts_with(want)), "{name} lacks {want}:\n{dump}");
+        }
+        for banned in [CANARY, "CARGO_MANIFEST_DIR=", "HOME=", "RUST_BACKTRACE=", "sk-ant-canary", ORACLE_INNER] {
+            assert!(!section.contains(banned), "{name} inherited {banned}:\n{dump}");
+        }
+    }
+}

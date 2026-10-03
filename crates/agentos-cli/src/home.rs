@@ -467,7 +467,15 @@ impl Home {
                 profile_digest,
             }),
         };
-        Ok(SupervisedExecutor::new(root.join("jobs"), supervisor_cmd()?, worker, ExecCounts::default())?)
+        let mut exec = SupervisedExecutor::new(root.join("jobs"), supervisor_cmd()?, worker, ExecCounts::default())?;
+        // The supervisor's environment is cleared: the test switches (and only they, and
+        // only in the test tier) travel explicitly.
+        if env_on(TEST_WORKERS_ENV) {
+            for (k, v) in std::env::vars().filter(|(k, _)| k.starts_with("AGENTOS_TEST_")) {
+                exec = exec.with_env(k, v);
+            }
+        }
+        Ok(exec)
     }
 }
 

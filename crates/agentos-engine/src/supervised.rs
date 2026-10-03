@@ -514,6 +514,12 @@ impl SupervisedExecutor {
                 .stdin(Stdio::from(lock))
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
+            // The controller holds secrets (the model API key): the supervisor, and the
+            // worker that inherits from it, get exactly `PATH` plus the explicit extras.
+            cmd.env_clear();
+            if let Some(path) = std::env::var_os("PATH") {
+                cmd.env("PATH", path);
+            }
             for (k, v) in &self.extra_env {
                 cmd.env(k, v);
             }

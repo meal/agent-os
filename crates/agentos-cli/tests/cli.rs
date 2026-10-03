@@ -2250,3 +2250,57 @@ fn cli_jailed_submit_status_export_then_kill_and_resume_on_the_real_worker() {
     assert_one_job_per_effect(&cli, "after the controller's kill");
     assert_no_job_processes(&cli);
 }
+
+/// A verification profile (a copy of `parser-checks-v1`) whose command first writes every
+/// ancestor's environment, up to and including the first one holding `CARGO_CANARY`, to
+/// `dump`, then runs the real check.
+fn env_dump_profiles(cli: &Cli, dump: &Path) -> PathBuf {
+    let profiles = cli.path("env-dump-profiles");
+    copy_tree(&fixtures().join("profiles/parser-checks-v1"), &profiles.join("parser-checks-v1")).unwrap();
+    let script = format!(
+        r#"p=$PPID; : > {d}
+while [ "$p" -gt 1 ]; do
+  {{ echo "@@@ $(tr '\0' ' ' < /proc/$p/cmdline)"; tr '\0' '\n' < /proc/$p/environ; }} >> {d}
+  if grep -qz '^CARGO_CANARY=' /proc/$p/environ; then break; fi
+  p=$(sed 's/.*) //' /proc/$p/stat | cut -d' ' -f2)
+done
+exec python3 check_parser.py "$1""#,
+        d = dump.display()
+    );
+    let profile = json!({ "id": "parser-checks-v1", "command": ["sh", "-c", script, "sh"], "protected": true });
+    fs::write(profiles.join("parser-checks-v1/profile.json"), profile.to_string()).unwrap();
+    profiles
+}
+
+/// The controller's own environment reaches neither the supervisor nor the worker: only the
+/// `AGENTOS_TEST_*` switches travel, and only because `AGENTOS_TEST_WORKERS=1`.
+#[test]
+fn test_switches_reach_the_supervisor_only_through_the_forwarding() {
+    let cli = Cli::bare();
+    let dump = cli.path("environ-dump.txt");
+    let profiles = env_dump_profiles(&cli, &dump);
+    let contract = cli.contract(&cli.repo_copy());
+    let mut cmd = Command::from_std(cli.std_cmd(
+        Mode::PlainFake,
+        false,
+        &profiles,
+        &["submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()],
+    ));
+    // The secret reaches the controller (a `Command::env`, never `set_var`).
+    cmd.env("CARGO_CANARY", "sk-ant-canary-0123456789");
+    cmd.assert().success();
+    let text = fs::read_to_string(&dump).expect("the verification wrote its environment dump");
+    let sections: Vec<&str> = text.split("@@@ ").filter(|s| !s.is_empty()).collect();
+    assert!(sections.len() >= 3, "worker, supervisor and controller expected:\n{text}");
+    let (controller, children) = sections.split_last().unwrap();
+    assert!(controller.contains("CARGO_CANARY=sk-ant-canary-0123456789"), "control: the controller holds the canary:\n{text}");
+    for child in children {
+        assert!(!child.contains("CARGO_CANARY") && !child.contains("sk-ant-canary"), "a child inherited the controller's environment:\n{child}");
+        assert!(!child.contains("HOME=") && !child.contains("CARGO_MANIFEST_DIR="), "a child inherited the controller's environment:\n{child}");
+        assert!(child.lines().any(|l| l.starts_with("PATH=")), "{child}");
+    }
+    let supervisor = children.iter().find(|c| c.contains("supervise")).expect("a supervisor among the ancestors");
+    for want in ["AGENTOS_TEST_WORKERS=1", "AGENTOS_TEST_FAKE_GUEST=1"] {
+        assert!(supervisor.lines().any(|l| l == want), "the supervisor lacks {want}:\n{supervisor}");
+    }
+}
