@@ -117,9 +117,31 @@ pub fn cgroup_values(vcpus: u32, memory_mib: u32) -> [(&'static str, String); 4]
     ]
 }
 
+/// Test-only replacements for two of `cgroup_values` (the KVM tier's cgroup tests lower the
+/// bounds to watch the cgroup enforce them). `None` keeps the contract's value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CgroupOverrides {
+    /// `memory.max` in MiB (replaces `memory_mib + JAIL_MEMORY_OVERHEAD_MIB`).
+    pub memory_max_mib: Option<u32>,
+    /// `cpu.max`'s quota in µs (replaces `vcpus × CPU_PERIOD_US`; the period stays).
+    pub cpu_quota_us: Option<u64>,
+}
+
 /// The jailer's argv, exactly: never `--new-pid-ns` (the jailer would fork and its parent
 /// exit), `--daemonize` or `--netns`; the jailer passes `--id` to Firecracker itself.
 pub fn jailer_args(cfg: &JailConfig, plan: &JailPlan, firecracker_bin: &Path, vcpus: u32, memory_mib: u32) -> Vec<OsString> {
+    jailer_args_with(cfg, plan, firecracker_bin, vcpus, memory_mib, CgroupOverrides::default())
+}
+
+/// `jailer_args` with `overrides` applied to the cgroup values (identical without any).
+pub fn jailer_args_with(
+    cfg: &JailConfig,
+    plan: &JailPlan,
+    firecracker_bin: &Path,
+    vcpus: u32,
+    memory_mib: u32,
+    overrides: CgroupOverrides,
+) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec![
         "--id".into(),
         plan.id.clone().into(),
@@ -136,7 +158,12 @@ pub fn jailer_args(cfg: &JailConfig, plan: &JailPlan, firecracker_bin: &Path, vc
         "--parent-cgroup".into(),
         JAIL_PARENT_CGROUP.into(),
     ];
-    for (file, value) in cgroup_values(vcpus, memory_mib) {
+    for (file, mut value) in cgroup_values(vcpus, memory_mib) {
+        match (file, overrides) {
+            ("memory.max", CgroupOverrides { memory_max_mib: Some(mib), .. }) => value = (u64::from(mib) * 1024 * 1024).to_string(),
+            ("cpu.max", CgroupOverrides { cpu_quota_us: Some(quota), .. }) => value = format!("{quota} {CPU_PERIOD_US}"),
+            _ => {}
+        }
         args.push("--cgroup".into());
         args.push(format!("{file}={value}").into());
     }
@@ -662,6 +689,11 @@ mod tests {
             assert!(!args.iter().any(|a| a == banned), "{banned}");
         }
         assert_eq!(args.iter().filter(|a| *a == "--id").count(), 1);
+        // No override: byte-identical; each override replaces exactly its value.
+        assert_eq!(jailer_args_with(&cfg, &p, fc, 2, 512, CgroupOverrides::default()), expected);
+        let lowered = jailer_args_with(&cfg, &p, fc, 2, 512, CgroupOverrides { memory_max_mib: Some(96), cpu_quota_us: Some(50_000) });
+        let changed: Vec<(usize, &OsString)> = lowered.iter().enumerate().filter(|(i, a)| **a != expected[*i]).collect();
+        assert_eq!(changed, [(15, &OsString::from("cpu.max=50000 100000")), (17, &OsString::from("memory.max=100663296"))]);
     }
 
     #[test]

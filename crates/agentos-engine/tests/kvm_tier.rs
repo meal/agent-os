@@ -1,11 +1,18 @@
-//! The KVM tier. Every test here begins with `let Some(kvm) = kvm::require() else { return };`
-//! (Task 13 fills it); this file starts with the gate's own tests, which run in every tier.
+//! The KVM tier: the real guest image booted by the real Firecracker under the real jailer.
+//! Every test of the tier begins with `let Some(kvm) = kvm::require() else { return };`
+//! (`docker compose run --rm test-kvm …`; without `AGENTOS_KVM_TESTS` each prints SKIPPED).
+//! The file starts with the gate's own tests, which run in every tier: the gate is exercised
+//! in child processes of this very test binary (`--exact` on the entry below), so each child
+//! gets exactly the environment the test gives it.
 //!
-//! The gate is exercised in child processes of this very test binary (`--exact` on the
-//! entry below), so each child gets exactly the environment the test gives it.
+//! What the fakes cannot show is proven here: the guest's boot path (mounts, mkfs, vsock,
+//! uid drop, read-only root), the threat model's hostile profiles (network, secrets, CPU,
+//! memory, processes, disk), the jail (uid, chroot, cgroup limits enforced), and the crash
+//! and kill paths with a real VM.
 
-#[path = "common/kvm.rs"]
-mod kvm;
+mod common;
+
+use common::kvm;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -136,3 +143,1315 @@ fn kvm_gate_panics_when_requested_but_unavailable() {
     assert!(stderr.contains(expected), "{stderr}");
     assert!(stderr.contains("jail probe"), "{stderr}");
 }
+
+
+// ---------------------------------------------------------------------------------------
+// The tier's fixture and probes.
+
+use std::collections::BTreeMap;
+use std::os::unix::fs::MetadataExt;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use agentos_core::contract::Contract;
+use agentos_core::effect::{AttemptId, EffectId, EffectKind, Outcome};
+use agentos_core::guest::{mint_attempt_token, Message, Mode, SCRATCH_IMAGE_BYTES, WS_IMAGE_BYTES};
+use agentos_core::ids::{Digest, TaskId};
+use agentos_core::state::TaskState;
+use agentos_engine::agent::FakeAgent;
+use agentos_engine::crash::{CrashHook, CrashPoint, RunOptions};
+use agentos_engine::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor};
+use agentos_engine::firecracker::{render_vm_json, Answer, FirecrackerConfig, FirecrackerWorker, Inspector, Query};
+use agentos_engine::guestlink::GuestLink;
+use agentos_engine::jail::{self, JailMode, StageSources, JAIL_UID};
+use agentos_engine::job::{JobDir, JobRequest, JobState, KillReason, WorkerConfig};
+use agentos_engine::recover::{recover, Decision};
+use agentos_engine::runner::{run_task, run_task_with, EngineError};
+use agentos_engine::supervised::{ExecCounts, SupervisedExecutor};
+use agentos_engine::worker::Worker;
+use agentos_engine::workspace::workspace_digest;
+use common::{
+    contract, copy_dir, firecracker_processes, fix_patch, fixtures, home_firecrackers, processes_naming, supervised, Env, FcProc,
+    SUPERVISOR_BIN, TEST_WORKERS_ENV,
+};
+use rustix::process::{kill_process, kill_process_group, Pid, Signal};
+use tempfile::TempDir;
+use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+/// Upper bound for anything a test waits on outside the engine.
+const PATIENCE: Duration = Duration::from_secs(60);
+/// Linux's `USER_HZ`: the unit of `utime`/`stime` in `/proc/<pid>/stat` (100 on x86-64).
+const CLOCK_TICKS: u64 = 100;
+/// The jail's `pids.max` and the bound `fork_bomb_never_adds_a_host_process` holds Firecracker
+/// to: its main thread, one per vCPU, and a few of its own.
+const MAX_FIRECRACKER_TASKS: u64 = 1 + 1 + 4;
+
+/// Tests that measure host-wide state (the listening sockets of the network namespace) or
+/// must not compete for the host's I/O take this exclusively; every other VM test shares
+/// it, so none of them runs meanwhile. (Each test has its own runtime: tokio's lock works
+/// across them and may be held across `.await`.)
+static HOST_WIDE: RwLock<()> = RwLock::const_new(());
+
+async fn shared() -> RwLockReadGuard<'static, ()> {
+    HOST_WIDE.read().await
+}
+
+async fn exclusive() -> RwLockWriteGuard<'static, ()> {
+    HOST_WIDE.write().await
+}
+
+fn test_env() -> Vec<(String, String)> {
+    vec![(TEST_WORKERS_ENV.into(), "1".into())]
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64
+}
+
+fn out_text(out: &ExecOutcome) -> String {
+    String::from_utf8_lossy(&out.output).into_owned()
+}
+
+fn failure(out: &ExecOutcome) -> String {
+    match &out.receipt.outcome {
+        Outcome::Failure(r) => r.clone(),
+        Outcome::Success => panic!("expected a failure, got success: {}", out_text(out)),
+    }
+}
+
+fn evidence(out: &ExecOutcome) -> serde_json::Value {
+    assert_eq!(out.receipt.outcome, Outcome::Success, "{}", out_text(out));
+    serde_json::from_slice(&out.output).unwrap()
+}
+
+/// The check's one JSON line of findings, from the evidence's `stdout`.
+fn findings(evidence: &serde_json::Value) -> serde_json::Value {
+    let stdout = evidence["stdout"].as_str().unwrap();
+    let line = stdout.lines().find(|l| l.starts_with('{')).unwrap_or_else(|| panic!("no findings line in {stdout:?}"));
+    serde_json::from_str(line).unwrap()
+}
+
+fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+    let started = Instant::now();
+    while !done() {
+        assert!(started.elapsed() < PATIENCE, "timed out waiting for {what}");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+async fn wait_for_async(what: &str, mut done: impl FnMut() -> bool) {
+    let started = Instant::now();
+    while !done() {
+        assert!(started.elapsed() < PATIENCE, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn alive(pid: i32) -> bool {
+    common::proc_state(pid).is_some_and(|(s, ..)| s != "Z")
+}
+
+/// `VmRSS` of `pid` in KiB.
+fn rss_kib(pid: i32) -> Option<u64> {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status.lines().find(|l| l.starts_with("VmRSS:"))?.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// `utime + stime` of `pid` (every thread), in clock ticks.
+fn cpu_ticks(pid: i32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let mut fields = stat[stat.rfind(')')? + 2..].split_whitespace();
+    let utime: u64 = fields.nth(11)?.parse().ok()?;
+    let stime: u64 = fields.next()?.parse().ok()?;
+    Some(utime + stime)
+}
+
+/// `key value` lines of a cgroup file (`memory.events`, `cpu.stat`).
+fn keyed(text: &str) -> BTreeMap<String, u64> {
+    text.lines().filter_map(|l| l.split_once(' ').and_then(|(k, v)| Some((k.to_string(), v.trim().parse().ok()?)))).collect()
+}
+
+/// Runs `probe` every `every` on a thread until `stop`, keeping what it returns.
+struct Sampler<T> {
+    stop: Arc<AtomicBool>,
+    handle: thread::JoinHandle<Vec<T>>,
+}
+
+fn sample<T: Send + 'static>(every: Duration, mut probe: impl FnMut(Duration) -> Option<T> + Send + 'static) -> Sampler<T> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    let handle = thread::spawn(move || {
+        let started = Instant::now();
+        let mut kept = Vec::new();
+        while !flag.load(Ordering::Relaxed) {
+            if let Some(v) = probe(started.elapsed()) {
+                kept.push(v);
+            }
+            thread::sleep(every);
+        }
+        kept
+    });
+    Sampler { stop, handle }
+}
+
+impl<T> Sampler<T> {
+    fn stop(self) -> Vec<T> {
+        self.stop.store(true, Ordering::Relaxed);
+        self.handle.join().unwrap()
+    }
+}
+
+/// What one sample saw of a VM: its process and its cgroup's files.
+#[derive(Debug, Clone)]
+struct VmSample {
+    at: Duration,
+    procs: Vec<FcProc>,
+    rss_kib: Option<u64>,
+    cpu_ticks: Option<u64>,
+    cgroup: BTreeMap<&'static str, String>,
+}
+
+const CGROUP_FILES: [&str; 10] = [
+    "cpu.max",
+    "memory.max",
+    "memory.swap.max",
+    "pids.max",
+    "pids.current",
+    "memory.events",
+    "memory.stat",
+    "memory.current",
+    "cpu.stat",
+    "cgroup.procs",
+];
+
+/// Samples the Firecracker of VM `id` (and its cgroup under `cgroup_root`) every `every`.
+fn watch_vm(id: String, cgroup_root: PathBuf, every: Duration) -> Sampler<VmSample> {
+    let cgroup = cgroup_root.join("agentos").join(&id);
+    sample(every, move |at| {
+        let procs: Vec<FcProc> = firecracker_processes().into_iter().filter(|p| p.id() == Some(id.as_str())).collect();
+        let files: BTreeMap<&'static str, String> =
+            CGROUP_FILES.iter().filter_map(|f| Some((*f, fs::read_to_string(cgroup.join(f)).ok()?))).collect();
+        if procs.is_empty() && files.is_empty() {
+            return None;
+        }
+        let pid = procs.first().map(|p| p.pid);
+        Some(VmSample { at, rss_kib: pid.and_then(rss_kib), cpu_ticks: pid.and_then(cpu_ticks), procs, cgroup: files })
+    })
+}
+
+/// A task of the real, jailed worker whose files live in a scratch root on the guest image's
+/// filesystem (the jail hard-links the image).
+struct Fx {
+    kvm: kvm::Kvm,
+    dir: TempDir,
+    task: TaskId,
+    contract: Contract,
+    cfg: FirecrackerConfig,
+    counts: ExecCounts,
+    step: AtomicU32,
+}
+
+impl Fx {
+    fn new(kvm: &kvm::Kvm) -> Fx {
+        let dir = kvm.root();
+        copy_dir(&fixtures().join("parser-repo"), &dir.path().join("snapshot"));
+        copy_dir(&fixtures().join("profiles/parser-checks-v1"), &dir.path().join("profile"));
+        let cfg = kvm.jailed_config(dir.path());
+        Fx { kvm: kvm.clone(), dir, task: TaskId::new(), contract: contract(10).0, cfg, counts: ExecCounts::default(), step: AtomicU32::new(0) }
+    }
+
+    fn root(&self) -> &Path {
+        self.dir.path()
+    }
+
+    fn path(&self, rel: &str) -> PathBuf {
+        self.root().join(rel)
+    }
+
+    fn task_dir(&self) -> PathBuf {
+        self.path("work").join(self.task.as_str())
+    }
+
+    fn ws_img(&self) -> PathBuf {
+        self.task_dir().join("ws.img")
+    }
+
+    /// Replaces the task's verification profile with `fixtures/profiles/<name>`.
+    fn use_profile(&self, name: &str) {
+        let profile = self.path("profile");
+        fs::remove_dir_all(&profile).unwrap();
+        copy_dir(&fixtures().join("profiles").join(name), &profile);
+    }
+
+    /// A one-line check (`python3 -c script`) as the task's profile.
+    fn use_script(&self, script: &str) {
+        let profile = serde_json::json!({ "id": "kvm", "command": ["python3", "-c", script], "protected": true });
+        fs::write(self.path("profile/profile.json"), profile.to_string()).unwrap();
+    }
+
+    /// A request with an effect id of its own (each call is a new step).
+    fn request(&self, kind: EffectKind, payload: &[u8]) -> EffectRequest {
+        let step = self.step.fetch_add(1, Ordering::Relaxed);
+        EffectRequest {
+            effect_id: EffectId::derive(&self.task, step, &kind, &Digest::of(payload)),
+            task_id: self.task.clone(),
+            kind,
+            payload: payload.to_vec(),
+            contract: self.contract.clone(),
+            deadline_ts: 0,
+        }
+    }
+
+    fn job_request(&self, req: &EffectRequest, ctx: &AttemptCtx, cfg: &FirecrackerConfig, lease_in_ms: Option<i64>) -> JobRequest {
+        JobRequest {
+            effect_id: req.effect_id.clone(),
+            task_id: req.task_id.clone(),
+            kind: req.kind.clone(),
+            payload: req.payload.clone(),
+            contract: req.contract.clone(),
+            attempt_id: ctx.attempt_id.clone(),
+            lease_generation: ctx.lease_generation,
+            lease_expiry_ms: lease_in_ms.map_or(i64::MAX, |l| now_ms() + l),
+            task_deadline_ms: 0,
+            worker: WorkerConfig::Firecracker(cfg.clone()),
+        }
+    }
+
+    /// Runs `req` with the worker in this process (no supervisor), configured by `tune`.
+    async fn run_with(
+        &self,
+        req: &EffectRequest,
+        cfg: &FirecrackerConfig,
+        tune: impl FnOnce(FirecrackerWorker) -> FirecrackerWorker,
+    ) -> Ran {
+        let ctx = ctx(self.step.load(Ordering::Relaxed) as u64 + 1);
+        let job = JobDir::create(&self.path("jobs"), &self.job_request(req, &ctx, cfg, None)).unwrap().0;
+        let worker = tune(FirecrackerWorker::new(cfg, &job).with_env(test_env()));
+        let started = Instant::now();
+        let out = worker.run(req, &ctx).await;
+        Ran { out, job, ctx, took: started.elapsed() }
+    }
+
+    async fn run(&self, kind: EffectKind) -> Ran {
+        let req = self.request(kind, b"");
+        self.run_with(&req, &self.cfg.clone(), |w| w).await
+    }
+
+    /// `ReadSnapshot`, which must succeed.
+    async fn snapshot(&self) -> Ran {
+        let ran = self.run(EffectKind::ReadSnapshot).await;
+        assert_eq!(ran.out.receipt.outcome, Outcome::Success, "{}", out_text(&ran.out));
+        ran
+    }
+
+    /// `RunVerification` with the worker tuned by `tune`, sampling its VM every `every`.
+    async fn verify_watched(&self, every: Duration, tune: impl FnOnce(FirecrackerWorker) -> FirecrackerWorker) -> (Ran, Vec<VmSample>) {
+        let req = self.request(EffectKind::RunVerification, b"");
+        let ctx = ctx(self.step.load(Ordering::Relaxed) as u64 + 1);
+        let job = JobDir::create(&self.path("jobs"), &self.job_request(&req, &ctx, &self.cfg, None)).unwrap().0;
+        let worker = tune(FirecrackerWorker::new(&self.cfg, &job).with_env(test_env()));
+        let watch = watch_vm(ctx.attempt_id.to_string(), self.kvm.cgroup_root.clone(), every);
+        let started = Instant::now();
+        let out = worker.run(&req, &ctx).await;
+        let took = started.elapsed();
+        (Ran { out, job, ctx, took }, watch.stop())
+    }
+
+    fn inspector(&self) -> Inspector {
+        Inspector::new(self.cfg.clone(), self.path("inspect")).with_env(test_env())
+    }
+
+    fn digest(&self) -> Digest {
+        match self.inspector().query(&self.task, Query::Digest).unwrap() {
+            Answer::Digest(d) => d,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A supervised executor (the real `agentos-supervisor`) over this task.
+    fn executor(&self, crash: Option<CrashHook>, env: &[(&str, &str)]) -> SupervisedExecutor {
+        supervised(&self.path("jobs"), WorkerConfig::Firecracker(self.cfg.clone()), &self.counts, crash, env)
+    }
+
+    /// No Firecracker of this home is alive within `within`.
+    fn assert_no_vm_within(&self, within: Duration) {
+        let started = Instant::now();
+        loop {
+            let live = home_firecrackers(self.root());
+            if live.is_empty() {
+                return;
+            }
+            assert!(started.elapsed() < within, "Firecracker processes outlived the job: {live:?}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// No process of this home (supervisors, workers, VMs) is alive within `within`.
+    fn assert_nothing_left_within(&self, within: Duration) {
+        let started = Instant::now();
+        loop {
+            let live = processes_naming(self.root());
+            let vms = home_firecrackers(self.root());
+            if live.is_empty() && vms.is_empty() {
+                return;
+            }
+            assert!(started.elapsed() < within, "processes outlived the job: {live:?} {vms:?}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn cgroup_of(&self, ctx: &AttemptCtx) -> PathBuf {
+        self.kvm.cgroup_root.join("agentos").join(ctx.attempt_id.to_string())
+    }
+}
+
+/// One finished job of the worker run in this process.
+struct Ran {
+    out: ExecOutcome,
+    job: JobDir,
+    ctx: AttemptCtx,
+    took: Duration,
+}
+
+impl Ran {
+    fn log(&self, name: &str) -> String {
+        fs::read_to_string(self.job.path.join(name)).unwrap_or_default()
+    }
+}
+
+fn ctx(lease: u64) -> AttemptCtx {
+    AttemptCtx { attempt_id: AttemptId::new(), lease_generation: lease, worker: "kvm".into() }
+}
+
+fn nlink(path: &Path) -> u64 {
+    fs::metadata(path).unwrap().nlink()
+}
+
+/// Starts the real supervisor the way the controller does: the locked file is its stdin.
+fn spawn_supervisor(job: &JobDir, lock: fs::File, env: &[(&str, &str)]) -> std::process::Child {
+    let mut cmd = Command::new(SUPERVISOR_BIN);
+    cmd.arg("run").arg(&job.path).stdin(Stdio::from(lock)).stdout(Stdio::null()).stderr(Stdio::null());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.spawn().unwrap()
+}
+
+fn wait_exit(child: &mut std::process::Child) -> std::process::ExitStatus {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if started.elapsed() > PATIENCE {
+            let _ = child.kill();
+            panic!("supervisor still running after {PATIENCE:?}");
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The listening sockets of this network namespace: TCP (v4, v6) in `LISTEN` and Unix
+/// sockets in `LISTEN` (`/proc/net/unix` flag `00010000`).
+fn listening_sockets() -> Vec<String> {
+    let mut found = Vec::new();
+    for file in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        for line in fs::read_to_string(file).unwrap_or_default().lines().skip(1) {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.get(3) == Some(&"0A") {
+                found.push(format!("{file} {}", f[1]));
+            }
+        }
+    }
+    for line in fs::read_to_string("/proc/net/unix").unwrap_or_default().lines().skip(1) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.get(3) == Some(&"00010000") {
+            found.push(format!("unix {}", f.get(7).unwrap_or(&"")));
+        }
+    }
+    found.sort();
+    found
+}
+
+// ---------------------------------------------------------------------------------------
+// The guest boots.
+
+/// Boots the image jailed by hand (the worker's launch, from the public pieces) and says
+/// `Hello`: the guest answers `Ready` within 5 s, seeing the configured vCPUs and (as
+/// `MemTotal`) the configured memory less what its kernel keeps.
+#[tokio::test(flavor = "multi_thread")]
+async fn real_guest_boots_and_answers_ready_within_5s() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    for vcpus in [1, 2] {
+        let fx = Fx::new(&kvm);
+        let cfg = FirecrackerConfig { vcpus, ..fx.cfg.clone() };
+        let JailMode::Jailed(jc) = &cfg.jail else { unreachable!() };
+        let dir = fx.path("boot");
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(fx.task_dir()).unwrap();
+        fs::File::create(fx.ws_img()).unwrap().set_len(WS_IMAGE_BYTES).unwrap();
+        fs::File::create(dir.join("scratch.img")).unwrap().set_len(SCRATCH_IMAGE_BYTES).unwrap();
+        let id = AttemptId::new().to_string();
+        let plan = jail::plan(jc, &cfg.firecracker_bin, &dir, &id).unwrap();
+        let vm_json = render_vm_json(&cfg, &jail::chroot_view(&plan));
+        let sources = StageSources {
+            kernel: &cfg.image_dir.join("vmlinux"),
+            rootfs: &cfg.image_dir.join("rootfs.squashfs"),
+            ws_img: &fx.ws_img(),
+            scratch_img: &dir.join("scratch.img"),
+            vm_json: &vm_json,
+        };
+        jail::stage(jc, &plan, &dir, sources).unwrap();
+        let started = Instant::now();
+        let mut vm = Command::new(&jc.jailer_bin)
+            .args(jail::jailer_args(jc, &plan, &cfg.firecracker_bin, cfg.vcpus, cfg.memory_mib))
+            .env_clear()
+            .current_dir(&dir)
+            .stdin(Stdio::null())
+            .stdout(fs::File::create(dir.join("console.log")).unwrap())
+            .stderr(fs::File::create(dir.join("stderr.log")).unwrap())
+            .spawn()
+            .unwrap();
+        let deadline = started + Duration::from_secs(15);
+        let mut link = GuestLink::connect_until(&jail::host_uds(&plan), deadline, || vm.try_wait().ok().flatten().map(|s| s.to_string()))
+            .unwrap_or_else(|e| panic!("{e}; console: {}", fs::read_to_string(dir.join("console.log")).unwrap_or_default()));
+        let hello = Message::Hello {
+            protocol: 1,
+            attempt_token: mint_attempt_token(),
+            task_id: fx.task.as_str().to_string(),
+            effect_id: String::new(),
+            attempt_id: id.clone(),
+            lease_generation: 0,
+            mode: Mode::Inspect,
+        };
+        let ready = link.hello(hello, deadline).unwrap();
+        let took = started.elapsed();
+        let Message::Ready { vcpus: seen, memory_mib, mode, protocol, .. } = ready else { panic!("{ready:?}") };
+        println!("vcpus {vcpus}: Ready after {took:?}: vcpus {seen}, memory_mib {memory_mib}");
+        assert!(took <= Duration::from_secs(5), "Ready after {took:?}");
+        assert_eq!((seen, mode, protocol), (vcpus, Mode::Inspect, 1), "Ready.vcpus equals worker_vcpus");
+        // MemTotal: the 256 MiB less the kernel's own reservation (about 26 MiB with this
+        // kernel), so 10.5% below; within 15%, never above.
+        assert!((256 * 85 / 100..=256).contains(&memory_mib), "memory_mib {memory_mib} for 256 MiB");
+        // The cgroup carries the vCPU count.
+        assert_eq!(fs::read_to_string(plan.cgroup.join("cpu.max")).unwrap().trim(), format!("{} 100000", vcpus * 100_000));
+        link.send(&Message::Shutdown).unwrap();
+        assert!(matches!(link.recv(Instant::now() + Duration::from_secs(5)), Ok(Message::Bye)));
+        drop(link);
+        let until = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = vm.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < until, "Firecracker still running 5 s after Shutdown");
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert!(status.success(), "the guest's reboot ends Firecracker with 0: {status}");
+        let collected = jail::collect(&dir, &kvm.cgroup_root).unwrap();
+        assert!(collected.cgroup_removed && collected.jail_removed, "{collected:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_digest_from_the_real_guest_equals_the_host_digest() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let fx = Fx::new(&kvm);
+    let ran = fx.snapshot().await;
+    let host = workspace_digest(&fx.path("snapshot")).unwrap();
+    assert_eq!(host.to_string(), "be77aa19c032f85329a9596adfd692252a0c87fd09d337b1873feb6003bdd3b8", "the README's digest");
+    assert_eq!(ran.out.new_workspace, Some(host), "the guest's SnapshotDone digest");
+    assert_eq!(fx.digest(), host, "an inspection boot of ws.img answers it too");
+    // And the tree in the ext4 image, read on the host with debugfs, digests the same.
+    let dumped = common::dump_ws_img(&fx.ws_img(), &fx.path("dumps"));
+    assert_eq!(workspace_digest(&dumped).unwrap(), host, "the tree the guest wrote");
+}
+
+// ---------------------------------------------------------------------------------------
+// The threat model: one hostile profile per row of the spec's table.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn net_probe_cannot_reach_anything_and_sees_only_lo() {
+    let Some(kvm) = kvm::require() else { return };
+    // Alone: the listening sockets of the network namespace are compared across the run.
+    let _alone = exclusive().await;
+    let fx = Fx::new(&kvm);
+    fx.snapshot().await;
+    fx.use_profile("hostile/net-probe");
+    let before = listening_sockets();
+    let ran = fx.run(EffectKind::RunVerification).await;
+    let after = listening_sockets();
+    let v = evidence(&ran.out);
+    let f = findings(&v);
+    assert_eq!(v["passed"], true, "{v}");
+    assert_eq!(f["net"], "unreachable", "{f}");
+    assert_eq!(f["public"], "unreachable", "{f}");
+    assert_eq!(f["ifaces"], serde_json::json!(["lo"]), "{f}");
+    assert_eq!(after, before, "the run left a listening socket behind (or took one away)");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn secret_probe_finds_no_host_secret_anywhere() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    // A whole task through the real supervisor, whose environment (and its worker's) holds
+    // the secret; the home holds it in a file too.
+    let env = Env::new(10);
+    let root = kvm.root();
+    copy_dir(&env.dir.path().join("snapshot"), &root.path().join("snapshot"));
+    copy_dir(&fixtures().join("profiles/hostile/secret-probe"), &root.path().join("profile"));
+    let secret = mint_attempt_token();
+    fs::write(root.path().join("secret.txt"), format!("AGENTOS_TEST_SECRET={secret}\n")).unwrap();
+    let cfg = kvm.jailed_config(root.path());
+    let exec = supervised(&root.path().join("jobs"), WorkerConfig::Firecracker(cfg), &ExecCounts::default(), None, &[])
+        .with_env("AGENTOS_TEST_SECRET", secret.clone());
+    let mut agent = FakeAgent::from_fixture_patch(fix_patch());
+    let state = run_task(&env.db, &env.blobs, &exec, &mut agent, &env.task).await.unwrap();
+    assert_eq!(state, TaskState::Succeeded, "{:?}", env.event_types());
+
+    let verify = env.effects("RunVerification").remove(0);
+    let v = env.blob_json(&verify.result_digest.unwrap());
+    let f = findings(&v);
+    assert_eq!(v["passed"], true, "{v}");
+    assert_eq!(f["hits"], serde_json::json!([]), "{f}");
+    assert_eq!((f["vsock"].clone(), f["blockdev"].clone()), (serde_json::json!("EACCES"), serde_json::json!("EACCES")), "{f}");
+    assert_ne!(f["vsock_connect"], "connected", "{f}");
+    assert_eq!(f["fds"], serde_json::json!([0, 1, 2]), "the check holds no descriptor beyond 0-2: {f}");
+    assert_eq!((f["uid"].clone(), f["no_new_privs"].clone(), f["setuid0"].clone()), (1001.into(), 1.into(), "EPERM".into()), "{f}");
+    assert_eq!((f["nproc"].clone(), f["nofile"].clone()), (serde_json::json!([256, 256]), serde_json::json!([1024, 1024])), "{f}");
+    assert_eq!(f["oom_score_adj"], 1000, "{f}");
+    assert!(f["files_read"].as_u64().unwrap() > 1000 && f["truncated"] == false, "the walk read the filesystems: {f}");
+
+    // Nowhere on the way out either: no job's logs, no artifact, no exported file.
+    let bundle = root.path().join("bundle");
+    agentos_engine::export::export_bundle(&env.db, &env.blobs, &env.task, &bundle).unwrap();
+    let mut places = vec![(PathBuf::from("evidence"), v.to_string().into_bytes())];
+    for dir in [root.path().join("jobs"), bundle] {
+        let mut stack = vec![dir];
+        while let Some(d) = stack.pop() {
+            for e in fs::read_dir(&d).unwrap().flatten() {
+                let ty = e.file_type().unwrap();
+                if ty.is_dir() {
+                    stack.push(e.path());
+                } else if ty.is_file() && e.metadata().unwrap().len() < 64 << 20 {
+                    places.push((e.path(), fs::read(e.path()).unwrap()));
+                }
+            }
+        }
+    }
+    assert!(places.iter().any(|(p, _)| p.ends_with("console.log")), "the jobs' logs were searched");
+    for (path, bytes) in places {
+        let found = bytes.windows(secret.len()).any(|w| w == secret.as_bytes());
+        assert!(!found, "the secret is in {}", path.display());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cpu_burn_is_bounded_by_vcpu_count() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let fx = Fx::new(&kvm);
+    fx.snapshot().await;
+    fx.use_profile("hostile/cpu-burn");
+    let (ran, samples) = fx.verify_watched(Duration::from_millis(100), |w| w).await;
+    let v = evidence(&ran.out);
+    assert_eq!((v["passed"].clone(), v["exit_code"].clone()), (serde_json::json!(true), serde_json::json!(0)), "the check exits on its own: {v}");
+    assert_eq!(findings(&v)["nproc"], 1, "{v}");
+    let cpu: Vec<(Duration, u64)> = samples.iter().filter_map(|s| Some((s.at, s.cpu_ticks?))).collect();
+    let ((t0, c0), (t1, c1)) = (cpu[0], *cpu.last().unwrap());
+    let wall = (t1 - t0).as_secs_f64();
+    let used = (c1 - c0) as f64 / CLOCK_TICKS as f64;
+    println!("cpu-burn: Firecracker used {used:.2} s of CPU in {wall:.2} s with 1 vCPU and 8 burners");
+    assert!(wall >= 2.0, "the window covers the burn: {wall}");
+    assert!(used <= 1.25 * wall, "{used:.2} s of CPU in {wall:.2} s");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mem_hog_is_oom_killed_and_the_agent_survives() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let fx = Fx::new(&kvm);
+    fx.snapshot().await;
+    fx.use_profile("hostile/mem-hog");
+    let (ran, samples) = fx.verify_watched(Duration::from_millis(100), |w| w).await;
+    // A complete Verified: the agent survived to report the check's death.
+    let v = evidence(&ran.out);
+    assert_eq!((v["exit_code"].clone(), v["passed"].clone()), (serde_json::Value::Null, serde_json::json!(false)), "{v}");
+    let f = findings(&v);
+    assert_eq!(
+        (f["write_-1000"].clone(), f["write_0"].clone(), f["oom_score_adj"].clone()),
+        ("EACCES".into(), "EACCES".into(), 1000.into()),
+        "the check could not lower its OOM priority: {f}"
+    );
+    assert!(ran.log("console.log").contains("Out of memory: Killed process"), "the guest kernel's OOM killer: {}", ran.log("console.log"));
+    // The guest bound it, not the host: Firecracker stayed within the VM's memory and its
+    // cgroup never OOM-killed anything.
+    assert!(samples.len() >= 3, "{samples:?}");
+    for s in &samples {
+        if let Some(rss) = s.rss_kib {
+            assert!(rss <= (256 + 96) * 1024, "VmRSS {rss} KiB at {:?}", s.at);
+        }
+        if let Some(events) = s.cgroup.get("memory.events") {
+            assert_eq!(keyed(events).get("oom_kill"), Some(&0), "host-side OOM kill at {:?}: {events}", s.at);
+        }
+    }
+    // The next effect's VM boots and works.
+    let next = fx.run(EffectKind::ReadSnapshot).await;
+    assert_eq!(next.out.receipt.outcome, Outcome::Success, "{}", out_text(&next.out));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fork_bomb_fails_and_leaves_no_process() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let fx = Fx::new(&kvm);
+    fx.snapshot().await;
+    fx.use_profile("hostile/fork-bomb");
+    let ran = fx.run(EffectKind::RunVerification).await;
+    match &ran.out.receipt.outcome {
+        Outcome::Failure(reason) => assert_eq!(reason, "timeout"),
+        Outcome::Success => {
+            let v = evidence(&ran.out);
+            assert_eq!(v["passed"], false, "{v}");
+            assert_ne!(v["exit_code"], 0, "{v}");
+        }
+    }
+    // The guest shut down cleanly on `Shutdown` (it was not killed), and nothing is left.
+    let console = ran.log("console.log");
+    assert!(console.contains("powering off: Shutdown"), "{console}");
+    assert!(ran.took < Duration::from_secs(5 + 15 + 5), "{:?}", ran.took);
+    fx.assert_nothing_left_within(Duration::from_secs(1));
+    assert!(!fx.cgroup_of(&ran.ctx).exists() && !ran.job.path.join("jail").exists(), "the jail was collected");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn disk_fill_is_bounded_by_the_images_and_the_root_stays_read_only() {
+    let Some(kvm) = kvm::require() else { return };
+    // Alone (see the report's concern): the drives' host page cache is charged to the jail's
+    // cgroup, and with every other VM of the tier writing too, a page-cache charge at the
+    // full `memory.max` (guest + 128 MiB) has met the cgroup's OOM killer.
+    let _alone = exclusive().await;
+    let fx = Fx::new(&kvm);
+    fx.snapshot().await;
+    fx.use_profile("hostile/disk-fill");
+    // The images as the host sees them while the check fills them: (apparent, allocated).
+    let (ws, jobs) = (fx.ws_img(), fx.path("jobs"));
+    let sizes = sample(Duration::from_millis(50), move |_| {
+        let scratch = fs::read_dir(&jobs).ok()?.flatten().map(|e| e.path().join("scratch.img")).find(|p| p.exists())?;
+        let (w, s) = (fs::metadata(&ws).ok()?, fs::metadata(&scratch).ok()?);
+        Some(((w.len(), w.blocks() * 512), (s.len(), s.blocks() * 512)))
+    });
+    let (ran, samples) = fx.verify_watched(Duration::from_millis(20), |w| w).await;
+    let sizes = sizes.stop();
+    if std::env::var_os("KVM_DEBUG").is_some() || ran.out.receipt.outcome != Outcome::Success {
+        println!("console: {}", ran.log("console.log"));
+        for s in &samples {
+            let stat = keyed(s.cgroup.get("memory.stat").map_or("", String::as_str));
+            let pick = |k: &str| stat.get(k).copied().unwrap_or(0) >> 20;
+            println!(
+                "{:?} rss {:?} current {} anon {} file {} dirty {} writeback {} events {:?}",
+                s.at,
+                s.rss_kib.map(|k| k >> 10),
+                s.cgroup.get("memory.current").map_or(0, |c| c.trim().parse::<u64>().unwrap_or(0) >> 20),
+                pick("anon"),
+                pick("file"),
+                pick("file_dirty"),
+                pick("file_writeback"),
+                s.cgroup.get("memory.events").map(|e| keyed(e))
+            );
+        }
+    }
+    let v = evidence(&ran.out);
+    let f = findings(&v);
+    assert_eq!(v["passed"], true, "{v}");
+    assert_eq!((f["tmp"].clone(), f["scratch"].clone()), ("ENOSPC".into(), "ENOSPC".into()), "{f}");
+    assert_eq!(f["workspace"], "EACCES", "/workspace is not writable by the check: {f}");
+    assert_eq!(f["workspace_owner"], 1000, "{f}");
+    assert_eq!((f["root_ro"].clone(), f["root_ro_after"].clone()), (true.into(), true.into()), "{f}");
+    assert_eq!(f["remount_syscall"], "EPERM", "{f}");
+    assert_ne!(f["remount_rc"], 0, "{f}");
+    assert!(!sizes.is_empty(), "the images were sampled");
+    let max_scratch = sizes.iter().map(|(_, s)| s.1).max().unwrap();
+    for ((ws_len, ws_alloc), (scratch_len, scratch_alloc)) in &sizes {
+        assert_eq!((*ws_len, *scratch_len), (WS_IMAGE_BYTES, SCRATCH_IMAGE_BYTES), "apparent sizes stay the constants");
+        assert!(*ws_alloc <= WS_IMAGE_BYTES && *scratch_alloc <= SCRATCH_IMAGE_BYTES, "allocated {ws_alloc} / {scratch_alloc}");
+    }
+    println!("disk-fill: scratch.img allocated up to {max_scratch} bytes; check wrote {} to scratch", f["scratch_bytes"]);
+    assert!(max_scratch >= f["scratch_bytes"].as_u64().unwrap() / 2, "the fill reached the host file (sampled {max_scratch})");
+}
+
+/// A pinned profile whose source changed, a source changed while the check runs, and a
+/// check that rewrites its own staged copy: none of them ever yields passing evidence.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tampered_staged_profile_never_passes_in_the_real_guest() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let fx = Fx::new(&kvm);
+    fx.snapshot().await;
+
+    // Pinned, then the source changed: the guest's digest of what it staged is not the pin.
+    let pinned = FirecrackerConfig { profile_digest: Some(workspace_digest(&fx.path("profile")).unwrap()), ..fx.cfg.clone() };
+    fs::write(fx.path("profile/check_parser.py"), b"print('PASSED')\n").unwrap();
+    let req = fx.request(EffectKind::RunVerification, b"");
+    let ran = fx.run_with(&req, &pinned, |w| w).await;
+    assert!(failure(&ran.out).starts_with("profile digest mismatch: pinned "), "{}", out_text(&ran.out));
+
+    // Unpinned, the source changes once the VM is up (after the host digested it).
+    // The host cannot see into the guest, so "while the check runs" is by the clock: the
+    // check sleeps 10 s, the change comes 4 s after Firecracker started (a boot and the
+    // profile's transfer take under 1 s). A change before the transfer ends instead
+    // breaks the announced stream: the guest drops the connection (also a failure).
+    fx.use_script("import time; time.sleep(10); print('PASSED')");
+    let req = fx.request(EffectKind::RunVerification, b"");
+    let root = fx.root().to_path_buf();
+    let profile = fx.path("profile/profile.json");
+    let tamper = thread::spawn(move || {
+        wait_for("the VM", || !home_firecrackers(&root).is_empty());
+        thread::sleep(Duration::from_secs(4));
+        fs::write(profile, r#"{"id":"kvm","command":["python3","-c","print('PASSED')"],"protected":true}"#).unwrap();
+    });
+    let ran = fx.run_with(&req, &fx.cfg.clone(), |w| w).await;
+    tamper.join().unwrap();
+    assert_eq!(failure(&ran.out), "protected profile changed during verification");
+
+    // The check tries to rewrite its own staged profile (root's, read-only to it), then
+    // exits 0: the staged copy is untouched and the evidence names the staged digest.
+    fx.use_script(
+        "import errno, os\ntry:\n    open('profile.json', 'a').write(' ')\n    print('rewrote')\nexcept OSError as e:\n    print(errno.errorcode[e.errno])",
+    );
+    let source = workspace_digest(&fx.path("profile")).unwrap();
+    let ran = fx.run(EffectKind::RunVerification).await;
+    let v = evidence(&ran.out);
+    assert_eq!(v["summary"], "EACCES", "{v}");
+    assert_eq!(v["profile_digest"], source.to_string(), "{v}");
+}
+
+// ---------------------------------------------------------------------------------------
+// Crashes and kills with a real VM.
+
+/// The VM dies right after `ApplyPatch` was sent and the controller dies right after the
+/// launch: the image holds the base or the base plus the patch, the supervisor writes no
+/// receipt, recovery's inspection says which (`PublishReconciled` / `Redispatch`), and the
+/// task ends SUCCEEDED with the digest a fresh inspection reads from `ws.img`.
+#[tokio::test(flavor = "multi_thread")]
+async fn inspection_after_a_killed_patch_vm_converges_to_succeeded() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let env = Env::new(10);
+    let root = kvm.root();
+    copy_dir(&env.dir.path().join("snapshot"), &root.path().join("snapshot"));
+    copy_dir(&env.dir.path().join("profile"), &root.path().join("profile"));
+    let cfg = kvm.jailed_config(root.path());
+    let jobs = root.path().join("jobs");
+    let worker = WorkerConfig::Firecracker(cfg.clone());
+    let hook = CrashHook::at(CrashPoint::DuringExecute, "apply_patch");
+    let dying = supervised(&jobs, worker.clone(), &ExecCounts::default(), Some(hook.clone()), &[(TEST_WORKERS_ENV, "1"), ("AGENTOS_TEST_KILL_VM_AFTER_REQUEST", "1")]);
+    let mut agent = FakeAgent::from_fixture_patch(fix_patch());
+    let err = run_task_with(&env.db, &env.blobs, &dying, &mut agent, &env.task, &RunOptions::crash_with(hook)).await.unwrap_err();
+    assert!(matches!(err, EngineError::Crashed(CrashPoint::DuringExecute)), "{err:?}");
+    let patch = env.effects("ApplyPatch").remove(0);
+    let job = JobDir::list(&jobs, &patch.effect_id).unwrap().pop().unwrap();
+    wait_for_async("the patch job to end", || job.read_status().is_some_and(|s| s.state != JobState::Running)).await;
+    assert!(job.read_outcome().is_none() && job.read_receipt().is_none(), "no outcome, no receipt");
+
+    let inspector = Inspector::new(cfg.clone(), root.path().join("inspect")).with_env(test_env());
+    let Answer::Digest(on_disk) = inspector.query(&env.task, Query::Digest).unwrap() else { panic!() };
+    let base = workspace_digest(&root.path().join("snapshot")).unwrap();
+    let patch_file = root.path().join("fix.patch");
+    fs::write(&patch_file, fix_patch()).unwrap();
+    let patched_tree = tempfile::tempdir().unwrap();
+    copy_dir(&root.path().join("snapshot"), patched_tree.path());
+    let applied = Command::new("git").arg("apply").arg(&patch_file).current_dir(patched_tree.path()).status().unwrap();
+    assert!(applied.success());
+    let with_patch = workspace_digest(patched_tree.path()).unwrap();
+    assert!(on_disk == base || on_disk == with_patch, "ws.img holds {on_disk}: neither the base nor the base plus the patch");
+
+    let exec = supervised(&jobs, worker, &ExecCounts::default(), None, &[]);
+    let report = recover(&env.db, &env.blobs, &exec, &env.task).await.unwrap();
+    let decision = report.decisions.iter().find(|d| d.effect_id == patch.effect_id).unwrap_or_else(|| panic!("{report:?}"));
+    let expected = if on_disk == base { Decision::Redispatch } else { Decision::PublishReconciled };
+    assert_eq!(decision.decision, expected, "{decision:?} with ws.img at {on_disk}");
+    let mut agent = FakeAgent::from_fixture_patch(fix_patch());
+    let state = run_task(&env.db, &env.blobs, &exec, &mut agent, &env.task).await.unwrap();
+    assert_eq!(state, TaskState::Succeeded, "{:?}", env.event_types());
+    let task = env.db.task(&env.task).unwrap();
+    let Answer::Digest(now) = inspector.query(&env.task, Query::Digest).unwrap() else { panic!() };
+    assert_eq!(task.workspace_digest, now, "the journal's digest is what ws.img holds");
+    assert_eq!(task.verified_digest, Some(now));
+    assert_eq!(now, with_patch);
+    assert!(home_firecrackers(root.path()).is_empty());
+}
+
+/// A verification whose check hangs: the lease ends the supervisor's job, and the VM is
+/// gone with the worker.
+#[tokio::test(flavor = "multi_thread")]
+async fn vm_dies_with_the_worker_on_lease_expiry() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let fx = Fx::new(&kvm);
+    fx.snapshot().await;
+    fx.use_script("import time; time.sleep(30)");
+    let (req, c) = (fx.request(EffectKind::RunVerification, b""), ctx(2));
+    let (job, lock) = JobDir::create(&fx.path("jobs"), &fx.job_request(&req, &c, &fx.cfg, Some(2_500))).unwrap();
+    let mut supervisor = spawn_supervisor(&job, lock, &[]);
+    let id = c.attempt_id.to_string();
+    wait_for("the VM", || firecracker_processes().iter().any(|p| p.id() == Some(id.as_str())));
+    assert!(wait_exit(&mut supervisor).success());
+    let status = job.read_status().unwrap();
+    assert_eq!((status.state, status.reason), (JobState::Killed, Some(KillReason::Lease)), "{status:?}");
+    assert_eq!(failure(&job.read_receipt().unwrap()), "lease expired");
+    // The VM was killed with the worker's group: gone within 2 s of the supervisor's exit.
+    fx.assert_no_vm_within(Duration::from_secs(2));
+    fx.assert_nothing_left_within(Duration::from_secs(2));
+    // Its jail is left for the controller, which collects it once the job is settled.
+    let cgroup = fx.cgroup_of(&c);
+    assert!(cgroup.is_dir() && job.path.join("jail").is_dir(), "the jail waits for the controller");
+    assert!(fx.executor(None, &[]).fence_jobs(std::slice::from_ref(&job)).await);
+    assert!(!cgroup.exists() && !job.path.join("jail").exists(), "collected by the controller");
+}
+
+/// The controller dies after the snapshot completed; on resume it asks the inspector for
+/// the workspace (an inspection boot of `ws.img`) and the task continues to SUCCEEDED. The
+/// same with `ws.img` changed behind the journal's back fails the task as "workspace lost".
+#[tokio::test(flavor = "multi_thread")]
+async fn current_workspace_on_resume_boots_an_inspector_and_the_task_continues() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    for tampered in [false, true] {
+        let env = Env::new(10);
+        let root = kvm.root();
+        copy_dir(&env.dir.path().join("snapshot"), &root.path().join("snapshot"));
+        copy_dir(&env.dir.path().join("profile"), &root.path().join("profile"));
+        let worker = WorkerConfig::Firecracker(kvm.jailed_config(root.path()));
+        let jobs = root.path().join("jobs");
+        let hook = CrashHook::at(CrashPoint::AfterComplete, "read_snapshot");
+        let dying = supervised(&jobs, worker.clone(), &ExecCounts::default(), Some(hook.clone()), &[]);
+        let mut agent = FakeAgent::from_fixture_patch(fix_patch());
+        let err = run_task_with(&env.db, &env.blobs, &dying, &mut agent, &env.task, &RunOptions::crash_with(hook)).await.unwrap_err();
+        assert!(matches!(err, EngineError::Crashed(CrashPoint::AfterComplete)), "{err:?}");
+        let ws_img = root.path().join("work").join(env.task.as_str()).join("ws.img");
+        if tampered {
+            fs::write(root.path().join("stray.py"), b"x = 1\n").unwrap();
+            common::debugfs_write(&ws_img, &format!("cd /src\nwrite {} stray.py\n", root.path().join("stray.py").display()));
+        }
+        // Every Firecracker of this home while the task resumes.
+        let home = root.path().to_path_buf();
+        let seen = sample(Duration::from_millis(20), move |_| {
+            let ids: Vec<String> = home_firecrackers(&home).iter().filter_map(|p| p.id().map(str::to_string)).collect();
+            (!ids.is_empty()).then_some(ids)
+        });
+        let exec = supervised(&jobs, worker, &ExecCounts::default(), None, &[]);
+        let mut agent = FakeAgent::from_fixture_patch(fix_patch());
+        let state = run_task(&env.db, &env.blobs, &exec, &mut agent, &env.task).await.unwrap();
+        let seen = seen.stop();
+        let first = seen.first().cloned().unwrap_or_default();
+        assert!(first.iter().all(|id| id.starts_with("inspect-")) && !first.is_empty(), "the first VM of the resume is an inspection: {seen:?}");
+        if tampered {
+            assert_eq!(state, TaskState::Failed);
+            let failed: Vec<serde_json::Value> =
+                env.events().into_iter().filter(|e| e.event_type == "Failed").map(|e| e.payload).collect();
+            let reason = failed.first().and_then(|f| f["Failed"]["reason"].as_str()).unwrap_or_default().to_string();
+            assert!(reason.starts_with("workspace lost: expected "), "{failed:?} {:?}", env.event_types());
+        } else {
+            assert_eq!(state, TaskState::Succeeded, "{:?}", env.event_types());
+        }
+        assert!(home_firecrackers(root.path()).is_empty());
+    }
+}
+
+/// A full task with an injected crash and resume: at no time does this home run more than
+/// two Firecracker processes (a job's VM and an inspection at most).
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrency_bound_never_exceeds_two_firecracker_processes() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let env = Env::new(10);
+    let root = kvm.root();
+    copy_dir(&env.dir.path().join("snapshot"), &root.path().join("snapshot"));
+    copy_dir(&env.dir.path().join("profile"), &root.path().join("profile"));
+    let worker = WorkerConfig::Firecracker(kvm.jailed_config(root.path()));
+    let jobs = root.path().join("jobs");
+    let home = root.path().to_path_buf();
+    let counts = sample(Duration::from_millis(50), move |_| Some(home_firecrackers(&home).len()));
+    let hook = CrashHook::at(CrashPoint::DuringExecute, "apply_patch");
+    let dying = supervised(&jobs, worker.clone(), &ExecCounts::default(), Some(hook.clone()), &[]);
+    let mut agent = FakeAgent::from_fixture_patch(fix_patch());
+    let err = run_task_with(&env.db, &env.blobs, &dying, &mut agent, &env.task, &RunOptions::crash_with(hook)).await.unwrap_err();
+    assert!(matches!(err, EngineError::Crashed(_)), "{err:?}");
+    let exec = supervised(&jobs, worker, &ExecCounts::default(), None, &[]);
+    recover(&env.db, &env.blobs, &exec, &env.task).await.unwrap();
+    let mut agent = FakeAgent::from_fixture_patch(fix_patch());
+    let state = run_task(&env.db, &env.blobs, &exec, &mut agent, &env.task).await.unwrap();
+    assert_eq!(state, TaskState::Succeeded, "{:?}", env.event_types());
+    let counts = counts.stop();
+    let max = counts.iter().copied().max().unwrap_or(0);
+    println!("concurrency: {} samples, at most {max} Firecracker processes", counts.len());
+    assert!(max >= 1, "the sampler saw the VMs");
+    assert!(max <= 2, "{max} Firecracker processes at once");
+}
+
+// ---------------------------------------------------------------------------------------
+// The jail.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn jailed_firecracker_runs_as_the_jail_uid_in_its_chroot_and_cgroup() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let fx = Fx::new(&kvm);
+    fx.snapshot().await;
+    fx.use_script("import time; time.sleep(3); print('PASSED')");
+    let req = fx.request(EffectKind::RunVerification, b"");
+    let c = ctx(2);
+    let job = JobDir::create(&fx.path("jobs"), &fx.job_request(&req, &c, &fx.cfg, None)).unwrap().0;
+    let worker = FirecrackerWorker::new(&fx.cfg, &job).with_env(test_env());
+    let running = {
+        let (req, c) = (req.clone(), c.clone());
+        tokio::spawn(async move { worker.run(&req, &c).await })
+    };
+    let id = c.attempt_id.to_string();
+    let chroot = job.path.join("jail/firecracker").join(&id).join("root");
+    wait_for("the VM's socket", || chroot.join("v.sock").exists());
+    let procs: Vec<FcProc> = firecracker_processes().into_iter().filter(|p| p.id() == Some(id.as_str())).collect();
+    assert_eq!(procs.len(), 1, "{procs:?}");
+    let fc = &procs[0];
+    assert_eq!(fc.uid, JAIL_UID, "{fc:?}");
+    assert_eq!(&fc.cmdline[..3], ["/firecracker", "--id", id.as_str()], "{fc:?}");
+    assert_eq!(&fc.cmdline[fc.cmdline.len() - 3..], ["--no-api", "--config-file", "/vm.json"], "{fc:?}");
+    assert!(!fc.cmdline.iter().any(|a| a.contains(fx.root().to_str().unwrap())), "no host path: {fc:?}");
+    assert_eq!(fc.cgroup, format!("0::/agentos/{id}"));
+    let procs_file = fs::read_to_string(kvm.cgroup_root.join("agentos").join(&id).join("cgroup.procs")).unwrap();
+    assert_eq!(procs_file.split_whitespace().collect::<Vec<_>>(), [fc.pid.to_string()]);
+    let mut names: Vec<String> = fs::read_dir(&chroot).unwrap().flatten().map(|e| e.file_name().into_string().unwrap()).collect();
+    names.sort();
+    // The six staged files, the jailer's copy of the binary, its pid file, `dev/` (the
+    // jailer's device nodes, `kvm` among them), `run/` (empty: no API socket with
+    // `--no-api`), and the VM's socket.
+    assert_eq!(
+        names,
+        ["dev", "firecracker", "firecracker.log", "firecracker.pid", "rootfs.squashfs", "run", "scratch.img", "v.sock", "vm.json", "vmlinux", "ws.img"],
+        "the chroot"
+    );
+    let run: Vec<_> = fs::read_dir(chroot.join("run")).unwrap().flatten().map(|e| e.file_name()).collect();
+    assert!(run.is_empty(), "run/ holds {run:?}");
+    assert!(chroot.join("dev/kvm").exists());
+    assert_eq!(fs::read_to_string(chroot.join("firecracker.pid")).unwrap().trim(), fc.pid.to_string());
+    // The socket is `v.sock` relative to the chroot root (vm.json's relative `uds_path`):
+    // inside the jail, none beside the job.
+    assert!(!job.path.join("v.sock").exists());
+    let out = running.await.unwrap();
+    assert_eq!(evidence(&out)["passed"], true);
+    assert!(!job.path.join("jail").exists() && !fx.cgroup_of(&c).exists(), "collected after the run");
+    assert_eq!(nlink(&fx.ws_img()), 1, "the chroot's link to ws.img is gone");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn jail_cgroup_limits_equal_the_contract() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let fx = Fx::new(&kvm);
+    fx.snapshot().await;
+    fx.use_profile("hostile/mem-hog");
+    let (ran, samples) = fx.verify_watched(Duration::from_millis(100), |w| w).await;
+    assert_eq!(evidence(&ran.out)["exit_code"], serde_json::Value::Null, "mem-hog was OOM-killed in the guest");
+    // Samples taken once Firecracker runs: the jailer writes the limits before its `exec`
+    // (a sample of the cgroup alone may catch it between `mkdir` and the writes).
+    let with_limits: Vec<&VmSample> = samples.iter().filter(|s| !s.procs.is_empty() && s.cgroup.contains_key("cpu.max")).collect();
+    assert!(!with_limits.is_empty(), "the cgroup was read while the VM ran: {samples:?}");
+    for s in &with_limits {
+        let read = |f: &str| s.cgroup[f].trim().to_string();
+        assert_eq!(read("cpu.max"), "100000 100000");
+        assert_eq!(read("memory.max"), ((256u64 + 128) * 1048576).to_string());
+        assert_eq!(read("memory.swap.max"), "0");
+        assert_eq!(read("pids.max"), "64");
+        assert_eq!(keyed(&s.cgroup["memory.events"]).get("oom_kill"), Some(&0), "{:?}", s.cgroup["memory.events"]);
+        if let Some(rss) = s.rss_kib {
+            assert!(rss <= (256 + 96) * 1024, "VmRSS {rss} KiB");
+        }
+    }
+}
+
+/// `memory.max` lowered to 96 MiB under a 256 MiB guest running mem-hog: the cgroup's OOM
+/// killer ends Firecracker itself (SIGKILL), which the worker reports; the next VM boots.
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_hog_firecracker_is_oom_killed_by_the_cgroup_when_the_bound_is_lowered() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let fx = Fx::new(&kvm);
+    fx.snapshot().await;
+    fx.use_profile("hostile/mem-hog");
+    let parent_events = kvm.cgroup_root.join("agentos/memory.events");
+    let before = keyed(&fs::read_to_string(&parent_events).unwrap()).get("oom_kill").copied().unwrap_or(0);
+    let (ran, samples) = fx.verify_watched(Duration::from_millis(5), |w| w.with_jail_memory_max_mib(96)).await;
+    assert_eq!(failure(&ran.out), "guest exited before reporting: firecracker killed by signal 9");
+    let after = keyed(&fs::read_to_string(&parent_events).unwrap()).get("oom_kill").copied().unwrap_or(0);
+    let seen_in_own = samples.iter().filter_map(|s| keyed(s.cgroup.get("memory.events")?).get("oom_kill").copied()).max().unwrap_or(0);
+    println!("oom_kill: own cgroup (sampled) {seen_in_own}, parent agentos/ {before} -> {after}");
+    assert!(samples.iter().any(|s| s.cgroup.get("memory.max").is_some_and(|m| m.trim() == (96u64 << 20).to_string())), "the lowered bound applied");
+    assert!(after > before || seen_in_own >= 1, "the cgroup recorded the OOM kill");
+    assert!(!fx.cgroup_of(&ran.ctx).exists(), "collected");
+    assert!(home_firecrackers(fx.root()).is_empty());
+    // The next effect's VM boots (with the contract's bound).
+    fx.use_profile("parser-checks-v1");
+    let next = fx.run(EffectKind::RunVerification).await;
+    assert_eq!(evidence(&next.out)["exit_code"], 1, "the unpatched fixture fails its check, in a VM that came up");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cpu_burn_is_throttled_by_the_cgroup_when_the_quota_is_lowered() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let fx = Fx::new(&kvm);
+    fx.snapshot().await;
+    fx.use_profile("hostile/cpu-burn");
+    let (ran, samples) = fx.verify_watched(Duration::from_millis(50), |w| w.with_jail_cpu_quota_us(50_000)).await;
+    let v = evidence(&ran.out);
+    assert_eq!((v["passed"].clone(), findings(&v)["nproc"].clone()), (true.into(), 1.into()), "the check still completes: {v}");
+    let stats: Vec<(Duration, BTreeMap<String, u64>)> = samples.iter().filter_map(|s| Some((s.at, keyed(s.cgroup.get("cpu.stat")?)))).collect();
+    assert!(samples.iter().any(|s| s.cgroup.get("cpu.max").is_some_and(|m| m.trim() == "50000 100000")), "the lowered quota applied");
+    let (first, (last_at, last)) = (stats[0].0, stats.last().unwrap().clone());
+    // From the cgroup's first sight to its last: the VM's whole life within a sample.
+    let wall = (last_at - first).as_micros() as f64 + 50_000.0;
+    let usage = last["usage_usec"] as f64;
+    println!("throttled: usage {usage} µs over {wall} µs, nr_throttled {}", last["nr_throttled"]);
+    assert!(last["nr_throttled"] > 0, "{last:?}");
+    assert!(usage <= 0.6 * wall, "usage {usage} µs over {wall} µs");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fork_bomb_never_adds_a_host_process() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let fx = Fx::new(&kvm);
+    fx.snapshot().await;
+    fx.use_profile("hostile/fork-bomb");
+    let (ran, samples) = fx.verify_watched(Duration::from_millis(50), |w| w).await;
+    assert!(!matches!(ran.out.receipt.outcome, Outcome::Success) || evidence(&ran.out)["passed"] == false);
+    let pids: Vec<u64> = samples.iter().filter_map(|s| s.cgroup.get("pids.current")?.trim().parse().ok()).collect();
+    assert!(pids.len() >= 20, "sampled through the bomb: {}", pids.len());
+    let most = pids.iter().copied().max().unwrap();
+    println!("fork-bomb: pids.current at most {most} over {} samples", pids.len());
+    assert!(most <= MAX_FIRECRACKER_TASKS, "pids.current {most}");
+    assert!(samples.iter().all(|s| s.procs.len() <= 1), "one Firecracker for the attempt");
+}
+
+/// From the first jailed `ReadSnapshot` on, `ws.img` is the jail's (0600, uid 61000); after
+/// the collection it has one link again, and the controller (root) still inspects it.
+#[tokio::test(flavor = "multi_thread")]
+async fn staged_ws_img_is_owned_by_the_jail_uid_and_still_inspectable() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let fx = Fx::new(&kvm);
+    let ran = fx.snapshot().await;
+    let meta = fs::metadata(fx.ws_img()).unwrap();
+    assert_eq!((meta.uid(), meta.gid(), meta.mode() & 0o7777, meta.nlink()), (JAIL_UID, JAIL_UID, 0o600, 1));
+    assert_eq!(Some(fx.digest()), ran.out.new_workspace, "the inspector reads the jail's image");
+    assert_eq!(fs::metadata(fx.ws_img()).unwrap().nlink(), 1, "the inspection's link is collected too");
+}
+
+/// SIGKILL the supervisor during a verification, then everything of the job dies: the jail
+/// and the empty cgroup are left (the chroot's hard link keeps `scratch.img`), until the
+/// controller's fence on resume collects them.
+#[tokio::test(flavor = "multi_thread")]
+async fn leftover_jail_after_supervisor_sigkill_is_collected_on_resume() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let fx = Fx::new(&kvm);
+    fx.snapshot().await;
+    fx.use_script("import time; time.sleep(30)");
+    let req = fx.request(EffectKind::RunVerification, b"");
+    let c = ctx(2);
+    let dying = fx.executor(Some(CrashHook::at(CrashPoint::DuringExecute, "run_verification")), &[]);
+    let out = dying.run(&req, &c).await;
+    assert_eq!(failure(&out), "injected crash after the launch");
+    let job = JobDir::list(&fx.path("jobs"), &req.effect_id).unwrap().pop().unwrap();
+    let id = c.attempt_id.to_string();
+    wait_for_async("the VM", || firecracker_processes().iter().any(|p| p.id() == Some(id.as_str()))).await;
+    wait_for_async("Running status", || job.read_status().is_some_and(|s| s.state == JobState::Running)).await;
+    let status = job.read_status().unwrap();
+    let supervisor = Pid::from_raw(status.supervisor_pid.unwrap() as i32).unwrap();
+    kill_process(supervisor, Signal::KILL).unwrap();
+    wait_for_async("the job's lock to be free", || job.is_dead()).await;
+    // The worker and its VM outlive the supervisor; then they die too (the whole group, as
+    // a host crash would take them), leaving the jail as it was.
+    let vm_pid = firecracker_processes().into_iter().find(|p| p.id() == Some(id.as_str())).unwrap().pid;
+    let _ = kill_process_group(Pid::from_raw(status.worker_pgid.unwrap()).unwrap(), Signal::KILL);
+    wait_for_async("the VM to die", || !alive(vm_pid)).await;
+    let (cgroup, jail, scratch) = (fx.cgroup_of(&c), job.path.join("jail"), job.path.join("scratch.img"));
+    assert!(cgroup.is_dir(), "the cgroup is left: {}", cgroup.display());
+    assert_eq!(fs::read_to_string(cgroup.join("cgroup.procs")).unwrap().trim(), "", "and empty");
+    assert!(jail.is_dir(), "the jail is left");
+    assert_eq!(nlink(&scratch), 2, "scratch.img and its link in the chroot");
+
+    let controller = fx.executor(None, &[]);
+    assert!(controller.fence_jobs(std::slice::from_ref(&job)).await, "the fence settles the dead job");
+    assert!(!cgroup.exists(), "the cgroup is collected");
+    assert!(!jail.exists(), "the jail is collected");
+    assert_eq!(nlink(&scratch), 1);
+    fx.assert_nothing_left_within(Duration::from_secs(2));
+}
+
+/// SIGKILL the supervisor during a verification while the VM lives on: the controller's
+/// fence kills the job's worker and VM itself and collects the jail and the real cgroup
+/// right after (the `rmdir` right after a kill on a real cgroup).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_fence_kills_a_live_jailed_vm_and_collects_its_cgroup() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let fx = Fx::new(&kvm);
+    fx.snapshot().await;
+    fx.use_script("import time; time.sleep(30)");
+    let req = fx.request(EffectKind::RunVerification, b"");
+    let c = ctx(2);
+    let dying = fx.executor(Some(CrashHook::at(CrashPoint::DuringExecute, "run_verification")), &[]);
+    assert_eq!(failure(&dying.run(&req, &c).await), "injected crash after the launch");
+    let job = JobDir::list(&fx.path("jobs"), &req.effect_id).unwrap().pop().unwrap();
+    let id = c.attempt_id.to_string();
+    wait_for_async("the VM", || firecracker_processes().iter().any(|p| p.id() == Some(id.as_str()))).await;
+    wait_for_async("Running status", || job.read_status().is_some_and(|s| s.state == JobState::Running)).await;
+    let supervisor = Pid::from_raw(job.read_status().unwrap().supervisor_pid.unwrap() as i32).unwrap();
+    kill_process(supervisor, Signal::KILL).unwrap();
+    wait_for_async("the job's lock to be free", || job.is_dead()).await;
+    let vm = firecracker_processes().into_iter().find(|p| p.id() == Some(id.as_str())).expect("the VM outlives the supervisor");
+    let cgroup = fx.cgroup_of(&c);
+    assert_eq!(fs::read_to_string(cgroup.join("cgroup.procs")).unwrap().trim(), vm.pid.to_string());
+
+    let controller = fx.executor(None, &[]);
+    assert!(controller.fence_jobs(std::slice::from_ref(&job)).await, "the fence settles the job");
+    assert!(!alive(vm.pid), "the fence killed the VM");
+    assert!(!cgroup.exists(), "the cgroup is collected right after the kill");
+    assert!(!job.path.join("jail").exists(), "the jail is collected");
+    assert_eq!(nlink(&job.path.join("scratch.img")), 1);
+    fx.assert_nothing_left_within(Duration::from_secs(2));
+}
+
+/// The cgroup seams count only in a test run: without `AGENTOS_TEST_WORKERS=1` a lowered
+/// `memory.max` is ignored and the jail gets the contract's.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_cgroup_seams_are_ignored_without_the_test_switch() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let fx = Fx::new(&kvm);
+    fx.snapshot().await;
+    fx.use_script("import time; time.sleep(1); print('PASSED')");
+    let (ran, samples) =
+        fx.verify_watched(Duration::from_millis(50), |w| w.with_env(Vec::new()).with_jail_memory_max_mib(96).with_jail_cpu_quota_us(10_000)).await;
+    assert_eq!(evidence(&ran.out)["passed"], true);
+    // Once Firecracker runs (the jailer has written every limit by its `exec`).
+    let seen: Vec<(&str, &str)> = samples
+        .iter()
+        .filter(|s| !s.procs.is_empty())
+        .filter_map(|s| Some((s.cgroup.get("memory.max")?.trim(), s.cgroup.get("cpu.max")?.trim())))
+        .collect();
+    assert!(!seen.is_empty(), "the cgroup was read");
+    let contract = ((256u64 + 128) * 1048576).to_string();
+    assert!(seen.iter().all(|(m, c)| *m == contract && *c == "100000 100000"), "{seen:?}");
+}
+
+/// Set only in the child of `a_dead_inspectors_jail_is_collected_by_the_next_inspection`:
+/// the JSON config file it inspects with.
+const INSPECT_CHILD: &str = "AGENTOS_KVM_INSPECT_CHILD";
+
+/// Not a test of its own: in a child, one inspection, which its parent kills mid-way.
+#[test]
+fn inspect_child_entry() {
+    let Some(config) = std::env::var_os(INSPECT_CHILD) else { return };
+    let (cfg, inspect_root, task): (FirecrackerConfig, PathBuf, TaskId) = serde_json::from_slice(&fs::read(config).unwrap()).unwrap();
+    let _ = Inspector::new(cfg, inspect_root).with_env(test_env()).query(&task, Query::Digest);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dead_inspectors_jail_is_collected_by_the_next_inspection() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let fx = Fx::new(&kvm);
+    let ran = fx.snapshot().await;
+    let config = fx.path("inspect-child.json");
+    fs::write(&config, serde_json::to_vec(&(&fx.cfg, fx.path("inspect"), &fx.task)).unwrap()).unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "inspect_child_entry", "--nocapture", "--test-threads=1"])
+        .env(INSPECT_CHILD, &config)
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let task_root = fx.path("inspect").join(fx.task.as_str());
+    let mut dead_dir = None;
+    wait_for("the child's inspection VM", || {
+        let vms = home_firecrackers(fx.root());
+        dead_dir = vms.iter().find_map(|p| p.id()?.strip_prefix("inspect-").map(|u| task_root.join(u)));
+        dead_dir.is_some()
+    });
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let dead_dir = dead_dir.unwrap();
+    let uuid = dead_dir.file_name().unwrap().to_str().unwrap().to_string();
+    let cgroup = kvm.cgroup_root.join("agentos").join(format!("inspect-{uuid}"));
+    // The orphaned VM powers itself off once its connection is gone (or never came).
+    wait_for("the orphaned inspection VM to end", || !firecracker_processes().iter().any(|p| p.id() == Some(&format!("inspect-{uuid}"))));
+    assert!(dead_dir.is_dir() && cgroup.is_dir(), "the dead inspector left its directory and cgroup");
+
+    assert_eq!(Some(fx.digest()), ran.out.new_workspace, "the next inspection answers");
+    assert!(!dead_dir.exists(), "it removed the dead inspector's directory");
+    assert!(!cgroup.exists(), "and its cgroup");
+    assert_eq!(fs::read_dir(&task_root).unwrap().count(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn allow_unjailed_runs_firecracker_as_the_container_user_without_a_cgroup() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let fx = Fx::new(&kvm);
+    let cfg = kvm.unjailed_config(fx.root());
+    let req = fx.request(EffectKind::ReadSnapshot, b"");
+    let c = ctx(1);
+    let job = JobDir::create(&fx.path("jobs"), &fx.job_request(&req, &c, &cfg, None)).unwrap().0;
+    let worker = FirecrackerWorker::new(&cfg, &job).with_env(test_env());
+    let running = {
+        let (req, c) = (req.clone(), c.clone());
+        tokio::spawn(async move { worker.run(&req, &c).await })
+    };
+    let id = c.attempt_id.to_string();
+    // The relative `uds_path` ("v.sock") binds in Firecracker's working directory, the job's.
+    wait_for("the VM's socket in the job directory", || job.path.join("v.sock").exists());
+    let fc = firecracker_processes().into_iter().find(|p| p.id() == Some(id.as_str())).expect("the VM");
+    let own_cgroup = fs::read_to_string("/proc/self/cgroup").unwrap().lines().find(|l| l.starts_with("0::")).unwrap().to_string();
+    assert_eq!(fc.uid, rustix::process::getuid().as_raw(), "{fc:?}");
+    assert_eq!(fc.cgroup, own_cgroup, "the test's own cgroup, no jail's");
+    assert!(fc.cmdline.iter().any(|a| a == &job.path.join("vm.json").display().to_string()), "{fc:?}");
+    assert!(!job.path.join("jail").exists(), "no jail");
+    assert!(!fx.cgroup_of(&c).exists(), "no cgroup");
+    let out = running.await.unwrap();
+    assert_eq!(out.new_workspace, Some(workspace_digest(&fx.path("snapshot")).unwrap()), "{}", out_text(&out));
+    assert_eq!(fs::metadata(fx.ws_img()).unwrap().uid(), rustix::process::getuid().as_raw(), "ws.img stays the user's");
+}
+
+/// `scripts/build-guest-image.sh … --verify` builds the image twice and compares the bytes.
+/// Slow (two image builds, network for the Debian snapshot): `-- --ignored`.
+#[test]
+#[ignore = "slow: image build"]
+fn image_build_is_reproducible() {
+    let Some(_kvm) = kvm::require() else { return };
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    // A fresh output directory, never $AGENTOS_GUEST_IMAGE: --verify replaces OUT_DIR.
+    let out = tempfile::tempdir().unwrap();
+    let image = out.path().join("python-stdlib-v1");
+    let run = Command::new("sh")
+        .arg(repo.join("scripts/build-guest-image.sh"))
+        .arg("guest/python-stdlib-v1")
+        .arg(&image)
+        .arg("--verify")
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    let stdout = text(&run.stdout);
+    assert!(run.status.success(), "{stdout}\n{}", text(&run.stderr));
+    println!("{}{stdout}", text(&run.stderr).lines().filter(|l| l.contains("--verify")).collect::<Vec<_>>().join("\n") + "\n");
+    assert!(text(&run.stderr).contains("--verify: two builds are byte-identical") || stdout.contains("byte-identical"), "{stdout}");
+    for f in kvm::IMAGE_FILES {
+        assert!(image.join(f).is_file(), "{f}");
+    }
+}
+

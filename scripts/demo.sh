@@ -12,18 +12,26 @@ while [ $# -gt 0 ]; do
   esac
 done
 case "$WORKER" in
-  host) WORKER_ARGS= ;;
+  host) ;;
   firecracker)
     : "${AGENTOS_FIRECRACKER:?set AGENTOS_FIRECRACKER to the Firecracker binary}"
     : "${AGENTOS_GUEST_IMAGE:?set AGENTOS_GUEST_IMAGE to the built guest image directory}"
-    WORKER_ARGS="--worker firecracker --firecracker $AGENTOS_FIRECRACKER" ;;
+    # The jailer next to the binary unless AGENTOS_JAILER names another; the demo never
+    # passes --allow-unjailed: on the KVM tier the task runs jailed.
+    : "${AGENTOS_JAILER:=$(dirname "$AGENTOS_FIRECRACKER")/jailer}" ;;
   *) echo "unknown worker $WORKER (host or firecracker)" >&2; exit 2 ;;
 esac
 cargo build -q -p agentos-cli
 BIN=/work/target/debug/agentos
 rm -rf /tmp/demo && mkdir -p /tmp/demo && cd /tmp/demo
-# shellcheck disable=SC2086 # WORKER_ARGS is a list of words
-agentos() { "$BIN" --home /tmp/demo/home $WORKER_ARGS "$@"; }
+# Each path is passed as one argument (no word splitting).
+agentos() {
+  if [ "$WORKER" = firecracker ]; then
+    "$BIN" --home /tmp/demo/home --worker firecracker --firecracker "$AGENTOS_FIRECRACKER" --jailer "$AGENTOS_JAILER" "$@"
+  else
+    "$BIN" --home /tmp/demo/home "$@"
+  fi
+}
 run() { echo "\$ agentos $*"; agentos "$@"; code=$?; [ $code -eq 0 ] || echo "(exit code $code)"; echo; }
 cat > task.json <<'JSON'
 {

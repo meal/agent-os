@@ -80,7 +80,7 @@ impl World {
 
     /// `check_prefix`: python prepended to the profile's check script.
     fn with_profile(deadline_seconds: u32, check_prefix: Option<&str>) -> World {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = common::scratch_root();
         copy_dir(&fixtures().join("parser-repo"), &dir.path().join("snapshot"));
         copy_dir(&fixtures().join("profiles/parser-checks-v1"), &dir.path().join("profile"));
         if let Some(prefix) = check_prefix {

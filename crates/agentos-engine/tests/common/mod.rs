@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod kvm;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -152,13 +154,15 @@ pub fn jailed_fake_firecracker_config(root: &Path) -> FirecrackerConfig {
 
 /// Which worker the migrated 3a suites (crash matrix, deadline, revoke, supervised) run
 /// against: `AGENTOS_TEST_WORKER` = `host` (default) | `firecracker-fake`, the latter jailed
-/// through the fake jailer with `AGENTOS_TEST_JAIL=fake`. Any other value panics, so a typo
+/// through the fake jailer with `AGENTOS_TEST_JAIL=fake` | `firecracker`, the real jailed
+/// worker of the KVM tier (`kvm::require()` must pass). Any other value panics, so a typo
 /// never runs the host tier under the name of another.
 pub fn test_worker() -> &'static str {
     let worker = match std::env::var("AGENTOS_TEST_WORKER").as_deref() {
         Err(_) | Ok("") | Ok("host") => "host",
         Ok("firecracker-fake") => "firecracker-fake",
-        Ok(other) => panic!("AGENTOS_TEST_WORKER={other:?}: this tier knows host and firecracker-fake"),
+        Ok("firecracker") => "firecracker",
+        Ok(other) => panic!("AGENTOS_TEST_WORKER={other:?}: this tier knows host, firecracker-fake and firecracker"),
     };
     if test_jail_fake() && worker != "firecracker-fake" {
         panic!("AGENTOS_TEST_JAIL=fake needs AGENTOS_TEST_WORKER=firecracker-fake");
@@ -180,36 +184,128 @@ pub fn fake_mode() -> bool {
     test_worker() == "firecracker-fake"
 }
 
+/// Whether the migrated suites run on the real, jailed Firecracker worker (KVM tier).
+pub fn real_mode() -> bool {
+    test_worker() == "firecracker"
+}
+
+/// A scratch root for one test's home: in real mode on the guest image's filesystem (the
+/// jail hard-links the image; elsewhere `Kvm::image_for` would copy it), else a plain
+/// temporary directory.
+pub fn scratch_root() -> TempDir {
+    if real_mode() { real_kvm().root() } else { tempfile::tempdir().unwrap() }
+}
+
+/// The KVM tier's settings, for `AGENTOS_TEST_WORKER=firecracker`: the gate must pass (it
+/// panics with its reasons when it cannot; without `AGENTOS_KVM_TESTS` this panics too, as
+/// the real worker was asked for).
+pub fn real_kvm() -> kvm::Kvm {
+    kvm::require().expect("AGENTOS_TEST_WORKER=firecracker needs the KVM tier: set AGENTOS_KVM_TESTS=1 (docker compose run --rm test-kvm …)")
+}
+
 /// The worker the migrated suites use over `root`'s `snapshot`, `profile` and `work`:
 /// `Host(host_config(root))`, or in fake mode `Firecracker(fake_firecracker_config(root))`
 /// (jailed with `AGENTOS_TEST_JAIL=fake`). The Firecracker config is built once per root
 /// and kept in `<root>/worker-config.json`: a restarted controller must never rewrite the
 /// image, the dummy binary or the fake jailer while a job that outlived it uses them.
 pub fn worker_config(root: &Path) -> WorkerConfig {
-    if !fake_mode() {
+    if !fake_mode() && !real_mode() {
         return WorkerConfig::Host(host_config(root));
     }
     let kept = root.join("worker-config.json");
     if let Ok(bytes) = fs::read(&kept) {
         return serde_json::from_slice(&bytes).unwrap();
     }
-    let cfg = if test_jail_fake() { jailed_fake_firecracker_config(root) } else { fake_firecracker_config(root) };
+    let cfg = if real_mode() {
+        // The real tier is always jailed.
+        real_kvm().jailed_config(root)
+    } else if test_jail_fake() {
+        jailed_fake_firecracker_config(root)
+    } else {
+        fake_firecracker_config(root)
+    };
     let worker = WorkerConfig::Firecracker(cfg);
     fs::write(&kept, serde_json::to_vec(&worker).unwrap()).unwrap();
     worker
 }
 
 /// Where the chosen worker keeps `task`'s workspace tree on the host: the host worker's
-/// `<work>/<task>/ws`, or the fake guest's view of `ws.img`, `<work>/<task>/workspace`.
+/// `<work>/<task>/ws`, or the fake guest's view of `ws.img`, `<work>/<task>/workspace`, or
+/// (real mode) a fresh copy of the tree in the ext4 `ws.img`, read with `debugfs` (the host
+/// never mounts a guest's filesystem): `<root>/ws-dumps/<n>`.
 pub fn workspace_dir(root: &Path, task: &TaskId) -> PathBuf {
     let task_dir = root.join("work").join(task.as_str());
+    if real_mode() {
+        return dump_ws_img(&task_dir.join("ws.img"), &root.join("ws-dumps"));
+    }
     if fake_mode() { task_dir.join("workspace") } else { task_dir.join("ws") }
+}
+
+/// The tree of an ext4 image, copied out with `debugfs -R "rdump / DIR"` into a new
+/// directory under `dumps` (read-only: the image is opened without `-w`).
+pub fn dump_ws_img(img: &Path, dumps: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let dir = dumps.join(N.fetch_add(1, Ordering::Relaxed).to_string());
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let out = std::process::Command::new("debugfs")
+        .arg("-R")
+        .arg(format!("rdump / {}", dir.display()))
+        .arg(img)
+        .output()
+        .expect("run debugfs");
+    assert!(out.status.success(), "debugfs rdump of {}: {}", img.display(), String::from_utf8_lossy(&out.stderr));
+    // `rdump` keeps the image's root and its `lost+found` (removed by the guest; never in
+    // the digest anyway).
+    dir
+}
+
+/// Runs `debugfs -w` on `img` with `commands` (one per line), for tests that tamper with a
+/// real guest's workspace image from the host. Panics with debugfs's output on failure.
+pub fn debugfs_write(img: &Path, commands: &str) {
+    use std::io::Write;
+    let mut child = std::process::Command::new("debugfs")
+        .args(["-w", "-f", "-"])
+        .arg(img)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run debugfs");
+    child.stdin.take().unwrap().write_all(commands.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    // debugfs exits 0 even when a command fails; it reports a failure as `<command>: <why>`.
+    let words: Vec<&str> = commands.lines().filter_map(|l| l.split_whitespace().next()).collect();
+    let failed = text.lines().any(|l| words.iter().any(|w| l.starts_with(&format!("{w}: "))));
+    assert!(out.status.success() && !failed, "debugfs -w {} <<< {commands:?}: {text}", img.display());
+}
+
+/// Writes `content` to `rel` (`dir/name`) in `task`'s workspace behind the worker's back:
+/// in the host's (or fake guest's) tree, or (real mode) in `ws.img` with `debugfs`.
+pub fn write_in_workspace(root: &Path, task: &TaskId, rel: &str, content: &str) {
+    if !real_mode() {
+        fs::write(workspace_dir(root, task).join(rel), content).unwrap();
+        return;
+    }
+    let img = root.join("work").join(task.as_str()).join("ws.img");
+    let (dir, name) = rel.rsplit_once('/').unwrap_or(("", rel));
+    let local = root.join(format!("planted-{}", rel.replace('/', "_")));
+    fs::write(&local, content).unwrap();
+    // `write` refuses an existing name: remove it first (a missing one is fine).
+    let _ = std::process::Command::new("debugfs").args(["-w", "-R"]).arg(format!("rm /{rel}")).arg(&img).output();
+    debugfs_write(&img, &format!("cd /{dir}\nwrite {} {name}\n", local.display()));
 }
 
 /// Makes `task`'s workspace gone for the chosen worker: the host directory, or (fake mode)
 /// `ws.img`, which is what the Firecracker worker and the inspector check, and the fake
-/// guest's tree with it.
+/// guest's tree with it, or (real mode) `ws.img`.
 pub fn lose_workspace(root: &Path, task: &TaskId) {
+    if real_mode() {
+        fs::remove_file(root.join("work").join(task.as_str()).join("ws.img")).unwrap();
+        return;
+    }
     if fake_mode() {
         let task_dir = root.join("work").join(task.as_str());
         fs::remove_file(task_dir.join("ws.img")).unwrap();
@@ -243,6 +339,73 @@ pub fn processes_naming(path: &Path) -> Vec<i32> {
             cmdline.windows(needle.len()).any(|w| w == needle) && proc_state(*pid).is_some_and(|(s, ..)| s != "Z")
         })
         .collect()
+}
+
+/// A live `firecracker` process (`comm`), as `/proc` shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FcProc {
+    pub pid: i32,
+    /// The real uid (`Uid:` of `/proc/<pid>/status`).
+    pub uid: u32,
+    /// The cgroup v2 line of `/proc/<pid>/cgroup` (`0::/agentos/<id>`).
+    pub cgroup: String,
+    pub cmdline: Vec<String>,
+}
+
+impl FcProc {
+    /// The value of `--id`: the attempt id, or `inspect-<uuid>`.
+    pub fn id(&self) -> Option<&str> {
+        self.cmdline.iter().position(|a| a == "--id").and_then(|i| self.cmdline.get(i + 1)).map(String::as_str)
+    }
+}
+
+/// Every live (non-zombie) `firecracker` process. A jailed one's command line is
+/// `/firecracker --id <id> … --config-file /vm.json` and names no host path, so a home's
+/// processes are told apart by `--id` (`home_firecrackers`), never by `processes_naming`.
+pub fn firecracker_processes() -> Vec<FcProc> {
+    all_pids()
+        .into_iter()
+        .filter_map(|pid| {
+            let comm = fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+            if comm.trim_end() != "firecracker" || proc_state(pid).is_none_or(|(s, ..)| s == "Z") {
+                return None;
+            }
+            let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+            let uid = status.lines().find(|l| l.starts_with("Uid:"))?.split_whitespace().nth(1)?.parse().ok()?;
+            let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?.lines().find(|l| l.starts_with("0::"))?.to_string();
+            let cmdline = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+            let cmdline = cmdline.split(|b| *b == 0).filter(|a| !a.is_empty()).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+            Some(FcProc { pid, uid, cgroup, cmdline })
+        })
+        .collect()
+}
+
+/// The VM ids a home under `root` ever used: the attempt id of every `<root>/jobs/<effect>-
+/// <attempt>` and `inspect-<uuid>` of every `<root>/inspect/<task>/<uuid>`.
+pub fn home_vm_ids(root: &Path) -> Vec<String> {
+    let names = |dir: &Path| -> Vec<String> {
+        fs::read_dir(dir).into_iter().flatten().flatten().filter_map(|e| e.file_name().into_string().ok()).collect()
+    };
+    let mut ids: Vec<String> = names(&root.join("jobs")).into_iter().filter_map(|n| n.get(65..).map(str::to_string)).collect();
+    for task in names(&root.join("inspect")) {
+        ids.extend(names(&root.join("inspect").join(task)).into_iter().map(|u| format!("inspect-{u}")));
+    }
+    ids
+}
+
+/// The live Firecracker processes of the home under `root` (`home_vm_ids`).
+pub fn home_firecrackers(root: &Path) -> Vec<FcProc> {
+    let ids = home_vm_ids(root);
+    firecracker_processes().into_iter().filter(|p| p.id().is_some_and(|id| ids.iter().any(|i| i == id))).collect()
+}
+
+/// `processes_naming(root)` plus, in real mode, the pids of `home_firecrackers(root)`.
+pub fn processes_of_home(root: &Path) -> Vec<i32> {
+    let mut pids = processes_naming(root);
+    if real_mode() {
+        pids.extend(home_firecrackers(root).into_iter().map(|p| p.pid));
+    }
+    pids
 }
 
 /// A supervised executor running `worker` jobs under `jobs_root` with the real supervisor

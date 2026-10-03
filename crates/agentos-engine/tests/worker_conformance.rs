@@ -1,10 +1,11 @@
 //! Worker conformance: one table of cases run against `HostProcessWorker` and against
 //! `FirecrackerWorker` over the fake guest (jailed through the fake jailer with
 //! `AGENTOS_TEST_JAIL=fake`), each in a fresh root with the same task, requests and attempt
-//! contexts, comparing every observation field by field with nothing normalized. Then the
-//! kill paths and the failure mapping of the Firecracker worker through the real
-//! `agentos-supervisor` binary, and the controller's rejection of a guest's forged
-//! verification digest. No KVM, no root.
+//! contexts, comparing every observation field by field with nothing normalized; and, in
+//! the KVM tier (`kvm::require()`), the same table against the real, jailed guest (the
+//! `Real` column). Then the kill paths and the failure mapping of the Firecracker worker
+//! through the real `agentos-supervisor` binary, and the controller's rejection of a
+//! guest's forged verification digest. Apart from the `Real` column: no KVM, no root.
 
 mod common;
 
@@ -36,8 +37,8 @@ use agentos_engine::supervised::{ExecCounts, Reconciler, SupervisedExecutor};
 use agentos_engine::worker::{HostProcessWorker, Worker};
 use agentos_engine::workspace::workspace_digest;
 use common::{
-    comment_patch, contract, copy_dir, create_patch, fake_firecracker_config, fix_patch, fixtures, host_config,
-    jailed_fake_firecracker_config, processes_naming, proc_state, supervised, test_jail_fake, Env, SUPERVISOR_BIN,
+    comment_patch, contract, copy_dir, create_patch, debugfs_write, fake_firecracker_config, fix_patch, fixtures, host_config,
+    jailed_fake_firecracker_config, kvm, processes_naming, proc_state, supervised, test_jail_fake, Env, SUPERVISOR_BIN,
     TEST_WORKERS_ENV,
 };
 use rustix::process::{kill_process, Pid, Signal};
@@ -107,6 +108,8 @@ fn snapshot_digest() -> Digest {
 enum Kind {
     Host,
     Fake,
+    /// The real guest image under the real Firecracker and jailer (KVM tier).
+    Real,
 }
 
 /// Per-case worker settings, the same on both sides.
@@ -133,11 +136,32 @@ struct Side {
 
 impl Side {
     fn new(kind: Kind, task: &TaskId, settings: Settings) -> Side {
-        let dir = fresh_root();
+        Side::build(kind, task, settings, None)
+    }
+
+    /// The `Real` side: a root on the guest image's filesystem, the jailed real worker.
+    fn real(kvm: &kvm::Kvm, task: &TaskId, settings: Settings) -> Side {
+        Side::build(Kind::Real, task, settings, Some(kvm))
+    }
+
+    fn build(kind: Kind, task: &TaskId, settings: Settings, kvm: Option<&kvm::Kvm>) -> Side {
+        let dir = match kvm {
+            Some(kvm) => {
+                let dir = kvm.root();
+                copy_dir(&fixtures().join("parser-repo"), &dir.path().join("snapshot"));
+                copy_dir(&fixtures().join("profiles/parser-checks-v1"), &dir.path().join("profile"));
+                dir
+            }
+            None => fresh_root(),
+        };
         let mut host = host_config(dir.path());
         host.profile_digest = settings.pinned;
         host.verify_timeout_secs = settings.timeout_secs;
-        let mut fc = if test_jail_fake() { jailed_fake_firecracker_config(dir.path()) } else { fake_firecracker_config(dir.path()) };
+        let mut fc = match kvm {
+            Some(kvm) => kvm.jailed_config(dir.path()),
+            None if test_jail_fake() => jailed_fake_firecracker_config(dir.path()),
+            None => fake_firecracker_config(dir.path()),
+        };
         fc.profile_digest = settings.pinned;
         fc.verify_timeout_secs = settings.timeout_secs;
         Side { kind, dir, task: task.clone(), host, fc }
@@ -152,15 +176,16 @@ impl Side {
     }
 
     /// The workspace tree on the host: the host worker's directory, or the fake guest's
-    /// view of `ws.img`.
+    /// view of `ws.img`. The real guest's tree is inside the ext4 `ws.img` (`plant_*`).
     fn ws(&self) -> PathBuf {
         match self.kind {
             Kind::Host => self.task_dir().join("ws"),
             Kind::Fake => self.task_dir().join("workspace"),
+            Kind::Real => panic!("the real guest's workspace is inside ws.img"),
         }
     }
 
-    /// The workspace is gone: the host directory, or `ws.img` (with the guest's tree).
+    /// The workspace is gone: the host directory, or `ws.img` (with the fake guest's tree).
     fn lose_workspace(&self) {
         match self.kind {
             Kind::Host => fs::remove_dir_all(self.ws()).unwrap(),
@@ -168,6 +193,28 @@ impl Side {
                 fs::remove_file(self.task_dir().join("ws.img")).unwrap();
                 fs::remove_dir_all(self.ws()).unwrap();
             }
+            Kind::Real => fs::remove_file(self.task_dir().join("ws.img")).unwrap(),
+        }
+    }
+
+    /// A symlink `src/<name>` to `target` planted in the workspace behind the worker's back
+    /// (in the real guest's image with `debugfs`).
+    fn plant_symlink(&self, name: &str, target: &str) {
+        match self.kind {
+            Kind::Real => debugfs_write(&self.task_dir().join("ws.img"), &format!("cd /src\nsymlink {name} {target}\n")),
+            _ => std::os::unix::fs::symlink(target, self.ws().join("src").join(name)).unwrap(),
+        }
+    }
+
+    /// A file `src/<name>` planted in the workspace behind the worker's back.
+    fn plant_file(&self, name: &str, content: &str) {
+        match self.kind {
+            Kind::Real => {
+                let local = self.root().join(format!("planted-{name}"));
+                fs::write(&local, content).unwrap();
+                debugfs_write(&self.task_dir().join("ws.img"), &format!("cd /src\nwrite {} {name}\n", local.display()));
+            }
+            _ => fs::write(self.ws().join("src").join(name), content).unwrap(),
         }
     }
 
@@ -178,7 +225,7 @@ impl Side {
     async fn run(&self, req: &EffectRequest, ctx: &AttemptCtx) -> ExecOutcome {
         match self.kind {
             Kind::Host => HostProcessWorker::new(&self.host, None).run(req, ctx).await,
-            Kind::Fake => {
+            Kind::Fake | Kind::Real => {
                 let job = JobDir::create(&self.root().join("jobs"), &job_request(req, ctx, WorkerConfig::Firecracker(self.fc.clone()), i64::MAX, 0)).unwrap().0;
                 FirecrackerWorker::new(&self.fc, &job).with_env(test_env()).run(req, ctx).await
             }
@@ -188,14 +235,14 @@ impl Side {
     async fn reconcile(&self, req: &EffectRequest, ctx: &AttemptCtx) -> Reconciliation {
         match self.kind {
             Kind::Host => HostProcessWorker::new(&self.host, None).reconcile(req, ctx).await,
-            Kind::Fake => self.inspector().reconcile(req, ctx).await,
+            Kind::Fake | Kind::Real => self.inspector().reconcile(req, ctx).await,
         }
     }
 
     fn current(&self) -> Option<Result<Digest, String>> {
         match self.kind {
             Kind::Host => HostProcessWorker::new(&self.host, None).current_workspace(&self.task),
-            Kind::Fake => self.inspector().current_workspace(&self.task),
+            Kind::Fake | Kind::Real => self.inspector().current_workspace(&self.task),
         }
     }
 }
@@ -251,10 +298,14 @@ struct Case {
     steps: Vec<Step>,
     /// What the case is about, asserted on the host's observations (the fake's are equal).
     check: fn(&[Obs]),
+    /// Only where the real guest's isolation makes the outcome differ by design: what the
+    /// `Real` column observes instead (asserted on the real observations; every other
+    /// case's real observations must equal the host's).
+    real: Option<fn(&[Obs])>,
 }
 
 fn case(name: &'static str, steps: Vec<Step>, check: fn(&[Obs])) -> Case {
-    Case { name, settings: Settings::default(), steps, check }
+    Case { name, settings: Settings::default(), steps, check, real: None }
 }
 
 /// A git binary patch creating `src/blob.bin` (made with `git diff --binary`).
@@ -292,7 +343,7 @@ fn cases() -> Vec<Case> {
             "symlink_on_path",
             vec![
                 Snapshot,
-                Do(|s| std::os::unix::fs::symlink("/tmp", s.ws().join("src/link")).unwrap()),
+                Do(|s| s.plant_symlink("link", "/tmp")),
                 Patch(create_patch("src/link/planted.py", "x")),
             ],
             |o| failed_with(&o[2], "path src/link/planted.py crosses symlink src/link"),
@@ -319,12 +370,14 @@ fn cases() -> Vec<Case> {
             settings: Settings { pinned: Some(Digest::of(b"some other profile")), ..Settings::default() },
             steps: vec![Snapshot, Verify],
             check: |o| failed_with(&o[1], "profile digest mismatch: pinned "),
+            real: None,
         },
         Case {
             name: "verification_timeout",
             settings: Settings { timeout_secs: 1, ..Settings::default() },
             steps: vec![Snapshot, Do(|s| set_profile(s.root(), serde_json::json!(["sh", "-c", "sleep 5", "sh"]))), Verify],
             check: |o| failed_with(&o[2], "timeout"),
+            real: None,
         },
         case(
             "oversized_output_truncation_flags",
@@ -344,20 +397,29 @@ fn cases() -> Vec<Case> {
                 assert_eq!(v["exit_code"], 0);
             },
         ),
-        case(
-            "check_pollution_voids_evidence",
-            vec![
-                Snapshot,
-                Do(|s| {
-                    set_profile(
-                        s.root(),
-                        serde_json::json!(["python3", "-c", "import os, sys; os.makedirs(os.path.join(sys.argv[1], 'src', '__pycache__')); print('PASSED')"]),
-                    )
-                }),
-                Verify,
-            ],
-            |o| failed_with(&o[2], "workspace polluted by excluded entries: src/__pycache__"),
-        ),
+        Case {
+            real: Some(|o| {
+                // The real check (uid 1001) cannot write to /workspace (builder's, 0755):
+                // it fails on its own and the workspace stays clean.
+                let v = evidence(o[2].out());
+                assert_eq!((v["passed"].clone(), v["exit_code"].clone()), (serde_json::json!(false), serde_json::json!(1)), "{v}");
+                assert!(v["stderr"].as_str().unwrap().contains("PermissionError: [Errno 13] Permission denied: '/workspace/src/__pycache__'"), "{v}");
+            }),
+            ..case(
+                "check_pollution_voids_evidence",
+                vec![
+                    Snapshot,
+                    Do(|s| {
+                        set_profile(
+                            s.root(),
+                            serde_json::json!(["python3", "-c", "import os, sys; os.makedirs(os.path.join(sys.argv[1], 'src', '__pycache__')); print('PASSED')"]),
+                        )
+                    }),
+                    Verify,
+                ],
+                |o| failed_with(&o[2], "workspace polluted by excluded entries: src/__pycache__"),
+            )
+        },
         case("reconcile_not_applied", vec![Snapshot, Reconcile(fix_patch())], |o| {
             assert_eq!(o[1], Obs::Recon(Reconciliation::NotApplied));
         }),
@@ -367,7 +429,7 @@ fn cases() -> Vec<Case> {
         }),
         case(
             "reconcile_unknown_on_tampered_workspace",
-            vec![Snapshot, Do(|s| fs::write(s.ws().join("src/stray.py"), "x = 1\n").unwrap()), Reconcile(fix_patch())],
+            vec![Snapshot, Do(|s| s.plant_file("stray.py", "x = 1\n")), Reconcile(fix_patch())],
             |o| assert_eq!(o[2], Obs::Recon(Reconciliation::Unknown)),
         ),
         case("current_workspace_missing", vec![Snapshot, Current, Do(Side::lose_workspace), Current], |o| {
@@ -404,12 +466,23 @@ async fn observe(side: &Side, step: &Step, req: Option<&EffectRequest>, ctx: &At
 /// Runs `case` on both workers and asserts every observation is equal. A missing workspace
 /// is the one place the texts differ by design (the spec names `workspace directory <path>
 /// is missing` for the host and `workspace image <path> is missing` for Firecracker, each
-/// path in its own root): there, both must be errors with their documented text.
+/// path in its own root): there, both must be errors with their documented text. With
+/// `real`, the other side is the real guest, and a case's `real` expectation replaces the
+/// equality for the observations it is about.
 async fn run_case(case: &Case) {
+    run_case_against(case, None).await
+}
+
+async fn run_case_against(case: &Case, real: Option<&kvm::Kvm>) {
     let task = TaskId::new();
     let contract = contract(10).0;
     let host = Side::new(Kind::Host, &task, case.settings);
-    let fake = Side::new(Kind::Fake, &task, case.settings);
+    let fake = match real {
+        Some(kvm) => Side::real(kvm, &task, case.settings),
+        None => Side::new(Kind::Fake, &task, case.settings),
+    };
+    let differs = real.is_some() && case.real.is_some();
+    let mut theirs = Vec::new();
     let mut seen = Vec::new();
     for (i, step) in case.steps.iter().enumerate() {
         let req = match step {
@@ -424,7 +497,9 @@ async fn run_case(case: &Case) {
         let ctx = ctx(i as u64 + 1);
         let h = observe(&host, step, req.as_ref(), &ctx).await;
         let f = observe(&fake, step, req.as_ref(), &ctx).await;
+        theirs.push(f.clone());
         match (&h, &f) {
+            _ if differs && matches!(step, Step::Verify) => {}
             (Obs::Current(Some(Err(he))), Obs::Current(Some(Err(fe)))) => {
                 assert_eq!(*he, format!("workspace directory {} is missing", host.ws().display()), "{}", case.name);
                 assert_eq!(*fe, format!("workspace image {} is missing", fake.task_dir().join("ws.img").display()), "{}", case.name);
@@ -441,6 +516,9 @@ async fn run_case(case: &Case) {
         seen.push(h);
     }
     (case.check)(&seen);
+    if let (Some(_), Some(real_check)) = (real, case.real) {
+        real_check(&theirs);
+    }
 }
 
 #[tokio::test]
@@ -452,6 +530,27 @@ async fn every_case_is_observationally_equal_on_host_and_fake() {
     assert_eq!(names.len(), 19, "every case has its own name");
     for case in &cases {
         run_case(case).await;
+    }
+}
+
+/// The `Real` column: the table against the real, jailed guest (KVM tier only).
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_table_passes_on_the_real_guest() {
+    let Some(kvm) = kvm::require() else { return };
+    // The cases run side by side: each boots its own VMs in its own root.
+    let mut runs = Vec::new();
+    for i in 0..cases().len() {
+        let kvm = kvm.clone();
+        runs.push(tokio::spawn(async move {
+            let cases = cases();
+            let case = &cases[i];
+            run_case_against(case, Some(&kvm)).await;
+            case.name
+        }));
+    }
+    for run in runs {
+        let name = run.await.unwrap();
+        println!("Real column: {name} ok");
     }
 }
 
@@ -467,6 +566,14 @@ async fn snapshot_digest_from_the_guest_equals_the_host_digest() {
     assert_eq!(out.new_workspace, Some(host_digest), "the guest's SnapshotDone digest");
     assert_eq!(workspace_digest(&fake.ws()).unwrap(), host_digest, "the tree the guest wrote");
     assert_eq!(fake.current(), Some(Ok(host_digest)), "an inspection boot reports it too");
+
+    // The real guest (KVM tier): its digest of the tree it wrote into the ext4 image.
+    let Some(kvm) = kvm::require() else { return };
+    let real = Side::real(&kvm, &task, Settings::default());
+    let out = real.run(&req, &ctx(1)).await;
+    succeeded(&out);
+    assert_eq!(out.new_workspace, Some(host_digest), "the real guest's SnapshotDone digest");
+    assert_eq!(real.current(), Some(Ok(host_digest)), "a real inspection boot reports it too");
 }
 
 // ---------------------------------------------------------------------------------------

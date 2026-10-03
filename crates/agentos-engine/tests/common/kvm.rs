@@ -123,15 +123,50 @@ pub fn require() -> Option<Kvm> {
     Some(Kvm { firecracker_bin, jailer_bin, image_dir, cgroup_root })
 }
 
+fn device(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(path).ok().map(|m| m.dev())
+}
+
 impl Kvm {
+    /// A scratch root on the guest image's filesystem: the jail hard-links the image into
+    /// the chroot, so a root on another filesystem (`/tmp` is the container's overlay, the
+    /// image lives on the `guest-images` volume) could not stage it.
+    pub fn root(&self) -> tempfile::TempDir {
+        let parent = self.image_dir.parent().expect("the image directory has a parent");
+        tempfile::Builder::new().prefix(".kvm-test-").tempdir_in(parent).expect("a scratch root next to the guest image")
+    }
+
+    /// The image a job under `root` can hard-link: the tier's own when `root` is on its
+    /// filesystem, else a copy in `<root>/guest-image` (made once; as the CLI's registry
+    /// copies an image into its home).
+    pub fn image_for(&self, root: &Path) -> PathBuf {
+        fs::create_dir_all(root).expect("create the root");
+        if device(root).is_some() && device(root) == device(&self.image_dir) {
+            return self.image_dir.clone();
+        }
+        let copy = root.join("guest-image");
+        if !copy.join("image.json").is_file() {
+            let tmp = root.join(".guest-image.tmp");
+            let _ = fs::remove_dir_all(&tmp);
+            fs::create_dir_all(&tmp).expect("create the image copy");
+            for f in IMAGE_FILES {
+                fs::copy(self.image_dir.join(f), tmp.join(f)).unwrap_or_else(|e| panic!("copy {f} of the guest image: {e}"));
+            }
+            fs::rename(&tmp, &copy).expect("install the image copy");
+        }
+        copy
+    }
+
     /// A Firecracker worker config over `root`'s `snapshot`, `profile` and `work`: the real
     /// launcher, jailed as `JAIL_UID`/`JAIL_GID` in this tier's cgroup tree, the image pinned
-    /// by its digest, 1 vCPU and 256 MiB.
+    /// by its digest (`image_for(root)`), 1 vCPU and 256 MiB.
     pub fn jailed_config(&self, root: &Path) -> FirecrackerConfig {
+        let image_dir = self.image_for(root);
         FirecrackerConfig {
             firecracker_bin: self.firecracker_bin.clone(),
-            image_dir: self.image_dir.clone(),
-            image_digest: workspace_digest(&self.image_dir).expect("digest the guest image"),
+            image_digest: workspace_digest(&image_dir).expect("digest the guest image"),
+            image_dir,
             snapshot_dir: root.join("snapshot"),
             profile_dir: root.join("profile"),
             profile_digest: None,
@@ -148,5 +183,11 @@ impl Kvm {
                 cgroup_root: self.cgroup_root.clone(),
             }),
         }
+    }
+
+    /// `jailed_config(root)` run without the jail: Firecracker as the current user, in the
+    /// caller's cgroup (`--allow-unjailed`).
+    pub fn unjailed_config(&self, root: &Path) -> FirecrackerConfig {
+        FirecrackerConfig { jail: JailMode::Unjailed, ..self.jailed_config(root) }
     }
 }

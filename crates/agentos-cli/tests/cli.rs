@@ -16,6 +16,10 @@ use predicates::prelude::*;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
+/// The KVM gate, shared with the engine's tests.
+#[path = "../../agentos-engine/tests/common/kvm.rs"]
+mod kvm;
+
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures").canonicalize().unwrap()
 }
@@ -31,13 +35,14 @@ const TERMINAL: [&str; 3] = ["SUCCEEDED", "FAILED", "CANCELLED"];
 
 /// Which worker `Cli::cmd` runs the tasks on: `AGENTOS_TEST_WORKER` = `host` (default) |
 /// `firecracker-fake` (the Firecracker worker over the fake guest, the CLI's own
-/// `supervise fake-guest`). Any other value panics, so a typo never runs the host tier under
-/// the name of another.
+/// `supervise fake-guest`) | `firecracker` (the real, jailed worker of the KVM tier). Any
+/// other value panics, so a typo never runs the host tier under the name of another.
 fn test_worker() -> &'static str {
     let worker = match std::env::var("AGENTOS_TEST_WORKER").as_deref() {
         Err(_) | Ok("") | Ok("host") => "host",
         Ok("firecracker-fake") => "firecracker-fake",
-        Ok(other) => panic!("AGENTOS_TEST_WORKER={other:?}: the CLI tier knows host and firecracker-fake"),
+        Ok("firecracker") => "firecracker",
+        Ok(other) => panic!("AGENTOS_TEST_WORKER={other:?}: the CLI tier knows host, firecracker-fake and firecracker"),
     };
     if test_jail_fake() && worker != "firecracker-fake" {
         panic!("AGENTOS_TEST_JAIL=fake needs AGENTOS_TEST_WORKER=firecracker-fake");
@@ -58,6 +63,17 @@ fn test_jail_fake() -> bool {
 
 fn fake_mode() -> bool {
     test_worker() == "firecracker-fake"
+}
+
+/// The real, jailed Firecracker worker (KVM tier).
+fn real_mode() -> bool {
+    test_worker() == "firecracker"
+}
+
+/// The KVM tier's binaries and image; the gate panics with its reasons when the real worker
+/// was asked for and cannot run.
+fn real_kvm() -> kvm::Kvm {
+    kvm::require().expect("AGENTOS_TEST_WORKER=firecracker needs the KVM tier: set AGENTOS_KVM_TESTS=1 (docker compose run --rm test-kvm …)")
 }
 
 /// The CLI's own configuration and test switches: never inherited from the test's
@@ -85,6 +101,9 @@ enum Mode {
     PlainFake,
     /// `--worker firecracker` over the fake guest.
     Fake,
+    /// `--worker firecracker --firecracker $AGENTOS_FIRECRACKER --jailer $AGENTOS_JAILER`:
+    /// the real worker, jailed (never `--allow-unjailed`: the tier must jail).
+    Real,
 }
 
 /// A scratch directory holding an agentos home (created on demand by the CLI) and inputs.
@@ -94,11 +113,16 @@ struct Cli {
 
 impl Cli {
     /// A scratch home; under `AGENTOS_TEST_WORKER=firecracker-fake` the dummy guest image is
-    /// registered once, so `cmd` can submit to the Firecracker worker.
+    /// registered once, under `firecracker` the real one (`$AGENTOS_GUEST_IMAGE`), so `cmd`
+    /// can submit to the Firecracker worker.
     fn new() -> Cli {
         let cli = Cli::bare();
         if fake_mode() {
             cli.register_guest_image();
+        }
+        if real_mode() {
+            let image = real_kvm().image_dir;
+            cli.json_as(Mode::Plain, &["image", "register", image.to_str().unwrap()]);
         }
         cli
     }
@@ -122,9 +146,16 @@ impl Cli {
         self.dir.path().join(rel)
     }
 
-    /// The tier's mode: `Fake` under `AGENTOS_TEST_WORKER=firecracker-fake`, else `Plain`.
+    /// The tier's mode: `Fake` under `AGENTOS_TEST_WORKER=firecracker-fake`, `Real` under
+    /// `firecracker`, else `Plain`.
     fn mode() -> Mode {
-        if fake_mode() { Mode::Fake } else { Mode::Plain }
+        if fake_mode() {
+            Mode::Fake
+        } else if real_mode() {
+            Mode::Real
+        } else {
+            Mode::Plain
+        }
     }
 
     fn cmd(&self, args: &[&str]) -> Command {
@@ -150,7 +181,11 @@ impl Cli {
         if mode == Mode::Fake {
             cmd.args(["--worker", "firecracker"]);
         }
-        if mode != Mode::Plain {
+        if mode == Mode::Real {
+            let kvm = real_kvm();
+            cmd.args(["--worker", "firecracker", "--firecracker"]).arg(&kvm.firecracker_bin).arg("--jailer").arg(&kvm.jailer_bin);
+        }
+        if matches!(mode, Mode::Fake | Mode::PlainFake) {
             cmd.env("AGENTOS_TEST_WORKERS", "1").env("AGENTOS_TEST_FAKE_GUEST", "1");
         }
         // The tier's jail setting applies to the tier's own commands only.
@@ -289,6 +324,10 @@ fn assert_tier_worker(cli: &Cli, id: &str) {
         assert_eq!(submitted["worker"], "firecracker", "{submitted}");
         assert_eq!(submitted["firecracker_version"], "fake", "{submitted}");
         assert_eq!(submitted["jailed"], test_jail_fake(), "{submitted}");
+    } else if real_mode() {
+        assert_eq!(submitted["worker"], "firecracker", "{submitted}");
+        assert_eq!(submitted["firecracker_version"], "Firecracker v1.17.0", "{submitted}");
+        assert_eq!(submitted["jailed"], true, "the real tier always jails: {submitted}");
     } else {
         assert_eq!(submitted["worker"], "host", "{submitted}");
     }
@@ -299,7 +338,7 @@ fn assert_tier_worker(cli: &Cli, id: &str) {
 fn assert_nothing_recorded(cli: &Cli) {
     let Ok(entries) = fs::read_dir(cli.home()) else { return };
     let names: Vec<String> = entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
-    assert!(fake_mode() && names == ["registry"], "the home holds {names:?}");
+    assert!((fake_mode() || real_mode()) && names == ["registry"], "the home holds {names:?}");
 }
 
 fn digest_of_file(path: &Path) -> String {
@@ -378,7 +417,7 @@ fn full_flow_submit_status_events_export_and_the_patch_reproduces_the_fix() {
     assert_eq!(submitted_event["payload"]["repository_digest"], repo_digest);
     assert_eq!(submitted_event["payload"]["profile_id"], "parser-checks-v1");
     assert_eq!(submitted_event["payload"]["profile_digest"], profile_digest);
-    if fake_mode() {
+    if fake_mode() || real_mode() {
         // The Firecracker worker records the registered image instead of the host's label.
         assert_eq!(submitted_event["payload"]["guest_image_id"], "python-stdlib-v1");
         assert!(submitted_event["payload"].get("guest_image").is_none());
@@ -1029,6 +1068,38 @@ fn wait_for_verification_job(cli: &Cli) {
 /// line (`<home>/jobs/…`, or the fake guest's `<home>/work/<task>`).
 fn assert_no_job_processes(cli: &Cli) {
     assert_eq!(processes_mentioning(cli.home().to_str().unwrap()), Vec::<String>::new(), "no supervisor, worker or guest left");
+    assert_eq!(home_vms(cli), Vec::<String>::new(), "no Firecracker of this home left");
+}
+
+/// Live `firecracker` processes of this home. A jailed one's command line names no host
+/// path (`/firecracker --id <id> … --config-file /vm.json`): it is told by its `--id`, the
+/// attempt id of a job under `<home>/jobs` or `inspect-<uuid>` of `<home>/inspect/<task>/<uuid>`.
+fn home_vms(cli: &Cli) -> Vec<String> {
+    let names = |dir: PathBuf| -> Vec<String> {
+        fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()
+    };
+    let mut ids: Vec<String> = names(cli.home().join("jobs")).into_iter().filter_map(|n| n.get(65..).map(str::to_string)).collect();
+    for task in names(cli.home().join("inspect")) {
+        ids.extend(names(cli.home().join("inspect").join(task)).into_iter().map(|u| format!("inspect-{u}")));
+    }
+    let mut found = Vec::new();
+    for entry in fs::read_dir("/proc").unwrap().flatten() {
+        let path = entry.path();
+        let comm = fs::read_to_string(path.join("comm")).unwrap_or_default();
+        let stat = fs::read_to_string(path.join("stat")).unwrap_or_default();
+        let zombie = stat.rsplit_once(") ").is_some_and(|(_, rest)| rest.starts_with('Z'));
+        if comm.trim_end() != "firecracker" || zombie {
+            continue;
+        }
+        let cmdline = fs::read(path.join("cmdline")).unwrap_or_default();
+        let args: Vec<String> = cmdline.split(|b| *b == 0).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+        if let Some(id) = args.iter().position(|a| a == "--id").and_then(|i| args.get(i + 1))
+            && ids.contains(id)
+        {
+            found.push(args.join(" "));
+        }
+    }
+    found
 }
 
 #[test]
@@ -2122,4 +2193,82 @@ fn revoke_stops_a_running_job_even_when_the_worker_cannot_run() {
     assert_eq!(serde_json::from_slice::<Value>(&out).unwrap(), json!({ "task_id": id, "revoked": ["verification.run"], "cancelled_jobs": 1 }));
     wait_for_no_home_processes(&cli, std::time::Duration::from_secs(15));
     assert!(started.elapsed() < std::time::Duration::from_secs(25), "the 30 s check was stopped, took {:?}", started.elapsed());
+}
+
+// ---------------------------------------------------------------------------------------
+// The KVM tier: the CLI on the real, jailed worker, whatever AGENTOS_TEST_WORKER says.
+
+/// `submit` with a jailer that is not there: refused before the task is touched (the probe
+/// runs the real `jailer --version`); with `--allow-unjailed` the task runs unjailed on the
+/// real worker and records it.
+#[test]
+fn jailer_unavailable_refuses_before_the_task_is_touched() {
+    let Some(kvm) = kvm::require() else { return };
+    let cli = Cli::bare();
+    cli.json_as(Mode::Plain, &["image", "register", kvm.image_dir.to_str().unwrap()]);
+    let contract = cli.contract(&cli.repo_copy());
+    let patch = fix_patch();
+    let submit = |extra: &[&str]| {
+        let mut cmd = cli.cmd_as(Mode::Plain, &["--worker", "firecracker", "submit", &contract, "--yes", "--fake-agent-patch", patch.to_str().unwrap()]);
+        cmd.arg("--firecracker").arg(&kvm.firecracker_bin).args(["--jailer", "/nonexistent/jailer"]).args(extra);
+        cmd
+    };
+    submit(&[]).assert().code(1).stdout("").stderr(predicate::str::contains(
+        "firecracker worker unavailable: jailer unavailable: jailer --version: /nonexistent/jailer: No such file or directory",
+    ));
+    assert_nothing_recorded_but_the_registry(&cli);
+
+    let out = submit(&["--allow-unjailed"]).assert().success().get_output().stdout.clone();
+    let done: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(done["state"], "SUCCEEDED", "{done}");
+    let submitted = cli.submitted(done["task_id"].as_str().unwrap());
+    assert_eq!((submitted["jailed"].clone(), submitted["firecracker_version"].clone()), (json!(false), json!("Firecracker v1.17.0")), "{submitted}");
+    assert_no_job_processes(&cli);
+}
+
+fn assert_nothing_recorded_but_the_registry(cli: &Cli) {
+    let names: Vec<String> = fs::read_dir(cli.home()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(names, ["registry"], "the home holds {names:?}");
+}
+
+/// The CLI's jailed launch end to end on the real worker: `submit --yes` (jailed) to
+/// SUCCEEDED, `status`, `export`; then the controller killed right after the patch job's
+/// launch (exit 75), `resume` to SUCCEEDED, and the bundle equals the uncrashed one.
+#[test]
+fn cli_jailed_submit_status_export_then_kill_and_resume_on_the_real_worker() {
+    let Some(kvm) = kvm::require() else { return };
+    let cli = Cli::bare();
+    cli.json_as(Mode::Plain, &["image", "register", kvm.image_dir.to_str().unwrap()]);
+    let contract = cli.contract(&fixtures().join("parser-repo"));
+    let patch = fix_patch();
+    let real = |args: &[&str]| cli.cmd_as(Mode::Real, args);
+
+    let out = real(&["submit", &contract, "--yes", "--fake-agent-patch", patch.to_str().unwrap()]).assert().success().get_output().stdout.clone();
+    let done: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(done["state"], "SUCCEEDED", "{done}");
+    let id = done["task_id"].as_str().unwrap().to_string();
+    let submitted = cli.submitted(&id);
+    assert_eq!((submitted["worker"].clone(), submitted["jailed"].clone()), (json!("firecracker"), json!(true)), "{submitted}");
+    let status: Value = serde_json::from_slice(&real(&["status", &id]).assert().success().get_output().stdout.clone()).unwrap();
+    assert_eq!((status["state"].clone(), status["jailed"].clone()), (json!("SUCCEEDED"), json!(true)), "{status}");
+    assert_eq!(status["verified_digest"], status["workspace_digest"]);
+    let clean = cli.path("clean");
+    let expected: Value = serde_json::from_slice(&real(&["export", &id, clean.to_str().unwrap()]).assert().success().get_output().stdout.clone()).unwrap();
+    assert_eq!(expected["guest_image_digest"], submitted["guest_image_digest"], "{expected}");
+
+    let crashed = real(&["submit", &contract, "--yes", "--fake-agent-patch", patch.to_str().unwrap(), "--crash-at", "during-execute:apply_patch"])
+        .assert()
+        .code(75)
+        .get_output()
+        .stderr
+        .clone();
+    let crashed: Value = String::from_utf8_lossy(&crashed).lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).find(|v| v.get("crashed").is_some()).unwrap();
+    let id = crashed["task_id"].as_str().unwrap().to_string();
+    let resumed: Value = serde_json::from_slice(&real(&["resume", &id]).assert().success().get_output().stdout.clone()).unwrap();
+    assert_eq!(resumed, json!({ "task_id": id, "state": "SUCCEEDED" }));
+    let recovered = cli.path("recovered");
+    let manifest: Value = serde_json::from_slice(&real(&["export", &id, recovered.to_str().unwrap()]).assert().success().get_output().stdout.clone()).unwrap();
+    assert_eq!(normalized(&manifest), normalized(&expected), "the recovered bundle equals the uncrashed one");
+    assert_one_job_per_effect(&cli, "after the controller's kill");
+    assert_no_job_processes(&cli);
 }

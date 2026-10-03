@@ -31,8 +31,9 @@ use agentos_store::blob::BlobStore;
 use agentos_store::db::{Db, StoredEvent};
 use agentos_store::effects::UsageSummary;
 use common::{
-    all_pids, comment_patch, contract, copy_dir, fix_patch, fixtures, lose_workspace, proc_state, processes_naming,
-    supervised, worker_config, workspace_dir, EXIT_BEFORE_RECEIPT_ENV, TEST_WORKERS_ENV,
+    all_pids, comment_patch, contract, copy_dir, firecracker_processes, fix_patch, fixtures, lose_workspace, proc_state,
+    processes_naming, processes_of_home, real_mode, supervised, worker_config, workspace_dir, write_in_workspace, EXIT_BEFORE_RECEIPT_ENV,
+    TEST_WORKERS_ENV,
 };
 use rustix::process::{kill_process, pidfd_open, pidfd_send_signal, Pid, PidfdFlags, Signal};
 use tempfile::TempDir;
@@ -123,7 +124,7 @@ struct Ctl {
 
 impl World {
     fn new() -> World {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = common::scratch_root();
         copy_dir(&fixtures().join("parser-repo"), &dir.path().join("snapshot"));
         copy_dir(&fixtures().join("profiles/parser-checks-v1"), &dir.path().join("profile"));
         let db = Db::open(&dir.path().join("agentos.db")).unwrap();
@@ -244,7 +245,7 @@ impl World {
     /// Live (non-zombie) processes whose command line names anything in this world: the
     /// supervisors and workers (their job directory) and the checks (the workspace).
     fn live_processes(&self) -> Vec<i32> {
-        processes_naming(self.dir.path())
+        processes_of_home(self.dir.path())
     }
 
     /// Waits for every process of this world to be gone; panics with the survivors.
@@ -325,8 +326,14 @@ fn check_started(job: &JobDir) -> bool {
     if !job.groups().is_empty() {
         return true;
     }
-    match job.request().map(|r| (r.worker, r.task_id)) {
-        Ok((WorkerConfig::Firecracker(cfg), task)) => {
+    match job.request().map(|r| (r.worker, r.task_id, r.attempt_id)) {
+        // The real guest's check is invisible to the host: its VM is the proxy (the check
+        // starts within a second of the boot; the slow profiles sleep for longer than that).
+        Ok((WorkerConfig::Firecracker(_), _, attempt)) if real_mode() => {
+            let id = attempt.to_string();
+            firecracker_processes().iter().any(|p| p.id() == Some(id.as_str()))
+        }
+        Ok((WorkerConfig::Firecracker(cfg), task, _)) => {
             !processes_naming(&cfg.work_root.join(task.as_str()).join("workspace")).is_empty()
         }
         _ => false,
@@ -850,7 +857,7 @@ async fn an_unreconcilable_patch_fails_the_task_and_keeps_its_reservation_uncert
     wait_until("the patch job to end", || job.is_dead()).await;
     assert_eq!(job.read_receipt(), None);
     // ... and someone else touched the workspace too: it is neither the base nor base + patch.
-    std::fs::write(w.ws().join("src/__init__.py"), "# changed by hand\n").unwrap();
+    write_in_workspace(w.dir.path(), &w.task, "src/__init__.py", "# changed by hand\n");
 
     let report = ctl.recover(&w).await;
 

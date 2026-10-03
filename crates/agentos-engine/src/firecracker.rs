@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Reconciliation};
 use crate::guestlink::{fake_command, guest_text, type_name, GuestLauncher, GuestLink, LinkError};
-use crate::jail::{self, JailMode, StageSources};
+use crate::jail::{self, CgroupOverrides, JailMode, StageSources};
 use crate::job::JobDir;
 use crate::outcomes::{self, Check};
 use crate::worker::{Worker, TEST_WORKERS_ENV};
@@ -389,6 +389,8 @@ pub struct FirecrackerWorker {
     inspect_root: Option<PathBuf>,
     boot_timeout: Duration,
     env: Vec<(String, String)>,
+    /// Test seams (`with_jail_memory_max_mib`, `with_jail_cpu_quota_us`).
+    cgroup_overrides: CgroupOverrides,
 }
 
 /// The request to send, prepared (and limit-checked) before anything is launched.
@@ -615,6 +617,7 @@ fn launch(
     id: &str,
     extra_env: &[(String, String)],
     group: Group,
+    overrides: CgroupOverrides,
 ) -> Result<(Child, PathBuf), String> {
     let start = |e: io::Error| format!("cannot start firecracker: {e}");
     let stdio = || -> io::Result<(File, File)> {
@@ -634,7 +637,9 @@ fn launch(
             };
             jail::stage(jc, &plan, &paths.dir, sources)?;
             let mut cmd = Command::new(&jc.jailer_bin);
-            cmd.args(jail::jailer_args(jc, &plan, &cfg.firecracker_bin, cfg.vcpus, cfg.memory_mib));
+            // The test seams' lowered bounds count only in a test run.
+            let overrides = if env_value(extra_env, TEST_WORKERS_ENV).as_deref() == Some("1") { overrides } else { CgroupOverrides::default() };
+            cmd.args(jail::jailer_args_with(jc, &plan, &cfg.firecracker_bin, cfg.vcpus, cfg.memory_mib, overrides));
             (cmd, jail::host_uds(&plan))
         }
         (JailMode::Unjailed, GuestLauncher::Real { .. }) => {
@@ -663,7 +668,30 @@ impl FirecrackerWorker {
     pub fn new(cfg: &FirecrackerConfig, job: &JobDir) -> FirecrackerWorker {
         // `<home>/jobs/<job>` ⇒ `<home>/inspect`, as `SupervisedExecutor` derives it.
         let inspect_root = job.path.parent().and_then(Path::parent).map(|home| home.join("inspect"));
-        FirecrackerWorker { cfg: cfg.clone(), job_dir: job.path.clone(), inspect_root, boot_timeout: BOOT_TIMEOUT, env: Vec::new() }
+        FirecrackerWorker {
+            cfg: cfg.clone(),
+            job_dir: job.path.clone(),
+            inspect_root,
+            boot_timeout: BOOT_TIMEOUT,
+            env: Vec::new(),
+            cgroup_overrides: CgroupOverrides::default(),
+        }
+    }
+
+    /// Test seam (honoured only with `AGENTOS_TEST_WORKERS=1`): the jail's `memory.max` is
+    /// `mib` MiB instead of `memory_mib + JAIL_MEMORY_OVERHEAD_MIB`, so a test can watch the
+    /// cgroup (not the guest) kill Firecracker.
+    pub fn with_jail_memory_max_mib(mut self, mib: u32) -> FirecrackerWorker {
+        self.cgroup_overrides.memory_max_mib = Some(mib);
+        self
+    }
+
+    /// Test seam (honoured only with `AGENTOS_TEST_WORKERS=1`): the jail's `cpu.max` quota is
+    /// `quota_us` per `CPU_PERIOD_US` instead of `vcpus × CPU_PERIOD_US`, so a test can watch
+    /// the cgroup throttle Firecracker.
+    pub fn with_jail_cpu_quota_us(mut self, quota_us: u64) -> FirecrackerWorker {
+        self.cgroup_overrides.cpu_quota_us = Some(quota_us);
+        self
     }
 
     /// Test seam: replaces `BOOT_TIMEOUT`.
@@ -794,7 +822,7 @@ impl FirecrackerWorker {
 
         // Spawn and boot.
         let attempt = ctx.attempt_id.to_string();
-        let (mut vm, uds) = match launch(&self.cfg, &paths, &task_dir, &attempt, &self.env, Group::Caller) {
+        let (mut vm, uds) = match launch(&self.cfg, &paths, &task_dir, &attempt, &self.env, Group::Caller, self.cgroup_overrides) {
             Ok((child, uds)) => (Vm { child, status: None, own_group: false, swept: false }, uds),
             Err(reason) => return fail(reason),
         };
@@ -986,6 +1014,8 @@ pub struct Inspector {
     inspect_timeout: Duration,
     boot_timeout: Duration,
     env: Vec<(String, String)>,
+    /// Test seams, as `FirecrackerWorker`'s.
+    cgroup_overrides: CgroupOverrides,
 }
 
 /// Never prints the config's attempt token.
@@ -998,6 +1028,7 @@ impl std::fmt::Debug for Inspector {
             .field("inspect_timeout", &self.inspect_timeout)
             .field("boot_timeout", &self.boot_timeout)
             .field("env", &self.env)
+            .field("cgroup_overrides", &self.cgroup_overrides)
             .finish()
     }
 }
@@ -1066,7 +1097,26 @@ pub(crate) fn collect_root(cfg: &FirecrackerConfig) -> &Path {
 impl Inspector {
     /// `inspect_root` is `<home>/inspect`; the engine takes it explicitly.
     pub fn new(cfg: FirecrackerConfig, inspect_root: PathBuf) -> Inspector {
-        Inspector { cfg, inspect_root, inspect_timeout: INSPECT_TIMEOUT, boot_timeout: BOOT_TIMEOUT, env: Vec::new() }
+        Inspector {
+            cfg,
+            inspect_root,
+            inspect_timeout: INSPECT_TIMEOUT,
+            boot_timeout: BOOT_TIMEOUT,
+            env: Vec::new(),
+            cgroup_overrides: CgroupOverrides::default(),
+        }
+    }
+
+    /// Test seam, as `FirecrackerWorker::with_jail_memory_max_mib`.
+    pub fn with_jail_memory_max_mib(mut self, mib: u32) -> Inspector {
+        self.cgroup_overrides.memory_max_mib = Some(mib);
+        self
+    }
+
+    /// Test seam, as `FirecrackerWorker::with_jail_cpu_quota_us`.
+    pub fn with_jail_cpu_quota_us(mut self, quota_us: u64) -> Inspector {
+        self.cgroup_overrides.cpu_quota_us = Some(quota_us);
+        self
     }
 
     /// Test seam: replaces `INSPECT_TIMEOUT`.
@@ -1170,7 +1220,7 @@ impl Inspector {
             return Err("cannot prepare the VM: a VM path is not valid UTF-8".into());
         }
         prepare_vm_files(&self.cfg, paths).map_err(|e| format!("cannot prepare the VM: {e}"))?;
-        let (child, uds) = launch(&self.cfg, paths, task_dir, id, &self.env, Group::Own)?;
+        let (child, uds) = launch(&self.cfg, paths, task_dir, id, &self.env, Group::Own, self.cgroup_overrides)?;
         let mut vm = Vm { child, status: None, own_group: true, swept: false };
 
         let boot_deadline = deadline.min(Instant::now() + self.boot_timeout);
