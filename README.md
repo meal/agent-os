@@ -504,9 +504,11 @@ ANTHROPIC_API_KEY=… agentos submit task.json --yes --model anthropic:<model>  
 ### `--anthropic-base-url`
 
 `--anthropic-base-url URL` (env `AGENTOS_ANTHROPIC_BASE_URL`) replaces `https://api.anthropic.com`;
-the tests use it to point at a local fake. See the limits below: the URL is **not validated** (a
-non-loopback `http://` URL would send the key in cleartext) and is **not recorded** in
-`Submitted`.
+the tests use it to point at a local fake. The URL must be `https://` (any host), or `http://`
+only to `localhost`, an address in 127.0.0.0/8 or `[::1]`, with no user info, query or fragment;
+anything else is a usage error (exit 2, the message never echoes the URL) at `submit` and at
+`resume`, before anything is written. `cancel` and the recovery of a finished task ignore an
+invalid URL (no provider is built). The URL is **not recorded** in `Submitted` (see the limits).
 
 ### The `model.request` capability and the limits
 
@@ -960,14 +962,16 @@ The model workflow (Phase 4):
 - **An environment-variable key is readable in `/proc/<controller pid>/environ`** for the life of
   `submit`/`resume`. Use `--api-key-file`. The key is in no argv, event, blob, export, job
   directory or child environment (see "The API key").
-- **`--anthropic-base-url` is not validated and not recorded.** It accepts a non-loopback
-  `http://` URL (the key would travel in cleartext) and the environment variable
-  `AGENTOS_ANTHROPIC_BASE_URL` can silently redirect the key; the URL is not part of
-  `Submitted`, so a `resume` may talk to a different endpoint than the `submit` did.
+- **`--anthropic-base-url` is validated but not recorded.** Only `https://` or loopback `http://`
+  without user info, query or fragment is accepted, but an `https://` URL may name any host (the
+  key goes there), and the environment variable `AGENTOS_ANTHROPIC_BASE_URL` can still redirect
+  it silently. The URL is not part of `Submitted`, so a `resume` may talk to a different
+  endpoint than the `submit` did.
 - **`cancel` and recovery of a terminal task build a live provider when a key is available.**
   They build the provider leniently (`Home::recovery_executor`), so with a key an
   `AnthropicProvider` is constructed although those paths never dispatch a model call (recovery
-  of a terminal or cancel-pending task only abandons). Without a key the provider is `None` and
+  of a terminal or cancel-pending task never dispatches; it only abandons, forfeits or publishes
+  retained receipts). Without a key the provider is `None` and
   a dispatch would fail with `no model provider configured`. The "never sends" guarantee rests on
   recovery's behaviour, not on the type.
 - **The key file has no size cap and no regular-file check.** A huge file, `/dev/zero` or a FIFO
@@ -979,11 +983,35 @@ The model workflow (Phase 4):
 - **The conversation history has no size cap.** Each request re-sends all of it (a read can add
   64 KiB), so request blobs are O(turns²) bytes on disk, and a long task can exceed the model's
   context window.
-- **A deterministic 4xx is retried with identical bytes.** An HTTP 400 is an
-  answer, the effect fails and settles, the agent asks again with the same request and spends
-  another request of the budget, until `model_requests` is exhausted (the task then fails with
+- **A deterministic 4xx is retried with identical bytes.** Any HTTP error status (400, 401, 403,
+  404, ... as well as 429, 529 and 5xx) is an answer: the effect fails and settles, the agent
+  asks again with the same request and spends another request of the budget, until `model_requests` is exhausted (the task then fails with
   `budget exhausted`) or the turn limit (4 x `tool_actions` + 8) fails it. (A refusal is not
   retried: it ends the agent and the task fails without a verified workspace.)
+- **429, 529 and 5xx are retried at once, with no backoff.** A rate limit (429), an overloaded
+  service (529) or a server error (5xx) is a `Rejected` settled failure like any other status;
+  the agent re-asks immediately with the same request, and `retry-after` is not read. On an
+  overloaded or rate-limited account the whole `model_requests` budget (say 8 to 12) can be spent
+  within seconds and the task fails with `budget exhausted`.
+- **The supervisor's environment is `PATH` plus the explicit `AGENTOS_TEST_*` switches.** `HOME`,
+  `LANG`, `TMPDIR` and `RUST_LOG` are no longer inherited by the host worker's verification
+  commands, and the test knob `AGENTOS_SUPERVISOR_POLL_MS` (not prefixed `AGENTOS_TEST_`) no
+  longer reaches the supervisor through the CLI.
+- **The host applies model-authored patch text, even for Firecracker tasks.** The shadow
+  workspace (`<home>/tasks/<id>/shadow`) is rebuilt by running `git apply` on the host over the
+  journal's patches; before Phase 4 the host only parsed patch text. Mitigations: only
+  `COMPLETED` patches, which already passed the summary, numstat and editable-path checks, are
+  replayed; `git` runs with a cleared environment and `GIT_CEILING_DIRECTORIES`; symlinks are
+  refused. A `git apply` bug is host-side attack surface.
+- **An exported `model/NNNN-response.json` can be the engine's failure record**, not an API
+  response, for a model call that failed with an HTTP error (the manifest's `state` says
+  `FAILED`).
+- **`<home>/model/` is never garbage-collected, and `retained_outcome` scans it.** Retained
+  responses accumulate for the life of the home, and each lookup lists the whole directory.
+- **Resuming a cancel-pending `anthropic:` task without a key exits 2.** `resume` needs the
+  provider; use `agentos cancel`, which does not.
+- **Older demo transcripts predate the `model` field** of `status` (and `Submitted.model` as a
+  non-constant); newly produced output carries `"model": "fake-agent"` for patch tasks.
 - **A lost model call counts for good.** Its reservation stays `uncertain`; the retry is a new
   effect with a new reservation (see "Uncertain model requests"). With a small `model_requests`
   a crash can use up the budget.
