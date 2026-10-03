@@ -496,7 +496,8 @@ ANTHROPIC_API_KEY=… agentos submit task.json --yes --model anthropic:<model>  
   submits with a canary key (once by environment variable, once by `--api-key-file`) and scans
   stdout, stderr, `status`, `events`, the export bundle, the whole home and the environments an
   `env-dump` verification profile recorded; `there_is_no_flag_that_takes_the_key_itself` pins
-  argv. A gated KVM test (`api_key_never_reaches_the_guest`) covers the guest; it was skipped
+  that no flag accepts the key, so the key cannot reach argv by construction. No test inspects
+  any process's command line. A gated KVM test (`api_key_never_reaches_the_guest`) covers the guest; it was skipped
   where this was written (no KVM).
 - Error messages name a key file's path or the variable, never the value.
 
@@ -510,7 +511,8 @@ non-loopback `http://` URL would send the key in cleartext) and is **not recorde
 ### The `model.request` capability and the limits
 
 A model task's contract grants `model.request` next to the usual four; the CLI shows it in the
-approval list. Without it the model call is refused (a `Denied` row) and the agent is told so.
+approval list. A model call without the grant fails the task: a `Denied` audit row is journaled and the task
+fails with `capability model.request not granted`.
 An example contract (the one the demo below uses):
 
 ```json
@@ -576,16 +578,21 @@ A `ModelCall` effect has no job directory: `status.jobs` lists none for it, and
 Provider calls cost money, so a call whose outcome is unknown is treated as spent:
 
 - A call is **lost** when it was dispatched but no response was retained: the controller died
-  after dispatch, or the transport failed (timeout, connection cut). Recovery then journals a
-  `RecoveryDecision` with `decision: "Forfeit"` and `EffectForfeited`; the reservation becomes
+  after dispatch, or the transport failed (timeout, connection cut). Recovery (after a crash) or
+  the runner (on a transport failure inside a running session) then forfeits it: recovery
+  journals a `RecoveryDecision` with `decision: "Forfeit"` and `EffectForfeited`, the runner only
+  `EffectForfeited`. The reservation becomes
   `uncertain` and **keeps counting** against `model_requests`. The agent is told
   (`ModelCallLost`) and asks again: **the retry is a new effect with a new reservation**, never
   a re-send of the old one. A lost response is not recovered from the provider.
 - If the response was retained before the crash, recovery publishes it and nothing is re-sent.
 - One HTTP send per attempt: no redirects (a 3xx is a rejected answer), no proxy, no client
   retries, a 600 s timeout.
-- An HTTP error (4xx/5xx), a refusal or a malformed body is an *answer*: the effect fails and
-  its reservation settles; the agent sees `ModelCallFailed` and asks again with a new request.
+- An HTTP error (4xx/5xx) or a malformed body is an *answer*: the effect fails and its
+  reservation settles; the agent sees `ModelCallFailed` and asks again.
+- A refusal (a 2xx with `stop_reason: "refusal"`) is a well-formed response: the effect
+  completes, the agent sees no tool call and finishes, and the task fails without a verified
+  workspace. It is not retried.
 - `status` shows the buckets under `usage`: `reserved_`, `settled_` and `uncertain_` for
   `model_requests` and `tool_actions`.
 
@@ -600,8 +607,8 @@ asks again and finishes (see the demo).
 
 Below is a real run from the `fake:parser-fix.json` transcript (no network, no key). The
 transcript lists the files, reads `src/parser.py`, applies a first patch that does not fix the
-bug (the verification fails), then applies the real fix (the verification passes) and
-finishes. Commands: `agentos profile register`, `agentos submit task.json --yes --model
+bug (the verification fails), then applies the real fix. The task succeeds when the verification
+passes (the model never calls `finish` in this demo). Commands: `agentos profile register`, `agentos submit task.json --yes --model
 fake:/work/fixtures/transcripts/parser-fix.json`, `agentos status`, `agentos events`,
 `agentos export` (home `/tmp/mdemo/home`, 2026-10-03):
 
@@ -957,6 +964,12 @@ The model workflow (Phase 4):
   `http://` URL (the key would travel in cleartext) and the environment variable
   `AGENTOS_ANTHROPIC_BASE_URL` can silently redirect the key; the URL is not part of
   `Submitted`, so a `resume` may talk to a different endpoint than the `submit` did.
+- **`cancel` and recovery of a terminal task build a live provider when a key is available.**
+  They build the provider leniently (`Home::recovery_executor`), so with a key an
+  `AnthropicProvider` is constructed although those paths never dispatch a model call (recovery
+  of a terminal or cancel-pending task only abandons). Without a key the provider is `None` and
+  a dispatch would fail with `no model provider configured`. The "never sends" guarantee rests on
+  recovery's behaviour, not on the type.
 - **The key file has no size cap and no regular-file check.** A huge file, `/dev/zero` or a FIFO
   is read as given (a FIFO blocks); there is no mode warning, and an unreadable key file's
   error echoes its path.
@@ -966,10 +979,11 @@ The model workflow (Phase 4):
 - **The conversation history has no size cap.** Each request re-sends all of it (a read can add
   64 KiB), so request blobs are O(turns²) bytes on disk, and a long task can exceed the model's
   context window.
-- **A deterministic 4xx is retried with identical bytes.** An HTTP 400 (or a refusal) is an
+- **A deterministic 4xx is retried with identical bytes.** An HTTP 400 is an
   answer, the effect fails and settles, the agent asks again with the same request and spends
-  another request of the budget, until `model_requests` is exhausted (the agent then stops
-  without a verified workspace) or the turn limit (4 x `tool_actions` + 8) fails the task.
+  another request of the budget, until `model_requests` is exhausted (the task then fails with
+  `budget exhausted`) or the turn limit (4 x `tool_actions` + 8) fails it. (A refusal is not
+  retried: it ends the agent and the task fails without a verified workspace.)
 - **A lost model call counts for good.** Its reservation stays `uncertain`; the retry is a new
   effect with a new reservation (see "Uncertain model requests"). With a small `model_requests`
   a crash can use up the budget.
