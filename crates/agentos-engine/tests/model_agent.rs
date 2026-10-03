@@ -130,9 +130,9 @@ fn tool_results_name_the_pending_tool_use_id_and_flag_errors() {
         (Observation::Verification { passed: false, summary: "s".into() }, true, Some("verification failed: s")),
         (Observation::Verification { passed: true, summary: "s".into() }, false, Some("verification passed: s")),
         (Observation::FileReadRejected { reason: "r".into() }, true, Some("r")),
-        (Observation::PatchApplied { workspace: ws.clone() }, false, None),
+        (Observation::PatchApplied { workspace: ws }, false, None),
         (
-            Observation::VersionConflict { expected: ws.clone(), actual: ws.clone() },
+            Observation::VersionConflict { expected: ws, actual: ws },
             true,
             None,
         ),
@@ -241,10 +241,10 @@ fn the_fixture_transcripts_drive_the_documented_action_sequence() {
         .collect();
     assert_eq!(responses.len(), 6);
     let ws = Digest::of(b"w");
-    let tool_obs = vec![
+    let tool_obs = [
         Observation::Files { files: vec!["src/parser.py".into()] },
         Observation::FileRead { path: "src/parser.py".into(), content: "x".into(), truncated: false },
-        Observation::PatchApplied { workspace: ws.clone() },
+        Observation::PatchApplied { workspace: ws },
         Observation::Verification { passed: false, summary: "fail".into() },
         Observation::PatchApplied { workspace: ws },
         Observation::Verification { passed: true, summary: "ok".into() },

@@ -82,7 +82,7 @@ impl ModelSpec {
 /// The agent a task runs: the fake agent over a patch, or the model agent.
 pub enum Driver {
     Fake(FakeAgent),
-    Model(ModelAgent),
+    Model(Box<ModelAgent>),
 }
 
 impl Agent for Driver {
@@ -129,7 +129,7 @@ pub fn agent_for(home: &Home, store: &Store, task: &TaskId, patch_flag: Option<&
     match model {
         None => Ok(Driver::Fake(FakeAgent::from_fixture_patch(agent_patch(home, task, patch_flag)?))),
         Some(_) if patch_flag.is_some() => Err(CliError::usage(format!("task {task} runs a model, not the fake agent"))),
-        Some(name) => Ok(Driver::Model(ModelAgent::new(store.db.contract(task)?, name))),
+        Some(name) => Ok(Driver::Model(Box::new(ModelAgent::new(store.db.contract(task)?, name)))),
     }
 }
 

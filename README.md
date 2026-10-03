@@ -7,8 +7,13 @@ through a protected verification of exactly the final workspace. The controller 
 killed at any of those boundaries, and a restarted one recovers the same task without
 repeating completed effects.
 
-This is milestone **v0.1, Phases 1-3b-1**. The agent is a deterministic fake that applies a
-given patch. Every effect is a job under its own supervisor, and every capability is an
+This is milestone **v0.1, Phases 1-3b-1 and 4**. The agent is either a deterministic fake that
+applies a given patch (`--fake-agent-patch`, the default for tests and demos) or a model agent
+that drives the repository through five tools (`--model anthropic:<model>` for the Anthropic
+Messages API, `--model fake:<transcript>` for a scripted, offline provider). **The real-model
+path has not been validated end-to-end against the live Anthropic API in this build:** the
+gated live test exists but was never run with a real key (see [Running a real
+model](#running-a-real-model)). Every effect is a job under its own supervisor, and every capability is an
 opaque, revocable handle checked by a broker. By default effects run as host processes (the
 `host` worker, not sandboxed). The VM sandbox is opt-in per task with `--worker firecracker`:
 one Firecracker microVM per effect, booted from a registered guest image, with no network
@@ -25,11 +30,17 @@ docker compose run --rm test cargo test --workspace          # all tests (defaul
 docker compose run --rm test cargo test -p agentos-engine --test crash_matrix   # crash/recovery matrix
 docker compose run --rm test cargo test -p agentos-engine --test supervisor     # supervisor, leases, kills
 docker compose run --rm test cargo build -p agentos-cli     # the `agentos` binary
+# the gated live model test (never run in this build; needs a real key and the network)
+docker compose run --rm -e AGENTOS_LIVE_MODEL_TESTS=1 -e ANTHROPIC_API_KEY test \
+  cargo test -p agentos-engine --test live_model -- --nocapture --test-threads 1
 ```
 
 The default tier needs neither KVM nor privilege beyond the container's own. Every KVM test
 prints `SKIPPED: set AGENTOS_KVM_TESTS=1 and pass /dev/kvm (docker compose run --rm test-kvm …)`
-and returns.
+and returns. The two live-model tests print `SKIPPED: set AGENTOS_LIVE_MODEL_TESTS=1 and
+ANTHROPIC_API_KEY (or AGENTOS_API_KEY_FILE) to run the live model test` and return, so the
+default `cargo test` makes no network call; with `AGENTOS_LIVE_MODEL_TESTS` set and no key
+they panic.
 
 ### Test tiers
 
@@ -188,10 +199,13 @@ agentos revoke <id> --capability artifact.export
 at an engine crash point:
 - `after-agent-turn-journaled`, `after-intent`, `after-dispatch`, `during-execute`,
   `after-execute-before-publish`, `after-blob-put`, `after-register` or `after-complete`;
-- optionally for one effect kind (`read_snapshot`, `apply_patch`, `run_verification`);
+- optionally for one effect kind (`read_snapshot`, `apply_patch`, `run_verification`,
+  `model_call`, `list_files`, `read_file`);
 - on the N-th pass.
 
-`resume` without `--fake-agent-patch` reuses the patch recorded at submission.
+`resume` without `--fake-agent-patch` reuses the patch recorded at submission. (A task
+submitted with `--model` records the model instead; `resume --fake-agent-patch` on it exits 2
+with `task <id> runs a model, not the fake agent`.)
 
 `agentos revoke <id> [--capability NAME]` withdraws a task's capability handles (all, or one by
 its contract name) and stops the running jobs that need them; it works while another process
@@ -432,6 +446,215 @@ What differs from the host run, and what does not:
   `ws.lock` is next to it. No job directory has a `jail/` left: every chroot and cgroup was
   collected once its job settled, and `scratch.img` was removed after `outcome.json`.
 
+## Running a real model
+
+`submit --model SPEC` replaces the fake agent with a model agent. `SPEC` is one of:
+
+- `anthropic:<model>`: the Anthropic Messages API (`POST <base>/v1/messages`, header
+  `anthropic-version: 2023-06-01`). The model name is 1 to 100 characters from `A-Z a-z 0-9 . _ -`
+  and is recorded in `Submitted.model`. There is no default: you name it.
+- `fake:<transcript file>`: a scripted provider that answers from a recorded transcript
+  (`fixtures/transcripts/parser-fix.json`), offline and deterministic. The CLI copies the file to
+  `<home>/tasks/<task>/transcript.json` and records its digest (`Submitted.transcript_digest`);
+  a later `resume` refuses a copy whose digest changed.
+
+`--model` and `--fake-agent-patch` are mutually exclusive (exit 2 `pass either --fake-agent-patch
+or --model`); `--yes` needs one of them (exit 2 `--yes needs --fake-agent-patch FILE or --model
+anthropic:<model>|fake:<transcript>`). `resume` takes no `--model`: it uses the recorded one.
+
+**What has and has not been validated.** The real-model path has **not** been validated
+end-to-end against the live Anthropic API in this build. The gated live test
+(`docker compose run --rm -e AGENTOS_LIVE_MODEL_TESTS=1 -e ANTHROPIC_API_KEY test cargo test -p
+agentos-engine --test live_model -- --nocapture --test-threads 1`) exists, but it was never run
+with a real key. Everything below that touches the provider is tested against a local fake of the
+Messages API (`127.0.0.1`) and the scripted transcript. Whether a real model fixes the fixture
+within the budget, and whether its real response bytes replay with the same digests, is unknown.
+
+### The API key
+
+```sh
+agentos submit task.json --yes --model anthropic:<model> --api-key-file ~/.anthropic-key
+ANTHROPIC_API_KEY=… agentos submit task.json --yes --model anthropic:<model>   # works, see below
+```
+
+- `--api-key-file FILE` (env `AGENTOS_API_KEY_FILE`) is **recommended**. The file holds the key
+  on one line; surrounding whitespace is trimmed, and anything but printable ASCII after that
+  (a second line, a space inside) is refused with exit 2. Without the flag the key is read from
+  `ANTHROPIC_API_KEY`. With neither, `submit --yes` exits 2 (`no API key: pass --api-key-file
+  FILE or set ANTHROPIC_API_KEY`) before anything is written. There is no flag that takes the
+  key itself (`--api-key` is an unknown argument, exit 2).
+- **Residual: an environment-variable key stays readable in `/proc/<controller pid>/environ`**
+  for the whole life of the `submit` or `resume` process that holds it (a process cannot clear
+  the environment image the kernel exposes there). Anything that can read that file (the same
+  user, root) can read the key. `--api-key-file` avoids this: the key is read from the file and
+  held only in memory.
+- The key never appears in argv, events, blobs, exports, job directories, `status`/`export`
+  output or any child's environment. It lives in the provider inside the controller process and
+  goes only into the `x-api-key` header of the HTTP request. The supervisor and every job start
+  with a cleared environment (`PATH` plus, in the test tier only, the `AGENTOS_TEST_*` switches).
+  A canary test pins the absences: `api_key_reaches_only_the_provider_and_never_the_journal_blobs_home_or_job_environments`
+  submits with a canary key (once by environment variable, once by `--api-key-file`) and scans
+  stdout, stderr, `status`, `events`, the export bundle, the whole home and the environments an
+  `env-dump` verification profile recorded; `there_is_no_flag_that_takes_the_key_itself` pins
+  argv. A gated KVM test (`api_key_never_reaches_the_guest`) covers the guest; it was skipped
+  where this was written (no KVM).
+- Error messages name a key file's path or the variable, never the value.
+
+### `--anthropic-base-url`
+
+`--anthropic-base-url URL` (env `AGENTOS_ANTHROPIC_BASE_URL`) replaces `https://api.anthropic.com`;
+the tests use it to point at a local fake. See the limits below: the URL is **not validated** (a
+non-loopback `http://` URL would send the key in cleartext) and is **not recorded** in
+`Submitted`.
+
+### The `model.request` capability and the limits
+
+A model task's contract grants `model.request` next to the usual four; the CLI shows it in the
+approval list. Without it the model call is refused (a `Denied` row) and the agent is told so.
+An example contract (the one the demo below uses):
+
+```json
+{
+  "goal": "fix the parser",
+  "repository": { "source": "/work/fixtures/parser-repo", "revision": "recorded-at-submission" },
+  "profile": "python-stdlib-v1",
+  "editable_paths": ["src/**"],
+  "verification_profile": "parser-checks-v1",
+  "capabilities": ["snapshot.read", "workspace.apply_patch", "verification.run",
+                   "artifact.export", "model.request"],
+  "limits": { "model_requests": 8, "max_output_tokens_per_request": 16000, "tool_actions": 8,
+              "deadline_seconds": 600, "worker_vcpus": 1, "worker_memory_mib": 256 }
+}
+```
+
+`model_requests` bounds model calls; `max_output_tokens_per_request` is sent as `max_tokens`
+(thinking tokens count against it, so use 16000 or more with a thinking model);
+`tool_actions` bounds the snapshot read at the start, `list_files`, `read_file` and
+`apply_patch` (a verification run does not consume one). In the demo, 6 model calls and 5 tool
+actions were settled.
+
+### What the model can do
+
+Five tools, exactly one call per turn (`tool_choice: {"type":"auto","disable_parallel_tool_use":true}`):
+
+| Tool | Effect |
+| --- | --- |
+| `list_files` | lists the repository's files |
+| `read_file(path)` | returns a file, at most 64 KiB (longer is cut with a `[truncated at 65536 bytes]` marker) |
+| `apply_patch(patch)` | applies a unified diff through the broker, only to the contract's `editable_paths` |
+| `run_verification` | runs the protected check against the current workspace |
+| `finish(summary)` | stops the agent; the task succeeds only through a passing protected verification of the final workspace, and a passing verification ends the task at once (the demo's last model answer is `run_verification`, so `finish` was never called) |
+
+Reads are served from a **shadow workspace**, `<home>/tasks/<task>/shadow`: the snapshot plus the
+task's journaled, completed patches, rebuilt for every read and accepted only if its digest equals
+the one the journal records for the task. The live workspace is never touched by a read, the
+path is validated (relative, no `..`, no excluded component) and a symlink on the path is
+refused. A read is a journaled `read_file` effect that costs a tool action; so is `list_files`
+(although the `Start` observation already lists the files).
+
+### How a model call is journaled
+
+1. The agent builds the request bytes from the observations it has seen (no clock, no ids), so
+   the same journal always yields the same request.
+2. The request body is registered as an artifact **before** the agent turn is journaled; the turn
+   records its digest.
+3. The call is a `ModelCall` effect with its own reservation (one model request): `EffectIntended`,
+   `EffectDispatched`, then the executor sends **one HTTP request** and retains the answer in
+   `<home>/model/<effect>-<attempt>/response.json` before returning. `EffectCompleted` publishes
+   the response as an artifact, and the next observation carries the response **inline**.
+4. A replay re-derives the request and compares digests; a mismatch fails the task
+   (`NondeterministicAgent`).
+5. `export` writes `model/NNNN-request.json` and `model/NNNN-response.json` for every finished
+   call, listed in `manifest.json` under `model_calls` (effect id, request digest, response
+   digest, state).
+
+A `ModelCall` effect has no job directory: `status.jobs` lists none for it, and
+`EffectDispatched.worker` still says `fixture-executor`.
+
+### Uncertain model requests
+
+Provider calls cost money, so a call whose outcome is unknown is treated as spent:
+
+- A call is **lost** when it was dispatched but no response was retained: the controller died
+  after dispatch, or the transport failed (timeout, connection cut). Recovery then journals a
+  `RecoveryDecision` with `decision: "Forfeit"` and `EffectForfeited`; the reservation becomes
+  `uncertain` and **keeps counting** against `model_requests`. The agent is told
+  (`ModelCallLost`) and asks again: **the retry is a new effect with a new reservation**, never
+  a re-send of the old one. A lost response is not recovered from the provider.
+- If the response was retained before the crash, recovery publishes it and nothing is re-sent.
+- One HTTP send per attempt: no redirects (a 3xx is a rejected answer), no proxy, no client
+  retries, a 600 s timeout.
+- An HTTP error (4xx/5xx), a refusal or a malformed body is an *answer*: the effect fails and
+  its reservation settles; the agent sees `ModelCallFailed` and asks again with a new request.
+- `status` shows the buckets under `usage`: `reserved_`, `settled_` and `uncertain_` for
+  `model_requests` and `tool_actions`.
+
+### Crash points
+
+`--crash-at POINT[:KIND][:N]` accepts the three new kinds `model_call`, `list_files` and
+`read_file` (exit 75, as for the others). Example: `--crash-at after-dispatch:model_call:2`
+kills the controller right after the second model call was dispatched; `resume` forfeits it,
+asks again and finishes (see the demo).
+
+### Demo: the scripted model fixes the fixture (offline)
+
+Below is a real run from the `fake:parser-fix.json` transcript (no network, no key). The
+transcript lists the files, reads `src/parser.py`, applies a first patch that does not fix the
+bug (the verification fails), then applies the real fix (the verification passes) and
+finishes. Commands: `agentos profile register`, `agentos submit task.json --yes --model
+fake:/work/fixtures/transcripts/parser-fix.json`, `agentos status`, `agentos events`,
+`agentos export` (home `/tmp/mdemo/home`, 2026-10-03):
+
+```text
+$ agentos submit task.json --yes --model fake:/work/fixtures/transcripts/parser-fix.json
+task 01a10388-51b8-76ef-a1d7-bd0cda33ac44 submitted; approve these permissions before it runs:
+  goal:                 fix the parser
+  repository:           /work/fixtures/parser-repo at be77aa19c032f85329a9596adfd692252a0c87fd09d337b1873feb6003bdd3b8
+  capabilities:         snapshot.read, workspace.apply_patch, verification.run, artifact.export, model.request
+  editable paths:       src/**
+  acceptance:           protected verification profile parser-checks-v1 (9ff584f31b7fef8ac5774ced5c8f1620c27f736b4bdc4d9e03e553df5d8ea12c)
+  limits:               model_requests=8 max_output_tokens_per_request=16000 tool_actions=8 deadline_seconds=600 worker_vcpus=1 worker_memory_mib=256
+  agent:                fake:parser-fix.json (transcript ea60190c674c1938283bc9cc90c35737773589f5f9e8c106af4321b1ae885586)
+  worker:               host (not sandboxed)
+{"state":"SUCCEEDED","task_id":"01a10388-51b8-76ef-a1d7-bd0cda33ac44"}
+
+$ agentos status 01a10388-51b8-76ef-a1d7-bd0cda33ac44     # abridged: capabilities omitted
+{"actions_used":5,"jobs":[],"model":"fake:parser-fix.json","outstanding_effects":[],"state":"SUCCEEDED","step":13,"usage":{"reserved_model_requests":0,"reserved_tool_actions":0,"settled_model_requests":6,"settled_tool_actions":5,"uncertain_model_requests":0,"uncertain_tool_actions":0},"verified_digest":"78503dd08dd9620dad258c576163e231472604dab1b42cda7cad69d7cfcef1c6","workspace_digest":"78503dd08dd9620dad258c576163e231472604dab1b42cda7cad69d7cfcef1c6", …}
+
+$ agentos events <id>        # 114 events, counted by type
+```
+
+```text
+CapabilityGranted 26, ArtifactRegistered 21, EffectIntended 13, EffectDispatched 13,
+EffectCompleted 13, AgentTurn 12, ActionUsed 5, WorkspaceUpdated 3, VerifyStarted 2,
+TaskCreated 1, Submitted 1, CapabilitiesIssued 1, Started 1, VerifyFailed 1, VerifyPassed 1
+```
+
+`export` produced `model/0001-request.json` … `model/0006-response.json` (six calls),
+`patches/` (two patches), `evidence/` (three files) and `manifest.json` with
+`"model":"fake:parser-fix.json"` and six `model_calls` entries.
+
+The same task with a crash in the middle of the second model call (`--crash-at
+after-dispatch:model_call:2`, a different run):
+
+```text
+$ agentos submit task.json --yes --model fake:… --crash-at after-dispatch:model_call:2
+{"crashed":"after-dispatch","task_id":"01a10388-877c-7264-a21f-051a045188d3"}
+(exit code 75)
+$ agentos status <id>          # usage and outstanding effects only
+"jobs":[], "outstanding_effects":[{"kind":"model_call","state":"Dispatched", …}],
+"usage":{"reserved_model_requests":1, "settled_model_requests":1, "uncertain_model_requests":0, …}
+$ agentos resume <id>
+{"state":"SUCCEEDED","task_id":"01a10388-877c-7264-a21f-051a045188d3"}
+$ agentos status <id>
+"usage":{"reserved_model_requests":0, "settled_model_requests":6, "uncertain_model_requests":1, …}
+```
+
+Seven model requests were counted for six answers: the lost one is `uncertain` and still counts.
+The journal has `RecoveryDecision` (`"decision":"Forfeit"`) and `EffectForfeited` for it.
+
+No live run was made in this build; there is no live transcript to show.
+
 ## Home layout
 
 ```text
@@ -443,6 +666,10 @@ What differs from the host run, and what does not:
                            owned by the jail uid (61000) from the first jailed ReadSnapshot on
 <home>/work/<task>/ws.lock advisory lock: which VM has ws.img attached
 <home>/tasks/<task>/       inputs recorded at submission: snapshot/, profile/, agent.patch
+                           (fake agent) or transcript.json (`--model fake:`, a copy whose digest
+                           `Submitted` records); shadow/ is the model's read-only view (see below)
+<home>/model/<effect>-<attempt>/   a model call's retained response (response.json), written before
+                           the call returns so recovery publishes it instead of sending again
 <home>/registry/<id>@<digest>/    registered verification profiles (read-only)
 <home>/registry/<id>@<digest>.meta.json   registration time, outside the digest
 <home>/registry/images/<id>@<digest>/     registered guest images (root 0444): image.json, vmlinux, rootfs.squashfs
@@ -619,7 +846,7 @@ process itself after a VM escape.
   jailer runs as root for the milliseconds of setup), the pinned guest kernel and image bytes,
   `agentos-guest`, `git`/`python3` in the guest, the controller, supervisor and worker.
 
-## Known limits (v0.1, Phases 1-3b-1)
+## Known limits (v0.1, Phases 1-3b-1 and 4)
 
 Sandboxing and the jail:
 
@@ -716,6 +943,53 @@ The Firecracker worker:
 - **The KVM tier's container** needs `/dev/kvm`, `CAP_SYS_ADMIN`, a seccomp profile that allows
   `pivot_root` and the cgroup-delegation entrypoint; the default `test` service needs none of it.
 
+The model workflow (Phase 4):
+
+- **Not validated against the live API.** The live test was never run with a real key. Unknown:
+  whether a real model fixes the fixture within its request budget, how real response bytes
+  behave, what the real provider's errors look like.
+- **One provider, no streaming, no parallel tool calls.** Only the Anthropic Messages API (and
+  the scripted fake) exists; each answer is read whole; `disable_parallel_tool_use` is set.
+- **An environment-variable key is readable in `/proc/<controller pid>/environ`** for the life of
+  `submit`/`resume`. Use `--api-key-file`. The key is in no argv, event, blob, export, job
+  directory or child environment (see "The API key").
+- **`--anthropic-base-url` is not validated and not recorded.** It accepts a non-loopback
+  `http://` URL (the key would travel in cleartext) and the environment variable
+  `AGENTOS_ANTHROPIC_BASE_URL` can silently redirect the key; the URL is not part of
+  `Submitted`, so a `resume` may talk to a different endpoint than the `submit` did.
+- **The key file has no size cap and no regular-file check.** A huge file, `/dev/zero` or a FIFO
+  is read as given (a FIFO blocks); there is no mode warning, and an unreadable key file's
+  error echoes its path.
+- **The provider response body is read unbounded** (2xx and error alike) before it is cut or
+  parsed; a hostile or broken endpoint can make the controller read without limit. Only the quoted
+  error text is bounded (4096 bytes).
+- **The conversation history has no size cap.** Each request re-sends all of it (a read can add
+  64 KiB), so request blobs are O(turns²) bytes on disk, and a long task can exceed the model's
+  context window.
+- **A deterministic 4xx is retried with identical bytes.** An HTTP 400 (or a refusal) is an
+  answer, the effect fails and settles, the agent asks again with the same request and spends
+  another request of the budget, until `model_requests` is exhausted (the agent then stops
+  without a verified workspace) or the turn limit (4 x `tool_actions` + 8) fails the task.
+- **A lost model call counts for good.** Its reservation stays `uncertain`; the retry is a new
+  effect with a new reservation (see "Uncertain model requests"). With a small `model_requests`
+  a crash can use up the budget.
+- **A revoke cannot abort an in-flight HTTP call.** The response is journaled and counted; the
+  revoke takes effect for the next call.
+- **Pause then resume starts a new session**: the model is asked again from the start (the
+  workspace keeps its patches; the new first request lists the current files).
+- **The shadow workspace is rebuilt for every read** (copy and digest of the whole repository:
+  O(repository) per read, with blocking I/O) and the rebuild is not atomic or serialized; it is
+  safe only because one runner drives a task at a time.
+- **A crash between registering a model request's artifact and journaling the agent turn leaves
+  an unlinked request blob** that garbage collection never collects (bounded: one per such crash).
+- **`ModelCall` effects have no job directory** (`status.jobs` lists none) and
+  `EffectDispatched.worker` stays `fixture-executor`.
+- **Thinking tokens count against `max_output_tokens_per_request`.** Use at least 16000 with a
+  thinking model.
+- **`list_files` consumes a tool action** although `Start` already lists the files.
+- **Long file names and control characters** in a model-chosen `read_file` path are journaled as
+  given (bounded only by the request body).
+
 Carried from 3a:
 
 - **A revoke can miss a job that is just starting.** A revoke that lands between a dispatch
@@ -730,8 +1004,6 @@ Carried from 3a:
 - **Host paths can leak into exports (host worker).** Exported verification evidence
   (stdout/stderr) of the host worker can contain absolute host paths. The guest sees only
   guest paths (`/workspace`, `/scratch/…`).
-- **No real model.** The model call is a stand-in: only the fake agent exists, and the real
-  model adapter is Phase 4.
 - **One driver per home.** Only one process drives a home at a time (`driver.lock`).
   Recovery's blob garbage collection assumes no concurrent writers.
 - **Resume needs the same patch.** `resume --fake-agent-patch` must be given the same
