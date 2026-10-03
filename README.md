@@ -41,7 +41,7 @@ The engine and CLI tests pick the worker they drive from `AGENTOS_TEST_WORKER`:
 | `… -e AGENTOS_TEST_WORKER=firecracker-fake test cargo test --workspace` | `FirecrackerWorker` with the **fake guest** (`agentos-supervisor fake-guest`: the real guest agent's session code over a Unix socket, the workspace in a host directory) | the host side only: the vsock protocol and its limits, `vm.json`, the worker's state machine and failure mapping, `ws.lock`, inspection (`reconcile`, `current_workspace`), the crash matrix, kill/lease/deadline/revoke paths, byte-identical outcomes. It proves nothing about the real guest (mounts, uid separation, OOM, no NIC, read-only root) or the real jail. |
 | `… -e AGENTOS_TEST_WORKER=firecracker-fake -e AGENTOS_TEST_JAIL=fake test cargo test --workspace` | as above, wrapped in `JailMode::Jailed` with a **fake jailer** (a `/bin/sh` script that parses the documented argv, records it, creates a directory standing in for the cgroup and execs the fake guest) | engine: the jailed launch path (staging by hard links, ownership to the test's own uid, the chroot `vm.json`, the argv, collection after settlement, leftovers after a SIGKILL). CLI: only the jail **decision and its record** (the probe answers `ok`, `jailed: true` is recorded and enforced on every later command) — the CLI's fake guest still runs unjailed. No real chroot, uid drop or cgroup is involved. |
 | `docker compose run --rm test-kvm cargo test --workspace` | every KVM-gated test runs for real (`kvm_tier`, the Real column of `worker_conformance`, two CLI tests); the rest as in the first row | the real guest and the real jail; see below |
-| `docker compose run --rm -e AGENTOS_TEST_WORKER=firecracker test-kvm cargo test --workspace` | the real, **jailed** Firecracker worker for the crash matrix, conformance, deadline, revoke and all CLI tests | every 3a guarantee against real VMs |
+| `docker compose run --rm -e AGENTOS_TEST_WORKER=firecracker test-kvm cargo test --workspace` | the real, **jailed** Firecracker worker for the crash matrix, conformance, deadline, revoke, supervised and all CLI tests | every 3a guarantee against real VMs |
 
 Only the KVM tier proves the guest and jail properties: no NIC (`net-probe`), no host secret
 (`secret-probe`), vCPU and memory bounds (`cpu-burn`, `mem-hog`), `fork-bomb`, `disk-fill` and a
@@ -612,7 +612,8 @@ process itself after a VM escape.
   `cpu.max`/`memory.max`/`memory.swap.max=0`/`pids.max=64`, with `RLIMIT_FSIZE` 1 GiB and
   Firecracker's own seccomp filter. It can write nothing of the home but its own `ws.img`,
   `scratch.img`, `vm.json` and `firecracker.log`; the registry, journal and `request.json` are
-  root-owned or outside the chroot. A further, kernel-level bug is needed to reach the host.
+  root-owned or outside the chroot. A second bug is needed to reach the host (in the kernel or KVM, or a bypass of
+  Firecracker's seccomp filter); note the jail has no PID or network namespace (3b-2).
   Unjailed, the escape lands as the controller's UID.
 - **Trusted computing base**: the host kernel and KVM, Firecracker and the jailer v1.17.0 (the
   jailer runs as root for the milliseconds of setup), the pinned guest kernel and image bytes,
@@ -632,6 +633,9 @@ Sandboxing and the jail:
   `--worker firecracker` refuses (exit 1, task untouched). `--allow-unjailed` runs it as the
   controller's UID without chroot or cgroup and records `jailed: false`; then the controller's
   UID is the blast radius of a VM escape.
+- **The jail edits the host's root cgroup.** `delegate` (the jail probe, on every executor
+  build) writes `+cpu +memory +pids` into the host root `cgroup.subtree_control` and, on
+  systemd hosts, creates `/sys/fs/cgroup/agentos` directly under the root cgroup.
 - **The jailed process has no PID or network namespace** of its own (`--new-pid-ns` and
   `--netns` are 3b-2). It has no network device and its seccomp filter forbids `fork`/`exec`.
 - **One jail uid (61000) per home.** Every VM of the home runs as it (at most one job VM and one
@@ -679,7 +683,7 @@ The Firecracker worker:
   inspection first).
 - **A globally exported `AGENTOS_WORKER=firecracker`** makes every command on a host task exit 2
   (`task was submitted with worker host`): the environment variable is the flag.
-- **A partially submitted task** (no `Submitted` event yet) shows `worker: host` in `status`.
+- **A partially submitted task** (no `Submitted` event yet) reports `"worker":"host"` in the JSON of `status`.
 - **`submit --yes` runs the preflight and the probe twice** (before anything is written, and
   again when building the executor). A host change in between leaves the task READY and
   unapproved.
@@ -693,8 +697,9 @@ The Firecracker worker:
   the host worker but fails in the guest (`cannot run profile command: Permission denied`); use
   `["sh", "check.sh"]` or `["python3", "check.py"]`.
 - **Guest-only reason strings.** The guest can refuse with `profile command too large: N bytes
-  of JSON, limit 869424` (a `command` whose JSON would overflow the reply frame) and
-  `scratch dir: …`; the host worker has neither.
+  of JSON, limit 869712` (a `command` whose JSON would overflow the reply frame) and
+  `scratch dir: …`. Only `profile command too large` is guest-only; the host worker also emits
+  `scratch dir: …`.
 - **Guest memory as reported.** `Ready.memory_mib` is the guest's `MemTotal`: 229 for a 256 MiB
   VM (the guest kernel keeps the rest).
 - **The guest image has no `mount` binary** (the root is read-only and `mount(2)` is denied to

@@ -1133,10 +1133,11 @@ async fn current_workspace_on_resume_boots_an_inspector_and_the_task_continues()
 }
 
 /// The controller dies while a verification's VM runs (its check sleeps); recovery waits
-/// for the job past its (clamped) lease bound, fences it and only then re-dispatches. With
-/// samples every 5 ms of this home's Firecracker processes (by `--id`): the old attempt's VM
-/// is seen alive after recovery began, no sample ever holds the old and the re-dispatched
-/// attempt's VMs together, and the home never runs more than two at once.
+/// for the job past its (clamped) lease bound and fences it; the fenced job's kill receipt is
+/// what recovery publishes (`WaitedForJob`), and the task then resumes with an inspection VM
+/// of its own. With samples every 5 ms of this home's Firecracker processes (by `--id`): the
+/// old attempt's VM is seen alive after recovery began, no sample ever holds the old VM and a
+/// later one (the resume's inspection) together, and the home never runs more than two at once.
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrency_bound_never_exceeds_two_firecracker_processes() {
     let Some(kvm) = kvm::require() else { return };
@@ -1175,7 +1176,9 @@ async fn concurrency_bound_never_exceeds_two_firecracker_processes() {
     assert_eq!(decisions.first(), Some(&Decision::WaitedForJob), "{report:?}");
     // The task goes on: the resume asks the inspector for the workspace (a VM of its own).
     let mut agent = FakeAgent::from_fixture_patch(fix_patch());
-    run_task(&env.db, &env.blobs, &exec, &mut agent, &env.task).await.unwrap();
+    let finished = run_task(&env.db, &env.blobs, &exec, &mut agent, &env.task).await.unwrap();
+    // The fenced verification's kill receipt is a failed check, so the resumed run ends Failed.
+    assert_eq!(finished, TaskState::Failed);
     let seen = seen.stop();
 
     let others = |ids: &[String]| ids.iter().any(|i| *i != old);

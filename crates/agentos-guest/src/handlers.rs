@@ -273,10 +273,11 @@ impl FileSink for DiscardSink {
     }
 }
 
-/// The profile files of a `RunVerification`, held in memory (≤ `PROFILE_LIMIT`).
-pub fn receive_profile(link: &mut impl Read, file_count: u64, total_bytes: u64) -> Result<StagedProfile, StreamError> {
+/// The profile files of a `RunVerification`, held in memory (≤ `PROFILE_LIMIT`). The sink
+/// cannot fail, so the only error is a protocol violation (its text).
+pub fn receive_profile(link: &mut impl Read, file_count: u64, total_bytes: u64) -> Result<StagedProfile, String> {
     let mut sink = MemSink::default();
-    receive_files(link, file_count, total_bytes, PROFILE_LIMIT, &mut sink).map_err(StreamError::Protocol)?;
+    receive_files(link, file_count, total_bytes, PROFILE_LIMIT, &mut sink)?;
     Ok(StagedProfile { files: sink.files })
 }
 

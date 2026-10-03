@@ -175,13 +175,7 @@ impl Session {
                 Message::RunVerification { profile_digest, timeout_secs, file_count, total_bytes } => {
                     let profile = match handlers::receive_profile(&mut stream, file_count, total_bytes) {
                         Ok(p) => p,
-                        Err(StreamError::Refused(reason)) => {
-                            if !send(&mut stream, Message::Refused { reason }) {
-                                return lost("cannot send the reply");
-                            }
-                            continue;
-                        }
-                        Err(StreamError::Protocol(why)) => return lost(why),
+                        Err(why) => return lost(why),
                     };
                     match handlers::run_verification(backend, profile_digest, timeout_secs, profile) {
                         Ok(v) => v.into_message(),

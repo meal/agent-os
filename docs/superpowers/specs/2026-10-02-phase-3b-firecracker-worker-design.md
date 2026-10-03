@@ -415,8 +415,10 @@ Serving: send the one request, stream files, await the reply
    │     Retry kinds (ReadSnapshot, RunVerification) ─▶ Failure("guest exited before reporting: firecracker exit code N")  [outcome written]
    │     ApplyPatch ─────────────▶ NO outcome; worker exits 1  ⇒ supervisor writes no receipt ⇒ reconciled (inspection)
    ▼
-Done: Shutdown → wait exit ≤ 5 s else SIGKILL → jail::collect (cgroup rmdir, chroot removal) → remove scratch.img → release ws.lock → write outcome.json → exit 0
+Done: Shutdown → wait exit ≤ 5 s else SIGKILL → remove scratch.img → release ws.lock → (after `run_vm` returns, in `run_blocking`) jail::collect (cgroup rmdir, chroot removal) → write outcome.json → exit 0
 ```
+
+The jail is collected after the lock is released: this is safe because the controller serialises on `ws.lock` (one driver per home, no new job before this one's outcome), and the next boot's `collect_dead_inspections` runs under the lock.
 
 At any point the supervisor may kill the worker group (lease, deadline, cancel): Firecracker dies with the worker; the 3a kill-receipt rule applies unchanged (a valid `outcome.json` present is published; else `Retry` kinds get a `Failure` receipt with the reason; `ReconcileThenRetry` kinds get none). A supervisor SIGKILL leaves the job dead by the lock; the controller's fence kills the session (worker and Firecracker) before `settled()` lets anyone reconcile or redispatch; the guest additionally shuts itself down on connection EOF. A job that died in any of these ways leaves its jail behind; the controller collects it once the job is settled ("The jail").
 

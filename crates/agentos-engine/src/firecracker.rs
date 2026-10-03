@@ -445,7 +445,7 @@ impl Vm {
         self.status.as_ref().map(exit_code_text)
     }
 
-    /// SIGKILLs the process (and the group it may lead; never the worker's own) and reaps it.
+    /// SIGKILLs the process (and the group it leads, if it leads one; never the worker's own) and reaps it.
     fn kill(&mut self) -> ExitStatus {
         let pid = i32::try_from(self.child.id()).ok().and_then(Pid::from_raw);
         let status = match self.status {
@@ -453,7 +453,12 @@ impl Vm {
             None => {
                 if let Some(pid) = pid {
                     let _ = kill_process(pid, Signal::KILL);
-                    let _ = kill_process_group(pid, Signal::KILL);
+                    // Only a VM that leads its own group: a job VM is a member of the
+                    // worker's group, and a group id equal to its pid (after pid reuse)
+                    // would be an unrelated group.
+                    if self.own_group {
+                        let _ = kill_process_group(pid, Signal::KILL);
+                    }
                 }
                 let status = self.child.wait().unwrap_or_else(|_| ExitStatus::from_raw(9));
                 self.status = Some(status);
@@ -497,6 +502,8 @@ impl Drop for Vm {
 fn not_up(e: &LinkError) -> String {
     match e {
         LinkError::BootTimeout | LinkError::Exited(_) => e.to_string(),
+        // A refusal at Hello is a handshake failure, not a 3a reason: escaped and capped.
+        LinkError::Refused(reason) => format!("guest did not come up: {}", guest_text(reason)),
         other => format!("guest did not come up: {other}"),
     }
 }
@@ -1474,6 +1481,13 @@ mod tests {
         let long = guest_text(&"é\n".repeat(10_000));
         assert!(long.len() <= GUEST_TEXT_LIMIT + " [truncated]".len() && long.ends_with(" [truncated]"), "{long}");
         assert!(!long.chars().any(|c| c.is_control()));
+    }
+
+    #[test]
+    fn a_refusal_at_hello_is_escaped_and_bounded() {
+        let why = not_up(&LinkError::Refused(format!("bad\n\u{1b}[31m{}", "x".repeat(5000))));
+        assert!(why.starts_with("guest did not come up: bad\\n\\u{1b}[31m"), "{why}");
+        assert!(!why.chars().any(|c| c.is_control()) && why.len() < 700, "{why}");
     }
 
     #[test]
