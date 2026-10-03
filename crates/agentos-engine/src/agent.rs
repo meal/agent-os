@@ -188,9 +188,17 @@ impl ModelAgent {
     fn on_response(&mut self, content: &Value) -> AgentAction {
         self.history.push(json!({"role": "assistant", "content": content}));
         self.pending_tool_use_id = None;
-        let block = content
+        let mut tool_uses = content
             .as_array()
-            .and_then(|blocks| blocks.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("tool_use")));
+            .into_iter()
+            .flatten()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"));
+        let block = tool_uses.next();
+        // Several tool calls would leave all but one unanswered (every later request would be
+        // rejected), and the agent asked for exactly one per turn: finish.
+        if tool_uses.next().is_some() {
+            return AgentAction::Finish;
+        }
         let Some(block) = block else { return AgentAction::Finish };
         let Some(id) = block.get("id").and_then(Value::as_str) else { return AgentAction::Finish };
         self.pending_tool_use_id = Some(id.to_string());

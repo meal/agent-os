@@ -274,3 +274,31 @@ fn the_fixture_transcripts_drive_the_documented_action_sequence() {
         ]
     );
 }
+
+#[test]
+fn a_response_with_several_tool_uses_is_finish_and_sets_no_pending_call() {
+    let mut a = agent();
+    a.next(&start());
+    let content = json!([
+        {"type": "thinking", "thinking": "", "signature": "sig-1"},
+        {"type": "tool_use", "id": "toolu_a", "name": "list_files", "input": {}},
+        {"type": "tool_use", "id": "toolu_b", "name": "apply_patch", "input": {"patch": "P"}}
+    ]);
+    assert_eq!(a.next(&response_with(content.clone(), "tool_use")), AgentAction::Finish);
+    assert_eq!(last(&a), json!({"role": "assistant", "content": content}));
+    // no pending id: a stray tool observation is Finish, not a result for toolu_a
+    assert_eq!(a.next(&Observation::Files { files: vec![] }), AgentAction::Finish);
+}
+
+#[test]
+fn one_tool_use_among_text_and_thinking_blocks_still_maps_normally() {
+    let mut a = agent();
+    a.next(&start());
+    let content = json!([
+        {"type": "thinking", "thinking": "", "signature": "s"},
+        {"type": "text", "text": "ok"},
+        {"type": "tool_use", "id": "toolu_x", "name": "run_verification", "input": {}},
+        {"type": "text", "text": "tail"}
+    ]);
+    assert_eq!(a.next(&response_with(content, "tool_use")), AgentAction::Verify);
+}
