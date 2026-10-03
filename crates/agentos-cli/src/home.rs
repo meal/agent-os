@@ -9,6 +9,7 @@
 //! <home>/driver.lock         held by the one process driving tasks (running or recovering)
 //! <home>/registry/<id>@<digest>/   registered verification profiles, read-only, content-addressed
 //! <home>/registry/<id>@<digest>.meta.json   registration time (outside the digest)
+//! <home>/registry/images/<id>@<digest>/   registered guest images, read-only, content-addressed
 //! <home>/profiles/<id>/      legacy profile directories (default for --profiles)
 //! ```
 
@@ -22,6 +23,7 @@ use agentos_engine::supervised::{ExecCounts, SupervisedExecutor};
 use agentos_store::blob::BlobStore;
 use agentos_store::db::Db;
 
+use crate::commands::registry::{check_id, list_entries};
 use crate::commands::supervise::supervisor_cmd;
 use crate::error::CliError;
 
@@ -109,19 +111,42 @@ impl Home {
 
     /// Every registered profile, unordered.
     pub fn registry_list(&self) -> Vec<RegistryEntry> {
-        let Ok(entries) = fs::read_dir(self.registry_dir()) else { return Vec::new() };
-        let mut out = Vec::new();
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let Some((id, digest)) = name.split_once('@') else { continue };
-            if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) || !entry.path().join("profile.json").is_file() {
-                continue;
-            }
-            let meta = fs::read(self.registry_dir().join(format!("{name}.meta.json"))).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
-            let registered_ms = meta.and_then(|m| m["registered_ms"].as_i64()).unwrap_or(0);
-            out.push(RegistryEntry { id: id.to_string(), digest: digest.to_string(), dir: entry.path(), registered_ms });
+        list_entries(&self.registry_dir(), |dir| dir.join("profile.json").is_file())
+    }
+
+    /// The guest image registry: `<home>/registry/images`.
+    pub fn images_dir(&self) -> PathBuf {
+        self.registry_dir().join("images")
+    }
+
+    /// Every registered guest image, unordered.
+    pub fn image_list(&self) -> Vec<RegistryEntry> {
+        list_entries(&self.images_dir(), |dir| dir.join("image.json").is_file())
+    }
+
+    // Consumed by the submit preflight (the next task).
+    #[allow(dead_code)]
+    /// Registered entries of guest image `id`, oldest registration first.
+    pub fn image_entries(&self, id: &str) -> Vec<RegistryEntry> {
+        let mut found: Vec<RegistryEntry> = self.image_list().into_iter().filter(|e| e.id == id).collect();
+        found.sort_by(|a, b| (a.registered_ms, &a.digest).cmp(&(b.registered_ms, &b.digest)));
+        found
+    }
+
+    // Consumed by the submit preflight (the next task).
+    #[allow(dead_code)]
+    /// Where guest image `id` comes from: the registry entry with exactly the digest `pin`
+    /// (none is an error: a pin never falls back to anything else); else the newest entry;
+    /// there is no legacy location. `Ok(None)` when there is none.
+    pub fn resolve_image(&self, id: &str, pin: Option<&str>) -> Result<Option<RegistryEntry>, CliError> {
+        check_id("guest image", id)?;
+        if let Some(pin) = pin {
+            return match self.image_entries(id).into_iter().find(|e| e.digest == pin) {
+                Some(entry) => Ok(Some(entry)),
+                None => Err(CliError::usage(format!("guest image {id}@{pin} is not in the registry; `agentos image register` it first"))),
+            };
         }
-        out
+        Ok(self.image_entries(id).pop())
     }
 
     /// Where profile `id` comes from, in order: the registry entry with exactly the digest
@@ -206,5 +231,36 @@ impl Home {
             profile_digest: Some(self.pinned_profile(store, task)?),
         };
         Ok(SupervisedExecutor::new(root.join("jobs"), supervisor_cmd()?, WorkerConfig::Host(host), ExecCounts::default())?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(home: &Home, id: &str, digest: &str, ms: i64) {
+        let name = format!("{id}@{digest}");
+        let dir = home.images_dir().join(&name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("image.json"), "{}").unwrap();
+        fs::write(home.images_dir().join(format!("{name}.meta.json")), format!("{{\"registered_ms\":{ms}}}")).unwrap();
+    }
+
+    #[test]
+    fn resolve_image_pins_exactly_else_newest_and_never_falls_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = Home::new(Some(tmp.path().to_path_buf()), None).unwrap();
+        let (old, new) = ("a".repeat(64), "b".repeat(64));
+        assert!(home.resolve_image("img", None).unwrap().is_none());
+        entry(&home, "img", &old, 1);
+        entry(&home, "img", &new, 2);
+        assert_eq!(home.resolve_image("img", None).unwrap().unwrap().digest, new);
+        assert_eq!(home.resolve_image("img", Some(&old)).unwrap().unwrap().digest, old);
+        let err = home.resolve_image("img", Some(&"c".repeat(64))).unwrap_err();
+        assert_eq!(err.code, 2);
+        assert!(err.message.contains("is not in the registry; `agentos image register` it first"), "{}", err.message);
+        assert_eq!(home.resolve_image("a@b", None).unwrap_err().code, 2);
+        // Profiles and images do not see each other.
+        assert!(home.registry_list().is_empty());
     }
 }

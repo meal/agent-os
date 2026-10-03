@@ -1270,3 +1270,129 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
     }
     out
 }
+
+// ---- guest image registry ----
+
+/// A dummy guest image (the Task 5 shape: `image.json` plus 16-byte `vmlinux` and
+/// `rootfs.squashfs`) in the scratch dir, named `name`, with manifest id `id`.
+fn fake_image_dir(cli: &Cli, name: &str, id: &str, rootfs_byte: u8) -> PathBuf {
+    let dir = cli.path(name);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("image.json"),
+        json!({
+            "id": id, "protocol": 1, "kernel": "vmlinux", "rootfs": "rootfs.squashfs", "agent_version": "0.1.0",
+            "kernel_sha256": "0545ba1781fc06cfa1d7699069057f4538103fd1644100cf0da434899a1ed447", "built_from": "test",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(dir.join("vmlinux"), [0x7fu8; 16]).unwrap();
+    fs::write(dir.join("rootfs.squashfs"), [rootfs_byte; 16]).unwrap();
+    dir
+}
+
+fn register_image(cli: &Cli, dir: &Path) -> Value {
+    cli.json(&["image", "register", dir.to_str().unwrap()])
+}
+
+#[test]
+fn image_register_twice_is_a_noop_and_changed_bytes_are_a_new_entry() {
+    let cli = Cli::new();
+    let dir = fake_image_dir(&cli, "i1", "img-v1", 0x68);
+    let first = register_image(&cli, &dir);
+    assert_eq!(first["id"], "img-v1");
+    assert_eq!(first["digest"].as_str().unwrap().len(), 64);
+    assert_eq!(register_image(&cli, &dir), first, "same bytes, same entry");
+    assert_eq!(cli.json(&["image", "list"]).as_array().unwrap().len(), 1);
+    let second = register_image(&cli, &fake_image_dir(&cli, "i2", "img-v1", 0x69));
+    assert_ne!(second["digest"], first["digest"]);
+    assert_eq!(cli.json(&["image", "list"]).as_array().unwrap().len(), 2);
+    let entry = cli.home().join("registry/images").join(format!("img-v1@{}", first["digest"].as_str().unwrap()));
+    assert!(entry.join("vmlinux").is_file() && entry.join("image.json").is_file());
+}
+
+#[test]
+fn image_register_refuses_a_bad_manifest() {
+    let cli = Cli::new();
+    let dir = fake_image_dir(&cli, "i1", "img-v1", 0x68);
+    let manifest = fs::read_to_string(dir.join("image.json")).unwrap();
+    fs::write(dir.join("image.json"), manifest.replace("\"protocol\":1", "\"protocol\":2")).unwrap();
+    cli.cmd(&["image", "register", dir.to_str().unwrap()]).assert().code(2).stderr(predicate::str::contains("protocol"));
+
+    let dir = fake_image_dir(&cli, "i2", "img-v1", 0x68);
+    fs::remove_file(dir.join("vmlinux")).unwrap();
+    cli.cmd(&["image", "register", dir.to_str().unwrap()]).assert().code(2).stderr(predicate::str::contains("vmlinux"));
+
+    cli.cmd(&["image", "register", cli.path("nope").to_str().unwrap()]).assert().code(2);
+    assert!(!cli.home().join("registry/images").exists() || cli.json(&["image", "list"]).as_array().unwrap().is_empty());
+}
+
+#[test]
+fn image_ids_with_at_sign_or_traversal_are_rejected_at_register() {
+    let cli = Cli::new();
+    for (i, id) in ["a@b", "../x", "a/b", "..", "", "-x"].into_iter().enumerate() {
+        let dir = fake_image_dir(&cli, &format!("bad-{i}"), id, 0x68);
+        cli.cmd(&["image", "register", dir.to_str().unwrap()]).assert().code(2).stderr(predicate::str::contains("plain name"));
+    }
+    assert!(cli.json(&["image", "list"]).as_array().unwrap().is_empty());
+}
+
+#[test]
+fn registered_images_have_no_write_bits() {
+    use std::os::unix::fs::PermissionsExt;
+    let cli = Cli::new();
+    let digest = register_image(&cli, &fake_image_dir(&cli, "i1", "ro-v1", 0x68))["digest"].as_str().unwrap().to_string();
+    let entry = cli.home().join("registry/images").join(format!("ro-v1@{digest}"));
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&entry), 0o555);
+    for file in ["image.json", "vmlinux", "rootfs.squashfs"] {
+        assert_eq!(mode(&entry.join(file)), 0o444, "{file}");
+    }
+    assert!(cli.home().join("registry/images").join(format!("ro-v1@{digest}.meta.json")).is_file());
+}
+
+#[test]
+fn image_list_shows_entries_sorted() {
+    let cli = Cli::new();
+    register_image(&cli, &fake_image_dir(&cli, "i1", "zeta-v1", 0x68));
+    register_image(&cli, &fake_image_dir(&cli, "i2", "alpha-v1", 0x68));
+    let listed = cli.json(&["image", "list"]);
+    let rows = listed.as_array().unwrap();
+    assert_eq!(rows.iter().map(|r| r["id"].as_str().unwrap()).collect::<Vec<_>>(), ["alpha-v1", "zeta-v1"]);
+    for row in rows {
+        assert_eq!(row["digest"].as_str().unwrap().len(), 64);
+        assert!(row["registered_ms"].as_i64().unwrap() > 0);
+        assert_eq!(row.as_object().unwrap().len(), 3);
+    }
+}
+
+#[test]
+fn images_do_not_leak_into_the_profile_list_and_back() {
+    let cli = Cli::new();
+    register_image(&cli, &fake_image_dir(&cli, "i1", "img-v1", 0x68));
+    register(&cli, &profile_variant(&cli, "p1", "reg-v1", ""));
+    let profiles = cli.json(&["profile", "list"]);
+    assert_eq!(profiles.as_array().unwrap().len(), 1, "{profiles}");
+    assert_eq!(profiles[0]["id"], "reg-v1");
+    let images = cli.json(&["image", "list"]);
+    assert_eq!(images.as_array().unwrap().len(), 1, "{images}");
+}
+
+#[test]
+fn profile_register_and_list_are_unchanged_by_the_shared_code() {
+    let cli = Cli::new();
+    let digest = register(&cli, &profile_variant(&cli, "p1", "shape-v1", ""))["digest"].as_str().unwrap().to_string();
+    let out = cli.cmd(&["profile", "list"]).assert().success().get_output().stdout.clone();
+    let text = String::from_utf8(out).unwrap();
+    let row = &serde_json::from_str::<Value>(&text).unwrap()[0];
+    let ms = row["registered_ms"].as_i64().unwrap();
+    assert_eq!(text, format!("[{{\"digest\":\"{digest}\",\"id\":\"shape-v1\",\"registered_ms\":{ms}}}]\n"));
+}
+
+#[test]
+fn image_help_lists_register_and_list() {
+    let cli = Cli::new();
+    cli.cmd(&["image", "--help"]).assert().success().stdout(predicate::str::contains("register")).stdout(predicate::str::contains("list"));
+    cli.cmd(&["--help"]).assert().success().stdout(predicate::str::contains("image"));
+}

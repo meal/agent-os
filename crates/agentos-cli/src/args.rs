@@ -57,6 +57,11 @@ pub enum Command {
         #[command(subcommand)]
         command: ProfileCommand,
     },
+    /// Manage the guest image registry.
+    Image {
+        #[command(subcommand)]
+        command: ImageCommand,
+    },
     /// Revoke a task's capabilities (all, or one by its contract name, e.g. verification.run);
     /// running jobs that depend on a revoked capability are stopped.
     Revoke {
@@ -80,5 +85,14 @@ pub enum ProfileCommand {
     /// content-addressed registry; the same bytes twice change nothing.
     Register { dir: PathBuf },
     /// List registered profiles.
+    List,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ImageCommand {
+    /// Copy a guest image directory (image.json, vmlinux, rootfs.squashfs) into the read-only,
+    /// content-addressed registry; the same bytes twice change nothing.
+    Register { dir: PathBuf },
+    /// List registered guest images.
     List,
 }
