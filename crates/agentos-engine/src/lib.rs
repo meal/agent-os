@@ -6,6 +6,7 @@ pub mod firecracker;
 pub mod fixture;
 pub mod guestlink;
 pub mod jail;
+pub mod model;
 pub mod job;
 mod journal;
 mod outcomes;

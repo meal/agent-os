@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+pub mod http;
 pub mod kvm;
 pub mod procs;
 
@@ -585,4 +586,9 @@ where
         (self.after)(req);
         out
     }
+}
+
+/// `fixtures/transcripts/<name>.json`.
+pub fn transcript(name: &str) -> PathBuf {
+    fixtures().join("transcripts").join(format!("{name}.json"))
 }
