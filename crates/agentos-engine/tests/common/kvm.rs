@@ -96,6 +96,9 @@ pub fn require() -> Option<Kvm> {
     let cgroup_root = find_cgroup2_root(&mounts);
 
     let mut reasons = Vec::new();
+    if cgroup_root.is_none() {
+        reasons.push("no cgroup v2 hierarchy in /proc/mounts".to_string());
+    }
     if let Err(e) = File::options().read(true).write(true).open("/dev/kvm") {
         reasons.push(format!("/dev/kvm: {e}"));
     }
@@ -103,20 +106,21 @@ pub fn require() -> Option<Kvm> {
     let jailer = executable("AGENTOS_JAILER", &jailer_bin);
     reasons.extend(jailer.clone().err());
     reasons.extend(image_complete(&image_dir).err());
-    // The probe runs whenever there is a jailer to probe, whatever else failed.
-    if jailer.is_ok() {
-        let root = cgroup_root.clone().unwrap_or_else(|| PathBuf::from("/sys/fs/cgroup"));
-        if let Err(e) = probe_jail(&jailer_bin, &root, &image_dir) {
-            reasons.push(format!("jail probe: {e}"));
-        }
+    // The probe runs whenever there is a jailer and a cgroup tree to probe, whatever else
+    // failed.
+    if jailer.is_ok()
+        && let Some(root) = &cgroup_root
+        && let Err(e) = probe_jail(&jailer_bin, root, &image_dir)
+    {
+        reasons.push(format!("jail probe: {e}"));
     }
-    if !reasons.is_empty() {
+    let Some(cgroup_root) = cgroup_root.filter(|_| reasons.is_empty()) else {
         panic!(
             "AGENTOS_KVM_TESTS is set but the KVM tier cannot run (docker compose run --rm test-kvm …):\n  - {}",
             reasons.join("\n  - ")
         );
-    }
-    Some(Kvm { firecracker_bin, jailer_bin, image_dir, cgroup_root: cgroup_root.expect("the probe found it") })
+    };
+    Some(Kvm { firecracker_bin, jailer_bin, image_dir, cgroup_root })
 }
 
 impl Kvm {

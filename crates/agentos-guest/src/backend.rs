@@ -362,18 +362,18 @@ impl Backend for VmBackend {
         cmd
     }
 
-    /// The trampoline applies the rlimits and the OOM priority, then `exec`s the check
-    /// (spec issue 6: no `pre_exec`).
+    /// The trampoline is started as root: it sets the OOM priority while privileged (so it
+    /// becomes the check's floor), the rlimits, drops to `check` and `exec`s the check (spec
+    /// issue 6: no `pre_exec`).
     fn check_command(&self, program: &str, args: &[String], workspace: &Path, cwd: &Path, pycache: &Path) -> Command {
         let (nproc, nofile, oom) = (CHECK_NPROC.to_string(), CHECK_NOFILE.to_string(), CHECK_OOM_SCORE_ADJ.to_string());
+        let id = CHECK_UID.to_string();
         let mut cmd = Command::new(INIT_PATH);
-        cmd.args(["exec-check", "--nproc", &nproc, "--nofile", &nofile, "--oom", &oom, "--"])
+        cmd.args(["exec-check", "--uid", &id, "--gid", &id, "--nproc", &nproc, "--nofile", &nofile, "--oom", &oom, "--"])
             .arg(program)
             .args(args)
             .arg(workspace)
             .current_dir(cwd)
-            .uid(CHECK_UID)
-            .gid(CHECK_UID)
             .process_group(0)
             .env_clear()
             .env("PATH", CHECK_PATH)
@@ -415,8 +415,11 @@ mod tests {
         let args: Vec<&OsStr> = cmd.get_args().collect();
         assert_eq!(
             args,
-            ["exec-check", "--nproc", "256", "--nofile", "1024", "--oom", "1000", "--", "python3", "check.py", "/workspace"]
-                .map(OsStr::new)
+            [
+                "exec-check", "--uid", "1001", "--gid", "1001", "--nproc", "256", "--nofile", "1024", "--oom", "1000", "--",
+                "python3", "check.py", "/workspace"
+            ]
+            .map(OsStr::new)
         );
         assert_eq!(cmd.get_current_dir(), Some(Path::new("/scratch/profile")));
         let mut envs: Vec<(String, String)> = cmd
@@ -435,6 +438,7 @@ mod tests {
         // The trampoline's own usage agrees with the arguments the agent builds.
         let parsed = crate::trampoline::parse(&args.iter().skip(1).map(|a| a.to_os_string()).collect::<Vec<_>>()).unwrap();
         assert_eq!((parsed.nproc, parsed.nofile, parsed.oom_score_adj), (CHECK_NPROC, CHECK_NOFILE, CHECK_OOM_SCORE_ADJ));
+        assert_eq!((parsed.uid, parsed.gid), (CHECK_UID, CHECK_UID));
         assert_eq!(parsed.program, "python3");
     }
 

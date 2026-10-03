@@ -34,8 +34,30 @@ use crate::backend::{
 pub const HOSTNAME: &str = "agentos-guest";
 /// The check's own directory on the scratch drive (0700, `check`).
 pub const CHECK_SCRATCH: &str = "/scratch/check";
-/// The control channel: root only, so the check cannot talk to the host.
+/// The control channel device, made root-only (0600). This is not what keeps the check
+/// from the host: `socket(AF_VSOCK)` needs no access to this node, so a check can still try
+/// to connect to the host (CID 2). The defence is that the host listens on nothing the
+/// guest can reach, and no token or open connection is ever handed to uid 1001.
 pub const VSOCK_DEVICE: &str = "/dev/vsock";
+
+/// Whether `cmdline` (`/proc/cmdline`) is the guest kernel's: it carries `init=INIT_PATH`
+/// as its own word.
+pub fn is_guest_cmdline(cmdline: &str) -> bool {
+    let marker = format!("init={}", agentos_core::guest::INIT_PATH);
+    cmdline.split_whitespace().any(|w| w == marker)
+}
+
+/// The second guard before init (the first being PID 1): mounts `/proc` if nothing is
+/// mounted there yet, then requires the guest kernel command line. A container whose PID 1
+/// runs this binary without arguments sees its host's command line and never reaches
+/// `mkfs`/`mount`/`reboot`.
+pub fn running_as_guest_init() -> bool {
+    let proc = Path::new("/proc");
+    if !is_mount_point(proc) && mount("proc", proc, "proc", MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC, None::<&std::ffi::CStr>).is_err() {
+        return false;
+    }
+    fs::read_to_string("/proc/cmdline").is_ok_and(|c| is_guest_cmdline(&c))
+}
 
 /// One runtime mount, as data, so the table can be checked without mounting anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +252,21 @@ mod tests {
         // A guest reboot must end Firecracker, and a panic must reboot.
         for arg in ["reboot=k", "panic=1", "console=ttyS0"] {
             assert!(BOOT_ARGS.split_whitespace().any(|a| a == arg), "{arg}");
+        }
+    }
+
+    #[test]
+    fn init_runs_only_under_the_guest_kernel_command_line() {
+        let guest = format!("{BOOT_ARGS} root=/dev/vda ro virtio_mmio.device=4K@0xd0000000:5\n");
+        assert!(is_guest_cmdline(&guest));
+        for other in [
+            "",
+            "BOOT_IMAGE=/vmlinuz-linux root=UUID=1234 rw quiet\n",
+            "init=/sbin/agentos-guest-not",
+            "xinit=/sbin/agentos-guest",
+            "init=/sbin/init agentos-guest",
+        ] {
+            assert!(!is_guest_cmdline(other), "{other:?}");
         }
     }
 

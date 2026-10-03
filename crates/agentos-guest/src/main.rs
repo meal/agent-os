@@ -12,9 +12,10 @@ const USAGE: &str = "usage: agentos-guest --fake UDS ROOT\n       \
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     match args.as_slice() {
-        // Only the kernel starts us without arguments, as PID 1; anywhere else this would
-        // mount over the host's /proc and reboot it.
-        [] if rustix::process::getpid().is_init() => agentos_guest::init::main(),
+        // Only the guest kernel starts us without arguments: PID 1 *and* its command line
+        // naming us as init. Anywhere else (a shell, a container's PID 1) this would mkfs,
+        // mount and reboot.
+        [] if rustix::process::getpid().is_init() && agentos_guest::init::running_as_guest_init() => agentos_guest::init::main(),
         [cmd, rest @ ..] if cmd == "exec-check" => {
             let code = agentos_guest::trampoline::main(rest);
             ExitCode::from(u8::try_from(code).unwrap_or(1))
