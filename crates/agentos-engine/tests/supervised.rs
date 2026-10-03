@@ -20,7 +20,10 @@ use agentos_engine::runner::run_task;
 use agentos_engine::supervised::{ExecCounts, JobWait, SupervisedExecutor};
 use agentos_engine::supervisor::SupervisorCmd;
 use agentos_engine::workspace::workspace_digest;
-use common::{contract, copy_dir, edit_patch, fake_mode, fix_patch, fixtures, worker_config, workspace_dir, Env, FnAgent};
+use common::{
+    contract, copy_dir, edit_patch, fake_mode, fix_patch, fixtures, real_mode, worker_config, workspace_dir, write_in_workspace, Env,
+    FnAgent,
+};
 use std::os::fd::OwnedFd;
 
 use rustix::process::{pidfd_open, pidfd_send_signal, Pid, PidfdFlags, Signal};
@@ -95,10 +98,11 @@ impl Fx {
     }
 
     /// A fixture executor whose workspace is a copy of the worker's: the host worker's own
-    /// directory, or the fake guest's tree copied into the host layout (`<work>/<task>/ws`)
-    /// under `<root>/host-view`, so the host's own reconciliation can be asked about it.
+    /// directory, or the fake guest's tree (real mode: the `debugfs` dump of `ws.img`) copied
+    /// into the host layout (`<work>/<task>/ws`) under `<root>/host-view`, so the host's own
+    /// reconciliation can be asked about it.
     fn host_view(&self) -> FixtureExecutor {
-        if !fake_mode() {
+        if !fake_mode() && !real_mode() {
             return self.fixture();
         }
         let work = self.path("host-view");
@@ -408,7 +412,7 @@ async fn unresolvable_apply_patch_returns_an_unresolved_outcome_and_the_runner_m
     // The executor: a workspace that is neither the base nor the base plus the patch.
     let fx = Fx::new();
     fx.snapshot().await;
-    fs::write(fx.ws().join("src/stray.py"), "x = 1\n").unwrap();
+    write_in_workspace(fx.dir.path(), &fx.task, "src/stray.py", "x = 1\n");
     let (req, ctx) = (fx.patch(&fix_patch()), ctx(1));
     let out = fx.hooked().run(&req, &ctx).await;
     assert!(out.unresolved, "{}", String::from_utf8_lossy(&out.output));
@@ -424,10 +428,10 @@ async fn unresolvable_apply_patch_returns_an_unresolved_outcome_and_the_runner_m
             .with_env(TEST_WORKERS, "1")
     };
     let exec = ByKind { plain: make(), hooked: make().with_env(EXIT_BEFORE_RECEIPT, "1") };
-    let ws = workspace_dir(env.dir.path(), &env.task);
+    let (root, task) = (env.dir.path().to_path_buf(), env.task.clone());
     let mut agent = FnAgent(move |obs: &Observation| match obs {
         Observation::Start { .. } => {
-            fs::write(ws.join("src/stray.py"), "x = 1\n").unwrap();
+            write_in_workspace(&root, &task, "src/stray.py", "x = 1\n");
             AgentAction::ApplyPatch(fix_patch())
         }
         _ => AgentAction::Finish,

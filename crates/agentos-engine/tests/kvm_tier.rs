@@ -1212,11 +1212,21 @@ async fn home_guard_kills_the_homes_vms_and_collects_their_jails() {
     fs::write(job.join("jail/cgroup"), format!("{}\n", cgroup.display())).unwrap();
     let stand_in = root.path().join("firecracker");
     fs::copy(fs::canonicalize("/usr/bin/python3").unwrap(), &stand_in).unwrap();
-    let mut vm = Command::new(&stand_in)
-        .args(["-c", "import time; time.sleep(60)", "--id", id.as_str()])
-        .env("PYTHONHOME", "/usr")
-        .spawn()
-        .unwrap();
+    let mut cmd = Command::new(&stand_in);
+    cmd.args(["-c", "import time; time.sleep(60)", "--id", id.as_str()]).env("PYTHONHOME", "/usr");
+    // The copy was just written: a fork by another test thread can briefly hold its write fd
+    // (until that child's exec closes it), and exec then fails with ETXTBSY. Retry that only.
+    let mut busy = 0;
+    let mut vm = loop {
+        match cmd.spawn() {
+            Ok(child) => break child,
+            Err(e) if e.raw_os_error() == Some(26) && busy < 100 => {
+                busy += 1;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("spawn the stand-in {}: {e}", stand_in.display()),
+        }
+    };
     fs::write(cgroup.join("cgroup.procs"), vm.id().to_string()).unwrap();
     wait_for("the stand-in", || firecracker_processes().iter().any(|p| p.id() == Some(id.as_str())));
 
