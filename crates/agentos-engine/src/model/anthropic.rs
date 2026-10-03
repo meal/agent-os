@@ -17,7 +17,12 @@ pub struct AnthropicProvider {
 }
 
 fn build_client(timeout: Duration) -> reqwest::Client {
-    reqwest::Client::builder().timeout(timeout).no_proxy().build().expect("build the HTTP client")
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .build().expect("build the HTTP client")
 }
 
 impl AnthropicProvider {

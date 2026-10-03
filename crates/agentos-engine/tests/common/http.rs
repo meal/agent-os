@@ -14,6 +14,10 @@ pub enum Reply {
     Status(u16, String),
     Hang(Duration),
     CloseMidBody,
+    /// A redirect with this status to this `Location`.
+    Redirect(u16, String),
+    /// Closes the connection without writing anything.
+    CloseAtOnce,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +115,14 @@ fn handle(mut stream: TcpStream, reply: &Reply, hits: &AtomicUsize, requests: &M
         }
         Reply::Status(status, text) => respond(&mut stream, *status, text.as_bytes()),
         Reply::Hang(d) => thread::sleep(*d),
+        Reply::CloseAtOnce => {}
+        Reply::Redirect(status, location) => {
+            let head = format!(
+                "HTTP/1.1 {status} Redirect\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.flush();
+        }
         Reply::CloseMidBody => {
             let _ = stream.write_all(
                 b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\nconnection: close\r\n\r\n0123456789",

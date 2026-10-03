@@ -151,3 +151,24 @@ fn the_fixture_transcripts_parse_and_have_the_documented_tool_sequence() {
     assert_eq!(names, ["list_files", "read_file", "apply_patch", "run_verification"]);
     assert_eq!(direct[2]["input"]["patch"], fix_patch());
 }
+
+#[tokio::test]
+async fn a_redirect_is_rejected_never_followed() {
+    for status in [301u16, 307] {
+        let target = serve(Reply::Status(200, "{}".into()));
+        let api = serve(Reply::Redirect(status, format!("{}/v1/messages", target.url())));
+        let r = provider(&api, secs2()).complete(BODY).await;
+        assert!(matches!(r, ProviderResult::Rejected { status: s, .. } if s == status), "{status}: {r:?}");
+        assert_eq!(api.hits(), 1, "{status}");
+        assert_eq!(target.hits(), 0, "{status}: the redirect target was contacted");
+        assert!(target.requests().iter().all(|q| q.headers.iter().all(|(k, _)| k != "x-api-key")));
+    }
+}
+
+#[tokio::test]
+async fn a_connection_closed_before_any_bytes_is_one_send_and_a_transport_failure() {
+    let api = serve(Reply::CloseAtOnce);
+    let r = provider(&api, secs2()).complete(BODY).await;
+    assert!(matches!(r, ProviderResult::Transport(_)), "{r:?}");
+    assert_eq!(api.hits(), 1);
+}

@@ -53,7 +53,8 @@ impl fmt::Debug for ApiKey {
     }
 }
 
-/// Sends one serialized request exactly once; no retry layer lives here.
+/// Sends one serialized request exactly once. The HTTP client sets `retry::never()` and
+/// `redirect::Policy::none()`, so neither reqwest nor this trait retries or re-sends.
 pub trait ModelProvider: Send + Sync {
     fn complete<'a>(&'a self, body: &'a [u8]) -> BoxFuture<'a, ProviderResult>;
 }
