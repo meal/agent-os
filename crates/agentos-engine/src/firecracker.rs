@@ -40,9 +40,8 @@ pub const BOOT_TIMEOUT: Duration = Duration::from_secs(15);
 pub const INSPECT_TIMEOUT: Duration = Duration::from_secs(60);
 /// From `Shutdown` (or a lost connection) to Firecracker's exit, before it is SIGKILLed.
 pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
-/// The guest kernel command line; Firecracker appends `root=/dev/vda ro` and the
-/// `virtio_mmio.device=` entries. It carries nothing secret.
-pub const BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off nomodule quiet loglevel=4 init=/sbin/agentos-guest";
+/// The guest kernel command line (defined next to the protocol, where the guest sees it).
+pub use agentos_core::guest::BOOT_ARGS;
 /// Test hook (with `AGENTOS_TEST_WORKERS=1`): SIGKILL the VM right after `ApplyPatch` was sent.
 pub const KILL_VM_AFTER_REQUEST_ENV: &str = "AGENTOS_TEST_KILL_VM_AFTER_REQUEST";
 /// What `firecracker --version` must start with.

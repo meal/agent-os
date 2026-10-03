@@ -34,7 +34,9 @@ fn spawn_with(env: &[(&str, &str)], prepare: impl FnOnce(&Path)) -> FakeGuest {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_agentos-guest"));
     cmd.arg("--fake").arg(&uds).arg(&root).stdin(Stdio::null());
     // Only the variables a test passes reach the guest, whatever the outer environment holds.
-    cmd.env_remove("AGENTOS_TEST_WORKERS").env_remove("AGENTOS_TEST_FAKE_GUEST_NEVER_LISTEN");
+    cmd.env_remove("AGENTOS_TEST_WORKERS")
+        .env_remove("AGENTOS_TEST_FAKE_GUEST_NEVER_LISTEN")
+        .env_remove("AGENTOS_TEST_FAKE_GUEST_WATCHDOG_MS");
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -181,6 +183,58 @@ fn a_second_connection_with_the_same_token_is_served() {
     let _first = g.hello(TOKEN, Mode::Job);
     let mut second = g.hello(TOKEN, Mode::Job);
     empty_snapshot(&mut second);
+}
+
+#[test]
+fn a_second_connection_with_the_same_token_but_another_mode_is_closed_without_a_reply() {
+    let g = spawn_with(&[("AGENTOS_TEST_WORKERS", "1")], |root| {
+        fs::create_dir_all(root.join("workspace")).unwrap();
+    });
+    let mut first = g.hello(TOKEN, Mode::Job);
+    // The mode is bound with the token for the whole process: an inspect Hello mid-job
+    // must never reach the inspect path (the VM would remount the workspace read-only).
+    let mut second = g.connect();
+    send(&mut second, hello_msg(1, TOKEN, Mode::Inspect));
+    assert_closed(&mut second);
+    empty_snapshot(&mut first);
+
+    // And the other way round: an inspection never becomes a job.
+    let g = spawn();
+    let mut first = g.hello(TOKEN, Mode::Inspect);
+    let mut second = g.connect();
+    send(&mut second, hello_msg(1, TOKEN, Mode::Job));
+    assert_closed(&mut second);
+    send(&mut first, Message::Digest);
+    assert!(matches!(recv(&mut first), Message::Refused { .. } | Message::DigestIs { .. }));
+}
+
+#[test]
+fn the_watchdog_ends_a_guest_that_never_gets_a_hello() {
+    let mut g = spawn_with(&[("AGENTOS_TEST_WORKERS", "1"), ("AGENTOS_TEST_FAKE_GUEST_WATCHDOG_MS", "300")], |_| {});
+    // A connection that never says Hello does not count.
+    let _silent = g.connect();
+    let status = wait_exit(&mut g.child, Duration::from_secs(5)).expect("the watchdog never fired");
+    assert_eq!(status.code(), Some(0));
+
+    // A bound Hello disarms it.
+    let mut g = spawn_with(&[("AGENTOS_TEST_WORKERS", "1"), ("AGENTOS_TEST_FAKE_GUEST_WATCHDOG_MS", "300")], |_| {});
+    let mut s = g.hello(TOKEN, Mode::Job);
+    thread::sleep(Duration::from_millis(800));
+    assert!(g.child.try_wait().unwrap().is_none(), "the watchdog fired after a bound Hello");
+    empty_snapshot(&mut s);
+
+    // A rejected Hello (another protocol) does not disarm it either.
+    let mut g = spawn_with(&[("AGENTOS_TEST_WORKERS", "1"), ("AGENTOS_TEST_FAKE_GUEST_WATCHDOG_MS", "300")], |_| {});
+    let mut s = g.connect();
+    send(&mut s, hello_msg(2, TOKEN, Mode::Job));
+    let status = wait_exit(&mut g.child, Duration::from_secs(5)).expect("the watchdog never fired");
+    assert_eq!(status.code(), Some(0));
+
+    // The shortening hook is honoured only with AGENTOS_TEST_WORKERS=1.
+    let mut g = spawn_with(&[("AGENTOS_TEST_FAKE_GUEST_WATCHDOG_MS", "300")], |_| {});
+    assert!(wait_for(&g.uds, Duration::from_secs(5)));
+    thread::sleep(Duration::from_millis(800));
+    assert!(g.child.try_wait().unwrap().is_none(), "the hook was honoured without AGENTOS_TEST_WORKERS=1");
 }
 
 #[test]

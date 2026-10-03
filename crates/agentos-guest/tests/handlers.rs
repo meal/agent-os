@@ -379,3 +379,116 @@ fn digest_and_patch_state_trichotomy() {
     assert_eq!(s.reason.unwrap(), format!("workspace {actual} is neither the base {base} nor the base with this patch"));
     assert_eq!(handlers::digest(&g.backend).unwrap(), actual);
 }
+
+#[test]
+fn the_bytecode_cache_is_fresh_for_every_verification_in_one_boot() {
+    let mut g = Guest::new();
+    g.snapshot();
+    // Each run reports what it found under the check's own scratch, then leaves something.
+    let script = "ls -A \"$PYTHONPYCACHEPREFIX\" 2>/dev/null | wc -l; ls -A \"$PYTHONPYCACHEPREFIX/..\" | wc -l; \
+                  mkdir -p \"$PYTHONPYCACHEPREFIX\" && touch \"$PYTHONPYCACHEPREFIX/stale.pyc\" \"$PYTHONPYCACHEPREFIX/../junk\"";
+    for run in 0..2 {
+        let v = g.verify(None, 30, &sh_profile(script)).unwrap();
+        assert_eq!(v.exit_code, Some(0), "run {run}: {v:?}");
+        let counts: Vec<String> = String::from_utf8_lossy(&v.stdout).split_whitespace().map(str::to_string).collect();
+        assert_eq!(counts, ["0", "0"], "run {run} saw a previous run's leftovers");
+    }
+    // The check's directory itself stays (in a VM it is 0700 and owned by `check`).
+    assert!(g.backend.scratch_dir().join("check").is_dir());
+}
+
+/// `sh -c script` with `filler` split over extra arguments (one argument may not exceed
+/// 128 KiB at `execve`).
+fn padded_profile(script: &str, filler: &str) -> StagedProfile {
+    let mut command = vec!["sh".to_string(), "-c".to_string(), script.to_string(), "sh".to_string()];
+    let chars: Vec<char> = filler.chars().collect();
+    command.extend(chars.chunks(100_000).map(|c| c.iter().collect::<String>()));
+    profile(&serde_json::json!({ "id": "padded", "command": command, "protected": true }).to_string())
+}
+
+#[test]
+fn a_profile_command_too_large_for_the_verified_frame_is_refused_before_running() {
+    let mut g = Guest::new();
+    g.snapshot();
+    let marker = g.dir.path().join("ran");
+    let touch = format!("touch {}", marker.display());
+    // Plain bytes that JSON leaves alone, then control bytes that JSON escapes sixfold.
+    for filler in ["a".repeat(900_000), "\u{1}".repeat(150_000)] {
+        let err = g.verify(None, 30, &padded_profile(&touch, &filler)).unwrap_err();
+        assert!(err.starts_with("profile command too large: "), "{err}");
+        assert!(!marker.exists(), "the oversized command ran");
+    }
+    // Just under the budget still runs, and its Verified frame fits with full output.
+    let script = format!("{touch}; head -c 70000 /dev/zero; head -c 70000 /dev/zero >&2");
+    let v = g.verify(None, 30, &padded_profile(&script, &"a".repeat(800_000))).unwrap();
+    assert!(marker.exists());
+    assert!(v.stdout_truncated && v.stderr_truncated);
+    let mut buf = Vec::new();
+    write_frame(&mut buf, &Frame::Json(v.into_message())).expect("the Verified reply fits in one JSON frame");
+}
+
+/// A `FakeBackend` that records which trees the handlers hand to `own_tree`.
+struct Recording {
+    inner: FakeBackend,
+    owned: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>,
+}
+
+impl Backend for Recording {
+    fn workspace_dir(&self) -> &Path {
+        self.inner.workspace_dir()
+    }
+    fn scratch_dir(&self) -> &Path {
+        self.inner.scratch_dir()
+    }
+    fn prepare_workspace(&mut self) -> Result<(), String> {
+        self.inner.prepare_workspace()
+    }
+    fn sync_workspace(&self) -> Result<(), String> {
+        self.inner.sync_workspace()
+    }
+    fn remount_workspace_ro(&self) -> Result<(), String> {
+        self.inner.remount_workspace_ro()
+    }
+    fn own_tree(&self, dir: &Path) -> Result<(), String> {
+        self.owned.lock().unwrap().push(dir.to_path_buf());
+        Ok(())
+    }
+    fn git(&self, cwd: &Path) -> std::process::Command {
+        self.inner.git(cwd)
+    }
+    fn check_command(&self, program: &str, args: &[String], workspace: &Path, cwd: &Path, pycache: &Path) -> std::process::Command {
+        self.inner.check_command(program, args, workspace, cwd, pycache)
+    }
+    fn vcpus(&self) -> u32 {
+        1
+    }
+    fn memory_mib(&self) -> u32 {
+        1
+    }
+}
+
+#[test]
+fn trees_written_as_root_are_handed_to_the_builder_before_git_touches_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let owned = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut b = Recording { inner: FakeBackend::new(dir.path().join("root")).unwrap(), owned: owned.clone() };
+    let files: Vec<(String, Vec<u8>)> = list_files(&fixtures().join("parser-repo"))
+        .unwrap()
+        .into_iter()
+        .map(|(rel, p)| (rel, fs::read(p).unwrap()))
+        .collect();
+    let total: u64 = files.iter().map(|(_, b)| b.len() as u64).sum();
+    let count = files.len() as u64;
+    let (mut host, mut guest) = UnixStream::pair().unwrap();
+    let writer = thread::spawn(move || send_files(&mut host, &files));
+    handlers::read_snapshot(&mut b, &mut guest, count, total).unwrap();
+    writer.join().unwrap();
+    assert_eq!(*owned.lock().unwrap(), [b.workspace_dir().to_path_buf()]);
+
+    owned.lock().unwrap().clear();
+    handlers::apply_patch(&mut b, digest(BASE), &src(), &fix_patch()).unwrap();
+    // The reverse check runs git on a root-made copy under the scratch drive.
+    let s = handlers::patch_state(&b, digest(BASE), &fix_patch());
+    assert_eq!(s.state, PatchStateKind::Applied, "{s:?}");
+    assert_eq!(*owned.lock().unwrap(), [b.scratch_dir().join("reverse/ws")]);
+}

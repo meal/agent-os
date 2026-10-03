@@ -2,7 +2,10 @@
 //! answers, then one request at a time until `Shutdown` or the connection is lost.
 
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::thread;
+use std::time::Duration;
 
 use agentos_core::guest::{is_attempt_token, read_frame, write_frame, Frame, Message, Mode, GUEST_PROTOCOL, PATCH_LIMIT};
 
@@ -24,8 +27,12 @@ pub enum Exit {
     Rejected,
 }
 
-/// The attempt token bound by the first accepted `Hello`, for the life of the process.
-static BOUND_TOKEN: OnceLock<String> = OnceLock::new();
+/// The attempt token and the mode bound by the first accepted `Hello`, for the life of the
+/// process: a later connection must present both (an inspect `Hello` on a job VM would
+/// otherwise remount its workspace read-only mid-job).
+static BOUND: OnceLock<(String, Mode)> = OnceLock::new();
+/// Set once a `Hello` was accepted; the boot watchdog reads it.
+static HELLO_SEEN: AtomicBool = AtomicBool::new(false);
 /// Requests are served one at a time, also across connections of the same attempt.
 static REQUEST: Mutex<()> = Mutex::new(());
 
@@ -52,6 +59,24 @@ fn allowed(mode: Mode, m: &Message) -> bool {
     }
 }
 
+/// Whether a `Hello` has been accepted (bound) in this process.
+pub fn hello_seen() -> bool {
+    HELLO_SEEN.load(Ordering::SeqCst)
+}
+
+/// The boot watchdog: unless a `Hello` has been accepted `after` from now, calls `fire`
+/// (the VM shuts down; the fake guest exits). A connection that never completes a valid
+/// `Hello` does not count.
+pub fn spawn_watchdog(after: Duration, fire: impl FnOnce() + Send + 'static) {
+    thread::spawn(move || {
+        thread::sleep(after);
+        if !hello_seen() {
+            eprintln!("agentos-guest: no Hello within {} ms of boot, shutting down", after.as_millis());
+            fire();
+        }
+    });
+}
+
 fn send(stream: &mut impl Write, m: Message) -> bool {
     write_frame(stream, &Frame::Json(m)).is_ok()
 }
@@ -62,10 +87,14 @@ fn lost(why: impl std::fmt::Display) -> Exit {
 }
 
 impl Session {
-    /// Serves one connection. `expected` pins the token this connection must present;
-    /// `None` binds the process-wide token on the first accepted `Hello` and holds every
-    /// later connection to it.
+    /// Serves one connection. `expected` pins the token this connection must present (tests
+    /// of one in-process session); `None` (the VM and the fake guest) binds the process-wide
+    /// token **and mode** on the first accepted `Hello` and holds every later connection to
+    /// both.
     pub fn serve(backend: &mut dyn Backend, mut stream: impl Read + Write, expected: Option<&str>) -> Exit {
+        // `raw_limit` 0 wherever a request is expected: a non-empty raw frame is `TooLarge`
+        // before its body is read, an empty one comes back as `Frame::Raw` and is treated as
+        // the protocol violation it is.
         let first = match read_frame(&mut stream, 0) {
             Ok(Frame::Json(m)) => m,
             _ => return Exit::Rejected,
@@ -83,13 +112,19 @@ impl Session {
         if !is_attempt_token(&attempt_token) {
             return Exit::Rejected;
         }
-        let bound = match expected {
-            Some(t) => t,
-            None => BOUND_TOKEN.get_or_init(|| attempt_token.clone()).as_str(),
+        let accepted = match expected {
+            Some(t) => t == attempt_token,
+            None => {
+                let (token, bound_mode) = BOUND.get_or_init(|| (attempt_token.clone(), mode));
+                *token == attempt_token && *bound_mode == mode
+            }
         };
-        if bound != attempt_token {
+        // Another token, or the bound token in another mode: closed without a reply, before
+        // anything (the inspect remount included) happens.
+        if !accepted {
             return Exit::Rejected;
         }
+        HELLO_SEEN.store(true, Ordering::SeqCst);
         if mode == Mode::Inspect
             && let Err(e) = backend.remount_workspace_ro()
         {

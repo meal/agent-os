@@ -10,9 +10,9 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-use agentos_core::guest::VSOCK_PORT;
+use agentos_core::guest::{HELLO_WATCHDOG, VSOCK_PORT};
 
-use crate::agent::{Exit, Session};
+use crate::agent::{spawn_watchdog, Exit, Session};
 use crate::backend::FakeBackend;
 
 /// The longest handshake line accepted (`CONNECT 5200\n` is 13 bytes).
@@ -21,6 +21,17 @@ const MAX_CONNECT_LINE: usize = 32;
 /// A test hook: `name=1` together with `AGENTOS_TEST_WORKERS=1`.
 pub(crate) fn test_hook(name: &str) -> bool {
     std::env::var_os("AGENTOS_TEST_WORKERS").is_some_and(|v| v == "1") && std::env::var_os(name).is_some_and(|v| v == "1")
+}
+
+/// The boot watchdog's delay: `HELLO_WATCHDOG`, or `AGENTOS_TEST_FAKE_GUEST_WATCHDOG_MS`
+/// together with `AGENTOS_TEST_WORKERS=1`.
+fn watchdog_delay() -> Duration {
+    let test_workers = std::env::var_os("AGENTOS_TEST_WORKERS").is_some_and(|v| v == "1");
+    std::env::var("AGENTOS_TEST_FAKE_GUEST_WATCHDOG_MS")
+        .ok()
+        .filter(|_| test_workers)
+        .and_then(|ms| ms.parse().ok())
+        .map_or(HELLO_WATCHDOG, Duration::from_millis)
 }
 
 /// Reads the handshake line byte by byte, so nothing of the first frame is consumed.
@@ -54,8 +65,9 @@ fn handle(mut stream: UnixStream, mut backend: FakeBackend) {
 }
 
 /// Listens on `uds` (a stale file is removed first) and serves every connection on its own
-/// thread; the process exits 0 once a bound session ends. Returns only on a listener error,
-/// or with `Ok` after the never-listen test hook.
+/// thread; the process exits 0 once a bound session ends, or when no `Hello` was accepted
+/// within the boot watchdog (as a VM powers off). Returns only on a listener error, or with
+/// `Ok` after the never-listen test hook.
 pub fn serve(uds: &Path, root: &Path) -> io::Result<()> {
     if test_hook("AGENTOS_TEST_FAKE_GUEST_NEVER_LISTEN") {
         thread::sleep(Duration::from_secs(30));
@@ -68,6 +80,7 @@ pub fn serve(uds: &Path, root: &Path) -> io::Result<()> {
         Err(e) => return Err(e),
     }
     let listener = UnixListener::bind(uds)?;
+    spawn_watchdog(watchdog_delay(), || std::process::exit(0));
     loop {
         let (stream, _) = listener.accept()?;
         let backend = backend.clone();

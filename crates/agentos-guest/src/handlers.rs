@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use agentos_core::contract::path_matches;
 use agentos_core::guest::{
-    b64, raw_frames_for, read_frame, Frame, Message, PatchStateKind, FILE_LIMIT, OUTPUT_LIMIT, PROFILE_LIMIT,
+    b64, raw_frames_for, read_frame, Frame, Message, PatchStateKind, FILE_LIMIT, JSON_FRAME_LIMIT, OUTPUT_LIMIT, PROFILE_LIMIT,
     RAW_FRAME_LIMIT, SNAPSHOT_BYTES_LIMIT, SNAPSHOT_FILES_LIMIT,
 };
 use agentos_core::ids::Digest;
@@ -20,7 +20,7 @@ use agentos_core::patchrules::{check_summary, parse_numstat};
 use agentos_core::workspace::{
     copy_tree, excluded_entries, has_excluded_component, list_files, purge_excluded, symlink_on_path, workspace_digest,
 };
-use rustix::process::{kill_process_group, Pid, Signal};
+use rustix::process::{kill_process_group, waitpgid, Pid, Signal, WaitOptions};
 use serde::Deserialize;
 
 use crate::backend::Backend;
@@ -250,6 +250,8 @@ pub fn read_snapshot(
     if let Some(e) = written {
         return Err(failed(e.to_string()));
     }
+    // Written as root; `git` runs as `builder` from now on.
+    backend.own_tree(&ws).map_err(failed)?;
     backend.sync_workspace().map_err(failed)?;
     let files = list_files(&ws).map_err(|e| failed(e.to_string()))?.into_iter().map(|(rel, _)| rel).collect();
     let digest = workspace_digest(&ws).map_err(|e| failed(e.to_string()))?;
@@ -276,6 +278,27 @@ pub fn receive_profile(link: &mut impl Read, file_count: u64, total_bytes: u64) 
     let mut sink = MemSink::default();
     receive_files(link, file_count, total_bytes, PROFILE_LIMIT, &mut sink).map_err(StreamError::Protocol)?;
     Ok(StagedProfile { files: sink.files })
+}
+
+/// Empties `dir` but keeps the directory itself (its owner and mode: in a VM
+/// `/scratch/check` is `check`'s, 0700); creates it if missing. `remove_dir_all` never
+/// follows a symlink the previous check may have planted.
+fn empty_dir(dir: &Path) -> io::Result<()> {
+    match fs::read_dir(dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let path = entry?.path();
+                if fs::symlink_metadata(&path)?.is_dir() {
+                    fs::remove_dir_all(&path)?;
+                } else {
+                    fs::remove_file(&path)?;
+                }
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => fs::create_dir_all(dir),
+        Err(e) => Err(e),
+    }
 }
 
 /// A fresh, empty `<scratch>/<name>`.
@@ -376,6 +399,20 @@ struct Profile {
     command: Vec<String>,
 }
 
+/// The serialized `command` and `profile_id` must leave room in the `Verified` frame for
+/// both output streams at their limit (base64) and the fixed fields.
+pub const VERIFIED_TEXT_BUDGET: usize = JSON_FRAME_LIMIT - 2 * (4 * (OUTPUT_LIMIT + 1).div_ceil(3)) - 4096;
+
+/// Refuses a profile whose `id` and `command`, as JSON, would not fit `Verified`.
+fn check_reply_size(profile: &Profile) -> Result<(), String> {
+    let size = serde_json::to_vec(&profile.command).map_or(usize::MAX, |v| v.len())
+        + serde_json::to_vec(&profile.id).map_or(usize::MAX, |v| v.len());
+    if size > VERIFIED_TEXT_BUDGET {
+        return Err(format!("profile command too large: {size} bytes of JSON, limit {VERIFIED_TEXT_BUDGET}"));
+    }
+    Ok(())
+}
+
 fn cut(mut bytes: Vec<u8>) -> (Vec<u8>, bool) {
     let truncated = bytes.len() > OUTPUT_LIMIT;
     bytes.truncate(OUTPUT_LIMIT);
@@ -420,11 +457,17 @@ pub fn run_verification(
     let Some((program, args)) = profile.command.split_first() else {
         return Err("profile command is empty".into());
     };
+    check_reply_size(&profile)?;
     // Entries the digest ignores must not decide the check.
     purge_excluded(&ws).map_err(|e| format!("cannot clean workspace: {e}"))?;
     let workspace = workspace_digest(&ws).map_err(|e| format!("cannot digest workspace: {e}"))?;
 
-    let pycache = backend.scratch_dir().join("check").join("pycache");
+    // The check's own scratch starts empty on every run, also within one boot: no bytecode
+    // or file a previous check left behind may influence this one.
+    let check_dir = backend.scratch_dir().join("check");
+    empty_dir(&check_dir).map_err(|e| format!("scratch dir: {e}"))?;
+    let pycache = check_dir.join("pycache");
+    backend.check_program(program, &staged).map_err(|e| format!("cannot run profile command: {e}"))?;
     let cmd = backend.check_command(program, args, &ws, &staged, &pycache);
     let output = match run_in_group(cmd, Duration::from_secs(timeout_secs), OUTPUT_LIMIT) {
         Err(GroupError::Timeout) => return Err("timeout".into()),
@@ -489,6 +532,9 @@ pub fn patch_state(backend: &dyn Backend, expected_base: Digest, patch: &[u8]) -
     if let Err(e) = copy_tree(ws, &copy) {
         return PatchStateIs::unknown(Some(actual), format!("cannot copy workspace: {e}"));
     }
+    if let Err(e) = backend.own_tree(&copy) {
+        return PatchStateIs::unknown(Some(actual), e);
+    }
     let reverted = match backend.git(&copy).args(["apply", "--reverse"]).arg(&patch_file).output() {
         Ok(out) => out.status.success() && workspace_digest(&copy).is_ok_and(|d| d == expected_base),
         Err(e) => return PatchStateIs::unknown(Some(actual), format!("cannot run git: {e}")),
@@ -530,6 +576,28 @@ fn kill_group(pgid: Option<Pid>) {
     }
 }
 
+/// How long `reap_group` waits for killed members to become reapable.
+const REAP_WINDOW: Duration = Duration::from_secs(1);
+
+/// Reaps the killed group's members that were re-parented to this process. In the VM the
+/// agent is PID 1, so every orphan of the check lands here, and an unreaped zombie of `check`
+/// would keep counting against its `RLIMIT_NPROC` for the next run. Only this group is
+/// waited for (never "any child", which would steal the statuses of `git` and other children
+/// std is waiting on). Elsewhere (the fake) orphans go to the real init: `ECHILD` at once.
+fn reap_group(pgid: Option<Pid>) {
+    let Some(pgid) = pgid else { return };
+    let deadline = std::time::Instant::now() + REAP_WINDOW;
+    loop {
+        match waitpgid(pgid, WaitOptions::NOHANG) {
+            Ok(Some(_)) => {}
+            // Members of ours still dying.
+            Ok(None) if std::time::Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+            // ECHILD: none left; or the window is over.
+            Ok(None) | Err(_) => return,
+        }
+    }
+}
+
 /// Runs `cmd` as the leader of a new process group (3a `run_in_group`, without tokio): a
 /// waiter thread reaps the leader; when it exits or the timeout fires, the whole group is
 /// killed, so no grandchild outlives the run or holds the pipes open.
@@ -550,6 +618,9 @@ fn run_in_group(mut cmd: std::process::Command, timeout: Duration, limit: usize)
     let timed_out = matches!(rx.recv_timeout(timeout), Err(mpsc::RecvTimeoutError::Timeout));
     kill_group(pgid);
     let status = waiter.join().map_err(|_| GroupError::Io(io::Error::other("waiter thread panicked")))?;
+    // Only now that std has reaped the leader (waiting on the group earlier could steal its
+    // status).
+    reap_group(pgid);
     if timed_out {
         return Err(GroupError::Timeout);
     }

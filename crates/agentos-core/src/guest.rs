@@ -25,6 +25,14 @@ pub const SCRATCH_IMAGE_BYTES: u64 = 512 << 20;
 pub const GUEST_MIN_MEMORY_MIB: u32 = 128;
 pub const MAX_VCPUS: u32 = 32;
 pub const TMPFS_SIZE: &str = "size=64m";
+/// Where the image installs the agent; the kernel starts it as PID 1 (`init=`).
+pub const INIT_PATH: &str = "/sbin/agentos-guest";
+/// The guest kernel command line; Firecracker appends `root=/dev/vda ro` and the
+/// `virtio_mmio.device=` entries. It carries nothing secret. Here (not in the engine) so the
+/// guest can check it names `INIT_PATH`.
+pub const BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off nomodule quiet loglevel=4 init=/sbin/agentos-guest";
+/// Without a bound `Hello` this long after boot, the guest shuts itself down.
+pub const HELLO_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
