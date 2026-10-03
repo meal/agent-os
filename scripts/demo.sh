@@ -65,3 +65,13 @@ echo "\$ ls home/jobs      # one directory per effect attempt"; ls home/jobs | s
 echo
 run revoke "$ID" --capability artifact.export
 run export "$ID" bundle-after-revoke
+if [ "$WORKER" = firecracker ]; then
+  # Jailed: ws.img belongs to the jail uid (61000) from the first ReadSnapshot on; ws.lock is
+  # the attach lock. Every job's jail/ (chroot and cgroup marker) was collected after it settled.
+  echo "\$ ls -ln home/work/$ID"; ls -ln "home/work/$ID"
+  echo
+  for j in home/jobs/*; do
+    short=$(basename "$j" | sed -E 's/^([0-9a-f]{8})[0-9a-f]{56}-([0-9a-f]{8})[0-9a-f-]{28}$/\1…-\2…/')
+    echo "\$ ls home/jobs/$short"; ls "$j" | tr '\n' ' '; echo
+  done
+fi
