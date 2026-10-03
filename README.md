@@ -44,11 +44,11 @@ docker compose run --rm test-kvm sh scripts/demo.sh --worker firecracker
 every process into a leaf `init/` and delegates `+cpu +memory +pids`; `apparmor=unconfined`;
 and the seccomp profile `scripts/kvm-seccomp.json`. Docker's default profile is an allow-list
 without `pivot_root`, so the jailer cannot run under it. `kvm-seccomp.json` is the reverse:
-it allows every call except 46 host-dangerous ones, which it fails with `EPERM`. Docker's
-default profile also refuses these unless an extra capability enables them; here they stay
-refused even though the container has `CAP_SYS_ADMIN`. They cover kernel module and
-kexec loading, clock and hostname setting, keyrings, `bpf`, `perf_event_open`,
-`process_vm_*`, `setns`, `reboot`, swap, `userfaultfd`, NUMA policy and the obsolete
+it allows every call except 49 host-dangerous ones, which it fails with `EPERM`, even
+though the container has `CAP_SYS_ADMIN`. They are a subset of what Docker's default profile
+gates (behind a capability, a kernel version or outright): kernel module and kexec loading,
+clock and hostname setting, keyrings, `bpf`, `perf_event_open`, `kcmp`, `process_vm_*`,
+`setns`, `reboot`, swap, `userfaultfd`, `io_uring_*`, NUMA policy and the obsolete
 `vm86`/`uselib`/`ustat` calls. `pivot_root`, `mount`, `umount2` and `unshare` stay allowed.
 
 ## Demo: kill the controller, restart it, recover the task

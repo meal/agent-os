@@ -17,9 +17,9 @@ services:
     cap_add: [SYS_ADMIN]
     security_opt:
       # E3/E11: Docker's default profile does not allow pivot_root. kvm-seccomp.json allows
-      # everything but 46 host-dangerous calls (module and kexec loading, clock setting,
-      # keyrings, bpf, perf, process_vm_*, setns, reboot, swap, …), which stay refused even
-      # with CAP_SYS_ADMIN; pivot_root is not among them. README "The KVM tier" lists them.
+      # everything but 49 host-dangerous calls (module and kexec loading, clock setting,
+      # keyrings, bpf, perf, process_vm_*, setns, reboot, swap, io_uring, …), which stay
+      # refused even with CAP_SYS_ADMIN; pivot_root is not among them. README "The KVM tier" lists them.
       - "seccomp=./scripts/kvm-seccomp.json"
       # E12: accepted on a host without AppArmor; elsewhere docker-default denies the mounts.
       - "apparmor=unconfined"

@@ -20,9 +20,12 @@ mkdir -p /sys/fs/cgroup/init
 # Move every process out of the root (docker-init and this shell, as `init: true` makes the
 # entrypoint a child of docker-init). The list is read once; a pid in it may already be gone
 # (the `cat` that printed it, for one): only that case is tolerated, any other failure stops
-# here and the subtree_control write below would fail anyway.
+# here with the reason.
 for pid in $(cat /sys/fs/cgroup/cgroup.procs); do
-  echo "$pid" > /sys/fs/cgroup/init/cgroup.procs 2>/dev/null || [ ! -d "/proc/$pid" ]
+  if ! err=$( { echo "$pid" > /sys/fs/cgroup/init/cgroup.procs; } 2>&1 ) && [ -d "/proc/$pid" ]; then
+    echo "kvm-entrypoint.sh: cannot move pid $pid into /sys/fs/cgroup/init: $err" >&2
+    exit 1
+  fi
 done
 
 # Delegate the three controllers the jailer writes (E5: without this even a privileged
