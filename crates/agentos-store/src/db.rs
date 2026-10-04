@@ -146,6 +146,10 @@ CREATE TABLE IF NOT EXISTS observations(
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
+    #[error("invalid read query: {0}")]
+    InvalidQuery(String),
+    #[error("read exceeds the {limit}-byte limit")]
+    ReadLimit { limit: u64 },
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("json: {0}")]
@@ -253,7 +257,7 @@ pub(crate) fn state_to_str(s: TaskState) -> Result<String> {
     }
 }
 
-fn state_from_str(s: String) -> Result<TaskState> {
+pub(crate) fn state_from_str(s: String) -> Result<TaskState> {
     Ok(serde_json::from_value(serde_json::Value::String(s))?)
 }
 

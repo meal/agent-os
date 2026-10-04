@@ -68,7 +68,7 @@ impl UsageSummary {
     }
 }
 
-const EFFECT_COLUMNS: &str =
+pub(crate) const EFFECT_COLUMNS: &str =
     "effect_id, task_id, step, kind, state, request_digest, lease_generation, result_digest";
 
 fn effect_state_str(s: EffectState) -> &'static str {
@@ -114,7 +114,7 @@ fn to_sql_int(v: u64) -> Result<i64> {
     i64::try_from(v).map_err(|_| DbError::Corrupt(format!("value {v} exceeds i64")))
 }
 
-fn effect_row(r: &rusqlite::Row) -> rusqlite::Result<EffectRow> {
+pub(crate) fn effect_row(r: &rusqlite::Row) -> rusqlite::Result<EffectRow> {
     Ok((
         r.get(0)?,
         r.get(1)?,
@@ -127,7 +127,7 @@ fn effect_row(r: &rusqlite::Row) -> rusqlite::Result<EffectRow> {
     ))
 }
 
-fn effect_from_row(row: EffectRow) -> Result<EffectRecord> {
+pub(crate) fn effect_from_row(row: EffectRow) -> Result<EffectRecord> {
     let (effect_id, task_id, step, kind, state, request_digest, lease_generation, result_digest) =
         row;
     Ok(EffectRecord {

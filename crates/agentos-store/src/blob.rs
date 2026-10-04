@@ -1,10 +1,18 @@
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use agentos_core::ids::Digest;
 use uuid::Uuid;
+
+#[derive(Debug, thiserror::Error)]
+pub enum BlobReadError {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error("blob exceeds the {limit}-byte limit")]
+    TooLarge { limit: u64 },
+}
 
 /// Content-addressed blob store: `<dir>/objects/<2 hex>/<62 hex>` plus `<dir>/tmp/`.
 pub struct BlobStore {
@@ -114,6 +122,41 @@ impl BlobStore {
         self.object_path(d).is_file()
     }
 
+    /// Refuse oversized/nonregular objects before reading; keep the descriptor through
+    /// the size check, bounded read and digest check to avoid path replacement races.
+    pub fn get_bounded(&self, d: &Digest, limit: u64) -> Result<Vec<u8>, BlobReadError> {
+        use rustix::fs::{Mode, OFlags, open};
+        let fd = open(
+            self.object_path(d),
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(io::Error::from)?;
+        let file = File::from(fd);
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(
+                io::Error::new(io::ErrorKind::InvalidData, "blob is not a regular file").into(),
+            );
+        }
+        if metadata.len() > limit {
+            return Err(BlobReadError::TooLarge { limit });
+        }
+        let mut bytes = Vec::new();
+        file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > limit {
+            return Err(BlobReadError::TooLarge { limit });
+        }
+        if Digest::of(&bytes) != *d {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("blob {d} failed integrity check"),
+            )
+            .into());
+        }
+        Ok(bytes)
+    }
+
     /// Removes every object not in `referenced` and every leftover temp file.
     /// Returns the number of files removed. Names that are not valid object
     /// names are left untouched.
@@ -165,6 +208,45 @@ mod tests {
     use super::*;
     use std::fs;
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn bounded_blob_checks_limit_before_hashing() {
+        let (dir, s) = store();
+        let d = s.put(b"123456789").unwrap();
+        assert!(matches!(
+            s.get_bounded(&d, 8),
+            Err(BlobReadError::TooLarge { limit: 8 })
+        ));
+        assert_eq!(s.get_bounded(&d, 9).unwrap(), b"123456789");
+        let path = object_path(dir.path(), &d);
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(1024 * 1024 * 1024)
+            .unwrap();
+        assert!(matches!(
+            s.get_bounded(&d, 9),
+            Err(BlobReadError::TooLarge { limit: 9 })
+        ));
+    }
+
+    #[test]
+    fn bounded_blob_rejects_corruption_symlinks_and_directories() {
+        let (dir, s) = store();
+        let d = s.put(b"good").unwrap();
+        let path = object_path(dir.path(), &d);
+        fs::write(&path, b"evil").unwrap();
+        assert!(
+            matches!(s.get_bounded(&d, 4), Err(BlobReadError::Io(e)) if e.kind() == io::ErrorKind::InvalidData)
+        );
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", &path).unwrap();
+        assert!(s.get_bounded(&d, 4).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(s.get_bounded(&d, 4).is_err());
+    }
 
     fn store() -> (tempfile::TempDir, BlobStore) {
         let dir = tempfile::tempdir().unwrap();
