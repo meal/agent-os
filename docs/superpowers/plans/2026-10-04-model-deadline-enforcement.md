@@ -1,6 +1,6 @@
 # Model Deadline Enforcement Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Stop an in-flight model request when its task deadline expires, preserving possibly billed requests as uncertain.
 
@@ -42,7 +42,7 @@
 - Produces unchanged `Executor::run(&self, req: &EffectRequest, ctx: &AttemptCtx) -> ExecOutcome`.
 - Adds only private `deadline_remaining(deadline_ts: i64, at: SystemTime) -> Option<Duration>`; no interface changes for other tasks.
 
-- [ ] **Step 1: Install the confirmed regression and run it red.**
+- [x] **Step 1: Install the confirmed regression and run it red.**
 
 ```sh
 cp docs/reviews/model-deadline-regression.rs.txt crates/agentos-engine/tests/review_deadline_probe.rs
@@ -51,7 +51,7 @@ docker compose run --rm test cargo test -p agentos-engine --test review_deadline
 
 Expected current failure: elapsed about three seconds and effect `Success`, despite deadline one second away. This exact probe failed during the repository review.
 
-- [ ] **Step 2: Extend the regression's assertions.**
+- [x] **Step 2: Extend the regression's assertions.**
 
 After its existing `assert!(outcome.unresolved, ...)`, assert that no receipt was retained:
 
@@ -61,7 +61,7 @@ assert_eq!(executor.retained_outcome(&request.effect_id), None);
 
 Preserve the two-second outer assertion with a three-second provider: the failure is behavioral, not a scheduler timing margin of a few milliseconds.
 
-- [ ] **Step 3: Add precise remaining-duration tests to `model/executor.rs`.**
+- [x] **Step 3: Add precise remaining-duration tests to `model/executor.rs`.**
 
 ```rust
 #[cfg(test)]
@@ -90,7 +90,7 @@ docker compose run --rm test cargo test -p agentos-engine --lib deadline_tests -
 
 Expected initial compile failure: helper is not defined.
 
-- [ ] **Step 4: Add the helper and replace the provider await.**
+- [x] **Step 4: Add the helper and replace the provider await.**
 
 Add `Duration` to the existing `std::time` import. Add the private helper:
 
@@ -138,7 +138,7 @@ let out = match result {
 
 Remove the old private `now()` helper after verifying this file has no remaining callers. Keep `counts.record` and retention logic in their current positions: the timeout is counted as an executed call, becomes unresolved through the existing transport arm, and is not retained as an applicable receipt.
 
-- [ ] **Step 5: Run the relevant deadline, accounting, and crash gates.**
+- [x] **Step 5: Run the relevant deadline, accounting, and crash gates.**
 
 ```sh
 docker compose run --rm test cargo test -p agentos-engine --lib deadline_tests --locked
@@ -149,7 +149,7 @@ docker compose run --rm -e AGENTOS_TEST_WORKER=firecracker-fake -e AGENTOS_TEST_
 
 Expected: deadline probe green, expired requests still make zero sends, existing unresolved requests remain uncertain, successful responses still retain/replay, default and fake-jail regression suites pass. A timeout does not cancel a provider-side charge; it only stops local waiting and prevents more work after the task deadline.
 
-- [ ] **Step 6: Format changed Rust files, inspect the diff, and commit the fix.**
+- [x] **Step 6: Format changed Rust files, inspect the diff, and commit the fix.**
 
 ```sh
 docker compose run --rm test rustfmt --edition 2024 crates/agentos-engine/src/model/executor.rs crates/agentos-engine/tests/review_deadline_probe.rs
@@ -166,3 +166,6 @@ Rerun the focused tests if formatting or follow-up corrections change code. Work
 The task covers the confirmed deadline regression, precise timestamp conversion, existing no-send behavior, unchanged response retention, and uncertain accounting. No capability, worker, contract, provider, or schema interface changes are introduced. Cancellation responsiveness, HTTP retry policy, body caps, endpoint binding, GC, and Wasm are separately prioritized in the repository roadmap.
 
 The plan is ready for implementation; no runtime change or commit was made as part of the review. Native execution is sufficient for this single focused task.
+
+Execution status: implemented and verified offline in `codex/v01-completion`; see the
+[reviewed milestone report](../../reviews/2026-10-04-offline-milestone-review.md).

@@ -1,6 +1,6 @@
 # Bounded Model I/O Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Bound provider response collection and API-key file reads without changing successful model requests or exposing credentials.
 
@@ -44,7 +44,7 @@
 - Add test-only `Reply::Raw(Vec<u8>)` to the existing fake API.
 - Preserve `ProviderResult::{Response,Rejected,Transport}` fields in this package. Typed retry metadata comes in master Task 4.
 
-- [ ] **Step 1: Extend the local test server to emit raw HTTP replies.**
+- [x] **Step 1: Extend the local test server to emit raw HTTP replies.**
 
 Add the enum variant and corresponding match arm in `handle`:
 
@@ -61,7 +61,7 @@ Reply::Raw(bytes) => {
 
 The request-reading/hit recording behavior remains unchanged. This enables fixed-length, chunked, and incomplete-body wire cases without a new HTTP server dependency.
 
-- [ ] **Step 2: Write red provider tests.**
+- [x] **Step 2: Write red provider tests.**
 
 Import `MODEL_RESPONSE_LIMIT` alongside `PROVIDER_TEXT_LIMIT` in `tests/provider.rs`; reuse its existing `provider`, `serve`, `Reply`, `BODY` helpers.
 
@@ -120,7 +120,7 @@ docker compose run --rm test cargo test -p agentos-engine --test provider --lock
 
 Expected initial compile failure until the cap constant exists, then cap+1 failures under the current whole-body implementation. The incomplete 429 currently becomes transport failure instead of retaining the known status.
 
-- [ ] **Step 3: Add bounded collection helpers.**
+- [x] **Step 3: Add bounded collection helpers.**
 
 Add the cap and these helpers to `model/anthropic.rs`:
 
@@ -161,7 +161,7 @@ async fn read_error_excerpt(mut response: reqwest::Response) -> String {
 
 Error-prefix collection retains the definite HTTP error even when its remaining body is incomplete. The existing client timeout and Task 1 deadline timeout still bound the time needed to receive a prefix; a byte cap alone is not a time limit.
 
-- [ ] **Step 4: Replace whole-body collection in `complete`.**
+- [x] **Step 4: Replace whole-body collection in `complete`.**
 
 After obtaining `resp` and its status, replace the current `resp.bytes().await` branch with:
 
@@ -183,7 +183,7 @@ if resp.status().is_success() {
 
 Do not change `.send()`, no redirects, no retries, headers, key storage, or retained-outcome behavior.
 
-- [ ] **Step 5: Run collection and accounting gates, then commit.**
+- [x] **Step 5: Run collection and accounting gates, then commit.**
 
 ```sh
 docker compose run --rm test cargo test -p agentos-engine --locked --test provider --test model_executor --test model_flow --test recover_forfeit --test model_crash_matrix
@@ -206,7 +206,7 @@ Expected: exact-boundary success; cap+1 unresolved; known errors retain bounded 
 
 **Interfaces:** `pub(crate) const KEY_FILE_LIMIT: usize = 4096`; `pub(crate) fn read_key_file(path: &Path) -> io::Result<String>`. No new CLI flag or key serialization.
 
-- [ ] **Step 1: Add the behavioral test module before the helper.**
+- [x] **Step 1: Add the behavioral test module before the helper.**
 
 Create `secrets.rs` with the following tests, and declare it in `lib.rs`:
 
@@ -256,7 +256,7 @@ docker compose run --rm test cargo test -p agentos-cli --lib secrets --locked
 
 Expected compile failure: the helper/constants are absent. Do not introduce an unbounded helper as a runnable baseline for FIFO tests.
 
-- [ ] **Step 2: Implement opened-descriptor checks and actual-read cap.**
+- [x] **Step 2: Implement opened-descriptor checks and actual-read cap.**
 
 Add above the test module:
 
@@ -291,7 +291,7 @@ pub(crate) fn read_key_file(path: &Path) -> io::Result<String> {
 
 Linux is the supported platform. `NONBLOCK` prevents a FIFO open from waiting before the descriptor type check; `NOFOLLOW` refuses a symlink final component. Do not claim protection against every ancestor-directory race; the local owner controls key-file configuration.
 
-- [ ] **Step 3: Delegate `Home::api_key` to the helper.**
+- [x] **Step 3: Delegate `Home::api_key` to the helper.**
 
 Replace only the file-reading match arm:
 
@@ -302,7 +302,7 @@ Some(path) => crate::secrets::read_key_file(path)
 
 Keep the environment-key branch, trimming, `ApiKey::new`, printable ASCII check, and redaction. Add a CLI integration case using an oversized key file; assert exit 2, no submitted task, and no key content in stderr. Reuse the existing CLI setup and `an_unreadable_key_file_exits_2` assertions rather than inventing a separate harness.
 
-- [ ] **Step 4: Run CLI tests, document the regular-file limit, then commit.**
+- [x] **Step 4: Run CLI tests, document the regular-file limit, then commit.**
 
 ```sh
 docker compose run --rm test cargo test -p agentos-cli --lib secrets --locked
@@ -319,3 +319,6 @@ Do not remove unrelated key-file documentation. Update the known-limit statement
 Format the changed Rust files using the pinned container toolchain. Run the host and fake-jail workspace tests after both tasks. Once the independent CI-baseline package lands, require fmt/Clippy as well. Inspect retained model failure output to confirm oversized success follows transport uncertainty and definite rejection remains settled.
 
 The implementation adds no provider retry, journal schema, API key serialization, or ambient guest secret access. Actual byte collection is bounded even without length headers; actual descriptor reads are bounded even if metadata becomes stale. Deterministic mutation-after-open testing can use a descriptor/read seam if needed; do not rely on a racy concurrent-file test as the only proof of the read cap.
+
+Execution status: implemented and verified offline in `codex/v01-completion`; see the
+[reviewed milestone report](../../reviews/2026-10-04-offline-milestone-review.md).
