@@ -10,7 +10,12 @@ printf '%s\n' "$*" >> "$MOCK_LOG"
 exit "${MOCK_EXIT:-0}"
 MOCK
 chmod +x "$t/bin/docker"
-export PATH="$t/bin:$PATH" MOCK_LOG="$t/docker.log" AGENTOS_ACCEPTANCE_OUTPUT="$t/evidence"
+# Match the portable host tools available on a clean runner. Do not inherit optional
+# developer tools such as ripgrep from the caller's PATH.
+for utility in sh dirname mktemp mkdir rm chmod ln mkfifo stat realpath git grep; do
+  ln -s "$(command -v "$utility")" "$t/bin/$utility"
+done
+export PATH="$t/bin" MOCK_LOG="$t/docker.log" AGENTOS_ACCEPTANCE_OUTPUT="$t/evidence"
 # Missing/invalid key and unknown tier must fail before invoking Docker.
 for mode in unknown live; do
   if sh "$REPO/scripts/acceptance.sh" "$mode" >/dev/null 2>&1; then echo "accepted invalid setup" >&2; exit 1; else test "$?" -eq 2; fi
@@ -24,7 +29,7 @@ for key in "$t/link" "$t/fifo" "$t"; do
 done
 test ! -e "$MOCK_LOG"
 sh "$REPO/scripts/acceptance.sh" offline >/dev/null
-rg -q 'test cargo test -p agentos-engine --locked --test live_model' "$MOCK_LOG"
+grep -Fq 'test cargo test -p agentos-engine --locked --test live_model' "$MOCK_LOG"
 test -f "$t/evidence/offline.log"
 # A failed requested command must fail the script and leave its log for diagnosis.
 if AGENTOS_ACCEPTANCE_OUTPUT="$t/failed-evidence" MOCK_EXIT=37 sh "$REPO/scripts/acceptance.sh" offline >/dev/null 2>&1; then exit 1; else test "$?" -eq 37; fi
