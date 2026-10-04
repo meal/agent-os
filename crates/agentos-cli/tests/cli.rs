@@ -2574,6 +2574,22 @@ fn unknown_model_spec_exits_2() {
 }
 
 #[test]
+fn an_oversized_key_file_fails_before_submission_without_quoting_the_key() {
+    let cli = Cli::new();
+    let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
+    let key = cli.write("oversized-key", &CANARY.repeat(300));
+    let api = fake_api("parser-fix-direct.json");
+    let result = cli.cmd(&["submit", &contract, "--yes", "--model", "anthropic:x",
+        "--api-key-file", &key, "--anthropic-base-url", &api.url()])
+        .assert().code(2);
+    let stderr = String::from_utf8_lossy(&result.get_output().stderr);
+    assert!(stderr.contains("exceeds 4096 bytes"), "{stderr}");
+    assert!(!stderr.contains("SECRET"), "{stderr}");
+    assert_eq!(api.hits(), 0);
+    assert_nothing_recorded(&cli);
+}
+
+#[test]
 fn yes_without_patch_or_model_exits_2_with_the_new_text() {
     let cli = Cli::new();
     let contract = cli.contract(&cli.repo_copy());

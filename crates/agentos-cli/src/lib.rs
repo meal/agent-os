@@ -8,6 +8,7 @@ pub mod crash;
 mod drive;
 mod error;
 mod home;
+mod secrets;
 
 use clap::Parser;
 

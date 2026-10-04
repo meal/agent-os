@@ -489,7 +489,7 @@ impl Home {
     /// here quotes it.
     pub fn api_key(&self) -> Result<ApiKey, CliError> {
         let raw = match &self.api_key_file {
-            Some(path) => fs::read_to_string(path).map_err(|e| CliError::usage(format!("cannot read {}: {e}", path.display())))?,
+            Some(path) => crate::secrets::read_key_file(path).map_err(|e| CliError::usage(format!("cannot read {}: {e}", path.display())))?,
             None => match std::env::var("ANTHROPIC_API_KEY") {
                 Ok(v) if !v.trim().is_empty() => v,
                 _ => return Err(CliError::usage("no API key: pass --api-key-file FILE or set ANTHROPIC_API_KEY")),

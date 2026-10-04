@@ -477,7 +477,8 @@ agentos submit task.json --yes --model anthropic:<model> --api-key-file ~/.anthr
 ANTHROPIC_API_KEY=… agentos submit task.json --yes --model anthropic:<model>   # works, see below
 ```
 
-- `--api-key-file FILE` (env `AGENTOS_API_KEY_FILE`) is **recommended**. The file holds the key
+- `--api-key-file FILE` (env `AGENTOS_API_KEY_FILE`) is **recommended**. It must be a regular
+  file of at most 4096 bytes; symlinks, FIFOs, directories and devices are refused. The file holds the key
   on one line; surrounding whitespace is trimmed, and anything but printable ASCII after that
   (a second line, a space inside) is refused with exit 2. Without the flag the key is read from
   `ANTHROPIC_API_KEY`. With neither, `submit --yes` exits 2 (`no API key: pass --api-key-file
@@ -974,12 +975,11 @@ The model workflow (Phase 4):
   retained receipts). Without a key the provider is `None` and
   a dispatch would fail with `no model provider configured`. The "never sends" guarantee rests on
   recovery's behaviour, not on the type.
-- **The key file has no size cap and no regular-file check.** A huge file, `/dev/zero` or a FIFO
-  is read as given (a FIFO blocks); there is no mode warning, and an unreadable key file's
-  error echoes its path.
-- **The provider response body is read unbounded** (2xx and error alike) before it is cut or
-  parsed; a hostile or broken endpoint can make the controller read without limit. Only the quoted
-  error text is bounded (4096 bytes).
+- **Key files are bounded regular files.** Files over 4096 bytes and nonregular or symlink
+  final components are refused. There is no mode warning; an unreadable key file's error echoes its path.
+- **Provider bodies are bounded.** Successful bodies over 4 MiB become unresolved calls
+  and retain uncertain usage. Non-success responses retain at most 4096 raw bytes and their
+  definite HTTP status without draining the remaining body. The task deadline also bounds model I/O.
 - **The conversation history has no size cap.** Each request re-sends all of it (a read can add
   64 KiB), so request blobs are O(turns²) bytes on disk, and a long task can exceed the model's
   context window.
