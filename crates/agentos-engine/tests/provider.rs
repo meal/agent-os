@@ -10,6 +10,52 @@ use common::{fix_patch, transcript};
 
 const BODY: &[u8] = br#"{"messages":[{"role":"user","content":"go"}]}"#;
 
+fn raw_success(payload: &[u8], chunked: bool) -> Vec<u8> {
+    let mut wire = if chunked {
+        b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n".to_vec()
+    } else {
+        format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", payload.len()).into_bytes()
+    };
+    if chunked {
+        wire.extend_from_slice(format!("{:x}\r\n", payload.len()).as_bytes());
+    }
+    wire.extend_from_slice(payload);
+    if chunked {
+        wire.extend_from_slice(b"\r\n0\r\n\r\n");
+    }
+    wire
+}
+
+#[tokio::test]
+async fn response_byte_limit_applies_to_fixed_length_and_chunked_bodies() {
+    const CAP: usize = 4 * 1024 * 1024;
+    for chunked in [false, true] {
+        for length in [CAP, CAP + 1] {
+            let payload = vec![b'x'; length];
+            let api = serve(Reply::Raw(raw_success(&payload, chunked)));
+            let result = provider(&api, Duration::from_secs(5)).complete(BODY).await;
+            if length == CAP {
+                assert!(matches!(result, ProviderResult::Response(ref bytes, _) if bytes.len() == length));
+            } else {
+                assert!(matches!(result, ProviderResult::Transport(ref reason) if reason.contains("response body exceeds")), "unexpected oversized result");
+            }
+            assert_eq!(api.hits(), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn rejected_status_does_not_require_draining_the_body() {
+    let mut wire = b"HTTP/1.1 429 Too Many Requests\r\ncontent-length: 8192\r\nconnection: close\r\n\r\n".to_vec();
+    wire.extend_from_slice(&vec![b'x'; PROVIDER_TEXT_LIMIT]);
+    let api = serve(Reply::Raw(wire));
+    let result = provider(&api, Duration::from_secs(2)).complete(BODY).await;
+    assert_eq!(result, ProviderResult::Rejected {
+        status: 429, body: "x".repeat(PROVIDER_TEXT_LIMIT),
+    });
+    assert_eq!(api.hits(), 1);
+}
+
 fn provider(api: &FakeApi, timeout: Duration) -> AnthropicProvider {
     AnthropicProvider::new(ApiKey::new("sk-ant-test-SECRET").unwrap()).with_base_url(api.url()).with_timeout(timeout)
 }

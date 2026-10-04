@@ -9,6 +9,39 @@ pub const API_VERSION: &str = "2023-06-01";
 pub const MODEL_TIMEOUT: Duration = Duration::from_secs(600);
 /// Longest rejected-response body kept (bytes).
 pub const PROVIDER_TEXT_LIMIT: usize = 4096;
+/// Maximum raw bytes retained from a successful provider response.
+pub const MODEL_RESPONSE_LIMIT: usize = 4 * 1024 * 1024;
+
+async fn read_success_body(mut response: reqwest::Response) -> Result<Vec<u8>, String> {
+    let exceeded = || format!("response body exceeds {MODEL_RESPONSE_LIMIT} bytes");
+    if response.content_length().is_some_and(|n| n > MODEL_RESPONSE_LIMIT as u64) {
+        return Err(exceeded());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await
+        .map_err(|e| format!("response body: {}", e.without_url()))?
+    {
+        if chunk.len() > MODEL_RESPONSE_LIMIT.saturating_sub(bytes.len()) {
+            return Err(exceeded());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+async fn read_error_excerpt(mut response: reqwest::Response) -> String {
+    let mut bytes = Vec::new();
+    while bytes.len() < PROVIDER_TEXT_LIMIT {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let count = chunk.len().min(PROVIDER_TEXT_LIMIT - bytes.len());
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
 
 pub struct AnthropicProvider {
     client: reqwest::Client,
@@ -64,17 +97,17 @@ impl ModelProvider for AnthropicProvider {
                 Err(e) => return ProviderResult::Transport(e.without_url().to_string()),
             };
             let status = resp.status().as_u16();
-            let ok = resp.status().is_success();
-            let bytes = match resp.bytes().await {
-                Ok(b) => b,
-                Err(e) => return ProviderResult::Transport(format!("response body: {}", e.without_url())),
-            };
-            if ok {
-                let usage = serde_json::from_slice(&bytes).map(|v| usage_of(&v)).unwrap_or_default();
-                ProviderResult::Response(bytes.to_vec(), usage)
+            if resp.status().is_success() {
+                match read_success_body(resp).await {
+                    Ok(bytes) => {
+                        let usage = serde_json::from_slice(&bytes).map(|v| usage_of(&v)).unwrap_or_default();
+                        ProviderResult::Response(bytes, usage)
+                    }
+                    Err(reason) => ProviderResult::Transport(reason),
+                }
             } else {
-                let n = bytes.len().min(PROVIDER_TEXT_LIMIT);
-                ProviderResult::Rejected { status, body: String::from_utf8_lossy(&bytes[..n]).into_owned() }
+                let body = read_error_excerpt(resp).await;
+                ProviderResult::Rejected { status, body }
             }
         })
     }

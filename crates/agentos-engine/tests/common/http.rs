@@ -10,6 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 pub enum Reply {
+    Raw(Vec<u8>),
     Transcript(PathBuf),
     Status(u16, String),
     Hang(Duration),
@@ -109,6 +110,10 @@ fn handle(mut stream: TcpStream, reply: &Reply, hits: &AtomicUsize, requests: &M
     let body = req.body.clone();
     requests.lock().unwrap().push(req);
     match reply {
+        Reply::Raw(bytes) => {
+            let _ = stream.write_all(bytes);
+            let _ = stream.flush();
+        }
         Reply::Transcript(path) => {
             let (status, out) = transcript_reply(path, &body);
             respond(&mut stream, status, &out);
