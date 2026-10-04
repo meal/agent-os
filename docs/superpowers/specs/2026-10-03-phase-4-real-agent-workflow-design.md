@@ -1,7 +1,7 @@
 # Phase 4: real agent workflow — design
 
 Date: 2026-10-03
-Status: draft for owner review. Design approved in conversation (2026-10-03) with the recommended defaults for the open questions; this written spec still needs review before a plan is written.
+Status: historical approved design, implemented and tested offline. Live-provider and jailed live acceptance remain open. See the 2026-10-04 v0.1 completion plan for current work and policy versions.
 Parent spec: `Agent_OS_v1_Build_Plan.md` (Phase 4, "Real agent workflow").
 Builds on: Phases 1-3b-1 (merged to `main`).
 

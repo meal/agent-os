@@ -153,7 +153,7 @@ footer{color:var(--muted);font-size:.88rem;border-top:1px solid var(--rule);padd
     <div class="fact"><b>It checks permissions every time</b><span>The agent holds no authority itself. A broker checks a handle before each action and records the answer.</span></div>
     <div class="fact"><b>It contains the code it runs</b><span>With <code>--worker firecracker</code>, each step runs in its own microVM with no network, fixed-size disks and a jailed host process. The default host worker is not sandboxed.</span></div>
   </div>
-  <p class="note">The agent in this release is a deterministic stand-in that applies a given patch. The real model arrives in Phase 4. Everything around it is real. The event sequence is from a real run, and the sandbox figures are the bounds the KVM test tier asserts.</p>
+  <p class="note">The controller supports a deterministic patch agent and an Anthropic model agent with five tools. Model reliability and recovery are tested offline; live-provider and real KVM acceptance remain open for this build. The event sequence below comes from a fixture run. Sandbox figures are assertions in the gated KVM tier, not measurements from this review.</p>
 </header>
 
 <!-- ============ THE CONTRACT ============ -->
@@ -341,14 +341,14 @@ permissions before it runs:
     <div class="done"><span class="pill live">DONE</span><b>1 Contracts</b>Task state machine, effects, CLI, fixture repo.</div>
     <div class="done"><span class="pill live">DONE</span><b>2 Durability</b>SQLite journal, receipts, recovery after a kill.</div>
     <div class="done"><span class="pill live">DONE</span><b>3 Authority</b>Broker, leases, supervisors, cancel and revoke.</div>
-    <div class="done"><span class="pill live">DONE</span><b>3b-1 Isolation</b>Jailed Firecracker worker and guest image.</div>
-    <div><span class="pill idle">NEXT</span><b>4 Real model</b>Model broker, typed tool requests, repair loop.</div>
+    <div><span class="pill idle">BUILT</span><b>3b-1 Isolation</b>Jailed Firecracker worker; real KVM revalidation pending.</div>
+    <div><span class="pill idle">BUILT</span><b>4 Model workflow</b>Broker, tools and repair loop; live acceptance pending.</div>
     <div><span class="pill warn">LATER</span><b>5 Wasm ABI</b>Component interfaces and a repository analyzer.</div>
     <div><span class="pill warn">LATER</span><b>6 Release</b>Fault-injection suite, installer, reproducible image.</div>
   </div>
   <h3>Known limits in v0.1</h3>
   <div class="limits">
-    <div><b>No real model yet</b>Only the fake agent exists. The model adapter is Phase 4.</div>
+    <div><b>Live acceptance pending</b>The Anthropic adapter exists and passes offline tests; no live evidence is claimed.</div>
     <div><b>Host worker is not sandboxed</b>The VM sandbox is opt-in with <code>--worker firecracker</code>.</div>
     <div><b>Jailing needs root</b>It also needs a delegated cgroup v2 tree and <code>/dev/kvm</code>. x86_64 only.</div>
     <div><b>Nothing is garbage collected</b>Job directories and disk images grow with every attempt.</div>

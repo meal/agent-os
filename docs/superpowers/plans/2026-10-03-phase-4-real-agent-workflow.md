@@ -1,5 +1,9 @@
 # Phase 4 Real Agent Workflow Implementation Plan
 
+Current status (2026-10-04): historical implementation plan. Model workflow implementation
+and offline regression coverage are present; live-provider acceptance remains open.
+Current execution and reliability policy are tracked in [v0.1 completion](2026-10-04-v01-completion.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** A real language model (Anthropic Messages API, `claude-opus-5-5` by default) drives the existing `Agent` seam and fixes the fixture repository through the broker, inside the contract's limits, with every model call, file listing and file read journaled as an effect (`intend -> dispatch -> execute -> store_result -> register_result -> complete`), the verification evidence collected by the trusted profile only, a crash at any boundary neither replaying a completed model call nor double-spending the budget (a lost call is *forfeited*: FAILED, its reservation `Uncertain`, the agent asks again under a new reservation), reads served from a host-side shadow workspace validated by digest, the API key reaching nothing but the provider, and the deterministic `FakeAgent` staying the offline path — while `docker compose run --rm test cargo test --workspace` stays green and makes no network call.

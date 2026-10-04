@@ -1,0 +1,50 @@
+name: Manual acceptance evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      kvm:
+        description: Run actual jailed KVM acceptance on a provisioned runner
+        type: boolean
+        default: false
+      live:
+        description: Run paid live acceptance using a runner key file
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  trusted-ref:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require trusted main for credentialed or privileged acceptance
+        env:
+          REF: ${{ github.ref }}
+        run: test "$REF" = refs/heads/main
+  kvm:
+    needs: trusted-ref
+    if: inputs.kvm
+    runs-on: [self-hosted, linux, x64, agentos-kvm]
+    environment: agentos-acceptance
+    timeout-minutes: 90
+    env:
+      COMPOSE_PROJECT_NAME: agentos-evidence-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: sh scripts/acceptance.sh kvm
+  live:
+    needs: trusted-ref
+    if: inputs.live
+    runs-on: [self-hosted, linux, x64, agentos-kvm]
+    environment: agentos-acceptance
+    timeout-minutes: 90
+    env:
+      COMPOSE_PROJECT_NAME: agentos-live-${{ github.run_id }}
+      AGENTOS_LIVE_KEY_FILE: ${{ vars.AGENTOS_LIVE_KEY_FILE }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Require provisioned key file and actual KVM
+        run: test -n "$AGENTOS_LIVE_KEY_FILE" && test -f "$AGENTOS_LIVE_KEY_FILE" && test ! -L "$AGENTOS_LIVE_KEY_FILE" && test -c /dev/kvm
+      - run: sh scripts/acceptance.sh live "$AGENTOS_LIVE_KEY_FILE"

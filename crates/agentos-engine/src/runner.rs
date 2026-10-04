@@ -910,10 +910,8 @@ async fn drive<E: Executor, A: Agent>(cx: &Cx<'_, E>, agent: &mut A) -> Result<T
         Ok(Ok(found)) => found,
         Ok(Err(state)) | Err(state) => return Ok(state),
     };
-    if resumed {
-        if let Some(state) = workspace_lost(cx)? {
-            return Ok(state);
-        }
+    if resumed && let Some(state) = workspace_lost(cx)? {
+        return Ok(state);
     }
 
     let turns = journal::session_turns(&db.events(task)?)?;

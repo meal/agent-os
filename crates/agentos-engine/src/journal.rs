@@ -109,10 +109,10 @@ pub(crate) fn intended(
         if kind_name(&e.payload["kind"]) != Some(kind_variant) {
             continue;
         }
-        if let Some(request) = request {
-            if decode::<Digest>(&e.payload["request_digest"])? != *request {
-                continue;
-            }
+        if let Some(request) = request
+            && decode::<Digest>(&e.payload["request_digest"])? != *request
+        {
+            continue;
         }
         return Ok(Some(decode(&e.payload["effect_id"])?));
     }
@@ -171,10 +171,10 @@ pub(crate) fn journaled_patch(db: &Db, task: &TaskId, request: &Digest) -> Resul
         .iter()
         .filter(|e| e.event_type == "AgentTurn")
     {
-        if let AgentAction::ApplyPatch(patch) = decode(&e.payload["action"])? {
-            if Digest::of(patch.as_bytes()) == *request {
-                return Ok(Some(patch));
-            }
+        if let AgentAction::ApplyPatch(patch) = decode(&e.payload["action"])?
+            && Digest::of(patch.as_bytes()) == *request
+        {
+            return Ok(Some(patch));
         }
     }
     Ok(None)

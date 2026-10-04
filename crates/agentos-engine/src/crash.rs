@@ -63,6 +63,7 @@ pub struct CrashCtx {
 }
 
 type Decide = dyn Fn(CrashPoint, &CrashCtx) -> bool + Send + Sync;
+type CrashOccurrences = HashMap<(CrashPoint, Option<&'static str>), usize>;
 
 /// Cheap cloneable crash decision. Clones share their occurrence counters and the
 /// "tripped" latch, so a hook handed both to the runner and to a `SupervisedExecutor` acts
@@ -70,7 +71,7 @@ type Decide = dyn Fn(CrashPoint, &CrashCtx) -> bool + Send + Sync;
 #[derive(Clone)]
 pub struct CrashHook {
     decide: Arc<Decide>,
-    seen: Arc<Mutex<HashMap<(CrashPoint, Option<&'static str>), usize>>>,
+    seen: Arc<Mutex<CrashOccurrences>>,
     tripped: Arc<Mutex<Option<CrashPoint>>>,
 }
 

@@ -22,6 +22,22 @@ limits). The plan for later phases is in [`Agent_OS_v1_Build_Plan.md`](Agent_OS_
 
 ## Build and test
 
+Current completion work is tracked in the [v0.1 plan](docs/superpowers/plans/2026-10-04-v01-completion.md).
+Model deadlines, bounded I/O, versioned retry/endpoint policy, the development runtime, and
+CI are implemented and tested offline. Real provider/KVM acceptance remains open; GC,
+contract-driven VM resources, the component analyzer, and fresh-host release validation
+remain planned work.
+
+Required offline gates are centralized in `sh scripts/check.sh`: formatting, strict Clippy,
+host tests and fake-jail tests, all through Docker Compose with the lockfile enforced.
+The PR/push workflow uses the same commands with separate Compose projects. Run
+`docker compose build test` after runtime changes. Development uses pyenv 2.8.6 and Python
+3.14.8 pinned by source checksums; `pyenv exec python` selects the project version.
+The image exposes that interpreter directly to verification so pyenv shims add no
+environment variables. `scripts/test-python-runtime.sh` checks both legacy and current
+interpreter acceptance. The separate `python-stdlib-py314-v1` guest is a candidate;
+real conformance and reproducibility are pending, so the existing guest stays the default.
+
 Everything runs in Docker through compose (Rust toolchain, `python3` and `git` are in the
 image):
 
@@ -1063,3 +1079,12 @@ Carried from 3a:
   build" finishes there).
 - Jailer extras that need a different supervision model or more privilege: `--new-pid-ns` (the
   jailer parent exits at once), `--netns`, a per-job jail uid, the `userfaultfd` device.
+
+
+Requested acceptance is centralized in `sh scripts/acceptance.sh offline`, `kvm`, or
+`live /absolute/path/to/key-file`. The offline command exercises host and fake-jail repair
+and replay against the local fake API. The other tiers fail when setup is unavailable;
+they require a usable `/dev/kvm`, and live also requires a regular nonsymlink key file of
+at most 4096 bytes. Live runs mount that file read-only and produce host and actual jailed
+recordings, exports, and replay comparisons under `build/evidence/`.
+See [evidence collection](docs/evidence/README.md) for runner setup and pending gates.

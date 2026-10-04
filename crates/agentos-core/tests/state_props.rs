@@ -43,8 +43,7 @@ proptest! {
         let mut task = Task::new(TaskId::new(), Digest::of(&[0]));
         for ev in events {
             let before = task.clone();
-            match reduce(&task, &ev, &l) {
-                Ok(next) => {
+            if let Ok(next) = reduce(&task, &ev, &l) {
                     prop_assert!(!before.state.is_terminal());
                     prop_assert_eq!(next.step, before.step + 1);
                     prop_assert!(next.actions_used <= l.tool_actions);
@@ -67,8 +66,6 @@ proptest! {
                         prop_assert!(is_update, "only WorkspaceUpdated changes the digest");
                     }
                     task = next;
-                }
-                Err(_) => {}
             }
             if before.state.is_terminal() {
                 prop_assert_eq!(&task, &before);

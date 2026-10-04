@@ -1,7 +1,9 @@
 # Agent OS v0.1 — build plan
 
 Date: 2026-10-01  
-Status: proposed implementation scope; no software has been built as part of this plan.
+Status: historical scope document. As of 2026-10-04, Phases 1–3b-1 and the Phase 4
+model workflow are implemented and tested offline. Live/KVM acceptance, Phase 5 and
+release completion remain open. Current execution: [v0.1 completion plan](docs/superpowers/plans/2026-10-04-v01-completion.md).
 
 ## Objective
 
@@ -192,4 +194,3 @@ A seL4 port entails runtime and device integration work; the Linux prototype's h
 - [Rust support in seL4 userspace](https://docs.sel4.systems/projects/rust/)
 
 The scope, milestones, protocol and effort estimate above are proposed engineering choices.
-

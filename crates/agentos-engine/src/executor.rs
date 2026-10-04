@@ -118,6 +118,7 @@ pub enum JobWait {
 
 /// What an executor can tell about a dispatched effect it holds no receipt for.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)] // Preserve the executor interface; outcomes are passed once.
 pub enum Reconciliation {
     /// The effect provably did not take effect; a new attempt is safe.
     NotApplied,

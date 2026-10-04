@@ -148,7 +148,8 @@ self_test() {
     bad "--verify match: $(cat "$t/err")"
   fi
 
-  [ -f "$REPO/Cargo.toml" ] && [ -d "$REPO/.git" ] || bad "the repository is intact"
+  # Linked Git worktrees use a .git file instead of a directory.
+  [ -f "$REPO/Cargo.toml" ] && [ -e "$REPO/.git" ] || bad "the repository is intact"
   rm -rf "$t"
   [ "$fails" -eq 0 ] || { echo "$fails self-test(s) failed"; exit 1; }
   echo "all self-tests passed"

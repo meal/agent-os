@@ -27,26 +27,6 @@ pub struct ModelExecutor {
     crash: Option<CrashHook>,
 }
 
-#[cfg(test)]
-mod deadline_tests {
-    use super::*;
-    use std::time::Duration;
-
-    #[test]
-    fn remaining_duration_preserves_fractional_seconds() {
-        let at = UNIX_EPOCH + Duration::from_millis(9_750);
-        assert_eq!(deadline_remaining(10, at), Some(Duration::from_millis(250)));
-    }
-
-    #[test]
-    fn elapsed_or_invalid_deadlines_have_no_remaining_duration() {
-        let at = UNIX_EPOCH + Duration::from_secs(10);
-        assert_eq!(deadline_remaining(10, at), None);
-        assert_eq!(deadline_remaining(9, at), None);
-        assert_eq!(deadline_remaining(-1, at), None);
-    }
-}
-
 impl ModelExecutor {
     pub fn new(
         root: PathBuf,
@@ -243,5 +223,24 @@ impl Executor for ModelExecutor {
             }
         }
         best
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    #[test]
+    fn remaining_duration_preserves_fractional_seconds() {
+        let at = UNIX_EPOCH + Duration::from_millis(9_750);
+        assert_eq!(deadline_remaining(10, at), Some(Duration::from_millis(250)));
+    }
+
+    #[test]
+    fn elapsed_or_invalid_deadlines_have_no_remaining_duration() {
+        let at = UNIX_EPOCH + Duration::from_secs(10);
+        assert_eq!(deadline_remaining(10, at), None);
+        assert_eq!(deadline_remaining(9, at), None);
+        assert_eq!(deadline_remaining(-1, at), None);
     }
 }
