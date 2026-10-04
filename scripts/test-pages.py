@@ -1,4 +1,4 @@
-"""Check Pages links and execute its offline model example in the Compose test image."""
+"""Check Pages links and execute its offline usage examples in the Compose test image."""
 import json
 import os
 from pathlib import Path
@@ -85,6 +85,40 @@ class PagesTests(unittest.TestCase):
             self.assertEqual(manifest["model_policy_version"], 1)
             self.assertEqual(manifest["model_limits_version"], 1)
             self.assertTrue((root / "home/bundle/patch.diff").is_file())
+
+    def test_real_world_example_requires_approval_and_reproduces_the_export(self):
+        self.assertIn("real-world-commands", self.page.examples, "Pages needs a runnable review-and-apply example")
+        self.assertIn("real-world-review", self.page.examples, "Approval must be a separate step")
+        with tempfile.TemporaryDirectory(prefix="agentos-practice-") as scratch:
+            root = Path(scratch)
+            contract = root / "model-task.json"
+            contract.write_text(self.page.examples["model-contract"])
+            practice = root / "practice"
+            result = subprocess.run(
+                ["sh", "-eu", "-c", self.page.examples["real-world-commands"] + "\n" + self.page.examples["real-world-review"]],
+                cwd=REPO,
+                env={**os.environ, "MODEL_CONTRACT": str(contract), "PRACTICE_DIR": str(practice)},
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(json.loads((practice / "approval.json").read_text())["state"], "READY")
+            ready = json.loads((practice / "ready-status.json").read_text())
+            self.assertEqual(ready["state"], "READY")
+            self.assertEqual(ready["actions_used"], 0)
+            self.assertEqual(ready["usage"]["settled_model_requests"], 0)
+            self.assertEqual(ready["outstanding_effects"], [])
+            manifest = json.loads((practice / "bundle/manifest.json").read_text())
+            self.assertEqual(manifest["state"], "SUCCEEDED")
+            self.assertEqual(manifest["final_workspace_digest"], manifest["verified_digest"])
+            self.assertTrue(manifest["verification_results"][-1]["accepted_for_final_workspace"])
+            original = (REPO / "fixtures/parser-repo/src/parser.py").read_bytes()
+            self.assertEqual((practice / "service/src/parser.py").read_bytes(), original)
+            self.assertNotEqual((practice / "review/src/parser.py").read_bytes(), original)
+            for relative in ("tests/test_parser.py", "tests/__init__.py", "src/__init__.py"):
+                self.assertEqual((practice / "service" / relative).read_bytes(), (practice / "review" / relative).read_bytes())
+            self.assertIn("10/10 checks passed", result.stdout)
 
 
 if __name__ == "__main__":

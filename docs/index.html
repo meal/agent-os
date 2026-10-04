@@ -154,7 +154,7 @@ footer{color:var(--muted);font-size:.88rem;border-top:1px solid var(--rule);padd
     <div class="fact"><b>It contains the code it runs</b><span>With <code>--worker firecracker</code>, each step runs in its own microVM with no network, fixed-size disks and a jailed host process. The default host worker is not sandboxed.</span></div>
   </div>
   <p class="note">This static walkthrough simulates the controls in your browser; it does not run code, contact a model or start a VM. The controller supports a deterministic patch agent and an Anthropic model agent with five tools. Model reliability and recovery are tested offline; live-provider and real KVM acceptance remain open for this build. The event sequence below comes from a fixture run. Sandbox figures are assertions in the gated KVM tier, not measurements from this review.</p>
-  <p class="note"><a href="#model">Try the offline model workflow</a> · <a href="#status">Current progress and open gates</a> · Updated 4 October 2026</p>
+  <p class="note"><a href="#usage">Use it for a real bug fix</a> · <a href="#model">Try the offline model workflow</a> · <a href="https://github.com/meal/agent-os/blob/main/docs/testing.md">Testing guide</a> · <a href="#status">Current progress and open gates</a></p>
 </header>
 
 <!-- ============ THE CONTRACT ============ -->
@@ -276,6 +276,80 @@ printf 'Export: %s/bundle\n' "$demo_home"</pre>
 sh scripts/acceptance.sh offline</pre>
   <p>This runs the host and fake-jail harnesses against a loopback fake API, including a 429 followed by repair, then replays without network. It compares request digests, call counts, final workspace, exported patch and protected profile. It needs no real API key or <code>/dev/kvm</code>. Fake-jail tests exercise the harness; they do not prove VM isolation.</p>
   <p class="note">Real host and jailed provider runs, real KVM tests and candidate guest-image acceptance remain pending. See the <a href="https://github.com/meal/agent-os/blob/main/docs/evidence/README.md">acceptance setup and evidence requirements</a> before enabling those tiers.</p>
+</section>
+
+<!-- ============ PRACTICAL USAGE ============ -->
+<section id="usage">
+  <h2>From a bug report to a patch you can review</h2>
+  <p>Your Python service reads settings such as <code>PORT = 8080</code>. A customer reports that spaces around the equals sign break the configuration. Give the agent this narrow bug, allow edits only under <code>src/</code>, and let a protected regression check decide whether the fix works. The result is a reviewable export; applying it to your project is a separate step you control.</p>
+  <div class="cols">
+    <div class="panel" style="display:flex;flex-direction:column;gap:16px">
+      <h3>1. Reproduce the bug</h3>
+      <p>Start with a clean source snapshot and a check that fails for the reported input. Register that check separately from the editable code. The practice run below uses the included parser as the service's configuration reader.</p>
+      <h3>2. Review, then approve</h3>
+      <p>Submit without <code>--yes</code>. Inspect the goal, editable paths, protected profile, worker and budgets. The task stays <code>READY</code>; <code>resume</code> approves this recorded task and starts it.</p>
+      <h3>3. Inspect the evidence</h3>
+      <p>Check <code>status</code> and export the result. Require <code>SUCCEEDED</code>, matching final and verified workspace digests, and a passing verification accepted for the final workspace. Read the diff and the verification results before accepting the change.</p>
+      <h3>4. Apply it to a clean checkout</h3>
+      <p>Run <code>git apply --check</code>, apply the reviewed export, and rerun your checks. The practice uses a disposable review copy. The original source snapshot stays unchanged throughout the agent run.</p>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:12px;min-width:0">
+      <h3>Practice the whole handoff without an API key</h3>
+      <p>Save <a href="#model">the contract above</a> as <code>model-task.json</code>, then paste this in <code>docker compose run --rm test sh</code>. The scripted answers are specific to this parser example; an arbitrary project needs a live provider.</p>
+      <pre class="block" aria-label="Practice a real-world bug-fix handoff" data-demo="real-world-commands">cargo build --locked -q -p agentos-cli
+mkdir -p build
+practice=${PRACTICE_DIR:-$(mktemp -d /work/build/usage.XXXXXX)}
+mkdir -p "$practice"
+cp -R fixtures/parser-repo "$practice/service"
+cp -R "$practice/service" "$practice/review"
+git init -q "$practice/review"
+check=fixtures/profiles/parser-checks-v1/check_parser.py
+
+# The protected check must expose the bug before we ask for a fix.
+if pyenv exec python "$check" "$practice/service"; then
+  echo 'Expected the original parser to fail' >&amp;2; exit 1
+else
+  [ "$?" -eq 1 ]
+fi
+
+pyenv exec python - "${MODEL_CONTRACT:-model-task.json}" "$practice" &lt;&lt;'PY'
+import json, sys
+from pathlib import Path
+root = Path(sys.argv[2]).resolve()
+task = json.loads(Path(sys.argv[1]).read_text())
+task["goal"] = ("Fix config parsing: trim keys and values, "
+                "skip indented comments, preserve equals signs in values.")
+task["repository"]["source"] = str(root / "service")
+(root / "task.json").write_text(json.dumps(task))
+PY
+agentos() {
+  target/debug/agentos --home "$practice/home" --worker host "$@"
+}
+agentos profile register fixtures/profiles/parser-checks-v1
+agentos submit "$practice/task.json" \
+  --model fake:fixtures/transcripts/parser-fix.json > "$practice/approval.json"
+task_id=$(pyenv exec python -c \
+  'import json,sys; print(json.load(open(sys.argv[1]))["task_id"])' \
+  "$practice/approval.json")
+agentos status "$task_id" > "$practice/ready-status.json"
+cat "$practice/ready-status.json"</pre>
+      <p><strong>Stop here and review the printed permissions.</strong> The task is <code>READY</code> and has run no effects. When you approve it, continue in the same shell:</p>
+      <pre class="block" aria-label="Approve, export and review the fix" data-demo="real-world-review">agentos resume "$task_id"
+agentos events "$task_id" > "$practice/events.ndjson"
+agentos export "$task_id" "$practice/bundle"
+cat "$practice/bundle/patch.diff"
+
+# Apply only to this disposable review copy after inspecting the diff.
+git -C "$practice/review" apply --check "$practice/bundle/patch.diff"
+git -C "$practice/review" apply "$practice/bundle/patch.diff"
+pyenv exec python "$check" "$practice/review"
+printf 'Task, evidence and review copy: %s\n' "$practice"</pre>
+    </div>
+  </div>
+  <h3>Use the same process on your own repository</h3>
+  <p>Prepare a clean snapshot of the committed revision, replace the source path and goal in the contract, and register your project's regression checks as a protected profile. Keep credentials outside the snapshot: Agent OS copies regular files, including untracked files, and does not use <code>.gitignore</code> as a filter. The current Python profile supports standard-library checks; projects needing extra runtimes or packages need a matching execution image.</p>
+  <p>For a live task, mount the snapshot read-only and a regular key file read-only into the container, then submit with <code>--model anthropic:MODEL_ID --api-key-file /run/agentos/key</code>. Choose an available ID from <a href="https://platform.claude.com/docs/en/models/overview">Anthropic's model list</a>. Submit first, approve with <code>resume</code> after reviewing permissions, and use the same export/review flow. Repository content included in model requests goes to the selected provider; live calls consume your API account's budget.</p>
+  <p class="note">Use the host worker for a trusted first test; it is not sandboxed. For untrusted checks, prepare the jailed Firecracker worker on a Linux KVM host. Live-provider and real KVM acceptance remain pending. The <a href="https://github.com/meal/agent-os/blob/main/docs/testing.md">hands-on testing guide</a> includes setup, the own-repository commands, expected results, recovery tests and the later KVM/live gates.</p>
 </section>
 
 <!-- ============ CRASH STATION ============ -->

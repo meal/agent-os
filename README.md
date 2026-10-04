@@ -22,6 +22,11 @@ limits). The plan for later phases is in [`Agent_OS_v1_Build_Plan.md`](Agent_OS_
 
 ## Build and test
 
+For a first hands-on session, follow the [testing guide](docs/testing.md) and the
+[real-world bug-fix walkthrough](https://meal.github.io/agent-os/#usage): reproduce
+a configuration bug, review permissions, run the task, inspect its export, and
+apply the reviewed patch to a clean copy.
+
 Current completion work is tracked in the [v0.1 plan](docs/superpowers/plans/2026-10-04-v01-completion.md).
 Model deadlines, bounded I/O, versioned retry/endpoint policy, the development runtime, and
 CI are implemented and tested offline. Real provider/KVM acceptance remains open; GC,
@@ -525,7 +530,10 @@ the tests use it to point at a local fake. The URL must be `https://` (any host)
 only to `localhost`, an address in 127.0.0.0/8 or `[::1]`, with no user info, query or fragment;
 anything else is a usage error (exit 2, the message never echoes the URL) at `submit` and at
 `resume`, before anything is written. `cancel` and the recovery of a finished task ignore an
-invalid URL (no provider is built). The URL is **not recorded** in `Submitted` (see the limits).
+invalid URL (no provider is built). New submissions record the validated endpoint;
+resume uses it and refuses a different endpoint before reading credentials or
+changing the task. Legacy tasks without an endpoint may resume only with the
+official endpoint (see the limits).
 
 ### The `model.request` capability and the limits
 
