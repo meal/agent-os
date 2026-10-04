@@ -9,7 +9,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;700&family=Instrument+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
 <style>
-/* Layout: one reading column; three interactive stations (crash, authority, sandbox) separated by plain prose. */
+/* Layout: one reading column, an offline model example; three interactive stations (crash, authority, sandbox) separated by plain prose. */
 :root{
   --paper:#eceff1; --panel:#f7f9fa; --ink:#14212b; --muted:#56656f; --rule:#cfd7dc;
   --signal:#1d5fd1;      /* journal / controller */
@@ -141,7 +141,7 @@ footer{color:var(--muted);font-size:.88rem;border-top:1px solid var(--rule);padd
 <div class="wrap">
 
 <div class="top">
-  <span class="eyebrow">Agent OS · v0.1 · Phases 1 to 3b-1</span>
+  <span class="eyebrow">Agent OS · v0.1 · Phase 4 built · Offline acceptance</span>
   <button class="theme" id="theme" type="button">Switch theme</button>
 </div>
 
@@ -153,7 +153,8 @@ footer{color:var(--muted);font-size:.88rem;border-top:1px solid var(--rule);padd
     <div class="fact"><b>It checks permissions every time</b><span>The agent holds no authority itself. A broker checks a handle before each action and records the answer.</span></div>
     <div class="fact"><b>It contains the code it runs</b><span>With <code>--worker firecracker</code>, each step runs in its own microVM with no network, fixed-size disks and a jailed host process. The default host worker is not sandboxed.</span></div>
   </div>
-  <p class="note">The controller supports a deterministic patch agent and an Anthropic model agent with five tools. Model reliability and recovery are tested offline; live-provider and real KVM acceptance remain open for this build. The event sequence below comes from a fixture run. Sandbox figures are assertions in the gated KVM tier, not measurements from this review.</p>
+  <p class="note">This static walkthrough simulates the controls in your browser; it does not run code, contact a model or start a VM. The controller supports a deterministic patch agent and an Anthropic model agent with five tools. Model reliability and recovery are tested offline; live-provider and real KVM acceptance remain open for this build. The event sequence below comes from a fixture run. Sandbox figures are assertions in the gated KVM tier, not measurements from this review.</p>
+  <p class="note"><a href="#model">Try the offline model workflow</a> · <a href="#status">Current progress and open gates</a> · Updated 4 October 2026</p>
 </header>
 
 <!-- ============ THE CONTRACT ============ -->
@@ -212,6 +213,69 @@ permissions before it runs:
                 jailed</pre>
   </div>
   <p class="note">The repository is pinned by digest, and the check that decides success is a registered profile pinned by digest too. The agent cannot edit the check, and a patch that touches a path outside <code>src/**</code> is refused.</p>
+</section>
+
+<!-- ============ MODEL WORKFLOW ============ -->
+<section id="model">
+  <span class="eyebrow">Phase 4 · offline model workflow</span>
+  <h2>A model can repair the fixture through five tools</h2>
+  <p>The model agent can list files, read a file, apply a patch, run protected verification and finish. A scripted provider exercises the same loop without a key or network call: it reads the parser, tries a patch, sees the check fail, then fixes it. Only the passing check on the final workspace makes the task succeed.</p>
+  <p>Save this contract as <code>model-task.json</code> in the repository root. Run <code>docker compose build test</code>, then open the test container with <code>docker compose run --rm test sh</code> and paste these commands. This example uses the host worker on the trusted fixture. The exported bundle stays in a new directory under <code>build/</code>.</p>
+  <div class="cols">
+    <pre class="block" aria-label="Offline model contract" data-demo="model-contract">{
+  "goal": "fix the parser",
+  "repository": {
+    "source": "/work/fixtures/parser-repo",
+    "revision": "recorded-at-submission"
+  },
+  "profile": "python-stdlib-v1",
+  "editable_paths": ["src/**"],
+  "verification_profile": "parser-checks-v1",
+  "capabilities": [
+    "snapshot.read",
+    "workspace.apply_patch",
+    "verification.run",
+    "artifact.export",
+    "model.request"
+  ],
+  "limits": {
+    "model_requests": 8,
+    "max_output_tokens_per_request": 16000,
+    "tool_actions": 8,
+    "deadline_seconds": 600,
+    "worker_vcpus": 1,
+    "worker_memory_mib": 256
+  }
+}</pre>
+    <pre class="block" aria-label="Offline model commands" data-demo="model-commands">cargo build --locked -q -p agentos-cli
+mkdir -p build
+demo_home=${DEMO_HOME:-$(mktemp -d /work/build/model-demo.XXXXXX)}
+contract=${DEMO_CONTRACT:-model-task.json}
+agentos() {
+  target/debug/agentos --home "$demo_home" --worker host "$@"
+}
+agentos profile register fixtures/profiles/parser-checks-v1
+agentos submit "$contract" --yes \
+  --model fake:fixtures/transcripts/parser-fix.json
+task_id=$(basename "$demo_home"/tasks/*)
+agentos status "$task_id"
+agentos export "$task_id" "$demo_home/bundle"
+printf 'Export: %s/bundle\n' "$demo_home"</pre>
+  </div>
+  <p class="note">The fixture makes six model calls and settles five tool actions. Its final verification pins the workspace digest and the protected profile; the export includes the patch, requests, responses and verification evidence. The original crash simulation below still illustrates the deterministic patch-agent run.</p>
+  <h3>Model failures have durable rules</h3>
+  <div class="limits">
+    <div><b>Permanent errors stop</b>New policy-1 tasks stop on 400, 401, 403, 404, redirects or malformed complete responses. Only 408, 429 and 5xx responses retry.</div>
+    <div><b>Retries wait and survive a restart</b>Transient failures and lost calls get journaled waits of 2, 4, 8, 16, 32, then 60 seconds. <code>Retry-After</code> can extend them. Every new attempt gets its own effect and reservation.</div>
+    <div><b>Interrupted calls stay counted</b>A sent call whose response is lost remains uncertain and counts against the budget. Pause, cancel, revocation and deadline expiry stop waiting without another send.</div>
+    <div><b>Model I/O is bounded</b>New tasks cap requests at 8 MiB. Success bodies are capped at 4 MiB, error prefixes and regular key files at 4096 bytes. The task deadline bounds network waiting.</div>
+  </div>
+  <p class="note">New submissions record the endpoint and policy versions. Resume refuses a different provider endpoint before reading credentials or changing the task. Older journals retain their recorded behavior. Version-2 recordings preserve ordered attempts, including transient rejections and retry metadata; legacy response-only fixtures still replay.</p>
+  <h3>Test repair and replay on both worker paths</h3>
+  <pre class="block" aria-label="Offline acceptance commands">docker compose build test
+sh scripts/acceptance.sh offline</pre>
+  <p>This runs the host and fake-jail harnesses against a loopback fake API, including a 429 followed by repair, then replays without network. It compares request digests, call counts, final workspace, exported patch and protected profile. It needs no real API key or <code>/dev/kvm</code>. Fake-jail tests exercise the harness; they do not prove VM isolation.</p>
+  <p class="note">Real host and jailed provider runs, real KVM tests and candidate guest-image acceptance remain pending. See the <a href="https://github.com/meal/agent-os/blob/main/docs/evidence/README.md">acceptance setup and evidence requirements</a> before enabling those tiers.</p>
 </section>
 
 <!-- ============ CRASH STATION ============ -->
@@ -325,7 +389,7 @@ permissions before it runs:
 <section id="sandbox">
   <span class="eyebrow">Station 3 · containment</span>
   <h2>Run hostile code. See what stops it.</h2>
-  <p>The check that verifies a task is code from the registered verification profile, and it runs as untrusted. The test suite includes hostile profiles that try to burn CPU, eat memory, fork without limit, fill the disk, reach the network and find a host secret. Pick one.</p>
+  <p>The check that verifies a task is code from the registered verification profile, and it runs as untrusted. The gated KVM suite includes hostile profiles that try to burn CPU, eat memory, fork without limit, fill the disk, reach the network and find a host secret. These controls illustrate its expected assertions; this build has not rerun them on real KVM. Pick one.</p>
   <div class="panel" style="display:flex;flex-direction:column;gap:18px">
     <div class="probes" id="probes" role="group" aria-label="hostile profiles"></div>
     <dl class="verdict" id="verdict"></dl>
@@ -342,10 +406,14 @@ permissions before it runs:
     <div class="done"><span class="pill live">DONE</span><b>2 Durability</b>SQLite journal, receipts, recovery after a kill.</div>
     <div class="done"><span class="pill live">DONE</span><b>3 Authority</b>Broker, leases, supervisors, cancel and revoke.</div>
     <div><span class="pill idle">BUILT</span><b>3b-1 Isolation</b>Jailed Firecracker worker; real KVM revalidation pending.</div>
-    <div><span class="pill idle">BUILT</span><b>4 Model workflow</b>Broker, tools and repair loop; live acceptance pending.</div>
+    <div><span class="pill idle">BUILT</span><b>4 Model workflow</b>Tools, repair loop, deadlines and durable retries; host/fake-jail tests pass. Live acceptance pending.</div>
+    <div class="done"><span class="pill live">TESTED OFFLINE</span><b>Reliability and CI</b>Bounded model I/O, Python pins, formatting, lint and Compose test gates.</div>
+    <div><span class="pill warn">LATER</span><b>Resource lifecycle</b>Safe collection, publication failure tests and measured VM resource limits.</div>
     <div><span class="pill warn">LATER</span><b>5 Wasm ABI</b>Component interfaces and a repository analyzer.</div>
-    <div><span class="pill warn">LATER</span><b>6 Release</b>Fault-injection suite, installer, reproducible image.</div>
+    <div><span class="pill warn">LATER</span><b>6 Release</b>Source-built kernel, fresh-host installer and evidence across two snapshots.</div>
   </div>
+  <p>All four required offline gates pass: formatting, strict Clippy, the host suite and the fake-jail suite. Offline and skipped gated tests do not establish real provider or KVM acceptance. The new Python guest is a candidate; the legacy image remains the default.</p>
+  <p class="note"><a href="https://github.com/meal/agent-os/blob/main/docs/superpowers/plans/2026-10-04-v01-completion.md">Completion plan</a> · <a href="https://github.com/meal/agent-os/blob/main/docs/reviews/2026-10-04-offline-milestone-review.md">Verification and review decisions</a></p>
   <h3>Known limits in v0.1</h3>
   <div class="limits">
     <div><b>Live acceptance pending</b>The Anthropic adapter exists and passes offline tests; no live evidence is claimed.</div>
@@ -358,7 +426,7 @@ permissions before it runs:
 </section>
 
 <footer>
-  <span>Source: github.com/meal/agent-os. The README has the full transcripts, the home layout and the security model.</span>
+  <span><a href="https://github.com/meal/agent-os">Source</a> · <a href="https://github.com/meal/agent-os/blob/main/README.md">README and full transcripts</a> · <a href="#model">Offline model demo</a></span>
   <span>Run it yourself: <code>docker compose run --rm test sh scripts/demo.sh</code></span>
 </footer>
 </div>
@@ -553,7 +621,7 @@ permissions before it runs:
     {id:'mem-hog',s:'allocate 2x its memory',
      what:'Allocates twice the memory the contract gave the worker.',
      stop:'The VM has a fixed memory size. Inside it the check is the first thing the guest OOM killer picks, and the agent is protected.',
-     result:'The check dies (exit_code null, passed false). The agent survives and reports. Firecracker\'s resident memory stays under 256 + 96 MiB.'},
+     result:'The check dies (exit_code null, passed false). The agent survives and reports. The KVM tier asserts a resident-memory ceiling; the jailed memory limit also accounts for host overhead and page cache. Real resource revalidation is pending.'},
     {id:'fork-bomb',s:'fork without limit',
      what:'Forks processes until something gives.',
      stop:'RLIMIT_NPROC in the guest, a group kill when the check ends, VM teardown, and pids.max=64 on the host cgroup.',
