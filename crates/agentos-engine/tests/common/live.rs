@@ -7,7 +7,10 @@
 //! [`ApiKey`] (redacted `Debug`) and never printed, logged or written down; panic texts name
 //! the variables, never their values.
 
-use std::fs;
+use std::fs::OpenOptions;
+use std::io::{self, Read};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 
 use agentos_core::contract::Contract;
 use agentos_core::ids::Digest;
@@ -22,21 +25,55 @@ pub struct Live {
     pub base_url: Option<String>,
     /// `AGENTOS_LIVE_MODEL`, else the default model.
     pub model: String,
+    pub worker: String,
 }
 
 fn nonempty(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
+pub fn enabled(value: Option<&str>) -> bool {
+    match value {
+        None | Some("") | Some("0") => false,
+        Some("1") => true,
+        Some(_) => panic!("AGENTOS_LIVE_MODEL_TESTS must be 0 or 1"),
+    }
+}
+
+pub fn read_key_file(path: &Path) -> io::Result<String> {
+    let flags = rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(flags.bits() as i32)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > 4096 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "key must be a regular file of at most 4096 bytes",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(4097).read_to_end(&mut bytes)?;
+    if bytes.len() > 4096 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "key exceeds 4096 bytes",
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "key must be UTF-8"))
+}
+
 /// The gate. See the module documentation.
 pub fn require() -> Option<Live> {
-    if std::env::var_os("AGENTOS_LIVE_MODEL_TESTS").is_none() {
+    if !enabled(std::env::var("AGENTOS_LIVE_MODEL_TESTS").ok().as_deref()) {
         println!("{SKIP_MESSAGE}");
         return None;
     }
     let raw = match nonempty("AGENTOS_API_KEY_FILE") {
         // The file is named in the panic text, its content never.
-        Some(path) => fs::read_to_string(&path).unwrap_or_else(|e| panic!("AGENTOS_API_KEY_FILE={path}: {e}")),
+        Some(path) => read_key_file(Path::new(&path)).unwrap_or_else(|e| panic!("AGENTOS_API_KEY_FILE={path}: {e}")),
         None => nonempty("ANTHROPIC_API_KEY").unwrap_or_else(|| {
             panic!(
                 "AGENTOS_LIVE_MODEL_TESTS is set but there is no API key: set ANTHROPIC_API_KEY (or AGENTOS_API_KEY_FILE) \
@@ -47,8 +84,14 @@ pub fn require() -> Option<Live> {
     let key = ApiKey::new(&raw).unwrap_or_else(|e| {
         panic!("AGENTOS_LIVE_MODEL_TESTS is set but the API key is unusable: {e}")
     });
+    let worker = nonempty("AGENTOS_LIVE_WORKER").unwrap_or_else(|| "host".into());
+    assert!(
+        matches!(worker.as_str(), "host" | "firecracker"),
+        "AGENTOS_LIVE_WORKER must be host or firecracker"
+    );
     Some(Live {
         key,
+        worker,
         base_url: nonempty("AGENTOS_ANTHROPIC_BASE_URL"),
         model: nonempty("AGENTOS_LIVE_MODEL").unwrap_or_else(|| DEFAULT_MODEL.to_string()),
     })
@@ -76,5 +119,7 @@ pub fn contract() -> (Contract, Digest) {
         }}
     }}"#
     );
-    (Contract::parse(&json).unwrap(), Digest::of(json.as_bytes()))
+    let contract = Contract::parse(&json).unwrap();
+    let digest = Digest::of(&serde_json::to_vec(&contract).unwrap());
+    (contract, digest)
 }

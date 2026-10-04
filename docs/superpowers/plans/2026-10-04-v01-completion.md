@@ -10,6 +10,19 @@
 
 **Spec:** [v0.1 completion design](../specs/2026-10-04-v01-completion-design.md), [repository review](../../reviews/2026-10-04-repository-review.md), and the original [build plan](../../../Agent_OS_v1_Build_Plan.md).
 
+## Execution status — 2026-10-04
+
+Packages 1–4 are implemented and verified offline. Package 5 has scoped dependency
+updates, pinned pyenv/Python, compatibility tests and a candidate guest recipe; its real
+guest conformance/reproducibility gate remains open. Package 6 implements required
+Compose/CI checks and accurate status documentation. Package 7's host and jailed harnesses
+are verified with the local fake API, with acceptance/evidence tooling ready.
+
+The user requested continuing offline and will provide live/KVM setup later. No real
+provider or KVM run has been performed in this execution. Packages 8–12 remain planned;
+they require focused designs and later acceptance gates. This is an offline reliability
+milestone, not completed v0.1 acceptance. See [evidence collection](../../evidence/README.md).
+
 ## Global Constraints
 
 - One local owner, one driver per home, serialized workspace changes.
@@ -69,9 +82,9 @@ Total provisional effort: 23–37 engineering days. This is effort, not calendar
 
 **Interfaces:** Preserve `ModelProvider::complete` and `Executor::run`; timeout yields existing unresolved outcome.
 
-- [ ] Execute the complete [model deadline plan](2026-10-04-model-deadline-enforcement.md), using the preserved regression to prove the defect before fixing it.
-- [ ] Confirm timeout retains uncertain usage, pre-expired calls make no send, and completed retained responses replay without another send.
-- [ ] Commit only the focused code/tests and its documentation.
+- [x] Execute the complete [model deadline plan](2026-10-04-model-deadline-enforcement.md), using the preserved regression to prove the defect before fixing it.
+- [x] Confirm timeout retains uncertain usage, pre-expired calls make no send, and completed retained responses replay without another send.
+- [x] Commit only the focused code/tests and its documentation.
 
 **Gate:** focused regression and host/fake-jail suites pass. Do not silently settle/release an interrupted sent request.
 
@@ -83,9 +96,9 @@ Total provisional effort: 23–37 engineering days. This is effort, not calendar
 
 **Interfaces:** Keep `ProviderResult` unchanged in this package. Successful response limit is 4 MiB; definite errors retain a 4096-byte prefix and status.
 
-- [ ] Execute Task 1 of [bounded model I/O](2026-10-04-bounded-model-io.md), including fixed-length and chunked limit tests.
-- [ ] Verify oversized success is unresolved/possibly billed; oversized definite error remains a rejected status and stops downloading.
-- [ ] Keep no-redirect and no-client-retry tests green.
+- [x] Execute Task 1 of [bounded model I/O](2026-10-04-bounded-model-io.md), including fixed-length and chunked limit tests.
+- [x] Verify oversized success is unresolved/possibly billed; oversized definite error remains a rejected status and stops downloading.
+- [x] Keep no-redirect and no-client-retry tests green.
 
 **Gate:** collector accepts exactly the cap, rejects cap+1, and error responses do not require an unbounded body read.
 
@@ -97,9 +110,9 @@ Total provisional effort: 23–37 engineering days. This is effort, not calendar
 
 **Interfaces:** New private `read_key_file(&Path) -> io::Result<String>`; key size limit 4096 bytes. Key construction/redaction remains existing `ApiKey` behavior.
 
-- [ ] Execute Task 2 of [bounded model I/O](2026-10-04-bounded-model-io.md).
-- [ ] Test regular-file boundary, oversize, invalid UTF-8, symlink, FIFO, directory, and device paths.
-- [ ] Confirm errors happen before a task starts and never quote key contents.
+- [x] Execute Task 2 of [bounded model I/O](2026-10-04-bounded-model-io.md).
+- [x] Test regular-file boundary, oversize, invalid UTF-8, symlink, FIFO, directory, and device paths.
+- [x] Confirm errors happen before a task starts and never quote key contents.
 
 **Gate:** normal key files work; hostile/nonregular inputs return promptly; existing secret-exclusion CLI tests pass.
 
@@ -111,13 +124,13 @@ Total provisional effort: 23–37 engineering days. This is effort, not calendar
 
 **Interfaces:** `ModelFailureClass::{Permanent,Transient}`; optional typed failure metadata on `Observation::ModelCallFailed` with serde defaults; `Submitted.model_policy_version`, `model_limits_version`, `model_endpoint`; owned `ModelRetryScheduled` event `{failed_effect_id,retry_turn,not_before_ts,policy_version}`. Preserve old policy 0 replay. Policy 1 is recorded for new submissions.
 
-- [ ] Write a focused policy implementation plan from the completion design before changing the journal/agent interfaces. Include actual serialization fixtures for policy 0 and 1 and the expected turn sequence for each.
-- [ ] Add red cases: 401 sends once and fails with auth reason; 429 waits before a new effect; 529 recovers after a transient sequence; invalid/HTTP-date/integer `Retry-After`; transport loss stays uncertain; retry past deadline sends nothing; cancel/pause/revoke while waiting sends nothing more.
-- [ ] Add crashes after recording the retry schedule, after journaling the retry turn, and before dispatch. Assert the resumed request uses the original not-before time and a new effect/reservation exactly once.
-- [ ] Add endpoint cases: omitted override uses recorded URL; different flag/env URL exits 2 before key read/task mutation; old missing endpoint defaults only to official endpoint; status/export match submission.
-- [ ] Enforce 8 MiB serialized-request cap before blob/turn/reservation creation. Test exact boundary and cap+1, with a specific context-size failure.
-- [ ] Implement permanent/transient classification, durable 2–60-second backoff, both `Retry-After` forms, bounded polling, and compatibility rules from the spec. Add `httpdate` only if needed; the checked current version is [1.0.3](https://docs.rs/crate/httpdate/latest).
-- [ ] Run the package gate and update README error/retry/compatibility documentation.
+- [x] Write a focused policy implementation plan from the completion design before changing the journal/agent interfaces. Include actual serialization fixtures for policy 0 and 1 and the expected turn sequence for each.
+- [x] Add red cases: 401 sends once and fails with auth reason; 429 waits before a new effect; 529 recovers after a transient sequence; invalid/HTTP-date/integer `Retry-After`; transport loss stays uncertain; retry past deadline sends nothing; cancel/pause/revoke while waiting sends nothing more.
+- [x] Add crashes after recording the retry schedule, after journaling the retry turn, and before dispatch. Assert the resumed request uses the original not-before time and a new effect/reservation exactly once.
+- [x] Add endpoint cases: omitted override uses recorded URL; different flag/env URL exits 2 before key read/task mutation; old missing endpoint defaults only to official endpoint; status/export match submission.
+- [x] Enforce 8 MiB serialized-request cap before blob/turn/reservation creation. Test exact boundary and cap+1, with a specific context-size failure.
+- [x] Implement permanent/transient classification, durable 2–60-second backoff, both `Retry-After` forms, bounded polling, and compatibility rules from the spec. Add `httpdate` only if needed; the checked current version is [1.0.3](https://docs.rs/crate/httpdate/latest).
+- [x] Run the package gate and update README error/retry/compatibility documentation.
 
 ```sh
 docker compose run --rm test cargo test -p agentos-engine --locked --test provider --test model_agent --test model_flow --test model_crash_matrix --test recover_forfeit
@@ -132,9 +145,9 @@ docker compose run --rm test cargo test -p agentos-cli --test cli --locked
 
 **Files:** `Cargo.toml`, `Cargo.lock`, `Dockerfile`, `rust-toolchain.toml`; new `.python-version`; new versioned recipe under `guest/`; interpreter provenance in `scripts/build-guest-image.sh` and image metadata.
 
-- [ ] Recheck official latest versions online. On 2026-10-04 the checked candidates are [Tokio 1.53.2](https://docs.rs/crate/tokio/latest), [UUID 1.27.0](https://docs.rs/crate/uuid/latest), and [Python 3.14.8](https://www.python.org/downloads/). Rust remains [1.98.1](https://doc.rust-lang.org/stable/releases.html).
-- [ ] Update Tokio and UUID as scoped changes, remove unused `jsonschema` workspace declaration, and preserve reviewed locked dependencies otherwise.
-- [ ] Pin pyenv itself by reviewed release/commit and Python source/version/checksum in the Docker development image; record `.python-version`. Add a new Python guest recipe rather than changing an existing registered digest.
+- [x] Recheck official latest versions online. On 2026-10-04 the checked candidates are [Tokio 1.53.2](https://docs.rs/crate/tokio/latest), [UUID 1.27.0](https://docs.rs/crate/uuid/latest), and [Python 3.14.8](https://www.python.org/downloads/). Rust remains [1.98.1](https://doc.rust-lang.org/stable/releases.html).
+- [x] Update Tokio and UUID as scoped changes, remove unused `jsonschema` workspace declaration, and preserve reviewed locked dependencies otherwise.
+- [x] Pin pyenv itself by reviewed release/commit and Python source/version/checksum in the Docker development image; record `.python-version`. Add a new Python guest recipe rather than changing an existing registered digest.
 - [ ] Add fixture/profile compatibility cases for both interpreters. Verify two clean builds of the new guest image are byte-identical and interpreter provenance is correct.
 
 ```sh
@@ -175,7 +188,7 @@ docker compose run --rm -e AGENTOS_TEST_WORKER=firecracker-fake -e AGENTOS_TEST_
 
 **Files:** `crates/agentos-engine/tests/live_model.rs`, `crates/agentos-engine/tests/common/{live,kvm}.rs`; new `scripts/acceptance.sh`; sanitized evidence under `docs/evidence/`; versioned recordings under `fixtures/transcripts/`.
 
-- [ ] Refactor live harness to accept recorded worker configuration; add host and jailed variants. Test both harness paths against the local fake API first.
+- [x] Refactor live harness to accept recorded worker configuration; add host and jailed variants. Test both harness paths against the local fake API first.
 - [ ] Run a real host repair and jailed repair with bounded contract budgets and a mounted regular key file. Save recordings where they can be exported from the Compose target volume.
 - [ ] Replay the recordings without network and compare request digests, call count, workspace digest, protected profile evidence, and exported patch.
 - [ ] Run real KVM hostile profiles, conformance, and the full real-worker crash suite:
