@@ -29,9 +29,10 @@ apply the reviewed patch to a clean copy.
 
 Current completion work is tracked in the [v0.1 plan](docs/superpowers/plans/2026-10-04-v01-completion.md).
 Model deadlines, bounded I/O, versioned retry/endpoint policy, the development runtime, and
-CI are implemented and tested offline. Real provider/KVM acceptance remains open; GC,
-contract-driven VM resources, the component analyzer, and fresh-host release validation
-remain planned work.
+CI are implemented and tested offline. Conservative transient GC and host publication
+failure recovery are implemented in the current completion worktree. Real provider/KVM
+acceptance remains open; contract-driven VM resources, the component analyzer, and
+fresh-host release validation remain planned work.
 
 Required offline gates are centralized in `sh scripts/check.sh`: formatting, strict Clippy,
 host tests and fake-jail tests, all through Docker Compose with the lockfile enforced.
@@ -955,8 +956,8 @@ The Firecracker worker:
   again when building the executor). A host change in between leaves the task READY and
   unapproved.
 - **Workspace and scratch image sizes are constants** (`ws.img` 1 GiB, `scratch.img` 512 MiB),
-  not contract limits, and the images are never garbage-collected (the jails are). A killed job
-  leaves its `scratch.img`.
+  not contract limits. `gc` collects eligible terminal workspace images and settled job
+  copies; a killed job's `scratch.img` stays while its receipt or effect is unresolved.
 - **One VM boot per effect** (about 0.65 s to `Ready` here) and one inspector boot per resume
   and per receipt-less patch; no VM reuse or snapshots.
 - **Executable bits are lost** in the guest: the protocol's `File{path, len}` carries no mode, so
@@ -1029,8 +1030,8 @@ The model workflow (Phase 4):
 - **An exported `model/NNNN-response.json` can be the engine's failure record**, not an API
   response, for a model call that failed with an HTTP error (the manifest's `state` says
   `FAILED`).
-- **`<home>/model/` is never garbage-collected, and `retained_outcome` scans it.** Retained
-  responses accumulate for the life of the home, and each lookup lists the whole directory.
+- **`retained_outcome` scans `<home>/model/`.** `gc` removes proven redundant terminal-task
+  response copies; uncollected entries still make each lookup scan the directory.
 - **Resuming a cancel-pending `anthropic:` task without a key exits 2.** `resume` needs the
   provider; use `agentos cancel`, which does not.
 - **Older demo transcripts predate the `model` field** of `status` (and `Submitted.model` as a
@@ -1062,7 +1063,8 @@ Carried from 3a:
   completion, and the next request is denied.
 - **`Denied` rows are forgeable.** They are audit rows any caller can append; only the
   `Capability*` rows are written by the broker itself.
-- **No job-directory garbage collection.** `<home>/jobs` grows with every attempt.
+- **Job collection is conservative.** `gc` requires terminal tasks, settled effects,
+  published receipts and free locks; unknown or unresolved copies remain.
 - **Export bypasses the effect model.** It is authorized through the broker
   (`artifact.export`, journaled, revocable) but is not a journaled effect; it leaves an
   `Exported` audit row.
@@ -1096,3 +1098,31 @@ they require a usable `/dev/kvm`, and live also requires a regular nonsymlink ke
 at most 4096 bytes. Live runs mount that file read-only and produce host and actual jailed
 recordings, exports, and replay comparisons under `build/evidence/`.
 See [evidence collection](docs/evidence/README.md) for runner setup and pending gates.
+
+## Collecting transient data
+
+```sh
+agentos --home /path/to/home gc --dry-run
+agentos --home /path/to/home gc
+```
+
+Both commands return JSON entries with `candidate`, `deleted` or `refused` status and a
+reason. The driver lock excludes running controllers. This first collector removes only
+published job/model copies and workspaces of fully settled terminal tasks. It preserves
+the journal, task inputs, registries, every blob, and exported patch/evidence. Dry-run
+can create workspace lock files but deletes no task data.
+
+Any validation refusal retains the entire pass: finish/reconcile outstanding work and
+inspect the reported reason before retrying. Active tasks, busy locks, missing/corrupt
+receipts or blobs, inspection/jail leftovers, symlinks, hard links, mounted data and unexpected special
+files are retained. The owned top-level Firecracker `v.sock` is allowed after the same
+receipt and lock checks. The report is capped at 1000 candidates and each tree
+at 10000 entries; an over-limit home is retained rather than partially collected. Empty
+historical workspace parents do not consume the candidate limit. GC
+never launches a model, worker or inspector and does not clean external cgroups.
+
+Deletion uses pinned directory handles and stages each candidate under `gc-trash` with
+a durable ownership ticket before removal. After interruption, rerun `gc`; it can finish
+an eligible staged deletion even after its original receipt files have been removed.
+Mount-root detection requires a supported Linux kernel; when unavailable, GC reports
+a refusal and retains the data.

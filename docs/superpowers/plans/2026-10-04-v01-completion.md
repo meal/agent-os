@@ -19,8 +19,9 @@ Compose/CI checks and accurate status documentation. Package 7's host and jailed
 are verified with the local fake API, with acceptance/evidence tooling ready.
 
 The user requested continuing offline and will provide live/KVM setup later. No real
-provider or KVM run has been performed in this execution. Packages 8–12 remain planned;
-they require focused designs and later acceptance gates. This is an offline reliability
+provider or KVM run has been performed in this execution. Package 8 has been implemented
+offline in the continued completion worktree. Packages 9–12 remain planned and require
+focused designs and later acceptance gates. This is an offline reliability
 milestone, not completed v0.1 acceptance. See [evidence collection](../../evidence/README.md).
 
 ## Global Constraints
@@ -210,10 +211,17 @@ docker compose run --rm -e AGENTOS_TEST_WORKER=firecracker test-kvm cargo test -
 
 **Interfaces:** proposed `agentos gc --dry-run` and `agentos gc`; shared collector produces a bounded JSON report of owned candidates/deletions/refusals. No task/linked artifact deletion in this first collector.
 
-- [ ] Write focused GC design and implementation plan with exact ownership/reference predicates and deletion order before destructive implementation.
-- [ ] Add cases: live job/inspection excluded; terminal task with outstanding effects excluded; pending-cancel task retained; missing receipt retained; settled retained model response collectable; repeated collection idempotent; symlink candidate refused; export unchanged after collection.
-- [ ] Hold driver lock, revalidate workspace/job locks and references, and remove only reconstructible owned transient paths.
-- [ ] Inject ENOSPC before rename/fsync/reference publication using an isolated bounded filesystem or explicit publication fault seam. Recover after clearing the fault and assert no false success/reference.
+- [x] Write focused GC design and implementation plan with exact ownership/reference predicates and deletion order before destructive implementation.
+- [x] Add cases: live job/inspection excluded; terminal task with outstanding effects excluded; pending-cancel task retained; missing receipt retained; settled retained model response collectable; repeated collection idempotent; symlink candidate refused; export unchanged after collection.
+- [x] Hold driver lock, revalidate workspace/job locks and references, and remove only reconstructible owned transient paths.
+- [x] Inject ENOSPC before rename/fsync/reference publication using an isolated bounded filesystem or explicit publication fault seam. Recover after clearing the fault and assert no false success/reference.
+
+Implemented and verified offline through the [focused plan](2026-10-04-conservative-gc.md).
+Independent review fixes add descriptor-relative deletion, durable interruption tickets,
+candidate identity pins and historical-parent handling. Actual read-only bind mounts and
+oversized malformed-receipt errors also have regressions. The collector deliberately
+retains the whole pass after a validation refusal and leaves inspection/cgroup cleanup
+to existing worker reconciliation. See the [review record](../../reviews/2026-10-04-conservative-gc-review.md).
 
 ```sh
 docker compose run --rm test cargo test -p agentos-engine --test gc --locked
