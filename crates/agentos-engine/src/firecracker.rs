@@ -250,6 +250,14 @@ pub fn exit_code_text(status: &ExitStatus) -> String {
 /// `image.json` of a registered guest image.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct InterpreterProvenance {
+    pub version: String,
+    pub source_sha256: String,
+    pub pyenv_commit: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImageManifest {
     pub id: String,
     pub protocol: u32,
@@ -258,6 +266,8 @@ pub struct ImageManifest {
     pub agent_version: String,
     pub kernel_sha256: String,
     pub built_from: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interpreter: Option<InterpreterProvenance>,
 }
 
 /// Parses `<image_dir>/image.json` and checks that it speaks `GUEST_PROTOCOL` and names
@@ -266,6 +276,14 @@ pub fn read_image(image_dir: &Path) -> Result<ImageManifest, String> {
     let path = image_dir.join("image.json");
     let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let image: ImageManifest = serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    if let Some(interpreter) = &image.interpreter {
+        let hex = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if interpreter.version.is_empty() || interpreter.version.len() > 32
+            || !interpreter.version.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+            || !hex(&interpreter.source_sha256, 64) || !hex(&interpreter.pyenv_commit, 40) {
+            return Err("invalid interpreter provenance".into());
+        }
+    }
     if image.protocol != GUEST_PROTOCOL {
         return Err(format!("{}: guest image speaks protocol {}, expected {GUEST_PROTOCOL}", path.display(), image.protocol));
     }
@@ -1512,5 +1530,30 @@ mod tests {
         write(good);
         fs::remove_file(dir.path().join(ROOTFS_FILE)).unwrap();
         assert!(read_image(dir.path()).unwrap_err().contains("is missing"));
+    }
+
+    #[test]
+    fn image_manifest_records_optional_interpreter_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(KERNEL_FILE), b"k").unwrap();
+        fs::write(dir.path().join(ROOTFS_FILE), b"r").unwrap();
+        let mut value = serde_json::json!({
+            "id": "python-stdlib-py314-v1", "protocol": 1, "kernel": "vmlinux",
+            "rootfs": "rootfs.squashfs", "agent_version": "0.1.0",
+            "kernel_sha256": "0545ba1781fc06cfa1d7699069057f4538103fd1644100cf0da434899a1ed447",
+            "built_from": "test",
+            "interpreter": {
+                "version": "3.14.8",
+                "source_sha256": "c2215904f02b175596dc49351585104f4bc20341e1c47378b26a2c274360ce73",
+                "pyenv_commit": "3787bacc9188d76ba7ca24c23e26afb1a841a543"
+            }
+        });
+        let write = |v: &serde_json::Value| fs::write(dir.path().join("image.json"), serde_json::to_vec(v).unwrap()).unwrap();
+        write(&value);
+        let manifest = read_image(dir.path()).unwrap();
+        assert_eq!(serde_json::to_value(manifest).unwrap()["interpreter"], value["interpreter"]);
+        value["interpreter"]["source_sha256"] = serde_json::json!("invalid");
+        write(&value);
+        assert!(read_image(dir.path()).is_err());
     }
 }
