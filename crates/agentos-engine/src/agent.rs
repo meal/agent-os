@@ -40,7 +40,11 @@ pub enum Observation {
     /// The model answered: its content blocks, why it stopped and the tokens it produced.
     ModelResponse { content: serde_json::Value, stop_reason: String, output_tokens: u64 },
     /// The model request failed with an answer (an HTTP error, a refusal).
-    ModelCallFailed { reason: String },
+    ModelCallFailed {
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure: Option<crate::model::policy::ModelFailure>,
+    },
     /// The model request was sent but its outcome was lost; it was forfeited and counts as
     /// used.
     ModelCallLost,

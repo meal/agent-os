@@ -131,6 +131,12 @@ pub struct Manifest {
     pub contract_digest: Digest,
     /// The model recorded at submission, if any.
     pub model: Option<String>,
+    #[serde(default)]
+    pub model_policy_version: u32,
+    #[serde(default)]
+    pub model_limits_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_endpoint: Option<String>,
     /// Journal events of the task at export time.
     pub generated_events: usize,
     /// The task's capability handles, by 8-character prefix only (a full handle never
@@ -372,6 +378,10 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
         usage_summary: db.usage_summary(task)?,
         contract_digest,
         model: submitted.and_then(|s| s["model"].as_str()).map(str::to_string),
+        model_policy_version: crate::model::policy::versions(db, task)?.0,
+        model_limits_version: crate::model::policy::versions(db, task)?.1,
+        model_endpoint: submitted.filter(|s| s["model"].as_str().is_some_and(|m| m.starts_with("anthropic:")))
+            .map(|s| s["model_endpoint"].as_str().unwrap_or(crate::model::anthropic::ANTHROPIC_BASE_URL).to_string()),
         generated_events: events.len(),
         capabilities: db
             .grants(task)?
@@ -516,6 +526,9 @@ mod tests {
             usage_summary: UsageSummary::default(),
             contract_digest: Digest::of(b"contract"),
             model: None,
+            model_policy_version: 0,
+            model_limits_version: 0,
+            model_endpoint: None,
             generated_events: 1,
             capabilities: Vec::new(),
             guest_image_digest: None,

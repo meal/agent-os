@@ -509,6 +509,27 @@ impl Home {
         self.anthropic_base_url.as_deref().map(validate_base_url).transpose()
     }
 
+    pub fn recorded_model_endpoint(&self, store: &Store, task: &TaskId) -> Result<Option<String>, CliError> {
+        if !self.recorded_model(store, task)?.is_some_and(|m| m.starts_with("anthropic:")) {
+            return Ok(None);
+        }
+        let payload = self.submitted_payload(store, task)?;
+        let endpoint = payload.as_ref().and_then(|p| p["model_endpoint"].as_str())
+            .unwrap_or(agentos_engine::model::anthropic::ANTHROPIC_BASE_URL);
+        Ok(Some(validate_base_url(endpoint)?.trim_end_matches('/').to_string()))
+    }
+
+    /// Resolve before reading credentials or mutating the task. Legacy tasks with no
+    /// recorded endpoint may only use the official endpoint.
+    pub fn model_endpoint(&self, store: &Store, task: &TaskId) -> Result<Option<String>, CliError> {
+        let recorded = self.recorded_model_endpoint(store, task)?;
+        if let Some(endpoint) = &recorded && let Some(requested) = self.checked_base_url()?
+            && requested.trim_end_matches('/') != endpoint {
+            return Err(CliError::usage("provider override differs from the recorded endpoint; submit a new task to change providers"));
+        }
+        Ok(recorded)
+    }
+
     /// The provider for `task`'s recorded model: Anthropic (needs the key), the scripted fake
     /// over the task's own copy of the transcript, or none for the fake agent. With `lenient`
     /// (recovery and cancel, which never send) a provider that cannot be built is `None`
@@ -516,7 +537,7 @@ impl Home {
     fn provider(&self, store: &Store, task: &TaskId, lenient: bool) -> Result<Option<Box<dyn ModelProvider>>, CliError> {
         let Some(model) = self.recorded_model(store, task)? else { return Ok(None) };
         let built = if model.starts_with("anthropic:") {
-            self.checked_base_url().and_then(|base| {
+            self.model_endpoint(store, task).and_then(|base| {
                 let provider = AnthropicProvider::new(self.api_key()?);
                 let provider = match base {
                     Some(url) => provider.with_base_url(url),
@@ -565,6 +586,7 @@ impl Home {
     }
 
     fn build_executor(&self, store: &Store, task: &TaskId, lenient: bool) -> Result<RoutingExecutor<SupervisedExecutor>, CliError> {
+        if !lenient { self.model_endpoint(store, task)?; }
         let recorded = self.task_worker(store, task)?;
         let dir = self.task_dir(task);
         if !dir.join("snapshot").is_dir() || !dir.join("profile").is_dir() {

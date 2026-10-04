@@ -30,11 +30,15 @@ pub(crate) struct Cx<'a, E> {
     /// Set in closing mode: recovery publishes and reconciles what is in flight, dispatches
     /// nothing, and fails the task with this reason (see [`Cx::closing_with`]).
     pub closing: Option<String>,
+    pub model_policy_version: u32,
+    pub model_limits_version: u32,
 }
 
 impl<'a, E> Cx<'a, E> {
     pub fn new(db: &'a Db, blobs: &'a BlobStore, exec: &'a E, task: &TaskId, opts: &'a RunOptions) -> Result<Self> {
-        Ok(Cx { db, blobs, exec, contract: db.contract(task)?, task: task.clone(), opts, closing: None })
+        let (model_policy_version, model_limits_version) = crate::model::policy::versions(db, task)?;
+        Ok(Cx { db, blobs, exec, contract: db.contract(task)?, task: task.clone(), opts, closing: None,
+            model_policy_version, model_limits_version })
     }
 
     /// The same run in closing mode: the task is being ended with `reason`.
@@ -47,6 +51,8 @@ impl<'a, E> Cx<'a, E> {
             task: self.task.clone(),
             opts: self.opts,
             closing: Some(reason.to_string()),
+            model_policy_version: self.model_policy_version,
+            model_limits_version: self.model_limits_version,
         }
     }
 

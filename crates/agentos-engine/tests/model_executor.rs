@@ -20,6 +20,20 @@ use common::{contract_model, routing_over, Env};
 
 const GOOD: &[u8] = br#"{"content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":2}}"#;
 
+#[tokio::test]
+async fn definite_failures_retain_typed_classification_with_matching_digest() {
+    for (status, class) in [(401, "Permanent"), (429, "Transient"), (529, "Transient")] {
+        let dir = tempfile::tempdir().unwrap();
+        let (ex, _) = exec(dir.path(), vec![ProviderResult::Rejected { status, body: "denied".into() }], &ExecCounts::default());
+        let r = req(model_kind());
+        let out = ex.run(&r, &ctx()).await;
+        let value: serde_json::Value = serde_json::from_slice(&out.output).unwrap();
+        assert_eq!(value["failure"]["class"], class);
+        assert_eq!(out.receipt.result_digest, Some(Digest::of(&out.output)));
+        assert_eq!(ex.retained_outcome(&r.effect_id), Some(out));
+    }
+}
+
 fn contract() -> Contract {
     contract_model(3, 5).0
 }

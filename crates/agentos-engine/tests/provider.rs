@@ -10,6 +10,27 @@ use common::{fix_patch, transcript};
 
 const BODY: &[u8] = br#"{"messages":[{"role":"user","content":"go"}]}"#;
 
+#[tokio::test]
+async fn retry_after_headers_reach_the_caller_without_client_retry() {
+    for (header, expected) in [
+        ("Thu, 01 Jan 1970 00:02:00 GMT", Some(120)),
+        ("invalid", None),
+        ("-1", None),
+    ] {
+        let api = serve(Reply::Raw(format!("HTTP/1.1 429 Too Many Requests\r\nretry-after: {header}\r\ncontent-length: 4\r\nconnection: close\r\n\r\nbusy").into_bytes()));
+        let result = provider(&api, Duration::from_secs(5)).complete(BODY).await;
+        match (expected, result) {
+            (Some(want), ProviderResult::RejectedWithRetryAfter { status: 429, body, retry_not_before_ts }) => {
+                assert_eq!(body, "busy");
+                assert_eq!(retry_not_before_ts, want);
+            }
+            (None, ProviderResult::Rejected { status: 429, body }) => assert_eq!(body, "busy"),
+            (_, other) => panic!("unexpected result: {other:?}"),
+        }
+        assert_eq!(api.hits(), 1);
+    }
+}
+
 fn raw_success(payload: &[u8], chunked: bool) -> Vec<u8> {
     let mut wire = if chunked {
         b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n".to_vec()

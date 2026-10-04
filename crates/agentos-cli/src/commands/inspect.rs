@@ -28,6 +28,7 @@ pub fn status(home: &Home, task: &TaskId) -> Result<(), CliError> {
         .map(|g| json!({ "operation": g.operation, "handle_prefix": g.handle.prefix(), "revoked": g.revoked, "expires_ts": g.expires_ts }))
         .collect();
     let worker = home.recorded_worker(&store, task)?;
+    let (model_policy_version, model_limits_version) = agentos_engine::model::policy::versions(&store.db, task)?;
     let mut shown = json!({
         "task_id": t.id,
         "state": t.state.label(),
@@ -42,6 +43,9 @@ pub fn status(home: &Home, task: &TaskId) -> Result<(), CliError> {
         "capabilities": capabilities,
         "worker": worker.kind.as_str(),
         "model": home.recorded_model(&store, task)?.unwrap_or_else(|| FAKE_AGENT.to_string()),
+        "model_policy_version": model_policy_version,
+        "model_limits_version": model_limits_version,
+        "model_endpoint": home.recorded_model_endpoint(&store, task)?,
     });
     if let Some((id, digest)) = &worker.image {
         shown["guest_image"] = json!({ "id": id, "digest": digest });

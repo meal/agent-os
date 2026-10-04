@@ -157,7 +157,7 @@ fn capability_names(contract: &Contract) -> Vec<String> {
 }
 
 /// What the owner approves, on stderr.
-fn summarize(task: &TaskId, contract: &Contract, repo: &Digest, profile: &Digest, agent: &str, fc: Option<&FirecrackerRecord>) {
+fn summarize(task: &TaskId, contract: &Contract, repo: &Digest, profile: &Digest, agent: &str, fc: Option<&FirecrackerRecord>, endpoint: Option<&str>) {
     let l = &contract.limits;
     eprintln!("task {task} submitted; approve these permissions before it runs:");
     eprintln!("  goal:                 {}", contract.goal);
@@ -170,6 +170,7 @@ fn summarize(task: &TaskId, contract: &Contract, repo: &Digest, profile: &Digest
         l.model_requests, l.max_output_tokens_per_request, l.tool_actions, l.deadline_seconds, l.worker_vcpus, l.worker_memory_mib
     );
     eprintln!("  agent:                {agent}");
+    if let Some(endpoint) = endpoint { eprintln!("  model endpoint:       {endpoint}"); }
     match fc {
         None => eprintln!("  worker:               host (not sandboxed)"),
         Some(fc) => eprintln!(
@@ -218,6 +219,14 @@ pub async fn submit(home: &Home, task_file: &Path, yes: bool, patch: Option<&Pat
         "profile_id": contract.verification_profile,
         "profile_digest": profile_digest,
         "model": model.as_ref().map_or_else(|| FAKE_AGENT.to_string(), ModelSpec::recorded),
+        "model_policy_version": 1,
+        "model_limits_version": 1,
+        "model_endpoint": match &model {
+            Some(ModelSpec::Anthropic(_)) => Some(home.checked_base_url()?
+                .unwrap_or_else(|| agentos_engine::model::anthropic::ANTHROPIC_BASE_URL.into())
+                .trim_end_matches('/').to_string()),
+            _ => None,
+        },
         "fake_agent_patch_digest": patch.as_ref().map(|p| Digest::of(p.as_bytes())),
     });
     let fields = submitted.as_object_mut().expect("an object");
@@ -247,7 +256,7 @@ pub async fn submit(home: &Home, task_file: &Path, yes: bool, patch: Option<&Pat
         (None, Some(m), None) => m.recorded(),
         (None, None, _) => "none yet".to_string(),
     };
-    summarize(&task, &contract, &repo_digest, &profile_digest, &agent, firecracker.as_ref());
+    summarize(&task, &contract, &repo_digest, &profile_digest, &agent, firecracker.as_ref(), submitted["model_endpoint"].as_str());
 
     match lock.filter(|_| patch.is_some() || model.is_some()) {
         Some(lock) => {

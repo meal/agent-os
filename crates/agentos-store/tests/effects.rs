@@ -19,6 +19,26 @@ use serde_json::json;
 
 const SAME_OUTPUT: &[u8] = b"ok\n";
 
+#[test]
+fn model_retry_schedule_is_owned_idempotent_and_validates_the_failed_effect() {
+    let fx = setup_with(MODEL_CAPS, 5, 5);
+    let kind = call(1);
+    let e = fx.db.record_intent(&fx.id, kind.clone(), Digest::of(b"request"), &fx.base(),
+        Reservation::for_kind(&kind, 1), &Resource::Task).unwrap();
+    assert!(fx.db.schedule_model_retry(&fx.id, &e.effect_id, 2, 2, None, 1).is_err());
+    let attempt = AttemptId::new();
+    fx.db.mark_dispatched(&e.effect_id, &attempt, "model", 1).unwrap();
+    fx.db.complete_effect(&e.effect_id, &receipt(&e, &attempt, 1, Outcome::Failure("busy".into())), None, None).unwrap();
+    let scheduled = fx.db.schedule_model_retry(&fx.id, &e.effect_id, 2, 2, None, 1).unwrap();
+    let again = fx.reopen().schedule_model_retry(&fx.id, &e.effect_id, 2, 60, Some(i64::MAX), 1).unwrap();
+    assert_eq!(again, scheduled);
+    assert_eq!(fx.count_events("ModelRetryScheduled"), 1);
+    assert!(fx.db.schedule_model_retry(&TaskId::new(), &e.effect_id, 2, 2, None, 1).is_err());
+    assert!(fx.db.schedule_model_retry(&fx.id, &e.effect_id, 0, 2, None, 1).is_err());
+    assert!(fx.db.schedule_model_retry(&fx.id, &e.effect_id, 2, 2, None, 9).is_err());
+    assert!(matches!(fx.db.append_audit(&fx.id, "ModelRetryScheduled", &json!({})), Err(DbError::ReservedEventType(_))));
+}
+
 const MODEL_CAPS: &[&str] = &["snapshot.read", "workspace.apply_patch", "verification.run", "artifact.export", "model.request"];
 
 fn call(turn: u32) -> EffectKind {

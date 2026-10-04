@@ -25,6 +25,7 @@ const RESERVED_EVENT_TYPES: &[&str] = &[
     "EffectIntended", "EffectDispatched", "EffectCompleted", "EffectFailed", "EffectUnknown", "EffectAbandoned", "EffectForfeited",
     "ArtifactRegistered", "TaskEventRejected", "ReceiptIgnored", "ReceiptRejected",
     "CapabilitiesIssued", "CapabilityGranted", "CapabilityDenied", "CapabilityRevoked",
+    "ModelRetryScheduled",
 ];
 
 const SCHEMA: &str = "
@@ -147,6 +148,8 @@ pub enum DbError {
     UnprovenVerification(String),
     #[error("event type {0:?} is reserved for the store and the engine; an audit row may not use it")]
     ReservedEventType(String),
+    #[error("invalid model retry schedule: {0}")]
+    InvalidModelRetry(String),
     #[error("database schema version {found} is newer than the {supported} this build supports; upgrade agentos")]
     SchemaVersion { found: i64, supported: i64 },
     #[error("database was created by an older Agent OS; v0.1 databases are not migrated (schema version {found}, this build needs {supported})")]
@@ -335,7 +338,7 @@ impl Db {
     }
 
     /// Now, by the injectable clock (unix seconds).
-    pub(crate) fn now(&self) -> i64 {
+    pub fn now(&self) -> i64 {
         (self.clock)()
     }
 

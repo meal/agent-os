@@ -120,7 +120,7 @@ pub(crate) fn denial_observation(payload: &Value) -> Result<Observation> {
             Observation::VersionConflict { expected: decode(&payload["expected"])?, actual: decode(&payload["actual"])? }
         }
         Some("CapabilityDenied") if kind_name(&payload["kind"]) == Some("ModelCall") => {
-            Observation::ModelCallFailed { reason: "capability model.request not granted".into() }
+            Observation::ModelCallFailed { reason: "capability model.request not granted".into(), failure: None }
         }
         Some("CapabilityDenied") if matches!(kind_name(&payload["kind"]), Some("ListFiles" | "ReadFile")) => {
             Observation::FileReadRejected { reason: "capability snapshot.read not granted".into() }
@@ -236,7 +236,10 @@ pub(crate) fn effect_observation(blobs: &BlobStore, rec: &EffectRecord) -> Resul
                 output_tokens: result["usage"]["output_tokens"].as_u64().unwrap_or(0),
             }
         }
-        (EffectKind::ModelCall { .. }, EffectState::Failed) => Observation::ModelCallFailed { reason: reason()? },
+        (EffectKind::ModelCall { .. }, EffectState::Failed) => Observation::ModelCallFailed {
+            reason: reason()?,
+            failure: result.get("failure").map(decode).transpose()?,
+        },
         (EffectKind::ListFiles { .. }, EffectState::Completed) => {
             Observation::Files { files: decode(&result["files"])? }
         }
@@ -310,7 +313,7 @@ mod tests {
         let failed = with_result(&blobs, model(), EffectState::Failed, json!({ "reason": "http 400: bad" }));
         assert_eq!(
             effect_observation(&blobs, &failed).unwrap(),
-            Observation::ModelCallFailed { reason: "http 400: bad".into() }
+            Observation::ModelCallFailed { reason: "http 400: bad".into(), failure: None }
         );
 
         let bare = with_result(&blobs, model(), EffectState::Completed, json!({ "stop_reason": "end_turn" }));
@@ -364,7 +367,7 @@ mod tests {
             json!({ "reason": "CapabilityDenied", "capability": "model.request", "kind": { "ModelCall": { "model": "m", "turn": 1 } } });
         assert_eq!(
             denial_observation(&model_denied).unwrap(),
-            Observation::ModelCallFailed { reason: "capability model.request not granted".into() }
+            Observation::ModelCallFailed { reason: "capability model.request not granted".into(), failure: None }
         );
         for kind in [json!({ "ListFiles": { "turn": 1 } }), json!({ "ReadFile": { "path": "a", "turn": 1 } })] {
             let denied = json!({ "reason": "CapabilityDenied", "capability": "snapshot.read", "kind": kind });

@@ -213,7 +213,47 @@ fn expect_one(n: usize, what: &str, effect: &EffectId) -> Result<()> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ModelRetrySchedule {
+    pub failed_effect_id: EffectId,
+    pub retry_turn: u32,
+    pub not_before_ts: i64,
+    pub policy_version: u32,
+}
+
 impl Db {
+    /// Persist a retry wait once, owned by a finished model effect. Repeated calls return
+    /// the original timestamp; callers must release the transaction before waiting.
+    pub fn schedule_model_retry(
+        &self, task: &TaskId, failed_effect_id: &EffectId, retry_turn: u32,
+        delay_seconds: i64, provider_not_before: Option<i64>, policy_version: u32,
+    ) -> Result<ModelRetrySchedule> {
+        if policy_version != 1 || retry_turn == 0 || !(2..=60).contains(&delay_seconds) {
+            return Err(DbError::InvalidModelRetry("unsupported policy, turn or delay".into()));
+        }
+        let tx = self.immediate()?;
+        load_task(&tx, task)?;
+        let rec = load_effect(&tx, failed_effect_id)?;
+        if rec.task_id != *task || rec.state != EffectState::Failed || !matches!(rec.kind, EffectKind::ModelCall { .. }) {
+            return Err(DbError::InvalidModelRetry("requires this task's failed model effect".into()));
+        }
+        let existing: Option<String> = tx.query_row(
+            "SELECT payload FROM events WHERE task_id = ?1 AND type = 'ModelRetryScheduled'
+             AND json_extract(payload, '$.failed_effect_id') = ?2 ORDER BY seq LIMIT 1",
+            params![task.as_str(), failed_effect_id.as_str()], |row| row.get(0),
+        ).optional()?;
+        if let Some(payload) = existing {
+            return Ok(serde_json::from_str(&payload)?);
+        }
+        let schedule = ModelRetrySchedule {
+            failed_effect_id: failed_effect_id.clone(), retry_turn, policy_version,
+            not_before_ts: self.now().saturating_add(delay_seconds).max(provider_not_before.unwrap_or(i64::MIN)),
+        };
+        insert_event(&tx, task, "ModelRetryScheduled", &serde_json::to_value(&schedule)?)?;
+        tx.commit()?;
+        Ok(schedule)
+    }
+
     /// Records an effect as INTENDED together with its usage reservation, any tool action it
     /// consumes, and an `EffectIntended` event. Idempotent: an existing effect is returned as is.
     /// A new effect is authorized by the broker for `kind`'s capability on `resource`; the

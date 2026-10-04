@@ -6,7 +6,7 @@ use std::str::FromStr;
 
 use agentos_engine::crash::{CrashHook, CrashPoint};
 
-const KINDS: [&str; 6] = ["read_snapshot", "apply_patch", "run_verification", "model_call", "list_files", "read_file"];
+const KINDS: [&str; 7] = ["read_snapshot", "apply_patch", "run_verification", "model_call", "list_files", "read_file", "model_retry"];
 
 /// The command-line name of `point`, e.g. `after-dispatch`.
 pub fn point_name(point: CrashPoint) -> String {

@@ -5,9 +5,11 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentos_core::effect::{AttemptId, EffectId, EffectKind};
+use agentos_core::ids::Digest;
 use serde_json::Value;
 
 use super::provider::{ModelProvider, ProviderResult};
+use super::policy::{classify, ModelFailure, ModelFailureClass};
 use crate::crash::{CrashHook, CrashPoint};
 use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor};
 use crate::guestlink::guest_text;
@@ -101,6 +103,15 @@ fn well_formed(bytes: &[u8]) -> bool {
     serde_json::from_slice::<Value>(bytes).is_ok_and(|v| v["content"].is_array() && v["stop_reason"].is_string())
 }
 
+fn classified_failure(req: &EffectRequest, ctx: &AttemptCtx, reason: String, failure: ModelFailure) -> ExecOutcome {
+    let mut out = ExecOutcome::failure(req, ctx, reason);
+    let mut value: Value = serde_json::from_slice(&out.output).expect("failure JSON");
+    value["failure"] = serde_json::to_value(failure).expect("failure metadata");
+    out.output = serde_json::to_vec(&value).expect("failure JSON");
+    out.receipt.result_digest = Some(Digest::of(&out.output));
+    out
+}
+
 impl Executor for ModelExecutor {
     async fn run(&self, req: &EffectRequest, ctx: &AttemptCtx) -> ExecOutcome {
         if !matches!(req.kind, EffectKind::ModelCall { .. }) {
@@ -124,10 +135,16 @@ impl Executor for ModelExecutor {
             ProviderResult::Response(bytes, _usage) if well_formed(&bytes) => ExecOutcome::success(req, ctx, bytes),
             ProviderResult::Response(bytes, _usage) => {
                 let excerpt = String::from_utf8_lossy(&bytes[..bytes.len().min(EXCERPT)]).into_owned();
-                ExecOutcome::failure(req, ctx, format!("malformed model response: {}", guest_text(&excerpt)))
+                classified_failure(req, ctx, format!("malformed model response: {}", guest_text(&excerpt)),
+                    ModelFailure { class: ModelFailureClass::Permanent, retry_not_before_ts: None })
             }
             ProviderResult::Rejected { status, body } => {
-                ExecOutcome::failure(req, ctx, format!("http {status}: {}", guest_text(&body)))
+                classified_failure(req, ctx, format!("http {status}: {}", guest_text(&body)),
+                    ModelFailure { class: classify(status), retry_not_before_ts: None })
+            }
+            ProviderResult::RejectedWithRetryAfter { status, body, retry_not_before_ts } => {
+                classified_failure(req, ctx, format!("http {status}: {}", guest_text(&body)),
+                    ModelFailure { class: classify(status), retry_not_before_ts: Some(retry_not_before_ts) })
             }
             ProviderResult::Transport(why) => {
                 ExecOutcome::unresolved(req, ctx, format!("transport failure: {}", guest_text(&why)))

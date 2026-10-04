@@ -1,5 +1,5 @@
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::provider::{ApiKey, BoxFuture, ModelProvider, ProviderResult, usage_of};
 
@@ -106,8 +106,15 @@ impl ModelProvider for AnthropicProvider {
                     Err(reason) => ProviderResult::Transport(reason),
                 }
             } else {
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+                let retry_not_before_ts = resp.headers().get("retry-after")
+                    .and_then(|h| h.to_str().ok())
+                    .and_then(|h| super::policy::parse_retry_after(h, now));
                 let body = read_error_excerpt(resp).await;
-                ProviderResult::Rejected { status, body }
+                match retry_not_before_ts {
+                    Some(retry_not_before_ts) => ProviderResult::RejectedWithRetryAfter { status, body, retry_not_before_ts },
+                    None => ProviderResult::Rejected { status, body },
+                }
             }
         })
     }

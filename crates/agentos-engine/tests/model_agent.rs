@@ -209,7 +209,7 @@ fn failed_and_lost_calls_are_asked_again_and_budget_exhaustion_finishes() {
     let mut a = agent();
     let first = a.next(&start());
     let n = a.history().len();
-    let again = a.next(&Observation::ModelCallFailed { reason: "http 500".into() });
+    let again = a.next(&Observation::ModelCallFailed { reason: "http 500".into(), failure: None });
     assert_eq!(body_of(&first), body_of(&again));
     let lost = a.next(&Observation::ModelCallLost);
     assert_eq!(body_of(&first), body_of(&lost));

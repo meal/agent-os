@@ -5,5 +5,6 @@ pub mod anthropic;
 pub mod executor;
 pub mod fake;
 pub mod provider;
+pub mod policy;
 
 pub use executor::ModelExecutor;

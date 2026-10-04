@@ -28,6 +28,179 @@ fn failed_reason(env: &Env) -> String {
     failed.payload["Failed"]["reason"].as_str().unwrap().to_string()
 }
 
+fn policy_one(env: &Env) {
+    env.db.append_audit(&env.task, "Submitted", &json!({
+        "model_policy_version": 1, "model_limits_version": 1, "model": "fake:test"
+    })).unwrap();
+}
+
+#[tokio::test]
+async fn policy_one_transport_loss_waits_and_preserves_uncertain_usage() {
+    let mut responses = vec![ProviderResult::Transport("lost".into())];
+    responses.extend(fixture_responses("parser-fix"));
+    let (env, exec, provider) = flow_with(FakeProvider::scripted(responses), 12, 10);
+    policy_one(&env);
+    assert_eq!(run_model(&env, &exec).await, TaskState::Succeeded);
+    assert_eq!(provider.calls(), 7);
+    assert_eq!(env.count("ModelRetryScheduled"), 1);
+    let usage = env.db.usage_summary(&env.task).unwrap();
+    assert_eq!((usage.uncertain_model_requests, usage.settled_model_requests, usage.reserved_model_requests), (1, 6, 0));
+}
+
+#[tokio::test]
+async fn policy_one_malformed_complete_response_stops_after_one_send() {
+    let (env, exec, provider) = flow_with(FakeProvider::scripted(vec![
+        ProviderResult::Response(b"not JSON".to_vec(), Default::default()),
+    ]), 12, 10);
+    policy_one(&env);
+    assert_eq!(run_model(&env, &exec).await, TaskState::Failed);
+    assert_eq!(provider.calls(), 1);
+    assert!(failed_reason(&env).contains("malformed model response"));
+}
+
+#[tokio::test]
+async fn policy_one_stops_permanent_errors_after_one_settled_send() {
+    for status in [400, 401, 403, 404, 302] {
+        let (env, exec, provider) = flow_with(FakeProvider::scripted(vec![
+            ProviderResult::Rejected { status, body: "denied".into() },
+        ]), 12, 10);
+        policy_one(&env);
+        assert_eq!(run_model(&env, &exec).await, TaskState::Failed);
+        assert_eq!(provider.calls(), 1, "status {status}");
+        assert!(failed_reason(&env).contains(&format!("http {status}")), "{}", failed_reason(&env));
+        assert_eq!(env.db.usage_summary(&env.task).unwrap().settled_model_requests, 1);
+    }
+}
+
+#[tokio::test]
+async fn policy_one_records_a_wait_then_uses_a_fresh_effect() {
+    let mut responses = vec![ProviderResult::Rejected { status: 529, body: "busy".into() }];
+    responses.extend(fixture_responses("parser-fix"));
+    let (env, exec, provider) = flow_with(FakeProvider::scripted(responses), 12, 10);
+    policy_one(&env);
+    let started = std::time::Instant::now();
+    assert_eq!(run_model(&env, &exec).await, TaskState::Succeeded);
+    assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+    assert_eq!(provider.calls(), 7);
+    assert_eq!(env.count("ModelRetryScheduled"), 1);
+    let calls = env.effects("ModelCall");
+    assert_ne!(calls[0].effect_id, calls[1].effect_id);
+    assert_eq!(calls[0].request_digest, calls[1].request_digest);
+    assert_eq!(env.db.usage_summary(&env.task).unwrap().settled_model_requests, 7);
+}
+
+#[test]
+fn legacy_failure_observation_serializes_without_new_metadata() {
+    let fixture = json!({"ModelCallFailed": {"reason": "http 401: denied"}});
+    let observation: agentos_engine::agent::Observation = serde_json::from_value(fixture.clone()).unwrap();
+    assert_eq!(serde_json::to_value(observation).unwrap(), fixture);
+    let new_fixture = json!({"ModelCallFailed": {"reason": "http 429: busy",
+        "failure": {"class": "Transient", "retry_not_before_ts": 120}}});
+    let observation: agentos_engine::agent::Observation = serde_json::from_value(new_fixture.clone()).unwrap();
+    assert_eq!(serde_json::to_value(observation).unwrap(), new_fixture);
+}
+
+#[tokio::test]
+async fn retry_schedule_survives_crashes_without_an_extra_reservation() {
+    for (point, kind, occurrence) in [
+        (CrashPoint::AfterComplete, "model_retry", 0),
+        (CrashPoint::AfterAgentTurnJournaled, "model_call", 1),
+        (CrashPoint::AfterIntent, "model_call", 1),
+    ] {
+        let mut responses = vec![ProviderResult::Rejected { status: 429, body: "busy".into() }];
+        responses.extend(fixture_responses("parser-fix"));
+        let (env, exec, provider) = flow_with(FakeProvider::scripted(responses), 12, 10);
+        policy_one(&env);
+        let opts = RunOptions::crash_with(CrashHook::new(move |p, ctx| p == point
+            && ctx.kind == Some(kind) && ctx.occurrence == occurrence));
+        let error = run_task_with(&env.db, &env.blobs, &exec, &mut model_agent(&env), &env.task, &opts).await.unwrap_err();
+        assert!(matches!(error, agentos_engine::runner::EngineError::Crashed(_)));
+        assert_eq!(provider.calls(), 1);
+        let original = env.events().into_iter().find(|e| e.event_type == "ModelRetryScheduled").unwrap().payload;
+        assert_eq!(run_model(&env, &exec).await, TaskState::Succeeded);
+        assert_eq!(provider.calls(), 7);
+        assert_eq!(env.count("ModelRetryScheduled"), 1);
+        assert_eq!(env.events().into_iter().find(|e| e.event_type == "ModelRetryScheduled").unwrap().payload, original);
+        assert_eq!(env.effects("ModelCall").len(), 7);
+        assert_eq!(env.db.usage_summary(&env.task).unwrap().settled_model_requests, 7);
+    }
+}
+
+#[tokio::test]
+async fn retry_wait_obeys_pause_cancel_and_revocation_without_more_sends() {
+    for action in ["pause", "cancel", "revoke"] {
+        let (env, exec, _) = flow_with(FakeProvider::scripted(vec![]), 12, 10);
+        policy_one(&env);
+        // Keep the provider timestamp within the deadline, so the test actually waits.
+        let deadline = env.db.deadline_ts(&env.task).unwrap();
+        // Replace the script with a wait of up to 30 seconds.
+        let waiting = FakeProvider::scripted(vec![ProviderResult::RejectedWithRetryAfter {
+            status: 429, body: "busy".into(), retry_not_before_ts: deadline - 1,
+        }]);
+        let exec = RoutingExecutor::new(exec.jobs,
+            agentos_engine::model::ModelExecutor::new(env.dir.path().join("model"), Some(Box::new(waiting.clone())), Default::default()), exec.reads);
+        let writer = env.second_db();
+        let interrupt = async {
+            for _ in 0..100 {
+                if writer.events(&env.task).unwrap().iter().any(|e| e.event_type == "ModelRetryScheduled") { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(writer.events(&env.task).unwrap().iter().any(|e| e.event_type == "ModelRetryScheduled"));
+            let instant = std::time::Instant::now();
+            match action {
+                "pause" => { writer.append(&env.task, &TaskEvent::Paused).unwrap(); }
+                "cancel" => { writer.append(&env.task, &TaskEvent::CancelRequested).unwrap(); }
+                _ => { writer.revoke(&env.task, Some(agentos_core::contract::Capability::ModelRequest)).unwrap(); }
+            }
+            instant
+        };
+        let (state, interrupted_at) = tokio::time::timeout(std::time::Duration::from_secs(5),
+            async { tokio::join!(run_model(&env, &exec), interrupt) }).await.unwrap();
+        assert_eq!(state, match action { "pause" => TaskState::Paused, "cancel" => TaskState::Cancelled, _ => TaskState::Failed });
+        assert!(interrupted_at.elapsed() < std::time::Duration::from_millis(500));
+        assert_eq!(waiting.calls(), 1);
+        assert_eq!(env.effects("ModelCall").len(), 1);
+        assert_eq!(env.db.usage_summary(&env.task).unwrap().reserved_model_requests, 0);
+    }
+}
+
+#[tokio::test]
+async fn retry_after_the_deadline_fails_without_a_second_send() {
+    let (env, exec, provider) = flow_with(FakeProvider::scripted(vec![
+        ProviderResult::RejectedWithRetryAfter { status: 429, body: "busy".into(), retry_not_before_ts: i64::MAX },
+    ]), 12, 10);
+    policy_one(&env);
+    assert_eq!(run_model(&env, &exec).await, TaskState::Failed);
+    assert_eq!(provider.calls(), 1);
+    assert!(failed_reason(&env).contains("retry would exceed task deadline"));
+}
+
+#[tokio::test]
+async fn policy_one_request_limit_precedes_turn_blob_and_reservation() {
+    for size in [8 * 1024 * 1024, 8 * 1024 * 1024 + 1] {
+        let (env, exec, provider) = flow_with(FakeProvider::scripted(vec![ok(json!({
+            "content": [], "stop_reason": "end_turn"
+        }))]), 12, 10);
+        policy_one(&env);
+        let body = vec![b' '; size];
+        let request = Digest::of(&body);
+        let mut agent = agentos_engine::agent::FakeAgent::scripted(vec![
+            agentos_engine::agent::AgentAction::CallModel { request, body }
+        ]);
+        assert_eq!(run_task(&env.db, &env.blobs, &exec, &mut agent, &env.task).await.unwrap(), TaskState::Failed);
+        if size == 8 * 1024 * 1024 {
+            assert_eq!(provider.calls(), 1);
+            assert_eq!(env.effects("ModelCall").len(), 1);
+        } else {
+            assert_eq!(provider.calls(), 0);
+            assert!(env.effects("ModelCall").is_empty());
+            assert_eq!(env.count("AgentTurn"), 0);
+            assert!(!env.blobs.exists(&request));
+            assert!(failed_reason(&env).contains("context size"));
+        }
+    }
+}
+
 fn ok(v: Value) -> ProviderResult {
     ProviderResult::Response(serde_json::to_vec(&v).unwrap(), usage_of(&v))
 }

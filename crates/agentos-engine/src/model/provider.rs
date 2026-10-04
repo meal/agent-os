@@ -25,6 +25,8 @@ pub enum ProviderResult {
     Response(Vec<u8>, Usage),
     /// A non-2xx answer; the body is bounded.
     Rejected { status: u16, body: String },
+    /// A definite rejection with the provider's parsed Retry-After timestamp.
+    RejectedWithRetryAfter { status: u16, body: String, retry_not_before_ts: i64 },
     /// No answer arrived (connect failure, timeout, cut connection).
     Transport(String),
 }

@@ -32,6 +32,8 @@ pub fn pause(home: &Home, task: &TaskId) -> Result<(), CliError> {
 /// the effects a dead process left in flight, and run the task on.
 pub async fn resume(home: &Home, task: &TaskId, patch: Option<&Path>, crash: Option<&CrashSpec>) -> Result<(), CliError> {
     let store = home.open()?;
+    home.model_endpoint(&store, task)?;
+    agentos_engine::model::policy::versions(&store.db, task)?;
     let t = store.db.task(task)?;
     if t.state.is_terminal() {
         // A task that ended with effects still in flight (left by an older build or a

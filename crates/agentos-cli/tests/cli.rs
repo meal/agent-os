@@ -1835,8 +1835,8 @@ fn submit_without_the_flag_records_worker_host_and_no_image_fields() {
     let three_a = [
         "contract_digest", "repository_source", "repository_digest", "profile_id", "profile_digest", "guest_image", "model", "fake_agent_patch_digest",
     ];
-    let expected: BTreeSet<&str> = three_a.into_iter().chain(["worker"]).collect();
-    assert_eq!(keys, expected, "the 3a keys plus `worker`, no image fields");
+    let expected: BTreeSet<&str> = three_a.into_iter().chain(["worker", "model_endpoint", "model_limits_version", "model_policy_version"]).collect();
+    assert_eq!(keys, expected, "submission provenance, no image fields");
     assert_eq!(s["worker"], "host");
     assert_eq!(s["guest_image"], "fixture-executor-v0");
 }
@@ -2649,6 +2649,56 @@ fn resume_of_an_anthropic_task_without_a_key_is_a_usage_error_and_changes_nothin
 }
 
 #[test]
+fn resume_uses_the_recorded_endpoint_and_rejects_overrides_before_key_reads() {
+    let cli = Cli::new();
+    let api = fake_api("parser-fix-direct.json");
+    let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
+    let id = cli.json(&["submit", &contract, "--model", "anthropic:x", "--anthropic-base-url", &api.url()])["task_id"]
+        .as_str().unwrap().to_string();
+    let status = cli.status(&id);
+    assert_eq!(status["model_endpoint"], api.url());
+    assert_eq!(status["model_policy_version"], 1);
+    assert_eq!(status["model_limits_version"], 1);
+    let before = cli.events(&id);
+    let missing = cli.path("no-key");
+    for environment in [false, true] {
+        let mut command = cli.cmd(&["resume", &id, "--api-key-file", missing.to_str().unwrap()]);
+        if environment {
+            command.env("AGENTOS_ANTHROPIC_BASE_URL", "http://127.0.0.1:1");
+        } else {
+            command.args(["--anthropic-base-url", "http://127.0.0.1:1"]);
+        }
+        command.assert().code(2).stderr(predicate::str::contains("differs from the recorded endpoint"));
+        assert_eq!(cli.events(&id), before);
+    }
+    cli.cmd(&["resume", &id]).env("ANTHROPIC_API_KEY", CANARY).assert().success();
+    assert_eq!(cli.status(&id)["state"], "SUCCEEDED");
+    assert_eq!(api.hits(), 4);
+    let export = cli.path("endpoint-export");
+    cli.cmd(&["export", &id, export.to_str().unwrap()]).assert().success();
+    let manifest: Value = serde_json::from_slice(&fs::read(export.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["model_endpoint"], api.url());
+    assert_eq!(manifest["model_policy_version"], 1);
+}
+
+#[test]
+fn legacy_missing_endpoint_allows_only_the_official_provider() {
+    let cli = Cli::new();
+    let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
+    let id = cli.json(&["submit", &contract, "--model", "anthropic:x"])["task_id"].as_str().unwrap().to_string();
+    rusqlite::Connection::open(cli.home().join("agentos.db")).unwrap().execute(
+        "UPDATE events SET payload=json_remove(payload, '$.model_endpoint', '$.model_policy_version', '$.model_limits_version')
+         WHERE task_id=?1 AND type='Submitted'", [&id]).unwrap();
+    let before = cli.events(&id);
+    cli.cmd(&["resume", &id, "--anthropic-base-url", "http://127.0.0.1:1"])
+        .assert().code(2).stderr(predicate::str::contains("differs from the recorded endpoint"));
+    assert_eq!(cli.events(&id), before);
+    let status = cli.status(&id);
+    assert_eq!(status["model_endpoint"], "https://api.anthropic.com");
+    assert_eq!(status["model_policy_version"], 0);
+}
+
+#[test]
 fn a_crash_on_the_model_call_resumes_with_a_forfeit_and_no_second_charge() {
     for (point, decision, uncertain) in [
         ("after-dispatch:model_call", "Forfeit", 1),
@@ -2684,7 +2734,7 @@ fn a_crash_on_the_model_call_resumes_with_a_forfeit_and_no_second_charge() {
 }
 
 #[test]
-fn a_4xx_from_the_api_is_journaled_bounded_and_the_task_fails_on_budget() {
+fn a_permanent_4xx_is_journaled_bounded_and_stops_after_one_send() {
     let cli = Cli::new();
     let api = http::serve(http::Reply::Status(400, "x".repeat(100_000)));
     let contract = cli.model_contract(&cli.repo_copy(), 2, 10);
@@ -2699,16 +2749,16 @@ fn a_4xx_from_the_api_is_journaled_bounded_and_the_task_fails_on_budget() {
     let done: Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(done["state"], "FAILED", "{done}");
     let id = done["task_id"].as_str().unwrap();
-    assert_eq!(api.hits(), 2);
+    assert_eq!(api.hits(), 1);
     let events = cli.events(id);
-    assert_eq!(events_of(&events, "Failed")[0]["payload"]["Failed"]["reason"], "budget exhausted", "{events:?}");
+    assert!(events_of(&events, "Failed")[0]["payload"]["Failed"]["reason"].as_str().unwrap().starts_with("http 400: "));
     let reasons: Vec<String> = walk(&cli.home().join("blobs"))
         .iter()
         .filter_map(|f| serde_json::from_slice::<Value>(&fs::read(f).unwrap()).ok())
         .filter_map(|b| b["reason"].as_str().map(str::to_string))
         .filter(|r| r.starts_with("http 400: "))
         .collect();
-    assert_eq!(reasons.len(), 2, "{reasons:?}");
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
     assert!(reasons.iter().all(|r| r.len() <= 600), "{:?}", reasons.iter().map(String::len).collect::<Vec<_>>());
 }
 

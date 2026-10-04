@@ -25,6 +25,8 @@ use crate::steps::{intend, run_attempt, Attempt, Cx};
 use crate::workspace::has_excluded_component;
 
 pub use crate::steps::{follow_up_event, verification_verdict, WORKER};
+use crate::model::policy::{backoff_seconds, check_request_size, ModelFailureClass};
+use agentos_store::effects::ModelRetrySchedule;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -379,6 +381,10 @@ fn model_of(body: &[u8]) -> String {
 /// budget ends it too.
 async fn call_model<E: Executor>(cx: &Cx<'_, E>, since: u64, turn: u32, base: Digest, request: Digest, body: Vec<u8>) -> Result<Next> {
     let (db, task) = (cx.db, &cx.task);
+    if cx.model_policy_version == 1 && let Some(schedule) = pending_model_retry(cx)?
+        && let Some(state) = wait_model_retry(cx, &schedule).await? {
+        return Ok(Next::Stop(state));
+    }
     let after = journal::events_after(db, task, since)?;
     if let Some(id) = journal::intended(&after, "ModelCall", Some(&request))? {
         let rec = db.effect(&id)?;
@@ -398,6 +404,9 @@ async fn call_model<E: Executor>(cx: &Cx<'_, E>, since: u64, turn: u32, base: Di
         return Ok(Next::Stop(fail(db, task, &not_granted())?));
     }
     let body = request_body(cx.blobs, &request, body, None)?;
+    if cx.model_limits_version == 1 && let Err(reason) = check_request_size(body.len()) {
+        return Ok(Next::Stop(fail(db, task, reason)?));
+    }
     let kind = EffectKind::ModelCall { model: model_of(&body), turn };
     let rec = match intend(db, task, kind, request, &base, &Resource::Task) {
         Ok(rec) => rec,
@@ -520,6 +529,69 @@ fn observed_workspace(obs: &Observation) -> Option<Digest> {
     }
 }
 
+fn pending_model_retry<E>(cx: &Cx<'_, E>) -> Result<Option<ModelRetrySchedule>> {
+    let events = cx.db.events(&cx.task)?;
+    let Some(index) = events.iter().rposition(|e| e.event_type == "ModelRetryScheduled") else {
+        return Ok(None);
+    };
+    if events[index + 1..].iter().any(|e| e.event_type == "EffectIntended"
+        && e.payload["kind"].get("ModelCall").is_some()) {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_value(events[index].payload.clone()).map_err(DbError::from)?))
+}
+
+async fn wait_model_retry<E: Executor>(cx: &Cx<'_, E>, schedule: &ModelRetrySchedule) -> Result<Option<TaskState>> {
+    loop {
+        if let Some(state) = interrupted(cx.db, &cx.task)? { return Ok(Some(state)); }
+        if let Some(state) = deadline_stop(cx).await? { return Ok(Some(state)); }
+        match cx.db.check(&cx.task, Capability::ModelRequest, &Resource::Task) {
+            Ok(()) => {}
+            Err(DbError::CapabilityDenied { .. }) => return Ok(Some(fail(cx.db, &cx.task, "capability model.request not granted during retry wait")?)),
+            Err(error) => return Err(error.into()),
+        }
+        let deadline = cx.db.deadline_ts(&cx.task)?;
+        if deadline != 0 && schedule.not_before_ts >= deadline {
+            return Ok(Some(fail(cx.db, &cx.task, "model retry would exceed task deadline")?));
+        }
+        if cx.db.now() >= schedule.not_before_ts { return Ok(None); }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+async fn model_failure_policy<E: Executor>(cx: &Cx<'_, E>, obs: &Observation, retry_turn: u32) -> Result<Option<TaskState>> {
+    if cx.model_policy_version == 0 { return Ok(None); }
+    let provider_not_before = match obs {
+        Observation::ModelCallFailed { reason, failure } => {
+            match failure.as_ref().map(|f| f.class).unwrap_or(ModelFailureClass::Permanent) {
+                ModelFailureClass::Permanent => return Ok(Some(fail(cx.db, &cx.task, reason)?)),
+                ModelFailureClass::Transient => failure.as_ref().and_then(|f| f.retry_not_before_ts),
+            }
+        }
+        Observation::ModelCallLost => None,
+        _ => return Ok(None),
+    };
+    let events = cx.db.events(&cx.task)?;
+    let mut failures = 0u32;
+    let mut failed_effect = None;
+    for event in events.iter().rev().filter(|e| e.event_type == "EffectIntended"
+        && e.payload["kind"].get("ModelCall").is_some()) {
+        let effect: EffectId = serde_json::from_value(event.payload["effect_id"].clone()).map_err(DbError::from)?;
+        let rec = cx.db.effect(&effect)?;
+        if rec.state == EffectState::Completed { break; }
+        if rec.state == EffectState::Failed {
+            if failed_effect.is_none() { failed_effect = Some(effect); }
+            failures = failures.saturating_add(1);
+        }
+    }
+    let effect = failed_effect.ok_or_else(|| EngineError::Protocol("model failure has no failed effect".into()))?;
+    let schedule = cx.db.schedule_model_retry(&cx.task, &effect, retry_turn,
+        backoff_seconds(failures), provider_not_before, cx.model_policy_version)?;
+    // The retry schedule is a durable completion boundary distinct from a model send.
+    cx.crash(CrashPoint::AfterComplete, Some("model_retry"))?;
+    wait_model_retry(cx, &schedule).await
+}
+
 /// Drives `task` until it is terminal, paused or waiting. Resumable: outstanding effects
 /// of a crashed run are recovered first ([`crate::recover`]); the open session's journaled
 /// turns are replayed into `agent` (which must be deterministic: a divergence fails the task
@@ -611,14 +683,21 @@ async fn drive<E: Executor, A: Agent>(cx: &Cx<'_, E>, agent: &mut A) -> Result<T
     };
     let mut turn = turns.len() as u32;
     loop {
-        let obs = match next {
+        let mut obs = match next {
             Next::Observe(obs) => obs,
             Next::Stop(state) => return Ok(state),
         };
+        // Legacy journals retain their original observation shape and decisions.
+        if cx.model_policy_version == 0 && let Observation::ModelCallFailed { failure, .. } = &mut obs {
+            *failure = None;
+        }
         if let Some(state) = interrupted(db, task)? {
             return Ok(state);
         }
         if let Some(state) = deadline_stop(cx).await? {
+            return Ok(state);
+        }
+        if let Some(state) = model_failure_policy(cx, &obs, turn.saturating_add(1)).await? {
             return Ok(state);
         }
         if turn >= turn_limit(&cx.contract) {
@@ -637,6 +716,13 @@ async fn drive<E: Executor, A: Agent>(cx: &Cx<'_, E>, agent: &mut A) -> Result<T
         // The request body is a registered artifact before the turn that names it exists, or
         // recovery's blob collection could delete it and an intended call would be lost.
         if let AgentAction::CallModel { request, body } = &action {
+            if cx.model_limits_version == 1 && let Err(reason) = check_request_size(body.len()) {
+                return fail(db, task, reason);
+            }
+            if cx.model_policy_version == 1 && let Some(schedule) = pending_model_retry(cx)?
+                && let Some(state) = wait_model_retry(cx, &schedule).await? {
+                return Ok(state);
+            }
             ensure_request_artifact(cx, None, request, body)?;
         }
         let since = journal::append_turn(db, task, turn, &obs, &action)?;

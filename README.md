@@ -590,9 +590,15 @@ Provider calls cost money, so a call whose outcome is unknown is treated as spen
   a re-send of the old one. A lost response is not recovered from the provider.
 - If the response was retained before the crash, recovery publishes it and nothing is re-sent.
 - One HTTP send per attempt: no redirects (a 3xx is a rejected answer), no proxy, no client
-  retries, a 600 s timeout.
+  retries, a 600 s timeout capped by the task's remaining deadline.
 - An HTTP error (4xx/5xx) or a malformed body is an *answer*: the effect fails and its
-  reservation settles; the agent sees `ModelCallFailed` and asks again.
+  reservation settles. New submissions record model policy 1: permanent errors (including
+  400/401/403/404, redirects and malformed complete responses) stop with their reason.
+  Only 408, 429 and 5xx errors retry. Transient errors and lost calls record a durable
+  `ModelRetryScheduled` wait of 2, 4, 8, 16, 32, then 60 seconds, reset after success.
+  Integer or HTTP-date `Retry-After` can extend this wait. Pause, cancel, revocation and
+  deadline stop waiting without another send. Each retry has a fresh effect/reservation.
+  Tasks without recorded policy retain legacy immediate retries for replay compatibility.
 - A refusal (a 2xx with `stop_reason: "refusal"`) is a well-formed response: the effect
   completes, the agent sees no tool call and finishes, and the task fails without a verified
   workspace. It is not retried.
@@ -963,11 +969,11 @@ The model workflow (Phase 4):
 - **An environment-variable key is readable in `/proc/<controller pid>/environ`** for the life of
   `submit`/`resume`. Use `--api-key-file`. The key is in no argv, event, blob, export, job
   directory or child environment (see "The API key").
-- **`--anthropic-base-url` is validated but not recorded.** Only `https://` or loopback `http://`
-  without user info, query or fragment is accepted, but an `https://` URL may name any host (the
-  key goes there), and the environment variable `AGENTOS_ANTHROPIC_BASE_URL` can still redirect
-  it silently. The URL is not part of `Submitted`, so a `resume` may talk to a different
-  endpoint than the `submit` did.
+- **The provider endpoint is recorded.** New Anthropic submissions record the validated
+  URL in `Submitted`, status and exports. Resume uses that URL; a different flag or
+  `AGENTOS_ANTHROPIC_BASE_URL` is refused before credentials or task writes. Legacy tasks
+  lacking an endpoint may only resume with the official endpoint; re-submit custom tasks.
+  HTTPS URLs can name any host, so select the provider when submitting.
 - **`cancel` and recovery of a terminal task build a live provider when a key is available.**
   They build the provider leniently (`Home::recovery_executor`), so with a key an
   `AnthropicProvider` is constructed although those paths never dispatch a model call (recovery
@@ -980,19 +986,12 @@ The model workflow (Phase 4):
 - **Provider bodies are bounded.** Successful bodies over 4 MiB become unresolved calls
   and retain uncertain usage. Non-success responses retain at most 4096 raw bytes and their
   definite HTTP status without draining the remaining body. The task deadline also bounds model I/O.
-- **The conversation history has no size cap.** Each request re-sends all of it (a read can add
-  64 KiB), so request blobs are O(turns²) bytes on disk, and a long task can exceed the model's
-  context window.
-- **A deterministic 4xx is retried with identical bytes.** Any HTTP error status (400, 401, 403,
-  404, ... as well as 429, 529 and 5xx) is an answer: the effect fails and settles, the agent
-  asks again with the same request and spends another request of the budget, until `model_requests` is exhausted (the task then fails with
-  `budget exhausted`) or the turn limit (4 x `tool_actions` + 8) fails it. (A refusal is not
-  retried: it ends the agent and the task fails without a verified workspace.)
-- **429, 529 and 5xx are retried at once, with no backoff.** A rate limit (429), an overloaded
-  service (529) or a server error (5xx) is a `Rejected` settled failure like any other status;
-  the agent re-asks immediately with the same request, and `retry-after` is not read. On an
-  overloaded or rate-limited account the whole `model_requests` budget (say 8 to 12) can be spent
-  within seconds and the task fails with `budget exhausted`.
+- **New tasks cap each serialized model request at 8 MiB.** Oversize fails before request
+  publication, turn recording or reservation. History is still re-sent and request storage
+  grows with conversation length; legacy limit-policy 0 keeps its original behavior.
+- **Retries are versioned.** New policy 1 stops permanent failures and persists transient
+  waits as described above. Policy 0 tasks retain immediate retries, including deterministic
+  4xx failures, so replay decisions do not change.
 - **The supervisor's environment is `PATH` plus the explicit `AGENTOS_TEST_*` switches.** `HOME`,
   `LANG`, `TMPDIR` and `RUST_LOG` are no longer inherited by the host worker's verification
   commands, and the test knob `AGENTOS_SUPERVISOR_POLL_MS` (not prefixed `AGENTOS_TEST_`) no
