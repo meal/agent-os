@@ -20,15 +20,15 @@ use std::sync::Mutex;
 use std::thread;
 
 use agentos_core::guest::{HELLO_WATCHDOG, TMPFS_SIZE, VSOCK_PORT};
-use rustix::fs::{syncfs, Mode};
-use rustix::mount::{mount, unmount, MountFlags, UnmountFlags};
-use rustix::system::{reboot, sethostname, RebootCommand};
-use vsock::{VsockListener, VsockStream, VMADDR_CID_ANY};
+use rustix::fs::{Mode, syncfs};
+use rustix::mount::{MountFlags, UnmountFlags, mount, unmount};
+use rustix::system::{RebootCommand, reboot, sethostname};
+use vsock::{VMADDR_CID_ANY, VsockListener, VsockStream};
 
-use crate::agent::{spawn_watchdog, Exit, Session};
+use crate::agent::{Exit, Session, spawn_watchdog};
 use crate::backend::{
-    chown_tree, is_mount_point, mkfs_ext4, mount_ext4, VmBackend, AGENT_OOM_SCORE_ADJ, CHECK_UID, SCRATCH_DEVICE,
-    SCRATCH_DIR, WORKSPACE_DEVICE, WORKSPACE_DIR,
+    AGENT_OOM_SCORE_ADJ, CHECK_UID, SCRATCH_DEVICE, SCRATCH_DIR, VmBackend, WORKSPACE_DEVICE,
+    WORKSPACE_DIR, chown_tree, is_mount_point, mkfs_ext4, mount_ext4,
 };
 
 pub const HOSTNAME: &str = "agentos-guest";
@@ -53,7 +53,16 @@ pub fn is_guest_cmdline(cmdline: &str) -> bool {
 /// `mkfs`/`mount`/`reboot`.
 pub fn running_as_guest_init() -> bool {
     let proc = Path::new("/proc");
-    if !is_mount_point(proc) && mount("proc", proc, "proc", MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC, None::<&std::ffi::CStr>).is_err() {
+    if !is_mount_point(proc)
+        && mount(
+            "proc",
+            proc,
+            "proc",
+            MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC,
+            None::<&std::ffi::CStr>,
+        )
+        .is_err()
+    {
         return false;
     }
     fs::read_to_string("/proc/cmdline").is_ok_and(|c| is_guest_cmdline(&c))
@@ -76,8 +85,20 @@ pub fn mount_plan() -> Vec<MountSpec> {
     let kernel = MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC;
     let tmpfs = MountFlags::NOSUID | MountFlags::NODEV;
     vec![
-        MountSpec { source: "proc", target: "/proc", fstype: "proc", flags: kernel, data: String::new() },
-        MountSpec { source: "sysfs", target: "/sys", fstype: "sysfs", flags: kernel, data: String::new() },
+        MountSpec {
+            source: "proc",
+            target: "/proc",
+            fstype: "proc",
+            flags: kernel,
+            data: String::new(),
+        },
+        MountSpec {
+            source: "sysfs",
+            target: "/sys",
+            fstype: "sysfs",
+            flags: kernel,
+            data: String::new(),
+        },
         // Device nodes are the point of /dev: no `nodev` here.
         MountSpec {
             source: "devtmpfs",
@@ -86,8 +107,20 @@ pub fn mount_plan() -> Vec<MountSpec> {
             flags: MountFlags::NOSUID | MountFlags::NOEXEC,
             data: "mode=0755".into(),
         },
-        MountSpec { source: "tmpfs", target: "/run", fstype: "tmpfs", flags: tmpfs, data: format!("{TMPFS_SIZE},mode=0755") },
-        MountSpec { source: "tmpfs", target: "/tmp", fstype: "tmpfs", flags: tmpfs, data: format!("{TMPFS_SIZE},mode=1777") },
+        MountSpec {
+            source: "tmpfs",
+            target: "/run",
+            fstype: "tmpfs",
+            flags: tmpfs,
+            data: format!("{TMPFS_SIZE},mode=0755"),
+        },
+        MountSpec {
+            source: "tmpfs",
+            target: "/tmp",
+            fstype: "tmpfs",
+            flags: tmpfs,
+            data: format!("{TMPFS_SIZE},mode=1777"),
+        },
     ]
 }
 
@@ -109,8 +142,12 @@ fn mount_one(m: &MountSpec) -> Result<(), String> {
     if is_mount_point(Path::new(m.target)) {
         return Ok(());
     }
-    let data = (!m.data.is_empty()).then(|| CString::new(m.data.as_str())).transpose().map_err(|e| e.to_string())?;
-    mount(m.source, m.target, m.fstype, m.flags, data.as_deref()).map_err(|e| format!("mount {} on {}: {e}", m.fstype, m.target))
+    let data = (!m.data.is_empty())
+        .then(|| CString::new(m.data.as_str()))
+        .transpose()
+        .map_err(|e| e.to_string())?;
+    mount(m.source, m.target, m.fstype, m.flags, data.as_deref())
+        .map_err(|e| format!("mount {} on {}: {e}", m.fstype, m.target))
 }
 
 /// Everything before the listener, in the spec's order.
@@ -119,18 +156,25 @@ fn boot() -> Result<VsockListener, String> {
     for m in mount_plan() {
         mount_one(&m)?;
     }
-    fs::write("/proc/self/oom_score_adj", AGENT_OOM_SCORE_ADJ.to_string()).map_err(|e| format!("oom_score_adj: {e}"))?;
+    fs::write("/proc/self/oom_score_adj", AGENT_OOM_SCORE_ADJ.to_string())
+        .map_err(|e| format!("oom_score_adj: {e}"))?;
 
     mkfs_ext4(SCRATCH_DEVICE)?;
     let scratch = Path::new(SCRATCH_DIR);
     mount_ext4(SCRATCH_DEVICE, scratch)?;
-    fs::set_permissions(scratch, fs::Permissions::from_mode(0o755)).map_err(|e| format!("chmod {SCRATCH_DIR}: {e}"))?;
+    fs::set_permissions(scratch, fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("chmod {SCRATCH_DIR}: {e}"))?;
     let check = Path::new(CHECK_SCRATCH);
-    fs::DirBuilder::new().mode(0o700).create(check).map_err(|e| format!("mkdir {CHECK_SCRATCH}: {e}"))?;
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(check)
+        .map_err(|e| format!("mkdir {CHECK_SCRATCH}: {e}"))?;
     chown_tree(check, CHECK_UID, CHECK_UID).map_err(|e| format!("chown {CHECK_SCRATCH}: {e}"))?;
-    fs::set_permissions(check, fs::Permissions::from_mode(0o700)).map_err(|e| format!("chmod {CHECK_SCRATCH}: {e}"))?;
+    fs::set_permissions(check, fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("chmod {CHECK_SCRATCH}: {e}"))?;
 
-    fs::set_permissions(VSOCK_DEVICE, fs::Permissions::from_mode(0o600)).map_err(|e| format!("chmod {VSOCK_DEVICE}: {e}"))?;
+    fs::set_permissions(VSOCK_DEVICE, fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("chmod {VSOCK_DEVICE}: {e}"))?;
     sethostname(HOSTNAME.as_bytes()).map_err(|e| format!("sethostname: {e}"))?;
 
     // A job after `ReadSnapshot`, or an inspection, finds the workspace on its drive; a blank
@@ -139,7 +183,8 @@ fn boot() -> Result<VsockListener, String> {
         log(&format!("no workspace yet ({e})"));
     }
 
-    VsockListener::bind_with_cid_port(VMADDR_CID_ANY, VSOCK_PORT).map_err(|e| format!("vsock listen on port {VSOCK_PORT}: {e}"))
+    VsockListener::bind_with_cid_port(VMADDR_CID_ANY, VSOCK_PORT)
+        .map_err(|e| format!("vsock listen on port {VSOCK_PORT}: {e}"))
 }
 
 /// Ends the VM: `syncfs` and unmount `/workspace` and `/scratch`, then `reboot` (with
@@ -175,7 +220,9 @@ pub fn power_off(why: &str) -> ! {
 fn handle(stream: VsockStream) {
     let mut backend = VmBackend::default();
     // A panic would end only this thread and leave the VM running without its session.
-    let served = panic::catch_unwind(AssertUnwindSafe(|| Session::serve(&mut backend, stream, None)));
+    let served = panic::catch_unwind(AssertUnwindSafe(|| {
+        Session::serve(&mut backend, stream, None)
+    }));
     match served {
         Ok(Exit::Shutdown) => power_off("Shutdown"),
         Ok(Exit::Lost) => power_off("control connection lost"),
@@ -188,7 +235,9 @@ fn handle(stream: VsockStream) {
 /// PID 1. Never returns: the VM ends with `power_off`.
 pub fn main() -> ! {
     // Armed first: the 10 s count from boot, whatever the preparation costs.
-    spawn_watchdog(HELLO_WATCHDOG, || power_off("no Hello within the boot watchdog"));
+    spawn_watchdog(HELLO_WATCHDOG, || {
+        power_off("no Hello within the boot watchdog")
+    });
     let listener = match boot() {
         Ok(l) => l,
         Err(e) => {
@@ -215,7 +264,10 @@ mod tests {
     #[test]
     fn mount_plan_names_the_five_runtime_mounts_in_order() {
         let plan = mount_plan();
-        let rows: Vec<(&str, &str, &str)> = plan.iter().map(|m| (m.source, m.target, m.fstype)).collect();
+        let rows: Vec<(&str, &str, &str)> = plan
+            .iter()
+            .map(|m| (m.source, m.target, m.fstype))
+            .collect();
         assert_eq!(
             rows,
             [
@@ -231,9 +283,15 @@ mod tests {
             assert!(!m.flags.contains(MountFlags::RDONLY), "{m:?}");
         }
         for m in &plan[..2] {
-            assert!(m.flags.contains(MountFlags::NODEV | MountFlags::NOEXEC), "{m:?}");
+            assert!(
+                m.flags.contains(MountFlags::NODEV | MountFlags::NOEXEC),
+                "{m:?}"
+            );
         }
-        assert!(!plan[2].flags.contains(MountFlags::NODEV), "/dev needs its device nodes");
+        assert!(
+            !plan[2].flags.contains(MountFlags::NODEV),
+            "/dev needs its device nodes"
+        );
         let tmpfs: Vec<&MountSpec> = plan.iter().filter(|m| m.fstype == "tmpfs").collect();
         assert_eq!(tmpfs.len(), 2);
         for m in &tmpfs {
@@ -248,7 +306,11 @@ mod tests {
     #[test]
     fn boot_args_in_core_match_the_init_path() {
         assert!(BOOT_ARGS.contains("init=/sbin/agentos-guest"));
-        assert!(BOOT_ARGS.split_whitespace().any(|a| a == format!("init={INIT_PATH}")));
+        assert!(
+            BOOT_ARGS
+                .split_whitespace()
+                .any(|a| a == format!("init={INIT_PATH}"))
+        );
         // A guest reboot must end Firecracker, and a panic must reboot.
         for arg in ["reboot=k", "panic=1", "console=ttyS0"] {
             assert!(BOOT_ARGS.split_whitespace().any(|a| a == arg), "{arg}");
@@ -273,7 +335,15 @@ mod tests {
     #[test]
     fn the_check_and_the_agent_get_the_contract_priorities() {
         use crate::backend::{CHECK_NOFILE, CHECK_NPROC, CHECK_OOM_SCORE_ADJ};
-        assert_eq!((CHECK_NPROC, CHECK_NOFILE, CHECK_OOM_SCORE_ADJ, AGENT_OOM_SCORE_ADJ), (256, 1024, 1000, -1000));
+        assert_eq!(
+            (
+                CHECK_NPROC,
+                CHECK_NOFILE,
+                CHECK_OOM_SCORE_ADJ,
+                AGENT_OOM_SCORE_ADJ
+            ),
+            (256, 1024, 1000, -1000)
+        );
         assert_eq!(HELLO_WATCHDOG, std::time::Duration::from_secs(10));
     }
 }

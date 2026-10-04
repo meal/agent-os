@@ -7,11 +7,13 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use agentos_core::guest::{is_attempt_token, read_frame, write_frame, Frame, Message, Mode, GUEST_PROTOCOL, PATCH_LIMIT};
+use agentos_core::guest::{
+    Frame, GUEST_PROTOCOL, Message, Mode, PATCH_LIMIT, is_attempt_token, read_frame, write_frame,
+};
 
+use crate::AGENT_VERSION;
 use crate::backend::Backend;
 use crate::handlers::{self, StreamError};
-use crate::AGENT_VERSION;
 
 /// How a session ended; the caller acts on it (fake: exit 0 on `Shutdown`/`Lost`; VM:
 /// reboot).
@@ -54,8 +56,17 @@ fn mode_name(mode: Mode) -> &'static str {
 
 fn allowed(mode: Mode, m: &Message) -> bool {
     match mode {
-        Mode::Job => matches!(m, Message::ReadSnapshot { .. } | Message::ApplyPatch { .. } | Message::RunVerification { .. } | Message::Shutdown),
-        Mode::Inspect => matches!(m, Message::Digest | Message::PatchState { .. } | Message::Shutdown),
+        Mode::Job => matches!(
+            m,
+            Message::ReadSnapshot { .. }
+                | Message::ApplyPatch { .. }
+                | Message::RunVerification { .. }
+                | Message::Shutdown
+        ),
+        Mode::Inspect => matches!(
+            m,
+            Message::Digest | Message::PatchState { .. } | Message::Shutdown
+        ),
     }
 }
 
@@ -71,7 +82,10 @@ pub fn spawn_watchdog(after: Duration, fire: impl FnOnce() + Send + 'static) {
     thread::spawn(move || {
         thread::sleep(after);
         if !hello_seen() {
-            eprintln!("agentos-guest: no Hello within {} ms of boot, shutting down", after.as_millis());
+            eprintln!(
+                "agentos-guest: no Hello within {} ms of boot, shutting down",
+                after.as_millis()
+            );
             fire();
         }
     });
@@ -91,7 +105,11 @@ impl Session {
     /// of one in-process session); `None` (the VM and the fake guest) binds the process-wide
     /// token **and mode** on the first accepted `Hello` and holds every later connection to
     /// both.
-    pub fn serve(backend: &mut dyn Backend, mut stream: impl Read + Write, expected: Option<&str>) -> Exit {
+    pub fn serve(
+        backend: &mut dyn Backend,
+        mut stream: impl Read + Write,
+        expected: Option<&str>,
+    ) -> Exit {
         // `raw_limit` 0 wherever a request is expected: a non-empty raw frame is `TooLarge`
         // before its body is read, an empty one comes back as `Frame::Raw` and is treated as
         // the protocol violation it is.
@@ -99,12 +117,25 @@ impl Session {
             Ok(Frame::Json(m)) => m,
             _ => return Exit::Rejected,
         };
-        let Message::Hello { protocol, attempt_token, mode, .. } = first else {
-            send(&mut stream, Message::Refused { reason: format!("expected Hello, got {}", type_of(&first)) });
+        let Message::Hello {
+            protocol,
+            attempt_token,
+            mode,
+            ..
+        } = first
+        else {
+            send(
+                &mut stream,
+                Message::Refused {
+                    reason: format!("expected Hello, got {}", type_of(&first)),
+                },
+            );
             return Exit::Rejected;
         };
         if protocol != GUEST_PROTOCOL {
-            let reason = format!("unsupported protocol {protocol}, this agent speaks protocol {GUEST_PROTOCOL}");
+            let reason = format!(
+                "unsupported protocol {protocol}, this agent speaks protocol {GUEST_PROTOCOL}"
+            );
             send(&mut stream, Message::Refused { reason });
             return Exit::Rejected;
         }
@@ -128,7 +159,12 @@ impl Session {
         if mode == Mode::Inspect
             && let Err(e) = backend.remount_workspace_ro()
         {
-            send(&mut stream, Message::Refused { reason: format!("cannot remount the workspace read-only: {e}") });
+            send(
+                &mut stream,
+                Message::Refused {
+                    reason: format!("cannot remount the workspace read-only: {e}"),
+                },
+            );
             return lost(e);
         }
         let ready = Message::Ready {
@@ -148,36 +184,64 @@ impl Session {
                 Err(e) => return lost(e),
             };
             if !allowed(mode, &request) {
-                let reason = format!("unexpected request {} in {} mode", type_of(&request), mode_name(mode));
-                send(&mut stream, Message::Refused { reason: reason.clone() });
+                let reason = format!(
+                    "unexpected request {} in {} mode",
+                    type_of(&request),
+                    mode_name(mode)
+                );
+                send(
+                    &mut stream,
+                    Message::Refused {
+                        reason: reason.clone(),
+                    },
+                );
                 return lost(reason);
             }
             let _one_at_a_time = REQUEST.lock().unwrap_or_else(|p| p.into_inner());
             let reply = match request {
-                Message::ReadSnapshot { file_count, total_bytes } => {
-                    match handlers::read_snapshot(backend, &mut stream, file_count, total_bytes) {
-                        Ok((files, workspace_digest)) => Message::SnapshotDone { files, workspace_digest },
-                        Err(StreamError::Refused(reason)) => Message::Refused { reason },
-                        Err(StreamError::Protocol(why)) => return lost(why),
-                    }
-                }
-                Message::ApplyPatch { expected_base, editable_paths } => {
+                Message::ReadSnapshot {
+                    file_count,
+                    total_bytes,
+                } => match handlers::read_snapshot(backend, &mut stream, file_count, total_bytes) {
+                    Ok((files, workspace_digest)) => Message::SnapshotDone {
+                        files,
+                        workspace_digest,
+                    },
+                    Err(StreamError::Refused(reason)) => Message::Refused { reason },
+                    Err(StreamError::Protocol(why)) => return lost(why),
+                },
+                Message::ApplyPatch {
+                    expected_base,
+                    editable_paths,
+                } => {
                     let patch = match read_frame(&mut stream, PATCH_LIMIT) {
                         Ok(Frame::Raw(b)) => b,
-                        Ok(Frame::Json(_)) => return lost("JSON frame where the patch was expected"),
+                        Ok(Frame::Json(_)) => {
+                            return lost("JSON frame where the patch was expected");
+                        }
                         Err(e) => return lost(e),
                     };
                     match handlers::apply_patch(backend, expected_base, &editable_paths, &patch) {
-                        Ok((paths, workspace_digest)) => Message::PatchApplied { paths, workspace_digest },
+                        Ok((paths, workspace_digest)) => Message::PatchApplied {
+                            paths,
+                            workspace_digest,
+                        },
                         Err(reason) => Message::Refused { reason },
                     }
                 }
-                Message::RunVerification { profile_digest, timeout_secs, file_count, total_bytes } => {
-                    let profile = match handlers::receive_profile(&mut stream, file_count, total_bytes) {
-                        Ok(p) => p,
-                        Err(why) => return lost(why),
-                    };
-                    match handlers::run_verification(backend, profile_digest, timeout_secs, profile) {
+                Message::RunVerification {
+                    profile_digest,
+                    timeout_secs,
+                    file_count,
+                    total_bytes,
+                } => {
+                    let profile =
+                        match handlers::receive_profile(&mut stream, file_count, total_bytes) {
+                            Ok(p) => p,
+                            Err(why) => return lost(why),
+                        };
+                    match handlers::run_verification(backend, profile_digest, timeout_secs, profile)
+                    {
                         Ok(v) => v.into_message(),
                         Err(reason) => Message::Refused { reason },
                     }
@@ -189,7 +253,9 @@ impl Session {
                 Message::PatchState { expected_base } => {
                     let patch = match read_frame(&mut stream, PATCH_LIMIT) {
                         Ok(Frame::Raw(b)) => b,
-                        Ok(Frame::Json(_)) => return lost("JSON frame where the patch was expected"),
+                        Ok(Frame::Json(_)) => {
+                            return lost("JSON frame where the patch was expected");
+                        }
                         Err(e) => return lost(e),
                     };
                     if backend.hang_inspect() {

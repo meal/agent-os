@@ -10,22 +10,22 @@ use std::path::{Path, PathBuf};
 
 use agentos_core::contract::Contract;
 use agentos_core::effect::{EffectId, EffectRecord};
+use agentos_core::guest::mint_attempt_token;
 use agentos_core::ids::{Digest, TaskId};
 use agentos_core::state::TaskState;
 use agentos_engine::agent::{Agent, AgentAction, ModelAgent, Observation};
-use agentos_engine::model::fake::FakeProvider;
 use agentos_engine::crash::CrashHook;
 use agentos_engine::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor};
-use agentos_core::guest::mint_attempt_token;
 use agentos_engine::firecracker::FirecrackerConfig;
 use agentos_engine::fixture::FixtureExecutor;
 use agentos_engine::guestlink::GuestLauncher;
 use agentos_engine::jail::{JailConfig, JailMode};
+use agentos_engine::job::{HostConfig, WorkerConfig};
 use agentos_engine::model::executor::ModelExecutor;
+use agentos_engine::model::fake::FakeProvider;
 use agentos_engine::model::provider::ModelProvider;
 use agentos_engine::routing::RoutingExecutor;
 use agentos_engine::shadow::ShadowReader;
-use agentos_engine::job::{HostConfig, WorkerConfig};
 use agentos_engine::supervised::{ExecCounts, SupervisedExecutor};
 use agentos_engine::supervisor::SupervisorCmd;
 use agentos_engine::workspace::workspace_digest;
@@ -99,7 +99,10 @@ pub fn fake_firecracker_config(root: &Path) -> FirecrackerConfig {
         vcpus: 1,
         memory_mib: 256,
         attempt_token: mint_attempt_token(),
-        launcher: GuestLauncher::Fake { program: SUPERVISOR_BIN.into(), prefix_args: Vec::new() },
+        launcher: GuestLauncher::Fake {
+            program: SUPERVISOR_BIN.into(),
+            prefix_args: Vec::new(),
+        },
         jail: JailMode::Unjailed,
     }
 }
@@ -171,7 +174,9 @@ pub fn test_worker() -> &'static str {
         Err(_) | Ok("") | Ok("host") => "host",
         Ok("firecracker-fake") => "firecracker-fake",
         Ok("firecracker") => "firecracker",
-        Ok(other) => panic!("AGENTOS_TEST_WORKER={other:?}: this tier knows host, firecracker-fake and firecracker"),
+        Ok(other) => panic!(
+            "AGENTOS_TEST_WORKER={other:?}: this tier knows host, firecracker-fake and firecracker"
+        ),
     };
     if test_jail_fake() && worker != "firecracker-fake" {
         panic!("AGENTOS_TEST_JAIL=fake needs AGENTOS_TEST_WORKER=firecracker-fake");
@@ -202,7 +207,11 @@ pub fn real_mode() -> bool {
 /// jail hard-links the image; elsewhere `Kvm::image_for` would copy it), else a plain
 /// temporary directory.
 pub fn scratch_root() -> TempDir {
-    if real_mode() { real_kvm().root() } else { tempfile::tempdir().unwrap() }
+    if real_mode() {
+        real_kvm().root()
+    } else {
+        tempfile::tempdir().unwrap()
+    }
 }
 
 /// The KVM tier's settings, for `AGENTOS_TEST_WORKER=firecracker`: the gate must pass (it
@@ -247,7 +256,11 @@ pub fn workspace_dir(root: &Path, task: &TaskId) -> PathBuf {
     if real_mode() {
         return dump_ws_img(&task_dir.join("ws.img"), &root.join("ws-dumps"));
     }
-    if fake_mode() { task_dir.join("workspace") } else { task_dir.join("ws") }
+    if fake_mode() {
+        task_dir.join("workspace")
+    } else {
+        task_dir.join("ws")
+    }
 }
 
 /// The tree of an ext4 image, copied out with `debugfs -R "rdump / DIR"` into a new
@@ -264,7 +277,12 @@ pub fn dump_ws_img(img: &Path, dumps: &Path) -> PathBuf {
         .arg(img)
         .output()
         .expect("run debugfs");
-    assert!(out.status.success(), "debugfs rdump of {}: {}", img.display(), String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "debugfs rdump of {}: {}",
+        img.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
     // `rdump` keeps the image's root and its `lost+found` (removed by the guest; never in
     // the digest anyway).
     dir
@@ -282,13 +300,31 @@ pub fn debugfs_write(img: &Path, commands: &str) {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("run debugfs");
-    child.stdin.take().unwrap().write_all(commands.as_bytes()).unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(commands.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().unwrap();
-    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     // debugfs exits 0 even when a command fails; it reports a failure as `<command>: <why>`.
-    let words: Vec<&str> = commands.lines().filter_map(|l| l.split_whitespace().next()).collect();
-    let failed = text.lines().any(|l| words.iter().any(|w| l.starts_with(&format!("{w}: "))));
-    assert!(out.status.success() && !failed, "debugfs -w {} <<< {commands:?}: {text}", img.display());
+    let words: Vec<&str> = commands
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .collect();
+    let failed = text
+        .lines()
+        .any(|l| words.iter().any(|w| l.starts_with(&format!("{w}: "))));
+    assert!(
+        out.status.success() && !failed,
+        "debugfs -w {} <<< {commands:?}: {text}",
+        img.display()
+    );
 }
 
 /// Writes `content` to `rel` (`dir/name`) in `task`'s workspace behind the worker's back:
@@ -303,8 +339,15 @@ pub fn write_in_workspace(root: &Path, task: &TaskId, rel: &str, content: &str) 
     let local = root.join(format!("planted-{}", rel.replace('/', "_")));
     fs::write(&local, content).unwrap();
     // `write` refuses an existing name: remove it first (a missing one is fine).
-    let _ = std::process::Command::new("debugfs").args(["-w", "-R"]).arg(format!("rm /{rel}")).arg(&img).output();
-    debugfs_write(&img, &format!("cd /{dir}\nwrite {} {name}\n", local.display()));
+    let _ = std::process::Command::new("debugfs")
+        .args(["-w", "-R"])
+        .arg(format!("rm /{rel}"))
+        .arg(&img)
+        .output();
+    debugfs_write(
+        &img,
+        &format!("cd /{dir}\nwrite {} {name}\n", local.display()),
+    );
 }
 
 /// Makes `task`'s workspace gone for the chosen worker: the host directory, or (fake mode)
@@ -335,7 +378,11 @@ pub fn proc_state(pid: i32) -> Option<(String, i32, i32)> {
 }
 
 pub fn all_pids() -> Vec<i32> {
-    fs::read_dir("/proc").unwrap().flatten().filter_map(|e| e.file_name().to_str()?.parse().ok()).collect()
+    fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse().ok())
+        .collect()
 }
 
 /// Live (non-zombie) processes whose command line contains `path`.
@@ -344,14 +391,20 @@ pub fn processes_naming(path: &Path) -> Vec<i32> {
     all_pids()
         .into_iter()
         .filter(|pid| {
-            let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else { return false };
-            cmdline.windows(needle.len()).any(|w| w == needle) && proc_state(*pid).is_some_and(|(s, ..)| s != "Z")
+            let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
+                return false;
+            };
+            cmdline.windows(needle.len()).any(|w| w == needle)
+                && proc_state(*pid).is_some_and(|(s, ..)| s != "Z")
         })
         .collect()
 }
 
-#[allow(unused_imports, reason = "each test crate uses its own part of the shared scan")]
-pub use procs::{firecracker_processes, home_firecrackers, home_vm_ids, FcProc};
+#[allow(
+    unused_imports,
+    reason = "each test crate uses its own part of the shared scan"
+)]
+pub use procs::{FcProc, firecracker_processes, home_firecrackers, home_vm_ids};
 
 /// `processes_naming(root)` plus, in real mode, the pids of `home_firecrackers(root)`.
 pub fn processes_of_home(root: &Path) -> Vec<i32> {
@@ -374,8 +427,13 @@ pub fn supervised(
     crash: Option<CrashHook>,
     env: &[(&str, &str)],
 ) -> SupervisedExecutor {
-    let cmd = SupervisorCmd { program: SUPERVISOR_BIN.into(), prefix_args: Vec::new() };
-    let mut exec = SupervisedExecutor::new(jobs_root.to_path_buf(), cmd, worker, counts.clone()).unwrap().with_crash(crash);
+    let cmd = SupervisorCmd {
+        program: SUPERVISOR_BIN.into(),
+        prefix_args: Vec::new(),
+    };
+    let mut exec = SupervisedExecutor::new(jobs_root.to_path_buf(), cmd, worker, counts.clone())
+        .unwrap()
+        .with_crash(crash);
     if fake_mode() {
         exec = exec.with_env(TEST_WORKERS_ENV, "1");
     }
@@ -406,7 +464,12 @@ pub fn edit_patch(path: &str, old: &str, new: &str) -> String {
     format!("--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-{old}\n+{new}\n")
 }
 
-pub const ALL_CAPS: &[&str] = &["snapshot.read", "workspace.apply_patch", "verification.run", "artifact.export"];
+pub const ALL_CAPS: &[&str] = &[
+    "snapshot.read",
+    "workspace.apply_patch",
+    "verification.run",
+    "artifact.export",
+];
 
 pub fn contract(tool_actions: u32) -> (Contract, Digest) {
     contract_with(tool_actions, ALL_CAPS)
@@ -416,19 +479,33 @@ pub fn contract_with(tool_actions: u32, caps: &[&str]) -> (Contract, Digest) {
     contract_full(tool_actions, caps, 600)
 }
 
-pub const MODEL_CAPS: &[&str] =
-    &["snapshot.read", "workspace.apply_patch", "verification.run", "artifact.export", "model.request"];
+pub const MODEL_CAPS: &[&str] = &[
+    "snapshot.read",
+    "workspace.apply_patch",
+    "verification.run",
+    "artifact.export",
+    "model.request",
+];
 
 /// `contract_full` with `MODEL_CAPS` and the given number of model requests.
 pub fn contract_model(model_requests: u32, tool_actions: u32) -> (Contract, Digest) {
     contract_limits(model_requests, tool_actions, MODEL_CAPS, 600)
 }
 
-pub fn contract_full(tool_actions: u32, caps: &[&str], deadline_seconds: u32) -> (Contract, Digest) {
+pub fn contract_full(
+    tool_actions: u32,
+    caps: &[&str],
+    deadline_seconds: u32,
+) -> (Contract, Digest) {
     contract_limits(1, tool_actions, caps, deadline_seconds)
 }
 
-fn contract_limits(model_requests: u32, tool_actions: u32, caps: &[&str], deadline_seconds: u32) -> (Contract, Digest) {
+fn contract_limits(
+    model_requests: u32,
+    tool_actions: u32,
+    caps: &[&str],
+    deadline_seconds: u32,
+) -> (Contract, Digest) {
     let caps = serde_json::to_string(caps).unwrap();
     let json = format!(
         r#"{{
@@ -489,8 +566,14 @@ impl Env {
 
     fn build((contract, digest): (Contract, Digest), approve: bool) -> Env {
         let dir = tempfile::tempdir().unwrap();
-        copy_dir(&fixtures().join("parser-repo"), &dir.path().join("snapshot"));
-        copy_dir(&fixtures().join("profiles/parser-checks-v1"), &dir.path().join("profile"));
+        copy_dir(
+            &fixtures().join("parser-repo"),
+            &dir.path().join("snapshot"),
+        );
+        copy_dir(
+            &fixtures().join("profiles/parser-checks-v1"),
+            &dir.path().join("profile"),
+        );
         let db = Db::open(&dir.path().join("agentos.db")).unwrap();
         let blobs = BlobStore::open(dir.path().join("blobs")).unwrap();
         let exec = FixtureExecutor::new(
@@ -502,7 +585,14 @@ impl Env {
         if approve {
             db.approve_task(&task).unwrap();
         }
-        Env { dir, db, blobs, exec, task, contract }
+        Env {
+            dir,
+            db,
+            blobs,
+            exec,
+            task,
+            contract,
+        }
     }
 
     /// A second connection to the same database, as a concurrent writer would hold.
@@ -512,7 +602,11 @@ impl Env {
 
     /// Another executor over the same snapshot, profile and work root.
     pub fn fixture_exec(&self) -> FixtureExecutor {
-        FixtureExecutor::new(self.snapshot_dir(), self.profile_dir(), self.dir.path().join("work"))
+        FixtureExecutor::new(
+            self.snapshot_dir(),
+            self.profile_dir(),
+            self.dir.path().join("work"),
+        )
     }
 
     pub fn profile_dir(&self) -> PathBuf {
@@ -540,7 +634,10 @@ impl Env {
     }
 
     pub fn count(&self, event_type: &str) -> usize {
-        self.events().iter().filter(|e| e.event_type == event_type).count()
+        self.events()
+            .iter()
+            .filter(|e| e.event_type == event_type)
+            .count()
     }
 
     /// `Denied` audit events whose payload `reason` equals `reason`.
@@ -614,23 +711,47 @@ pub fn routing_over<J: Executor>(
     counts: &ExecCounts,
     hook: Option<CrashHook>,
 ) -> RoutingExecutor<J> {
-    let model = ModelExecutor::new(root.join("model"), provider, counts.clone()).with_crash(hook.clone());
-    let reads = ShadowReader::new(root.join("agentos.db"), root.join("snapshot"), root.join("shadow")).with_crash(hook);
+    let model =
+        ModelExecutor::new(root.join("model"), provider, counts.clone()).with_crash(hook.clone());
+    let reads = ShadowReader::new(
+        root.join("agentos.db"),
+        root.join("snapshot"),
+        root.join("shadow"),
+    )
+    .with_crash(hook);
     RoutingExecutor::new(jobs, model, reads)
 }
 
 /// A model-driven task over `model_env(model_requests, tool_actions)`, with the routing
 /// executor answering model calls from `provider` (the returned handle shares its counter).
-pub fn flow_with(provider: FakeProvider, model_requests: u32, tool_actions: u32) -> (Env, RoutingExecutor<FixtureExecutor>, FakeProvider) {
+pub fn flow_with(
+    provider: FakeProvider,
+    model_requests: u32,
+    tool_actions: u32,
+) -> (Env, RoutingExecutor<FixtureExecutor>, FakeProvider) {
     let env = model_env(model_requests, tool_actions);
     let counts = ExecCounts::default();
-    let exec = routing_over(env.dir.path(), env.fixture_exec(), Some(Box::new(provider.clone_handle())), &counts, None);
+    let exec = routing_over(
+        env.dir.path(),
+        env.fixture_exec(),
+        Some(Box::new(provider.clone_handle())),
+        &counts,
+        None,
+    );
     (env, exec, provider)
 }
 
 /// [`flow_with`] a provider answering from `fixtures/transcripts/<transcript>.json`.
-pub fn flow(transcript_name: &str, model_requests: u32, tool_actions: u32) -> (Env, RoutingExecutor<FixtureExecutor>, FakeProvider) {
-    flow_with(FakeProvider::from_file(&transcript(transcript_name)).unwrap(), model_requests, tool_actions)
+pub fn flow(
+    transcript_name: &str,
+    model_requests: u32,
+    tool_actions: u32,
+) -> (Env, RoutingExecutor<FixtureExecutor>, FakeProvider) {
+    flow_with(
+        FakeProvider::from_file(&transcript(transcript_name)).unwrap(),
+        model_requests,
+        tool_actions,
+    )
 }
 
 /// A fresh `ModelAgent` for `env`'s contract.
@@ -641,5 +762,7 @@ pub fn model_agent(env: &Env) -> ModelAgent {
 /// Runs the task with a fresh `ModelAgent`.
 pub async fn run_model<E: Executor>(env: &Env, exec: &E) -> TaskState {
     let mut agent = model_agent(env);
-    agentos_engine::runner::run_task(&env.db, &env.blobs, exec, &mut agent, &env.task).await.unwrap()
+    agentos_engine::runner::run_task(&env.db, &env.blobs, exec, &mut agent, &env.task)
+        .await
+        .unwrap()
 }

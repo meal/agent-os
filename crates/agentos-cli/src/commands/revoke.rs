@@ -5,14 +5,17 @@
 use agentos_core::contract::Capability;
 use agentos_core::ids::TaskId;
 use agentos_engine::supervised::cancel_jobs_in;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::print;
 use crate::error::CliError;
 use crate::home::{Home, Store};
 
 fn capability_name(cap: Capability) -> String {
-    serde_json::to_value(cap).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()
+    serde_json::to_value(cap)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
 }
 
 fn parse_capability(name: &str) -> Result<Capability, CliError> {
@@ -26,7 +29,12 @@ fn parse_capability(name: &str) -> Result<Capability, CliError> {
 /// Drops the `cancel` marker of every live job of the task's outstanding effects (only
 /// those whose kind needs a capability in `only`, when given); their supervisors kill the
 /// workers. Returns how many jobs were asked to stop.
-pub fn cancel_running_jobs(home: &Home, store: &Store, task: &TaskId, only: Option<&[Capability]>) -> Result<usize, CliError> {
+pub fn cancel_running_jobs(
+    home: &Home,
+    store: &Store,
+    task: &TaskId,
+    only: Option<&[Capability]>,
+) -> Result<usize, CliError> {
     let effects: Vec<_> = store
         .db
         .outstanding_effects(task)?
@@ -36,7 +44,10 @@ pub fn cancel_running_jobs(home: &Home, store: &Store, task: &TaskId, only: Opti
         .collect();
     // Dropping a cancel marker needs no worker (and so no preflight): whatever the worker,
     // the job's supervisor kills it within a poll interval.
-    Ok(cancel_jobs_in(&std::path::absolute(&home.root)?.join("jobs"), &effects))
+    Ok(cancel_jobs_in(
+        &std::path::absolute(&home.root)?.join("jobs"),
+        &effects,
+    ))
 }
 
 pub fn revoke(home: &Home, task: &TaskId, capability: Option<&str>) -> Result<(), CliError> {
@@ -44,7 +55,11 @@ pub fn revoke(home: &Home, task: &TaskId, capability: Option<&str>) -> Result<()
     let store = home.open()?;
     let revoked = store.db.revoke(task, only)?;
     let finished = store.db.task(task)?.state.is_terminal();
-    let cancelled = if finished || revoked.is_empty() { 0 } else { cancel_running_jobs(home, &store, task, Some(&revoked))? };
+    let cancelled = if finished || revoked.is_empty() {
+        0
+    } else {
+        cancel_running_jobs(home, &store, task, Some(&revoked))?
+    };
     print(&json!({
         "task_id": task,
         "revoked": revoked.into_iter().map(capability_name).collect::<Vec<_>>(),

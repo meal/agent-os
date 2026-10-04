@@ -8,7 +8,9 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agentos_core::guest::{read_frame, write_frame, Frame, FrameError, Message, Mode, RAW_FRAME_LIMIT};
+use agentos_core::guest::{
+    Frame, FrameError, Message, Mode, RAW_FRAME_LIMIT, read_frame, write_frame,
+};
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 const OTHER: &str = "fedcba9876543210fedcba9876543210";
@@ -40,7 +42,12 @@ fn spawn_with(env: &[(&str, &str)], prepare: impl FnOnce(&Path)) -> FakeGuest {
     for (k, v) in env {
         cmd.env(k, v);
     }
-    FakeGuest { child: cmd.spawn().unwrap(), uds, root, _dir: dir }
+    FakeGuest {
+        child: cmd.spawn().unwrap(),
+        uds,
+        root,
+        _dir: dir,
+    }
 }
 
 fn spawn() -> FakeGuest {
@@ -74,7 +81,10 @@ fn wait_exit(child: &mut Child, within: Duration) -> Option<ExitStatus> {
 impl FakeGuest {
     /// Connects and completes the `CONNECT 5200` / `OK 5200` handshake.
     fn connect(&self) -> UnixStream {
-        assert!(wait_for(&self.uds, Duration::from_secs(5)), "the fake guest never listened");
+        assert!(
+            wait_for(&self.uds, Duration::from_secs(5)),
+            "the fake guest never listened"
+        );
         let mut s = UnixStream::connect(&self.uds).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         s.write_all(b"CONNECT 5200\n").unwrap();
@@ -91,7 +101,9 @@ impl FakeGuest {
     fn hello(&self, token: &str, mode: Mode) -> UnixStream {
         let mut s = self.connect();
         send(&mut s, hello_msg(1, token, mode));
-        let Message::Ready { mode: got, .. } = recv(&mut s) else { panic!("no Ready") };
+        let Message::Ready { mode: got, .. } = recv(&mut s) else {
+            panic!("no Ready")
+        };
         assert_eq!(got, mode);
         s
     }
@@ -129,9 +141,17 @@ fn assert_closed(s: &mut UnixStream) {
 }
 
 fn empty_snapshot(s: &mut UnixStream) {
-    send(s, Message::ReadSnapshot { file_count: 0, total_bytes: 0 });
+    send(
+        s,
+        Message::ReadSnapshot {
+            file_count: 0,
+            total_bytes: 0,
+        },
+    );
     send(s, Message::EndFiles);
-    let Message::SnapshotDone { files, .. } = recv(s) else { panic!("no SnapshotDone") };
+    let Message::SnapshotDone { files, .. } = recv(s) else {
+        panic!("no SnapshotDone")
+    };
     assert!(files.is_empty());
 }
 
@@ -140,8 +160,20 @@ fn fake_guest_answers_connect_with_ok_and_hello_with_ready() {
     let g = spawn();
     let mut s = g.connect();
     send(&mut s, hello_msg(1, TOKEN, Mode::Job));
-    let Message::Ready { protocol, agent_version, mode, vcpus, memory_mib } = recv(&mut s) else { panic!("no Ready") };
-    assert_eq!((protocol, agent_version.as_str(), mode), (1, "0.1.0", Mode::Job));
+    let Message::Ready {
+        protocol,
+        agent_version,
+        mode,
+        vcpus,
+        memory_mib,
+    } = recv(&mut s)
+    else {
+        panic!("no Ready")
+    };
+    assert_eq!(
+        (protocol, agent_version.as_str(), mode),
+        (1, "0.1.0", Mode::Job)
+    );
     assert!(vcpus >= 1 && memory_mib > 0, "{vcpus} {memory_mib}");
 }
 
@@ -161,7 +193,9 @@ fn a_hello_with_protocol_2_is_refused_and_the_connection_closed() {
     let g = spawn();
     let mut s = g.connect();
     send(&mut s, hello_msg(2, TOKEN, Mode::Job));
-    let Message::Refused { reason } = recv(&mut s) else { panic!("no Refused") };
+    let Message::Refused { reason } = recv(&mut s) else {
+        panic!("no Refused")
+    };
     assert!(reason.contains("protocol 2"), "{reason}");
     assert_closed(&mut s);
 }
@@ -205,26 +239,50 @@ fn a_second_connection_with_the_same_token_but_another_mode_is_closed_without_a_
     send(&mut second, hello_msg(1, TOKEN, Mode::Job));
     assert_closed(&mut second);
     send(&mut first, Message::Digest);
-    assert!(matches!(recv(&mut first), Message::Refused { .. } | Message::DigestIs { .. }));
+    assert!(matches!(
+        recv(&mut first),
+        Message::Refused { .. } | Message::DigestIs { .. }
+    ));
 }
 
 #[test]
 fn the_watchdog_ends_a_guest_that_never_gets_a_hello() {
-    let mut g = spawn_with(&[("AGENTOS_TEST_WORKERS", "1"), ("AGENTOS_TEST_FAKE_GUEST_WATCHDOG_MS", "300")], |_| {});
+    let mut g = spawn_with(
+        &[
+            ("AGENTOS_TEST_WORKERS", "1"),
+            ("AGENTOS_TEST_FAKE_GUEST_WATCHDOG_MS", "300"),
+        ],
+        |_| {},
+    );
     // A connection that never says Hello does not count.
     let _silent = g.connect();
     let status = wait_exit(&mut g.child, Duration::from_secs(5)).expect("the watchdog never fired");
     assert_eq!(status.code(), Some(0));
 
     // A bound Hello disarms it.
-    let mut g = spawn_with(&[("AGENTOS_TEST_WORKERS", "1"), ("AGENTOS_TEST_FAKE_GUEST_WATCHDOG_MS", "300")], |_| {});
+    let mut g = spawn_with(
+        &[
+            ("AGENTOS_TEST_WORKERS", "1"),
+            ("AGENTOS_TEST_FAKE_GUEST_WATCHDOG_MS", "300"),
+        ],
+        |_| {},
+    );
     let mut s = g.hello(TOKEN, Mode::Job);
     thread::sleep(Duration::from_millis(800));
-    assert!(g.child.try_wait().unwrap().is_none(), "the watchdog fired after a bound Hello");
+    assert!(
+        g.child.try_wait().unwrap().is_none(),
+        "the watchdog fired after a bound Hello"
+    );
     empty_snapshot(&mut s);
 
     // A rejected Hello (another protocol) does not disarm it either.
-    let mut g = spawn_with(&[("AGENTOS_TEST_WORKERS", "1"), ("AGENTOS_TEST_FAKE_GUEST_WATCHDOG_MS", "300")], |_| {});
+    let mut g = spawn_with(
+        &[
+            ("AGENTOS_TEST_WORKERS", "1"),
+            ("AGENTOS_TEST_FAKE_GUEST_WATCHDOG_MS", "300"),
+        ],
+        |_| {},
+    );
     let mut s = g.connect();
     send(&mut s, hello_msg(2, TOKEN, Mode::Job));
     let status = wait_exit(&mut g.child, Duration::from_secs(5)).expect("the watchdog never fired");
@@ -234,22 +292,35 @@ fn the_watchdog_ends_a_guest_that_never_gets_a_hello() {
     let mut g = spawn_with(&[("AGENTOS_TEST_FAKE_GUEST_WATCHDOG_MS", "300")], |_| {});
     assert!(wait_for(&g.uds, Duration::from_secs(5)));
     thread::sleep(Duration::from_millis(800));
-    assert!(g.child.try_wait().unwrap().is_none(), "the hook was honoured without AGENTOS_TEST_WORKERS=1");
+    assert!(
+        g.child.try_wait().unwrap().is_none(),
+        "the hook was honoured without AGENTOS_TEST_WORKERS=1"
+    );
 }
 
 #[test]
 fn inspect_mode_refuses_job_requests_and_job_mode_refuses_inspect_requests() {
     let g = spawn();
     let mut s = g.hello(TOKEN, Mode::Inspect);
-    send(&mut s, Message::ReadSnapshot { file_count: 0, total_bytes: 0 });
-    let Message::Refused { reason } = recv(&mut s) else { panic!("no Refused") };
+    send(
+        &mut s,
+        Message::ReadSnapshot {
+            file_count: 0,
+            total_bytes: 0,
+        },
+    );
+    let Message::Refused { reason } = recv(&mut s) else {
+        panic!("no Refused")
+    };
     assert_eq!(reason, "unexpected request ReadSnapshot in inspect mode");
     assert_closed(&mut s);
 
     let g = spawn();
     let mut s = g.hello(TOKEN, Mode::Job);
     send(&mut s, Message::Digest);
-    let Message::Refused { reason } = recv(&mut s) else { panic!("no Refused") };
+    let Message::Refused { reason } = recv(&mut s) else {
+        panic!("no Refused")
+    };
     assert_eq!(reason, "unexpected request Digest in job mode");
     assert_closed(&mut s);
 
@@ -260,8 +331,13 @@ fn inspect_mode_refuses_job_requests_and_job_mode_refuses_inspect_requests() {
     });
     let mut s = g.hello(TOKEN, Mode::Inspect);
     send(&mut s, Message::Digest);
-    let Message::DigestIs { workspace_digest } = recv(&mut s) else { panic!("no DigestIs") };
-    assert_eq!(workspace_digest, agentos_core::workspace::workspace_digest(&g.root.join("workspace")).unwrap());
+    let Message::DigestIs { workspace_digest } = recv(&mut s) else {
+        panic!("no DigestIs")
+    };
+    assert_eq!(
+        workspace_digest,
+        agentos_core::workspace::workspace_digest(&g.root.join("workspace")).unwrap()
+    );
 }
 
 #[test]
@@ -270,7 +346,8 @@ fn shutdown_gets_bye_and_the_process_exits_0_within_1s() {
     let mut s = g.hello(TOKEN, Mode::Job);
     send(&mut s, Message::Shutdown);
     assert_eq!(recv(&mut s), Message::Bye);
-    let status = wait_exit(&mut g.child, Duration::from_secs(1)).expect("still running 1 s after Bye");
+    let status =
+        wait_exit(&mut g.child, Duration::from_secs(1)).expect("still running 1 s after Bye");
     assert_eq!(status.code(), Some(0));
 }
 
@@ -279,15 +356,28 @@ fn eof_makes_the_fake_guest_exit_within_500ms() {
     let mut g = spawn();
     let s = g.hello(TOKEN, Mode::Job);
     drop(s);
-    let status = wait_exit(&mut g.child, Duration::from_millis(500)).expect("still running 500 ms after EOF");
+    let status = wait_exit(&mut g.child, Duration::from_millis(500))
+        .expect("still running 500 ms after EOF");
     assert_eq!(status.code(), Some(0));
 }
 
 #[test]
 fn never_listen_hook_leaves_no_socket() {
-    let mut g = spawn_with(&[("AGENTOS_TEST_WORKERS", "1"), ("AGENTOS_TEST_FAKE_GUEST_NEVER_LISTEN", "1")], |_| {});
-    assert!(!wait_for(&g.uds, Duration::from_secs(1)), "the hook must keep the socket away");
-    assert!(g.child.try_wait().unwrap().is_none(), "the hooked guest sleeps rather than exiting");
+    let mut g = spawn_with(
+        &[
+            ("AGENTOS_TEST_WORKERS", "1"),
+            ("AGENTOS_TEST_FAKE_GUEST_NEVER_LISTEN", "1"),
+        ],
+        |_| {},
+    );
+    assert!(
+        !wait_for(&g.uds, Duration::from_secs(1)),
+        "the hook must keep the socket away"
+    );
+    assert!(
+        g.child.try_wait().unwrap().is_none(),
+        "the hooked guest sleeps rather than exiting"
+    );
 
     // Without AGENTOS_TEST_WORKERS=1 the hook is ignored.
     let g = spawn_with(&[("AGENTOS_TEST_FAKE_GUEST_NEVER_LISTEN", "1")], |_| {});
@@ -308,10 +398,15 @@ fn fake_start_recreates_an_empty_scratch_dir() {
 
 #[test]
 fn no_arguments_prints_the_usage_and_exits_2() {
-    let out = Command::new(env!("CARGO_BIN_EXE_agentos-guest")).output().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_agentos-guest"))
+        .output()
+        .unwrap();
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("usage: agentos-guest --fake UDS ROOT"), "{stderr}");
+    assert!(
+        stderr.contains("usage: agentos-guest --fake UDS ROOT"),
+        "{stderr}"
+    );
     // The exec-check line is the trampoline's own usage, with every required option.
     let exec_check = agentos_guest::trampoline::USAGE.trim_start_matches("usage: ");
     assert!(stderr.contains(exec_check), "{stderr}");

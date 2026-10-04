@@ -35,9 +35,9 @@ pub enum EffectKind {
 impl EffectKind {
     pub fn capability(&self) -> Capability {
         match self {
-            EffectKind::ReadSnapshot | EffectKind::ListFiles { .. } | EffectKind::ReadFile { .. } => {
-                Capability::SnapshotRead
-            }
+            EffectKind::ReadSnapshot
+            | EffectKind::ListFiles { .. }
+            | EffectKind::ReadFile { .. } => Capability::SnapshotRead,
             EffectKind::ModelCall { .. } => Capability::ModelRequest,
             EffectKind::ApplyPatch { .. } => Capability::WorkspaceApplyPatch,
             EffectKind::RunVerification => Capability::VerificationRun,
@@ -250,7 +250,11 @@ mod tests {
         let b = id_of("t", 1, &EffectKind::RunVerification, b"r");
         assert_eq!(a, b);
         assert_eq!(a.as_str().len(), 64);
-        assert!(a.as_str().chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')));
+        assert!(
+            a.as_str()
+                .chars()
+                .all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+        );
     }
 
     #[test]
@@ -270,9 +274,15 @@ mod tests {
             EffectKind::ApplyPatch { expected_base: b },
             EffectKind::RunVerification,
             EffectKind::ExportBundle,
-            EffectKind::ModelCall { model: "m".into(), turn: 1 },
+            EffectKind::ModelCall {
+                model: "m".into(),
+                turn: 1,
+            },
             EffectKind::ListFiles { turn: 1 },
-            EffectKind::ReadFile { path: "src/a.py".into(), turn: 1 },
+            EffectKind::ReadFile {
+                path: "src/a.py".into(),
+                turn: 1,
+            },
         ];
         let ids: Vec<_> = kinds.iter().map(|k| id_of("t", 1, k, b"r")).collect();
         for i in 0..ids.len() {
@@ -284,23 +294,51 @@ mod tests {
 
     #[test]
     fn model_turn_and_path_change_the_id() {
-        let mc = |m: &str, t| EffectKind::ModelCall { model: m.into(), turn: t };
-        let rf = |p: &str, t| EffectKind::ReadFile { path: p.into(), turn: t };
+        let mc = |m: &str, t| EffectKind::ModelCall {
+            model: m.into(),
+            turn: t,
+        };
+        let rf = |p: &str, t| EffectKind::ReadFile {
+            path: p.into(),
+            turn: t,
+        };
         let lf = |t| EffectKind::ListFiles { turn: t };
-        assert_ne!(id_of("t", 1, &mc("m", 1), b"r"), id_of("t", 1, &mc("m", 2), b"r"));
-        assert_ne!(id_of("t", 1, &mc("m", 1), b"r"), id_of("t", 1, &mc("n", 1), b"r"));
-        assert_eq!(id_of("t", 1, &mc("m", 1), b"r"), id_of("t", 1, &mc("m", 1), b"r"));
+        assert_ne!(
+            id_of("t", 1, &mc("m", 1), b"r"),
+            id_of("t", 1, &mc("m", 2), b"r")
+        );
+        assert_ne!(
+            id_of("t", 1, &mc("m", 1), b"r"),
+            id_of("t", 1, &mc("n", 1), b"r")
+        );
+        assert_eq!(
+            id_of("t", 1, &mc("m", 1), b"r"),
+            id_of("t", 1, &mc("m", 1), b"r")
+        );
         assert_ne!(id_of("t", 1, &lf(1), b"r"), id_of("t", 1, &lf(2), b"r"));
         assert_eq!(id_of("t", 1, &lf(1), b"r"), id_of("t", 1, &lf(1), b"r"));
-        assert_ne!(id_of("t", 1, &rf("a", 1), b"r"), id_of("t", 1, &rf("b", 1), b"r"));
-        assert_ne!(id_of("t", 1, &rf("a", 1), b"r"), id_of("t", 1, &rf("a", 2), b"r"));
-        assert_eq!(id_of("t", 1, &rf("a", 1), b"r"), id_of("t", 1, &rf("a", 1), b"r"));
+        assert_ne!(
+            id_of("t", 1, &rf("a", 1), b"r"),
+            id_of("t", 1, &rf("b", 1), b"r")
+        );
+        assert_ne!(
+            id_of("t", 1, &rf("a", 1), b"r"),
+            id_of("t", 1, &rf("a", 2), b"r")
+        );
+        assert_eq!(
+            id_of("t", 1, &rf("a", 1), b"r"),
+            id_of("t", 1, &rf("a", 1), b"r")
+        );
     }
 
     #[test]
     fn apply_patch_expected_base_changes_id() {
-        let k1 = EffectKind::ApplyPatch { expected_base: Digest::of(b"a") };
-        let k2 = EffectKind::ApplyPatch { expected_base: Digest::of(b"b") };
+        let k1 = EffectKind::ApplyPatch {
+            expected_base: Digest::of(b"a"),
+        };
+        let k2 = EffectKind::ApplyPatch {
+            expected_base: Digest::of(b"b"),
+        };
         assert_ne!(id_of("t", 1, &k1, b"r"), id_of("t", 1, &k2, b"r"));
         assert_eq!(id_of("t", 1, &k1, b"r"), id_of("t", 1, &k1, b"r"));
     }
@@ -315,29 +353,46 @@ mod tests {
             id_of("a", 0x0000_0100, &k, b"r"),
             id_of("a\u{0}", 0x0001_0000, &k, b"r")
         );
-        assert_ne!(
-            id_of("a\u{1}", 0, &k, b"r"),
-            id_of("a", 1, &k, b"r")
-        );
+        assert_ne!(id_of("a\u{1}", 0, &k, b"r"), id_of("a", 1, &k, b"r"));
     }
 
     #[test]
     fn kind_maps_to_capability() {
         let d = Digest::of(b"x");
-        assert_eq!(EffectKind::ReadSnapshot.capability(), Capability::SnapshotRead);
+        assert_eq!(
+            EffectKind::ReadSnapshot.capability(),
+            Capability::SnapshotRead
+        );
         assert_eq!(
             EffectKind::ApplyPatch { expected_base: d }.capability(),
             Capability::WorkspaceApplyPatch
         );
-        assert_eq!(EffectKind::RunVerification.capability(), Capability::VerificationRun);
-        assert_eq!(EffectKind::ExportBundle.capability(), Capability::ArtifactExport);
         assert_eq!(
-            EffectKind::ModelCall { model: "m".into(), turn: 1 }.capability(),
+            EffectKind::RunVerification.capability(),
+            Capability::VerificationRun
+        );
+        assert_eq!(
+            EffectKind::ExportBundle.capability(),
+            Capability::ArtifactExport
+        );
+        assert_eq!(
+            EffectKind::ModelCall {
+                model: "m".into(),
+                turn: 1
+            }
+            .capability(),
             Capability::ModelRequest
         );
-        assert_eq!(EffectKind::ListFiles { turn: 1 }.capability(), Capability::SnapshotRead);
         assert_eq!(
-            EffectKind::ReadFile { path: "p".into(), turn: 1 }.capability(),
+            EffectKind::ListFiles { turn: 1 }.capability(),
+            Capability::SnapshotRead
+        );
+        assert_eq!(
+            EffectKind::ReadFile {
+                path: "p".into(),
+                turn: 1
+            }
+            .capability(),
             Capability::SnapshotRead
         );
     }
@@ -350,15 +405,32 @@ mod tests {
             EffectKind::ApplyPatch { expected_base: d }.retry_policy(),
             RetryPolicy::ReconcileThenRetry
         );
-        assert_eq!(EffectKind::RunVerification.retry_policy(), RetryPolicy::Retry);
-        assert_eq!(EffectKind::ExportBundle.retry_policy(), RetryPolicy::ReconcileThenRetry);
         assert_eq!(
-            EffectKind::ModelCall { model: "m".into(), turn: 1 }.retry_policy(),
+            EffectKind::RunVerification.retry_policy(),
+            RetryPolicy::Retry
+        );
+        assert_eq!(
+            EffectKind::ExportBundle.retry_policy(),
+            RetryPolicy::ReconcileThenRetry
+        );
+        assert_eq!(
+            EffectKind::ModelCall {
+                model: "m".into(),
+                turn: 1
+            }
+            .retry_policy(),
             RetryPolicy::ForfeitThenRetry
         );
-        assert_eq!(EffectKind::ListFiles { turn: 1 }.retry_policy(), RetryPolicy::Retry);
         assert_eq!(
-            EffectKind::ReadFile { path: "p".into(), turn: 1 }.retry_policy(),
+            EffectKind::ListFiles { turn: 1 }.retry_policy(),
+            RetryPolicy::Retry
+        );
+        assert_eq!(
+            EffectKind::ReadFile {
+                path: "p".into(),
+                turn: 1
+            }
+            .retry_policy(),
             RetryPolicy::Retry
         );
     }
@@ -368,17 +440,46 @@ mod tests {
         assert_eq!(EffectKind::ReadSnapshot.tag(), "read_snapshot");
         assert_eq!(EffectKind::RunVerification.tag(), "run_verification");
         assert_eq!(EffectKind::ExportBundle.tag(), "export_bundle");
-        assert_eq!(EffectKind::ModelCall { model: "m".into(), turn: 1 }.tag(), "model_call");
+        assert_eq!(
+            EffectKind::ModelCall {
+                model: "m".into(),
+                turn: 1
+            }
+            .tag(),
+            "model_call"
+        );
         assert_eq!(EffectKind::ListFiles { turn: 1 }.tag(), "list_files");
-        assert_eq!(EffectKind::ReadFile { path: "p".into(), turn: 1 }.tag(), "read_file");
+        assert_eq!(
+            EffectKind::ReadFile {
+                path: "p".into(),
+                turn: 1
+            }
+            .tag(),
+            "read_file"
+        );
     }
 
     #[test]
     fn new_kinds_serde_round_trip() {
         let cases = [
-            (EffectKind::ModelCall { model: "m".into(), turn: 3 }, r#"{"ModelCall":{"model":"m","turn":3}}"#),
-            (EffectKind::ListFiles { turn: 1 }, r#"{"ListFiles":{"turn":1}}"#),
-            (EffectKind::ReadFile { path: "p".into(), turn: 2 }, r#"{"ReadFile":{"path":"p","turn":2}}"#),
+            (
+                EffectKind::ModelCall {
+                    model: "m".into(),
+                    turn: 3,
+                },
+                r#"{"ModelCall":{"model":"m","turn":3}}"#,
+            ),
+            (
+                EffectKind::ListFiles { turn: 1 },
+                r#"{"ListFiles":{"turn":1}}"#,
+            ),
+            (
+                EffectKind::ReadFile {
+                    path: "p".into(),
+                    turn: 2,
+                },
+                r#"{"ReadFile":{"path":"p","turn":2}}"#,
+            ),
         ];
         for (k, json) in cases {
             assert_eq!(serde_json::to_string(&k).unwrap(), json);
@@ -389,8 +490,14 @@ mod tests {
     #[test]
     fn receipt_applies_when_fresh() {
         let e = record(EffectState::Dispatched, 3);
-        assert_eq!(accept_receipt(&e, &receipt(e.effect_id.clone(), 3)), ReceiptVerdict::Apply);
-        assert_eq!(accept_receipt(&e, &receipt(e.effect_id.clone(), 4)), ReceiptVerdict::Apply);
+        assert_eq!(
+            accept_receipt(&e, &receipt(e.effect_id.clone(), 3)),
+            ReceiptVerdict::Apply
+        );
+        assert_eq!(
+            accept_receipt(&e, &receipt(e.effect_id.clone(), 4)),
+            ReceiptVerdict::Apply
+        );
     }
 
     #[test]
@@ -417,7 +524,10 @@ mod tests {
     fn receipt_with_other_id_is_wrong_effect() {
         let e = record(EffectState::Dispatched, 3);
         let other = id_of("t", 9, &EffectKind::ReadSnapshot, b"r");
-        assert_eq!(accept_receipt(&e, &receipt(other, 3)), ReceiptVerdict::WrongEffect);
+        assert_eq!(
+            accept_receipt(&e, &receipt(other, 3)),
+            ReceiptVerdict::WrongEffect
+        );
     }
 
     #[test]
@@ -425,7 +535,10 @@ mod tests {
         let other = id_of("t", 9, &EffectKind::ReadSnapshot, b"r");
         // wrong id beats stale lease and completed state
         let e = record(EffectState::Completed, 3);
-        assert_eq!(accept_receipt(&e, &receipt(other, 1)), ReceiptVerdict::WrongEffect);
+        assert_eq!(
+            accept_receipt(&e, &receipt(other, 1)),
+            ReceiptVerdict::WrongEffect
+        );
         // duplicate beats stale lease
         assert_eq!(
             accept_receipt(&e, &receipt(e.effect_id.clone(), 1)),
@@ -444,7 +557,10 @@ mod tests {
         }
         // wrong id still wins
         let other = id_of("t", 9, &EffectKind::ReadSnapshot, b"r");
-        assert_eq!(accept_receipt(&e, &receipt(other, 0)), ReceiptVerdict::WrongEffect);
+        assert_eq!(
+            accept_receipt(&e, &receipt(other, 0)),
+            ReceiptVerdict::WrongEffect
+        );
     }
 
     #[test]
@@ -461,7 +577,10 @@ mod tests {
     #[test]
     fn late_receipt_for_unknown_effect_applies() {
         let e = record(EffectState::Unknown, 2);
-        assert_eq!(accept_receipt(&e, &receipt(e.effect_id.clone(), 2)), ReceiptVerdict::Apply);
+        assert_eq!(
+            accept_receipt(&e, &receipt(e.effect_id.clone(), 2)),
+            ReceiptVerdict::Apply
+        );
         assert_eq!(
             accept_receipt(&e, &receipt(e.effect_id.clone(), 1)),
             ReceiptVerdict::StaleLeaseIgnored
@@ -487,7 +606,9 @@ mod tests {
     #[test]
     fn effect_record_and_receipt_serde_round_trip() {
         let mut e = record(EffectState::Completed, 2);
-        e.kind = EffectKind::ApplyPatch { expected_base: Digest::of(b"b") };
+        e.kind = EffectKind::ApplyPatch {
+            expected_base: Digest::of(b"b"),
+        };
         e.result_digest = Some(Digest::of(b"o"));
         let json = serde_json::to_string(&e).unwrap();
         assert_eq!(serde_json::from_str::<EffectRecord>(&json).unwrap(), e);

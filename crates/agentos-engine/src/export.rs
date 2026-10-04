@@ -167,7 +167,9 @@ fn read_blob(blobs: &BlobStore, d: &Digest) -> Result<Vec<u8>> {
         _ => ExportError::Io(e),
     })?;
     if Digest::of(&bytes) != *d {
-        return Err(ExportError::Integrity(format!("blob {d} does not match its digest")));
+        return Err(ExportError::Integrity(format!(
+            "blob {d} does not match its digest"
+        )));
     }
     Ok(bytes)
 }
@@ -177,7 +179,9 @@ fn parse(what: &str, bytes: &[u8]) -> Result<Value> {
 }
 
 fn digest_field(v: &Value, field: &str, what: &str) -> Result<Digest> {
-    let s = v[field].as_str().ok_or_else(|| inconsistent(format!("{what} has no {field}")))?;
+    let s = v[field]
+        .as_str()
+        .ok_or_else(|| inconsistent(format!("{what} has no {field}")))?;
     Digest::from_hex(s).map_err(|e| inconsistent(format!("{what}: {field}: {e}")))
 }
 
@@ -189,7 +193,8 @@ fn optional_digest(v: &Value, field: &str, what: &str) -> Result<Option<Digest>>
 }
 
 fn result_of(rec: &EffectRecord) -> Result<Digest> {
-    rec.result_digest.ok_or_else(|| inconsistent(format!("finished effect {} has no result", rec.effect_id)))
+    rec.result_digest
+        .ok_or_else(|| inconsistent(format!("finished effect {} has no result", rec.effect_id)))
 }
 
 /// Effects in intent order.
@@ -198,7 +203,8 @@ fn effects(db: &Db, events: &[StoredEvent]) -> Result<Vec<EffectRecord>> {
         .iter()
         .filter(|e| e.event_type == "EffectIntended")
         .map(|e| {
-            let id: EffectId = serde_json::from_value(e.payload["effect_id"].clone()).map_err(DbError::from)?;
+            let id: EffectId =
+                serde_json::from_value(e.payload["effect_id"].clone()).map_err(DbError::from)?;
             Ok(db.effect(&id)?)
         })
         .collect()
@@ -209,10 +215,18 @@ fn patch_text(db: &Db, blobs: &BlobStore, task: &TaskId, rec: &EffectRecord) -> 
     let bytes = match journal::journaled_patch(db, task, &rec.request_digest)? {
         Some(text) => text.into_bytes(),
         None if blobs.exists(&rec.request_digest) => read_blob(blobs, &rec.request_digest)?,
-        None => return Err(inconsistent(format!("the patch of effect {} is gone", rec.effect_id))),
+        None => {
+            return Err(inconsistent(format!(
+                "the patch of effect {} is gone",
+                rec.effect_id
+            )));
+        }
     };
     if Digest::of(&bytes) != rec.request_digest {
-        return Err(ExportError::Integrity(format!("patch of effect {} does not match its digest", rec.effect_id)));
+        return Err(ExportError::Integrity(format!(
+            "patch of effect {} does not match its digest",
+            rec.effect_id
+        )));
     }
     Ok(bytes)
 }
@@ -234,14 +248,23 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
     }
     let events = db.events(task)?;
     let contract = db.contract(task)?;
-    let created = events.iter().find(|e| e.event_type == "TaskCreated").ok_or_else(|| inconsistent("no TaskCreated event"))?;
+    let created = events
+        .iter()
+        .find(|e| e.event_type == "TaskCreated")
+        .ok_or_else(|| inconsistent("no TaskCreated event"))?;
     let contract_digest = digest_field(&created.payload, "contract_digest", "TaskCreated")?;
-    let submitted = events.iter().find(|e| e.event_type == "Submitted").map(|e| &e.payload);
+    let submitted = events
+        .iter()
+        .find(|e| e.event_type == "Submitted")
+        .map(|e| &e.payload);
     let (submitted_repo, submitted_profile, guest_image_digest) = match submitted {
         Some(s) => {
             // Submission digests the stored contract serialization, so it can be re-checked.
-            if Digest::of(&serde_json::to_vec(&contract).map_err(DbError::from)?) != contract_digest {
-                return Err(inconsistent(format!("contract digest {contract_digest} does not match the stored contract")));
+            if Digest::of(&serde_json::to_vec(&contract).map_err(DbError::from)?) != contract_digest
+            {
+                return Err(inconsistent(format!(
+                    "contract digest {contract_digest} does not match the stored contract"
+                )));
             }
             (
                 Some(digest_field(s, "repository_digest", "Submitted")?),
@@ -262,20 +285,36 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
             (EffectKind::ReadSnapshot, EffectState::Completed) => {
                 let d = result_of(&rec)?;
                 let bytes = read_blob(blobs, &d)?;
-                let ws = digest_field(&parse("snapshot manifest", &bytes)?, "workspace_digest", "snapshot manifest")?;
+                let ws = digest_field(
+                    &parse("snapshot manifest", &bytes)?,
+                    "workspace_digest",
+                    "snapshot manifest",
+                )?;
                 (base, last) = (Some(ws), Some(ws));
                 evidence.insert(d, bytes);
             }
             (EffectKind::ApplyPatch { .. }, EffectState::Completed) => {
                 let result = read_blob(blobs, &result_of(&rec)?)?;
-                last = Some(digest_field(&parse("patch result", &result)?, "workspace_digest", "patch result")?);
+                last = Some(digest_field(
+                    &parse("patch result", &result)?,
+                    "workspace_digest",
+                    "patch result",
+                )?);
                 let text = patch_text(db, blobs, task, &rec)?;
                 if !patch_diff.is_empty() && !patch_diff.ends_with(b"\n") {
                     patch_diff.push(b'\n');
                 }
                 patch_diff.extend_from_slice(&text);
-                let file = format!("patches/{:04}-{}.patch", entries.len() + 1, rec.request_digest);
-                entries.push(PatchEntry { effect_id: rec.effect_id.clone(), digest: rec.request_digest, file: file.clone() });
+                let file = format!(
+                    "patches/{:04}-{}.patch",
+                    entries.len() + 1,
+                    rec.request_digest
+                );
+                entries.push(PatchEntry {
+                    effect_id: rec.effect_id.clone(),
+                    digest: rec.request_digest,
+                    file: file.clone(),
+                });
                 patches.push((file, text));
             }
             (EffectKind::RunVerification, EffectState::Completed | EffectState::Failed) => {
@@ -288,10 +327,22 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
                     effect_id: rec.effect_id.clone(),
                     completed,
                     passed: completed && v["passed"] == true,
-                    workspace_digest: if completed { Some(digest_field(&v, "workspace_digest", &what)?) } else { None },
+                    workspace_digest: if completed {
+                        Some(digest_field(&v, "workspace_digest", &what)?)
+                    } else {
+                        None
+                    },
                     evidence_digest: d,
-                    profile_digest: if completed { Some(digest_field(&v, "profile_digest", &what)?) } else { None },
-                    exit_code: if completed { v["exit_code"].as_i64() } else { None },
+                    profile_digest: if completed {
+                        Some(digest_field(&v, "profile_digest", &what)?)
+                    } else {
+                        None
+                    },
+                    exit_code: if completed {
+                        v["exit_code"].as_i64()
+                    } else {
+                        None
+                    },
                     accepted_for_final_workspace: false,
                 });
                 evidence.insert(d, bytes);
@@ -300,7 +351,12 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
                 let n = model_calls.len() + 1;
                 let request = match blobs.exists(&rec.request_digest) {
                     true => read_blob(blobs, &rec.request_digest)?,
-                    false => return Err(inconsistent(format!("the request of model call {} is gone", rec.effect_id))),
+                    false => {
+                        return Err(inconsistent(format!(
+                            "the request of model call {} is gone",
+                            rec.effect_id
+                        )));
+                    }
                 };
                 let request_file = format!("model/{n:04}-request.json");
                 model_files.push((request_file.clone(), request));
@@ -316,7 +372,12 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
                     effect_id: rec.effect_id.clone(),
                     request_digest: rec.request_digest,
                     response_digest: rec.result_digest,
-                    state: if rec.state == EffectState::Completed { "COMPLETED" } else { "FAILED" }.to_string(),
+                    state: if rec.state == EffectState::Completed {
+                        "COMPLETED"
+                    } else {
+                        "FAILED"
+                    }
+                    .to_string(),
                     request_file,
                     response_file,
                 });
@@ -329,10 +390,15 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
     if let (Some(recorded), Some(read)) = (submitted_repo, base)
         && recorded != read
     {
-        return Err(inconsistent(format!("the snapshot read ({read}) is not the submitted repository ({recorded})")));
+        return Err(inconsistent(format!(
+            "the snapshot read ({read}) is not the submitted repository ({recorded})"
+        )));
     }
     let profile = submitted_profile.or_else(|| results.iter().find_map(|r| r.profile_digest));
-    if let Some(r) = results.iter().find(|r| r.profile_digest.is_some_and(|p| Some(p) != profile)) {
+    if let Some(r) = results
+        .iter()
+        .find(|r| r.profile_digest.is_some_and(|p| Some(p) != profile))
+    {
         return Err(inconsistent(format!(
             "verification {} ran profile {:?}, not the submitted profile {profile:?}",
             r.effect_id, r.profile_digest
@@ -340,7 +406,9 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
     }
     // The verification whose completion committed VerifyPassed (same transaction, so its
     // EffectCompleted is the event right before).
-    let accepting = events.windows(2).find(|w| w[1].event_type == "VerifyPassed" && w[0].event_type == "EffectCompleted");
+    let accepting = events
+        .windows(2)
+        .find(|w| w[1].event_type == "VerifyPassed" && w[0].event_type == "EffectCompleted");
     let accepting: Option<EffectId> = accepting
         .map(|w| serde_json::from_value(w[0].payload["effect_id"].clone()).map_err(DbError::from))
         .transpose()?;
@@ -353,10 +421,14 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
             && r.workspace_digest == last;
     }
     let verified = if t.state == TaskState::Succeeded {
-        let v = t.verified_digest.ok_or_else(|| inconsistent("SUCCEEDED without a verified digest"))?;
+        let v = t
+            .verified_digest
+            .ok_or_else(|| inconsistent("SUCCEEDED without a verified digest"))?;
         let evidenced = results.iter().any(|r| r.accepted_for_final_workspace);
         if last != Some(v) || t.workspace_digest != v || !evidenced {
-            return Err(inconsistent(format!("verified digest {v} is not the final workspace {last:?} with passing evidence")));
+            return Err(inconsistent(format!(
+                "verified digest {v} is not the final workspace {last:?} with passing evidence"
+            )));
         }
         Some(v)
     } else {
@@ -366,7 +438,8 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
     let manifest = Manifest {
         task_id: task.clone(),
         state: t.state.label().to_string(),
-        base_revision: submitted_repo.map_or_else(|| contract.repository.revision.clone(), |d| d.to_string()),
+        base_revision: submitted_repo
+            .map_or_else(|| contract.repository.revision.clone(), |d| d.to_string()),
         base_workspace_digest: base,
         patch_digest: Digest::of(&patch_diff),
         patches: entries,
@@ -377,24 +450,45 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
         model_calls,
         usage_summary: db.usage_summary(task)?,
         contract_digest,
-        model: submitted.and_then(|s| s["model"].as_str()).map(str::to_string),
+        model: submitted
+            .and_then(|s| s["model"].as_str())
+            .map(str::to_string),
         model_policy_version: crate::model::policy::versions(db, task)?.0,
         model_limits_version: crate::model::policy::versions(db, task)?.1,
-        model_endpoint: submitted.filter(|s| s["model"].as_str().is_some_and(|m| m.starts_with("anthropic:")))
-            .map(|s| s["model_endpoint"].as_str().unwrap_or(crate::model::anthropic::ANTHROPIC_BASE_URL).to_string()),
+        model_endpoint: submitted
+            .filter(|s| {
+                s["model"]
+                    .as_str()
+                    .is_some_and(|m| m.starts_with("anthropic:"))
+            })
+            .map(|s| {
+                s["model_endpoint"]
+                    .as_str()
+                    .unwrap_or(crate::model::anthropic::ANTHROPIC_BASE_URL)
+                    .to_string()
+            }),
         generated_events: events.len(),
         capabilities: db
             .grants(task)?
             .into_iter()
             .map(|g| CapabilityEntry {
-                operation: serde_json::to_value(g.operation).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default(),
+                operation: serde_json::to_value(g.operation)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_default(),
                 handle_prefix: g.handle.prefix().to_string(),
                 revoked: g.revoked,
             })
             .collect(),
         guest_image_digest,
     };
-    Ok(Contents { manifest, patch_diff, patches, model_files, evidence })
+    Ok(Contents {
+        manifest,
+        patch_diff,
+        patches,
+        model_files,
+        evidence,
+    })
 }
 
 fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -418,7 +512,9 @@ fn write_checked(root: &Path, files: &[(String, &[u8])], before: BeforeWrite) ->
     }
     for (rel, bytes) in files {
         if Digest::of(&fs::read(root.join(rel))?) != Digest::of(bytes) {
-            return Err(ExportError::Integrity(format!("{rel} changed while it was written")));
+            return Err(ExportError::Integrity(format!(
+                "{rel} changed while it was written"
+            )));
         }
     }
     Ok(())
@@ -439,7 +535,12 @@ fn ensure_free(out_dir: &Path) -> Result<()> {
 /// A successful export is journaled as an `Exported` audit event `{manifest_digest, dir,
 /// files}` (`dir` as given); a refused or failed one journals nothing. If that journal write
 /// itself fails, the error is returned although the bundle is in place.
-pub fn export_bundle(db: &Db, blobs: &BlobStore, task: &TaskId, out_dir: &Path) -> Result<Manifest> {
+pub fn export_bundle(
+    db: &Db,
+    blobs: &BlobStore,
+    task: &TaskId,
+    out_dir: &Path,
+) -> Result<Manifest> {
     let written = write_bundle(collect(db, blobs, task)?, out_dir, &|_| Ok(()))?;
     let payload = serde_json::json!({
         "manifest_digest": written.manifest_digest,
@@ -465,7 +566,9 @@ fn write_bundle(contents: Contents, out_dir: &Path, before: BeforeWrite) -> Resu
     };
     ensure_free(out_dir)?;
 
-    let tmp = tempfile::Builder::new().prefix(".agentos-export-").tempdir_in(parent)?;
+    let tmp = tempfile::Builder::new()
+        .prefix(".agentos-export-")
+        .tempdir_in(parent)?;
     let root = tmp.path();
     fs::create_dir(root.join("patches"))?;
     fs::create_dir(root.join("evidence"))?;
@@ -473,9 +576,24 @@ fn write_bundle(contents: Contents, out_dir: &Path, before: BeforeWrite) -> Resu
         fs::create_dir(root.join("model"))?;
     }
     let mut files: Vec<(String, &[u8])> = vec![("patch.diff".into(), &contents.patch_diff)];
-    files.extend(contents.patches.iter().map(|(rel, bytes)| (rel.clone(), bytes.as_slice())));
-    files.extend(contents.model_files.iter().map(|(rel, bytes)| (rel.clone(), bytes.as_slice())));
-    files.extend(contents.evidence.iter().map(|(d, bytes)| (format!("evidence/{d}.json"), bytes.as_slice())));
+    files.extend(
+        contents
+            .patches
+            .iter()
+            .map(|(rel, bytes)| (rel.clone(), bytes.as_slice())),
+    );
+    files.extend(
+        contents
+            .model_files
+            .iter()
+            .map(|(rel, bytes)| (rel.clone(), bytes.as_slice())),
+    );
+    files.extend(
+        contents
+            .evidence
+            .iter()
+            .map(|(d, bytes)| (format!("evidence/{d}.json"), bytes.as_slice())),
+    );
     let manifest_json = serde_json::to_vec_pretty(&contents.manifest).map_err(DbError::from)?;
     files.push(("manifest.json".into(), &manifest_json));
     write_checked(root, &files, before)?;
@@ -503,7 +621,11 @@ fn write_bundle(contents: Contents, out_dir: &Path, before: BeforeWrite) -> Resu
     }
     sync_dir(parent)?;
     tracing::info!(task_id = %contents.manifest.task_id, dir = %out_dir.display(), "bundle exported");
-    Ok(Written { manifest: contents.manifest, manifest_digest: Digest::of(&manifest_json), files })
+    Ok(Written {
+        manifest: contents.manifest,
+        manifest_digest: Digest::of(&manifest_json),
+        files,
+    })
 }
 
 #[cfg(test)]
@@ -533,12 +655,24 @@ mod tests {
             capabilities: Vec::new(),
             guest_image_digest: None,
         };
-        let evidence = [b"{\"a\":1}".to_vec(), b"{\"b\":2}".to_vec()].into_iter().map(|b| (Digest::of(&b), b)).collect();
-        Contents { manifest, patch_diff: b"diff".to_vec(), patches: vec![("patches/0001-x.patch".into(), b"p".to_vec())], model_files: Vec::new(), evidence }
+        let evidence = [b"{\"a\":1}".to_vec(), b"{\"b\":2}".to_vec()]
+            .into_iter()
+            .map(|b| (Digest::of(&b), b))
+            .collect();
+        Contents {
+            manifest,
+            patch_diff: b"diff".to_vec(),
+            patches: vec![("patches/0001-x.patch".into(), b"p".to_vec())],
+            model_files: Vec::new(),
+            evidence,
+        }
     }
 
     fn names(dir: &Path) -> Vec<String> {
-        fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect()
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
     }
 
     #[test]
@@ -548,7 +682,12 @@ mod tests {
         let written = std::cell::RefCell::new(Vec::new());
         let fail_on_second_evidence = |rel: &str| {
             written.borrow_mut().push(rel.to_string());
-            match written.borrow().iter().filter(|r| r.starts_with("evidence/")).count() {
+            match written
+                .borrow()
+                .iter()
+                .filter(|r| r.starts_with("evidence/"))
+                .count()
+            {
                 2 => Err(io::Error::other("disk full")),
                 _ => Ok(()),
             }
@@ -556,9 +695,19 @@ mod tests {
 
         let err = write_bundle(contents(), &out, &fail_on_second_evidence).unwrap_err();
 
-        assert!(matches!(err, ExportError::Io(ref e) if e.to_string() == "disk full"), "{err:?}");
-        assert_eq!(written.borrow().len(), 4, "patch.diff, the patch and one evidence file were written first");
-        assert!(names(root.path()).is_empty(), "no bundle and no temp directory remain");
+        assert!(
+            matches!(err, ExportError::Io(ref e) if e.to_string() == "disk full"),
+            "{err:?}"
+        );
+        assert_eq!(
+            written.borrow().len(),
+            4,
+            "patch.diff, the patch and one evidence file were written first"
+        );
+        assert!(
+            names(root.path()).is_empty(),
+            "no bundle and no temp directory remain"
+        );
     }
 
     #[test]
@@ -567,13 +716,20 @@ mod tests {
         let out = root.path().join("bundle");
         let written = write_bundle(contents(), &out, &|_| Ok(())).unwrap();
         assert_eq!(written.files, 5);
-        assert_eq!(written.manifest_digest, Digest::of(&fs::read(out.join("manifest.json")).unwrap()));
+        assert_eq!(
+            written.manifest_digest,
+            Digest::of(&fs::read(out.join("manifest.json")).unwrap())
+        );
         let manifest = written.manifest;
         let mut got = names(&out);
         got.sort();
-        assert_eq!(got, vec!["evidence", "manifest.json", "patch.diff", "patches"]);
+        assert_eq!(
+            got,
+            vec!["evidence", "manifest.json", "patch.diff", "patches"]
+        );
         assert_eq!(names(&out.join("evidence")).len(), 2);
-        let on_disk: Manifest = serde_json::from_slice(&fs::read(out.join("manifest.json")).unwrap()).unwrap();
+        let on_disk: Manifest =
+            serde_json::from_slice(&fs::read(out.join("manifest.json")).unwrap()).unwrap();
         assert_eq!(on_disk, manifest);
         assert_eq!(names(root.path()), vec!["bundle"]);
     }

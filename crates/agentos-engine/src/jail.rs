@@ -18,7 +18,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use rustix::fs::{chown, statvfs, Gid, StatVfsMountFlags, Uid};
+use rustix::fs::{Gid, StatVfsMountFlags, Uid, chown, statvfs};
 use rustix::io::Errno;
 use rustix::process::geteuid;
 use serde::{Deserialize, Serialize};
@@ -89,9 +89,17 @@ fn valid_id(id: &str) -> bool {
 }
 
 /// The jail of the VM `id` run from `dir` (a job or an inspect directory).
-pub fn plan(cfg: &JailConfig, firecracker_bin: &Path, dir: &Path, id: &str) -> Result<JailPlan, String> {
+pub fn plan(
+    cfg: &JailConfig,
+    firecracker_bin: &Path,
+    dir: &Path,
+    id: &str,
+) -> Result<JailPlan, String> {
     if !valid_id(id) {
-        return Err(format!("invalid jail id {}", guest_text(&format!("{id:?}"))));
+        return Err(format!(
+            "invalid jail id {}",
+            guest_text(&format!("{id:?}"))
+        ));
     }
     let exec_name = firecracker_bin
         .file_name()
@@ -101,7 +109,13 @@ pub fn plan(cfg: &JailConfig, firecracker_bin: &Path, dir: &Path, id: &str) -> R
     let base = dir.join(JAIL_DIR);
     let chroot = base.join(&exec_name).join(id).join("root");
     let cgroup = cfg.cgroup_root.join(JAIL_PARENT_CGROUP).join(id);
-    Ok(JailPlan { id: id.to_string(), exec_name, base, chroot, cgroup })
+    Ok(JailPlan {
+        id: id.to_string(),
+        exec_name,
+        base,
+        chroot,
+        cgroup,
+    })
 }
 
 /// The cgroup v2 files the jailer writes, from the contract's `worker_vcpus` and
@@ -129,8 +143,21 @@ pub struct CgroupOverrides {
 
 /// The jailer's argv, exactly: never `--new-pid-ns` (the jailer would fork and its parent
 /// exit), `--daemonize` or `--netns`; the jailer passes `--id` to Firecracker itself.
-pub fn jailer_args(cfg: &JailConfig, plan: &JailPlan, firecracker_bin: &Path, vcpus: u32, memory_mib: u32) -> Vec<OsString> {
-    jailer_args_with(cfg, plan, firecracker_bin, vcpus, memory_mib, CgroupOverrides::default())
+pub fn jailer_args(
+    cfg: &JailConfig,
+    plan: &JailPlan,
+    firecracker_bin: &Path,
+    vcpus: u32,
+    memory_mib: u32,
+) -> Vec<OsString> {
+    jailer_args_with(
+        cfg,
+        plan,
+        firecracker_bin,
+        vcpus,
+        memory_mib,
+        CgroupOverrides::default(),
+    )
 }
 
 /// `jailer_args` with `overrides` applied to the cgroup values (identical without any).
@@ -160,14 +187,29 @@ pub fn jailer_args_with(
     ];
     for (file, mut value) in cgroup_values(vcpus, memory_mib) {
         match (file, overrides) {
-            ("memory.max", CgroupOverrides { memory_max_mib: Some(mib), .. }) => value = (u64::from(mib) * 1024 * 1024).to_string(),
-            ("cpu.max", CgroupOverrides { cpu_quota_us: Some(quota), .. }) => value = format!("{quota} {CPU_PERIOD_US}"),
+            (
+                "memory.max",
+                CgroupOverrides {
+                    memory_max_mib: Some(mib),
+                    ..
+                },
+            ) => value = (u64::from(mib) * 1024 * 1024).to_string(),
+            (
+                "cpu.max",
+                CgroupOverrides {
+                    cpu_quota_us: Some(quota),
+                    ..
+                },
+            ) => value = format!("{quota} {CPU_PERIOD_US}"),
             _ => {}
         }
         args.push("--cgroup".into());
         args.push(format!("{file}={value}").into());
     }
-    args.extend(["--resource-limit".into(), format!("fsize={JAIL_FSIZE_BYTES}").into()]);
+    args.extend([
+        "--resource-limit".into(),
+        format!("fsize={JAIL_FSIZE_BYTES}").into(),
+    ]);
     args.extend(["--", "--no-api", "--config-file", "/vm.json"].map(OsString::from));
     args
 }
@@ -197,29 +239,46 @@ fn prepare_err(step: &str, e: io::Error) -> String {
 fn link(src: &Path, dst: &Path) -> Result<(), String> {
     match fs::symlink_metadata(src) {
         Ok(meta) if meta.is_file() => {}
-        Ok(_) => return Err(format!("cannot prepare the jail: {} is not a regular file", src.display())),
+        Ok(_) => {
+            return Err(format!(
+                "cannot prepare the jail: {} is not a regular file",
+                src.display()
+            ));
+        }
         Err(e) => return Err(prepare_err(&format!("stat {}", src.display()), e)),
     }
     fs::hard_link(src, dst).map_err(|e| match e.kind() {
         io::ErrorKind::CrossesDevices => {
-            format!("cannot prepare the jail: {} and {} are on different filesystems", src.display(), dst.display())
+            format!(
+                "cannot prepare the jail: {} and {} are on different filesystems",
+                src.display(),
+                dst.display()
+            )
         }
         _ => prepare_err(&format!("link {} to {}", src.display(), dst.display()), e),
     })?;
     // The link itself, so a source swapped for a symlink after the check is refused too.
     if !fs::symlink_metadata(dst).is_ok_and(|m| m.is_file()) {
         let _ = fs::remove_file(dst);
-        return Err(format!("cannot prepare the jail: {} is not a regular file", src.display()));
+        return Err(format!(
+            "cannot prepare the jail: {} is not a regular file",
+            src.display()
+        ));
     }
     Ok(())
 }
 
 /// Gives `path` to the jail's uid/gid with `mode`.
 fn hand_over(cfg: &JailConfig, path: &Path, mode: u32) -> Result<(), String> {
-    chown(path, Some(Uid::from_raw(cfg.uid)), Some(Gid::from_raw(cfg.gid)))
-        .map_err(io::Error::from)
-        .map_err(|e| prepare_err(&format!("chown {}", path.display()), e))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|e| prepare_err(&format!("chmod {}", path.display()), e))
+    chown(
+        path,
+        Some(Uid::from_raw(cfg.uid)),
+        Some(Gid::from_raw(cfg.gid)),
+    )
+    .map_err(io::Error::from)
+    .map_err(|e| prepare_err(&format!("chown {}", path.display()), e))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .map_err(|e| prepare_err(&format!("chmod {}", path.display()), e))
 }
 
 /// Builds the chroot before the jailer runs: exactly `vmlinux`, `rootfs.squashfs`, `ws.img`,
@@ -227,13 +286,22 @@ fn hand_over(cfg: &JailConfig, path: &Path, mode: u32) -> Result<(), String> {
 /// `vm.json`; then the marker `<dir>/jail/cgroup` naming the VM's cgroup. `ws.img` and
 /// `scratch.img` (shared inodes, so at their own paths too) and the new files belong to the
 /// jail's uid; the registry files keep their owner and mode.
-pub fn stage(cfg: &JailConfig, plan: &JailPlan, dir: &Path, src: StageSources) -> Result<(), String> {
+pub fn stage(
+    cfg: &JailConfig,
+    plan: &JailPlan,
+    dir: &Path,
+    src: StageSources,
+) -> Result<(), String> {
     // The jailer copies the binary there itself and refuses an existing file.
     let exec_copy = plan.chroot.join(&plan.exec_name);
     if fs::symlink_metadata(&exec_copy).is_ok() {
-        return Err(format!("cannot prepare the jail: stale jail: {} exists", exec_copy.display()));
+        return Err(format!(
+            "cannot prepare the jail: stale jail: {} exists",
+            exec_copy.display()
+        ));
     }
-    fs::create_dir_all(&plan.chroot).map_err(|e| prepare_err(&format!("create {}", plan.chroot.display()), e))?;
+    fs::create_dir_all(&plan.chroot)
+        .map_err(|e| prepare_err(&format!("create {}", plan.chroot.display()), e))?;
     link(src.kernel, &plan.chroot.join("vmlinux"))?;
     link(src.rootfs, &plan.chroot.join("rootfs.squashfs"))?;
     for (from, name) in [(src.ws_img, "ws.img"), (src.scratch_img, "scratch.img")] {
@@ -253,12 +321,15 @@ pub fn stage(cfg: &JailConfig, plan: &JailPlan, dir: &Path, src: StageSources) -
     let vm_json = plan.chroot.join("vm.json");
     // A `Value` serializes its keys alphabetically, not in the documented order: harmless,
     // Firecracker reads the document by key.
-    let mut bytes = serde_json::to_vec_pretty(src.vm_json).map_err(|e| prepare_err("vm.json", io::Error::other(e)))?;
+    let mut bytes = serde_json::to_vec_pretty(src.vm_json)
+        .map_err(|e| prepare_err("vm.json", io::Error::other(e)))?;
     bytes.push(b'\n');
-    fs::write(&vm_json, bytes).map_err(|e| prepare_err(&format!("write {}", vm_json.display()), e))?;
+    fs::write(&vm_json, bytes)
+        .map_err(|e| prepare_err(&format!("write {}", vm_json.display()), e))?;
     hand_over(cfg, &vm_json, 0o644)?;
     let marker = dir.join(JAIL_MARKER);
-    fs::write(&marker, format!("{}\n", plan.cgroup.display())).map_err(|e| prepare_err(&format!("write {}", marker.display()), e))
+    fs::write(&marker, format!("{}\n", plan.cgroup.display()))
+        .map_err(|e| prepare_err(&format!("write {}", marker.display()), e))
 }
 
 /// The `vm.json` paths inside the chroot. The socket is `v.sock` relative to Firecracker's
@@ -285,9 +356,15 @@ fn unescape_mount_field(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        let octal = (b[i] == b'\\' && i + 3 < b.len() && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c)))
-            .then(|| b[i + 1..i + 4].iter().fold(0u32, |v, c| v * 8 + u32::from(c - b'0')))
-            .and_then(|v| u8::try_from(v).ok());
+        let octal = (b[i] == b'\\'
+            && i + 3 < b.len()
+            && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c)))
+        .then(|| {
+            b[i + 1..i + 4]
+                .iter()
+                .fold(0u32, |v, c| v * 8 + u32::from(c - b'0'))
+        })
+        .and_then(|v| u8::try_from(v).ok());
         if let Some(v) = octal {
             out.push(v);
             i += 4;
@@ -303,7 +380,8 @@ fn unescape_mount_field(s: &str) -> String {
 pub fn find_cgroup2_root(proc_mounts: &str) -> Option<PathBuf> {
     proc_mounts.lines().find_map(|line| {
         let fields: Vec<&str> = line.split_whitespace().collect();
-        (fields.len() >= 3 && fields[2] == "cgroup2").then(|| PathBuf::from(unescape_mount_field(fields[1])))
+        (fields.len() >= 3 && fields[2] == "cgroup2")
+            .then(|| PathBuf::from(unescape_mount_field(fields[1])))
     })
 }
 
@@ -338,7 +416,10 @@ pub fn probe_with(f: &ProbeFacts) -> Result<(), String> {
     match &f.jailer_version {
         Err(e) => return Err(format!("jailer --version: {e}")),
         Ok(v) if !v.starts_with(JAILER_VERSION_PREFIX) => {
-            return Err(format!("jailer --version: expected {JAILER_VERSION_PREFIX}, got {}", guest_text(v)));
+            return Err(format!(
+                "jailer --version: expected {JAILER_VERSION_PREFIX}, got {}",
+                guest_text(v)
+            ));
         }
         Ok(_) => {}
     }
@@ -353,9 +434,16 @@ pub fn probe_with(f: &ProbeFacts) -> Result<(), String> {
             root.display()
         ));
     }
-    let missing: Vec<&str> = CONTROLLERS.into_iter().filter(|c| !f.controllers.iter().any(|have| have == c)).collect();
+    let missing: Vec<&str> = CONTROLLERS
+        .into_iter()
+        .filter(|c| !f.controllers.iter().any(|have| have == c))
+        .collect();
     if !missing.is_empty() {
-        return Err(format!("controllers missing in {}: {}", root.join("cgroup.controllers").display(), missing.join(", ")));
+        return Err(format!(
+            "controllers missing in {}: {}",
+            root.join("cgroup.controllers").display(),
+            missing.join(", ")
+        ));
     }
     if let Err((errno, msg)) = &f.delegation {
         let root = root.display();
@@ -370,13 +458,23 @@ pub fn probe_with(f: &ProbeFacts) -> Result<(), String> {
         });
     }
     if f.nodev {
-        return Err(format!("jail base {} is on a nodev filesystem", f.jail_base.display()));
+        return Err(format!(
+            "jail base {} is on a nodev filesystem",
+            f.jail_base.display()
+        ));
     }
     if f.noexec {
-        return Err(format!("jail base {} is on a noexec filesystem", f.jail_base.display()));
+        return Err(format!(
+            "jail base {} is on a noexec filesystem",
+            f.jail_base.display()
+        ));
     }
     if let Some((a, b)) = &f.same_device {
-        return Err(format!("{} and {} are on different filesystems: the jail hard-links them", a.display(), b.display()));
+        return Err(format!(
+            "{} and {} are on different filesystems: the jail hard-links them",
+            a.display(),
+            b.display()
+        ));
     }
     Ok(())
 }
@@ -405,7 +503,10 @@ fn existing(path: &Path) -> &Path {
 fn jailer_version(jailer_bin: &Path) -> Result<String, String> {
     let meta = fs::metadata(jailer_bin).map_err(|e| format!("{}: {e}", jailer_bin.display()))?;
     if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
-        return Err(format!("{} is not an executable file", jailer_bin.display()));
+        return Err(format!(
+            "{} is not an executable file",
+            jailer_bin.display()
+        ));
     }
     let mut cmd = Command::new(jailer_bin);
     cmd.arg("--version");
@@ -431,10 +532,19 @@ fn delegate(root: &Path) -> Result<(), (i32, String)> {
 /// Collects the facts for real and applies `probe_with`. The delegation writes are only
 /// attempted once every earlier step passed (as root, with a v1.17 jailer and the
 /// controllers present), so a probe that fails earlier never writes to the cgroup tree.
-pub fn probe(cfg: &JailConfig, jobs: &Path, inspect: &Path, work: &Path, image_dir: &Path) -> Result<(), String> {
+pub fn probe(
+    cfg: &JailConfig,
+    jobs: &Path,
+    inspect: &Path,
+    work: &Path,
+    image_dir: &Path,
+) -> Result<(), String> {
     let euid = geteuid().as_raw();
     let jailer_version = jailer_version(&cfg.jailer_bin);
-    let cgroup_root = fs::read_to_string("/proc/mounts").ok().as_deref().and_then(find_cgroup2_root);
+    let cgroup_root = fs::read_to_string("/proc/mounts")
+        .ok()
+        .as_deref()
+        .and_then(find_cgroup2_root);
     let controllers: Vec<String> = cgroup_root
         .as_ref()
         .and_then(|r| fs::read_to_string(r.join("cgroup.controllers")).ok())
@@ -460,7 +570,9 @@ pub fn probe(cfg: &JailConfig, jobs: &Path, inspect: &Path, work: &Path, image_d
         facts.delegation = delegate(root);
     }
     for base in [jobs, inspect] {
-        let flags = statvfs(existing(base)).map(|s| s.f_flag).unwrap_or(StatVfsMountFlags::empty());
+        let flags = statvfs(existing(base))
+            .map(|s| s.f_flag)
+            .unwrap_or(StatVfsMountFlags::empty());
         if flags.intersects(StatVfsMountFlags::NODEV | StatVfsMountFlags::NOEXEC) {
             facts.jail_base = base.to_path_buf();
             facts.nodev = flags.contains(StatVfsMountFlags::NODEV);
@@ -469,10 +581,15 @@ pub fn probe(cfg: &JailConfig, jobs: &Path, inspect: &Path, work: &Path, image_d
         }
     }
     let dev = |p: &Path| fs::metadata(existing(p)).map(|m| m.dev()).ok();
-    facts.same_device = [(jobs, work), (jobs, image_dir), (inspect, work), (inspect, image_dir)]
-        .into_iter()
-        .find(|(a, b)| dev(a) != dev(b))
-        .map(|(a, b)| (a.to_path_buf(), b.to_path_buf()));
+    facts.same_device = [
+        (jobs, work),
+        (jobs, image_dir),
+        (inspect, work),
+        (inspect, image_dir),
+    ]
+    .into_iter()
+    .find(|(a, b)| dev(a) != dev(b))
+    .map(|(a, b)| (a.to_path_buf(), b.to_path_buf()));
     probe_with(&facts)
 }
 
@@ -503,7 +620,9 @@ pub struct Collected {
 /// The cgroup the marker names, if it is exactly `<cgroup_root>/agentos/<one name>`.
 fn cgroup_under(cgroup_root: &Path, named: &str) -> Option<PathBuf> {
     let path = Path::new(named);
-    let rest = path.strip_prefix(cgroup_root.join(JAIL_PARENT_CGROUP)).ok()?;
+    let rest = path
+        .strip_prefix(cgroup_root.join(JAIL_PARENT_CGROUP))
+        .ok()?;
     let mut parts = rest.components();
     match (path.is_absolute(), parts.next(), parts.next()) {
         (true, Some(Component::Normal(_)), None) => Some(path.to_path_buf()),
@@ -558,15 +677,31 @@ pub fn collect_jail(dir: &Path, cgroup_root: &Path) -> Result<Collected, Collect
         Ok(None) => {}
         Ok(Some(named)) => {
             let Some(cgroup) = cgroup_under(cgroup_root, &named) else {
-                return Err(Failed(format!("marker names a path outside the cgroup root: {}", guest_text(&named))));
+                return Err(Failed(format!(
+                    "marker names a path outside the cgroup root: {}",
+                    guest_text(&named)
+                )));
             };
             match fs::remove_dir(&cgroup) {
                 Ok(()) => cgroup_removed = true,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) if matches!(e.kind(), io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::ResourceBusy) => {
-                    return Err(Busy(format!("cgroup {} still has processes", guest_text(&cgroup.display().to_string()))));
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::ResourceBusy
+                    ) =>
+                {
+                    return Err(Busy(format!(
+                        "cgroup {} still has processes",
+                        guest_text(&cgroup.display().to_string())
+                    )));
                 }
-                Err(e) => return Err(Failed(format!("cannot remove cgroup {}: {e}", guest_text(&cgroup.display().to_string())))),
+                Err(e) => {
+                    return Err(Failed(format!(
+                        "cannot remove cgroup {}: {e}",
+                        guest_text(&cgroup.display().to_string())
+                    )));
+                }
             }
         }
         Err(e) => return Err(Failed(format!("cannot read {}: {e}", marker.display()))),
@@ -577,35 +712,60 @@ pub fn collect_jail(dir: &Path, cgroup_root: &Path) -> Result<Collected, Collect
         Err(e) if e.kind() == io::ErrorKind::NotFound => false,
         Err(e) => return Err(Failed(format!("cannot remove {}: {e}", jail.display()))),
     };
-    Ok(Collected { cgroup_removed, jail_removed })
+    Ok(Collected {
+        cgroup_removed,
+        jail_removed,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::firecracker::{render_vm_json, FirecrackerConfig};
+    use crate::firecracker::{FirecrackerConfig, render_vm_json};
     use crate::guestlink::GuestLauncher;
     use agentos_core::ids::Digest;
     use std::ffi::OsString;
     use std::path::Path;
 
     fn jail_config() -> JailConfig {
-        JailConfig { jailer_bin: "/home/x/bin/jailer".into(), uid: JAIL_UID, gid: JAIL_GID, cgroup_root: "/sys/fs/cgroup".into() }
+        JailConfig {
+            jailer_bin: "/home/x/bin/jailer".into(),
+            uid: JAIL_UID,
+            gid: JAIL_GID,
+            cgroup_root: "/sys/fs/cgroup".into(),
+        }
     }
 
     const UUID: &str = "0b8a5f3e-7c1d-4e2a-9f6b-3d5c7e9a1b2c";
 
     #[test]
     fn plan_lays_out_chroot_and_cgroup_under_the_dir() {
-        let p = plan(&jail_config(), Path::new("/home/x/bin/firecracker"), Path::new("/home/x/jobs/e-a"), UUID).unwrap();
+        let p = plan(
+            &jail_config(),
+            Path::new("/home/x/bin/firecracker"),
+            Path::new("/home/x/jobs/e-a"),
+            UUID,
+        )
+        .unwrap();
         assert_eq!(p.id, UUID);
         assert_eq!(p.exec_name, "firecracker");
         assert_eq!(p.base, Path::new("/home/x/jobs/e-a/jail"));
-        assert_eq!(p.chroot, Path::new("/home/x/jobs/e-a/jail/firecracker").join(UUID).join("root"));
+        assert_eq!(
+            p.chroot,
+            Path::new("/home/x/jobs/e-a/jail/firecracker")
+                .join(UUID)
+                .join("root")
+        );
         assert_eq!(p.cgroup, Path::new("/sys/fs/cgroup/agentos").join(UUID));
         assert_eq!(host_uds(&p), p.chroot.join("v.sock"));
         // The executable's own name names the chroot level.
-        let p = plan(&jail_config(), Path::new("/opt/fc/firecracker-v1.17.0"), Path::new("/d"), "x").unwrap();
+        let p = plan(
+            &jail_config(),
+            Path::new("/opt/fc/firecracker-v1.17.0"),
+            Path::new("/d"),
+            "x",
+        )
+        .unwrap();
         assert_eq!(p.exec_name, "firecracker-v1.17.0");
         assert_eq!(p.chroot, Path::new("/d/jail/firecracker-v1.17.0/x/root"));
     }
@@ -617,7 +777,13 @@ mod tests {
         ok(UUID).unwrap();
         ok(&format!("inspect-{UUID}")).unwrap();
         ok(&"a".repeat(64)).unwrap();
-        for bad in ["a".repeat(65), "a_b".into(), "a/b".into(), "a.b".into(), String::new()] {
+        for bad in [
+            "a".repeat(65),
+            "a_b".into(),
+            "a/b".into(),
+            "a.b".into(),
+            String::new(),
+        ] {
             let err = ok(&bad).unwrap_err();
             assert_eq!(err, format!("invalid jail id {bad:?}"));
         }
@@ -644,7 +810,11 @@ mod tests {
 
     #[test]
     fn jailer_argv_is_exactly_the_documented_one() {
-        let cfg = JailConfig { uid: 61001, gid: 61002, ..jail_config() };
+        let cfg = JailConfig {
+            uid: 61001,
+            gid: 61002,
+            ..jail_config()
+        };
         let fc = Path::new("/home/x/bin/firecracker");
         let p = plan(&cfg, fc, Path::new("/home/x/jobs/e-a"), UUID).unwrap();
         let args = jailer_args(&cfg, &p, fc, 2, 512);
@@ -684,16 +854,42 @@ mod tests {
         assert_eq!(args, expected);
         let sep = args.iter().position(|a| a == "--").unwrap();
         assert_eq!(sep, 24, "24 elements before --");
-        assert_eq!(&args[sep + 1..], ["--no-api", "--config-file", "/vm.json"].map(OsString::from));
+        assert_eq!(
+            &args[sep + 1..],
+            ["--no-api", "--config-file", "/vm.json"].map(OsString::from)
+        );
         for banned in ["--new-pid-ns", "--daemonize", "--netns"] {
             assert!(!args.iter().any(|a| a == banned), "{banned}");
         }
         assert_eq!(args.iter().filter(|a| *a == "--id").count(), 1);
         // No override: byte-identical; each override replaces exactly its value.
-        assert_eq!(jailer_args_with(&cfg, &p, fc, 2, 512, CgroupOverrides::default()), expected);
-        let lowered = jailer_args_with(&cfg, &p, fc, 2, 512, CgroupOverrides { memory_max_mib: Some(96), cpu_quota_us: Some(50_000) });
-        let changed: Vec<(usize, &OsString)> = lowered.iter().enumerate().filter(|(i, a)| **a != expected[*i]).collect();
-        assert_eq!(changed, [(15, &OsString::from("cpu.max=50000 100000")), (17, &OsString::from("memory.max=100663296"))]);
+        assert_eq!(
+            jailer_args_with(&cfg, &p, fc, 2, 512, CgroupOverrides::default()),
+            expected
+        );
+        let lowered = jailer_args_with(
+            &cfg,
+            &p,
+            fc,
+            2,
+            512,
+            CgroupOverrides {
+                memory_max_mib: Some(96),
+                cpu_quota_us: Some(50_000),
+            },
+        );
+        let changed: Vec<(usize, &OsString)> = lowered
+            .iter()
+            .enumerate()
+            .filter(|(i, a)| **a != expected[*i])
+            .collect();
+        assert_eq!(
+            changed,
+            [
+                (15, &OsString::from("cpu.max=50000 100000")),
+                (17, &OsString::from("memory.max=100663296"))
+            ]
+        );
     }
 
     #[test]
@@ -701,10 +897,16 @@ mod tests {
         let host = "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n\
                     sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0\n\
                     cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime,nsdelegate,memory_recursiveprot 0 0\n";
-        assert_eq!(find_cgroup2_root(host), Some(PathBuf::from("/sys/fs/cgroup")));
+        assert_eq!(
+            find_cgroup2_root(host),
+            Some(PathBuf::from("/sys/fs/cgroup"))
+        );
         let container = "overlay / overlay rw,relatime,lowerdir=/a,upperdir=/b,workdir=/c 0 0\n\
                          cgroup /sys/fs/cgroup cgroup2 ro,nosuid,nodev,noexec,relatime,nsdelegate 0 0\n";
-        assert_eq!(find_cgroup2_root(container), Some(PathBuf::from("/sys/fs/cgroup")));
+        assert_eq!(
+            find_cgroup2_root(container),
+            Some(PathBuf::from("/sys/fs/cgroup"))
+        );
         let v1 = "tmpfs /sys/fs/cgroup tmpfs ro,nosuid,nodev,noexec,mode=755 0 0\n\
                   cgroup /sys/fs/cgroup/memory cgroup rw,nosuid,nodev,noexec,relatime,memory 0 0\n\
                   cgroup /sys/fs/cgroup/pids cgroup rw,nosuid,nodev,noexec,relatime,pids 0 0\n";
@@ -719,7 +921,9 @@ mod tests {
             jailer_version: Ok("Jailer v1.17.0".into()),
             configured_cgroup_root: "/sys/fs/cgroup".into(),
             cgroup_root: Some("/sys/fs/cgroup".into()),
-            controllers: ["cpuset", "cpu", "io", "memory", "hugetlb", "pids", "rdma"].map(String::from).to_vec(),
+            controllers: ["cpuset", "cpu", "io", "memory", "hugetlb", "pids", "rdma"]
+                .map(String::from)
+                .to_vec(),
             delegation: Ok(()),
             jail_base: "/home/x/jobs".into(),
             nodev: false,
@@ -801,7 +1005,12 @@ mod tests {
     fn decide_table() {
         assert_eq!(decide(Ok(()), false), Ok(JailDecision::Jailed));
         assert_eq!(decide(Ok(()), true), Ok(JailDecision::Jailed));
-        assert_eq!(decide(Err("needs root".into()), true), Ok(JailDecision::Unjailed { reason: "needs root".into() }));
+        assert_eq!(
+            decide(Err("needs root".into()), true),
+            Ok(JailDecision::Unjailed {
+                reason: "needs root".into()
+            })
+        );
         assert_eq!(
             decide(Err("needs root (euid 0), running as uid 1000".into()), false),
             Err("jailer unavailable: needs root (euid 0), running as uid 1000; pass --allow-unjailed to run Firecracker without a jail as the current user".into())
@@ -822,18 +1031,39 @@ mod tests {
             vcpus: 2,
             memory_mib: 512,
             attempt_token: "0123456789abcdef0123456789abcdef".into(),
-            launcher: GuestLauncher::Real { firecracker_bin: "/home/x/bin/firecracker".into() },
+            launcher: GuestLauncher::Real {
+                firecracker_bin: "/home/x/bin/firecracker".into(),
+            },
             jail: JailMode::Jailed(jail_config()),
         };
-        let p = plan(&jail_config(), &cfg.firecracker_bin, Path::new("/home/x/jobs/effect-1-attempt-1"), UUID).unwrap();
+        let p = plan(
+            &jail_config(),
+            &cfg.firecracker_bin,
+            Path::new("/home/x/jobs/effect-1-attempt-1"),
+            UUID,
+        )
+        .unwrap();
         let rendered = render_vm_json(&cfg, &chroot_view(&p));
-        let golden: serde_json::Value = serde_json::from_str(include_str!("../tests/golden/vm.jailed.json")).unwrap();
+        let golden: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/golden/vm.jailed.json")).unwrap();
         assert_eq!(rendered, golden);
-        let mut paths = vec![rendered["boot-source"]["kernel_image_path"].clone(), rendered["logger"]["log_path"].clone()];
-        paths.extend(rendered["drives"].as_array().unwrap().iter().map(|d| d["path_on_host"].clone()));
+        let mut paths = vec![
+            rendered["boot-source"]["kernel_image_path"].clone(),
+            rendered["logger"]["log_path"].clone(),
+        ];
+        paths.extend(
+            rendered["drives"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["path_on_host"].clone()),
+        );
         for p in paths {
             let p = p.as_str().unwrap();
-            assert!(p.starts_with('/') && !p[1..].contains('/'), "{p} is not a chroot-root name");
+            assert!(
+                p.starts_with('/') && !p[1..].contains('/'),
+                "{p} is not a chroot-root name"
+            );
         }
         // The socket is relative to Firecracker's working directory, the chroot root
         // (Task 5 ruling: the same rendering as unjailed).
@@ -860,8 +1090,14 @@ mod tests {
             std::fs::write(job.join(JAIL_MARKER), format!("{marker}\n")).unwrap();
             let err = collect(&job, &cg).unwrap_err();
             assert!(err.contains("outside the cgroup root"), "{marker}: {err}");
-            assert!(elsewhere.is_dir() && cg.join("agentos/x").is_dir(), "{marker}: something was removed");
-            assert!(job.join("jail/firecracker/x/root").is_dir(), "{marker}: jail/ was touched");
+            assert!(
+                elsewhere.is_dir() && cg.join("agentos/x").is_dir(),
+                "{marker}: something was removed"
+            );
+            assert!(
+                job.join("jail/firecracker/x/root").is_dir(),
+                "{marker}: jail/ was touched"
+            );
         }
         // Control characters in the marker are escaped in the error.
         std::fs::write(job.join(JAIL_MARKER), "/x\n\u{1b}[2J").unwrap();

@@ -14,16 +14,20 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agentos_core::broker::Resource;
 use agentos_core::budget::Reservation;
-use agentos_core::effect::{AttemptId, EffectId, EffectKind, EffectRecord, EffectState, Outcome, Receipt, ReceiptVerdict};
+use agentos_core::effect::{
+    AttemptId, EffectId, EffectKind, EffectRecord, EffectState, Outcome, Receipt, ReceiptVerdict,
+};
 use agentos_core::ids::{Digest, TaskId};
 use agentos_core::lease::EffectTimeouts;
 use agentos_core::state::{TaskEvent, TaskState};
 use agentos_engine::agent::{AgentAction, FakeAgent};
 use agentos_engine::crash::{CrashHook, CrashPoint, RunOptions};
-use agentos_engine::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor, JobWait, Reconciliation};
+use agentos_engine::executor::{
+    AttemptCtx, EffectRequest, ExecOutcome, Executor, JobWait, Reconciliation,
+};
 use agentos_engine::job::{JobDir, JobRequest, JobState, ScriptedConfig, WorkerConfig};
-use agentos_engine::recover::{recover, recover_with, Decision, RecoveryReport};
-use agentos_engine::runner::{run_task, run_task_with, EngineError};
+use agentos_engine::recover::{Decision, RecoveryReport, recover, recover_with};
+use agentos_engine::runner::{EngineError, run_task, run_task_with};
 use agentos_engine::supervised::{ExecCounts, SupervisedExecutor};
 use agentos_engine::supervisor::POLL_ENV;
 use agentos_engine::workspace::workspace_digest;
@@ -31,11 +35,11 @@ use agentos_store::blob::BlobStore;
 use agentos_store::db::{Db, StoredEvent};
 use agentos_store::effects::UsageSummary;
 use common::{
-    all_pids, comment_patch, contract, copy_dir, firecracker_processes, fix_patch, fixtures, lose_workspace, proc_state,
-    processes_naming, processes_of_home, real_mode, supervised, worker_config, workspace_dir, write_in_workspace, EXIT_BEFORE_RECEIPT_ENV,
-    TEST_WORKERS_ENV,
+    EXIT_BEFORE_RECEIPT_ENV, TEST_WORKERS_ENV, all_pids, comment_patch, contract, copy_dir,
+    firecracker_processes, fix_patch, fixtures, lose_workspace, proc_state, processes_naming,
+    processes_of_home, real_mode, supervised, worker_config, workspace_dir, write_in_workspace,
 };
-use rustix::process::{kill_process, pidfd_open, pidfd_send_signal, Pid, PidfdFlags, Signal};
+use rustix::process::{Pid, PidfdFlags, Signal, kill_process, pidfd_open, pidfd_send_signal};
 use tempfile::TempDir;
 
 const KINDS: [&str; 3] = ["read_snapshot", "apply_patch", "run_verification"];
@@ -125,13 +129,23 @@ struct Ctl {
 impl World {
     fn new() -> World {
         let dir = common::scratch_root();
-        copy_dir(&fixtures().join("parser-repo"), &dir.path().join("snapshot"));
-        copy_dir(&fixtures().join("profiles/parser-checks-v1"), &dir.path().join("profile"));
+        copy_dir(
+            &fixtures().join("parser-repo"),
+            &dir.path().join("snapshot"),
+        );
+        copy_dir(
+            &fixtures().join("profiles/parser-checks-v1"),
+            &dir.path().join("profile"),
+        );
         let db = Db::open(&dir.path().join("agentos.db")).unwrap();
         let (contract, digest) = contract(10);
         let task = db.create_task(&contract, &digest).unwrap();
         db.approve_task(&task).unwrap();
-        World { dir, task, counts: ExecCounts::default() }
+        World {
+            dir,
+            task,
+            counts: ExecCounts::default(),
+        }
     }
 
     fn path(&self, rel: &str) -> PathBuf {
@@ -142,24 +156,43 @@ impl World {
         let jobs = self.path("jobs");
         let host = worker_config(self.dir.path());
         let timeouts = opts.timeouts.unwrap_or_default();
-        let plain = supervised(&jobs, host.clone(), &self.counts, hook.clone(), &[]).with_timeouts(timeouts);
+        let plain = supervised(&jobs, host.clone(), &self.counts, hook.clone(), &[])
+            .with_timeouts(timeouts);
         let special = match (&opts.scripted_verification, opts.exit_before_receipt) {
             (None, None) if opts.slow_poll.is_some() => {
                 let env = [(TEST_WORKERS_ENV, "1"), (POLL_ENV, "10000")];
-                Some((opts.slow_poll.unwrap(), supervised(&jobs, host, &self.counts, hook, &env).with_timeouts(timeouts)))
+                Some((
+                    opts.slow_poll.unwrap(),
+                    supervised(&jobs, host, &self.counts, hook, &env).with_timeouts(timeouts),
+                ))
             }
             (Some(script), _) => {
-                let worker = WorkerConfig::Scripted(ScriptedConfig { script: script.clone() });
-                let exec = supervised(&jobs, worker, &self.counts, hook, &[(TEST_WORKERS_ENV, "1")]);
+                let worker = WorkerConfig::Scripted(ScriptedConfig {
+                    script: script.clone(),
+                });
+                let exec = supervised(
+                    &jobs,
+                    worker,
+                    &self.counts,
+                    hook,
+                    &[(TEST_WORKERS_ENV, "1")],
+                );
                 Some(("run_verification", exec.with_timeouts(timeouts)))
             }
             (None, Some(kind)) => {
                 let env = [(TEST_WORKERS_ENV, "1"), (EXIT_BEFORE_RECEIPT_ENV, "1")];
-                Some((kind, supervised(&jobs, host, &self.counts, hook, &env).with_timeouts(timeouts)))
+                Some((
+                    kind,
+                    supervised(&jobs, host, &self.counts, hook, &env).with_timeouts(timeouts),
+                ))
             }
             (None, None) => None,
         };
-        Exec { plain, special, fence: opts.fence }
+        Exec {
+            plain,
+            special,
+            fence: opts.fence,
+        }
     }
 
     /// A freshly restarted controller over this world's files.
@@ -189,7 +222,11 @@ impl World {
         for shard in std::fs::read_dir(self.path("blobs/objects")).unwrap() {
             let shard = shard.unwrap();
             for obj in std::fs::read_dir(shard.path()).unwrap() {
-                let hex = format!("{}{}", shard.file_name().to_str().unwrap(), obj.unwrap().file_name().to_str().unwrap());
+                let hex = format!(
+                    "{}{}",
+                    shard.file_name().to_str().unwrap(),
+                    obj.unwrap().file_name().to_str().unwrap()
+                );
                 out.insert(Digest::from_hex(&hex).unwrap());
             }
         }
@@ -224,7 +261,10 @@ impl World {
 
     async fn crash_run_with(&self, hook: CrashHook, opts: &ExecOpts) -> CrashPoint {
         let ctl = self.open_with(Some(hook.clone()), opts);
-        let err = self.run(&ctl, &RunOptions::crash_with(hook)).await.unwrap_err();
+        let err = self
+            .run(&ctl, &RunOptions::crash_with(hook))
+            .await
+            .unwrap_err();
         match err {
             EngineError::Crashed(p) => p,
             other => panic!("expected an injected crash, got {other:?}"),
@@ -239,7 +279,11 @@ impl World {
     }
 
     fn restore_profile(&self) {
-        fs::copy(fixtures().join("profiles/parser-checks-v1/profile.json"), self.path("profile/profile.json")).unwrap();
+        fs::copy(
+            fixtures().join("profiles/parser-checks-v1/profile.json"),
+            self.path("profile/profile.json"),
+        )
+        .unwrap();
     }
 
     /// Live (non-zombie) processes whose command line names anything in this world: the
@@ -256,24 +300,36 @@ impl World {
             if live.is_empty() {
                 return;
             }
-            assert!(started.elapsed() < Duration::from_secs(5), "processes outlived recovery: {live:?}");
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "processes outlived recovery: {live:?}"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 }
 
 fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
 }
 
 /// Live (non-zombie) processes in session `sid`.
 fn session_members(sid: i32) -> Vec<i32> {
-    all_pids().into_iter().filter(|pid| proc_state(*pid).is_some_and(|(s, _, sess)| sess == sid && s != "Z")).collect()
+    all_pids()
+        .into_iter()
+        .filter(|pid| proc_state(*pid).is_some_and(|(s, _, sess)| sess == sid && s != "Z"))
+        .collect()
 }
 
 /// Live (non-zombie) processes in process group `pgid`.
 fn group_members(pgid: i32) -> Vec<i32> {
-    all_pids().into_iter().filter(|pid| proc_state(*pid).is_some_and(|(s, grp, _)| grp == pgid && s != "Z")).collect()
+    all_pids()
+        .into_iter()
+        .filter(|pid| proc_state(*pid).is_some_and(|(s, grp, _)| grp == pgid && s != "Z"))
+        .collect()
 }
 
 /// No live process is left in the session of any job's recorded supervisor, nor in its
@@ -281,12 +337,24 @@ fn group_members(pgid: i32) -> Vec<i32> {
 fn assert_job_sessions_empty(w: &World) {
     for entry in fs::read_dir(w.path("jobs")).unwrap().flatten() {
         let job = JobDir::open(&entry.path()).unwrap();
-        let Some(status) = job.read_status() else { continue };
+        let Some(status) = job.read_status() else {
+            continue;
+        };
         if let Some(pid) = status.supervisor_pid {
-            assert_eq!(session_members(pid as i32), Vec::<i32>::new(), "session of {}", job.path.display());
+            assert_eq!(
+                session_members(pid as i32),
+                Vec::<i32>::new(),
+                "session of {}",
+                job.path.display()
+            );
         }
         for pgid in status.worker_pgid.into_iter().chain(job.groups()) {
-            assert_eq!(group_members(pgid), Vec::<i32>::new(), "group {pgid} of {}", job.path.display());
+            assert_eq!(
+                group_members(pgid),
+                Vec::<i32>::new(),
+                "group {pgid} of {}",
+                job.path.display()
+            );
         }
     }
 }
@@ -331,7 +399,9 @@ fn check_started(job: &JobDir) -> bool {
         // starts within a second of the boot; the slow profiles sleep for longer than that).
         Ok((WorkerConfig::Firecracker(_), _, attempt)) if real_mode() => {
             let id = attempt.to_string();
-            firecracker_processes().iter().any(|p| p.id() == Some(id.as_str()))
+            firecracker_processes()
+                .iter()
+                .any(|p| p.id() == Some(id.as_str()))
         }
         Ok((WorkerConfig::Firecracker(cfg), task, _)) => {
             !processes_naming(&cfg.work_root.join(task.as_str()).join("workspace")).is_empty()
@@ -343,7 +413,9 @@ fn check_started(job: &JobDir) -> bool {
 /// The supervisor pid of a running `job`, once its check (or script) has started.
 async fn running_supervisor(job: &JobDir) -> i32 {
     wait_until("the job's check to run", || {
-        job.read_status().is_some_and(|s| s.state == JobState::Running) && check_started(job)
+        job.read_status()
+            .is_some_and(|s| s.state == JobState::Running)
+            && check_started(job)
     })
     .await;
     job.read_status().unwrap().supervisor_pid.unwrap() as i32
@@ -355,25 +427,39 @@ impl Ctl {
     }
 
     fn of_type(&self, w: &World, event_type: &str) -> Vec<serde_json::Value> {
-        self.events(w).into_iter().filter(|e| e.event_type == event_type).map(|e| e.payload).collect()
+        self.events(w)
+            .into_iter()
+            .filter(|e| e.event_type == event_type)
+            .map(|e| e.payload)
+            .collect()
     }
 
     /// Effects in intent order.
     fn effects(&self, w: &World) -> Vec<EffectRecord> {
         self.of_type(w, "EffectIntended")
             .into_iter()
-            .map(|p| self.db.effect(&serde_json::from_value(p["effect_id"].clone()).unwrap()).unwrap())
+            .map(|p| {
+                self.db
+                    .effect(&serde_json::from_value(p["effect_id"].clone()).unwrap())
+                    .unwrap()
+            })
             .collect()
     }
 
     fn effect(&self, w: &World, tag: &str) -> EffectRecord {
-        let mut found: Vec<_> = self.effects(w).into_iter().filter(|e| e.kind.tag() == tag).collect();
+        let mut found: Vec<_> = self
+            .effects(w)
+            .into_iter()
+            .filter(|e| e.kind.tag() == tag)
+            .collect();
         assert_eq!(found.len(), 1, "exactly one {tag} effect");
         found.remove(0)
     }
 
     async fn recover(&self, w: &World) -> RecoveryReport {
-        recover(&self.db, &self.blobs, &self.exec, &w.task).await.unwrap()
+        recover(&self.db, &self.blobs, &self.exec, &w.task)
+            .await
+            .unwrap()
     }
 }
 
@@ -398,9 +484,17 @@ struct Summary {
 fn summarize(w: &World, ctl: &Ctl) -> Summary {
     let task = ctl.db.task(&w.task).unwrap();
     let effects = ctl.effects(w);
-    let referenced = ctl.db.referenced_blobs().unwrap().into_iter().collect::<BTreeSet<_>>();
+    let referenced = ctl
+        .db
+        .referenced_blobs()
+        .unwrap()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     let on_disk = w.blobs_on_disk();
-    assert_eq!(on_disk, referenced, "every stored blob is referenced and every referenced blob is stored");
+    assert_eq!(
+        on_disk, referenced,
+        "every stored blob is referenced and every referenced blob is stored"
+    );
     let result = |tag: &str| ctl.effect(w, tag).result_digest;
     Summary {
         state: task.state,
@@ -421,7 +515,10 @@ fn summarize(w: &World, ctl: &Ctl) -> Summary {
 async fn baseline() -> Summary {
     let w = World::new();
     let ctl = w.open(None);
-    assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Succeeded);
+    assert_eq!(
+        w.run(&ctl, &RunOptions::default()).await.unwrap(),
+        TaskState::Succeeded
+    );
     for k in KINDS {
         assert_eq!(w.counts.get(k), 1, "{k}");
     }
@@ -435,12 +532,24 @@ async fn baseline() -> Summary {
 fn assert_journal_sound(w: &World, ctl: &Ctl) {
     let events = ctl.events(w);
     let seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
-    assert_eq!(seqs, (1..=events.len() as u64).collect::<Vec<_>>(), "gapless sequence");
+    assert_eq!(
+        seqs,
+        (1..=events.len() as u64).collect::<Vec<_>>(),
+        "gapless sequence"
+    );
     let mut completed = HashMap::new();
-    for e in events.iter().filter(|e| e.event_type == "EffectCompleted" || e.event_type == "EffectFailed") {
-        *completed.entry(e.payload["effect_id"].as_str().unwrap().to_string()).or_insert(0) += 1;
+    for e in events
+        .iter()
+        .filter(|e| e.event_type == "EffectCompleted" || e.event_type == "EffectFailed")
+    {
+        *completed
+            .entry(e.payload["effect_id"].as_str().unwrap().to_string())
+            .or_insert(0) += 1;
     }
-    assert!(completed.values().all(|n| *n == 1), "an effect completed twice: {completed:?}");
+    assert!(
+        completed.values().all(|n| *n == 1),
+        "an effect completed twice: {completed:?}"
+    );
 }
 
 /// The decision recovery takes after a crash at `point` in `kind`. With `exit_before_receipt`
@@ -457,9 +566,9 @@ fn expected_decision(point: CrashPoint, kind: &str, exit_before_receipt: bool) -
         CrashPoint::DuringExecute if !exit_before_receipt => Some(Decision::PublishRetained),
         CrashPoint::DuringExecute if kind == "apply_patch" => Some(Decision::PublishReconciled),
         CrashPoint::DuringExecute => Some(Decision::Redispatch),
-        CrashPoint::AfterExecuteBeforePublish | CrashPoint::AfterBlobPut | CrashPoint::AfterRegister => {
-            Some(Decision::PublishRetained)
-        }
+        CrashPoint::AfterExecuteBeforePublish
+        | CrashPoint::AfterBlobPut
+        | CrashPoint::AfterRegister => Some(Decision::PublishRetained),
         CrashPoint::AfterComplete | CrashPoint::AfterAgentTurnJournaled => None,
     }
 }
@@ -467,8 +576,16 @@ fn expected_decision(point: CrashPoint, kind: &str, exit_before_receipt: bool) -
 /// Real executions (job launches) of `tag` once a crash at `point` in `kind` was recovered.
 /// Only an attempt that ran without leaving a durable receipt may run again, and only when
 /// its kind is safe to retry blindly; the patch is reconciled instead.
-fn expected_executions(point: CrashPoint, kind: &str, tag: &str, exit_before_receipt: bool) -> usize {
-    let rerun = exit_before_receipt && point == CrashPoint::DuringExecute && kind == tag && kind != "apply_patch";
+fn expected_executions(
+    point: CrashPoint,
+    kind: &str,
+    tag: &str,
+    exit_before_receipt: bool,
+) -> usize {
+    let rerun = exit_before_receipt
+        && point == CrashPoint::DuringExecute
+        && kind == tag
+        && kind != "apply_patch";
     if rerun { 2 } else { 1 }
 }
 
@@ -479,29 +596,63 @@ async fn crash_case(point: CrashPoint, kind: &'static str) {
 async fn crash_case_with(point: CrashPoint, kind: &'static str, exit_before_receipt: bool) {
     let baseline = baseline().await;
     let w = World::new();
-    let opts = ExecOpts { exit_before_receipt: exit_before_receipt.then_some(kind), ..ExecOpts::default() };
-    assert_eq!(w.crash_run_with(CrashHook::at(point, kind), &opts).await, point);
+    let opts = ExecOpts {
+        exit_before_receipt: exit_before_receipt.then_some(kind),
+        ..ExecOpts::default()
+    };
+    assert_eq!(
+        w.crash_run_with(CrashHook::at(point, kind), &opts).await,
+        point
+    );
 
     let ctl = w.open(None);
-    let outstanding: Vec<EffectId> =
-        ctl.db.outstanding_effects(&w.task).unwrap().into_iter().map(|e| e.effect_id).collect();
+    let outstanding: Vec<EffectId> = ctl
+        .db
+        .outstanding_effects(&w.task)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.effect_id)
+        .collect();
     let referenced_before = ctl.db.referenced_blobs().unwrap();
-    let leftovers: BTreeSet<_> = w.blobs_on_disk().into_iter().filter(|d| !referenced_before.contains(d)).collect();
+    let leftovers: BTreeSet<_> = w
+        .blobs_on_disk()
+        .into_iter()
+        .filter(|d| !referenced_before.contains(d))
+        .collect();
     if point == CrashPoint::AfterBlobPut {
-        assert!(!leftovers.is_empty(), "the crash left an unregistered blob behind");
+        assert!(
+            !leftovers.is_empty(),
+            "the crash left an unregistered blob behind"
+        );
     }
 
     let report = ctl.recover(&w).await;
 
-    assert!(report.gc_removed >= leftovers.len(), "{report:?} vs {leftovers:?}");
+    assert!(
+        report.gc_removed >= leftovers.len(),
+        "{report:?} vs {leftovers:?}"
+    );
     for d in &leftovers {
-        assert!(!w.blobs_on_disk().contains(d) || ctl.db.referenced_blobs().unwrap().contains(d), "leftover {d} kept");
+        assert!(
+            !w.blobs_on_disk().contains(d) || ctl.db.referenced_blobs().unwrap().contains(d),
+            "leftover {d} kept"
+        );
     }
     for d in &referenced_before {
-        assert!(w.blobs_on_disk().contains(d), "referenced blob {d} removed by gc");
+        assert!(
+            w.blobs_on_disk().contains(d),
+            "referenced blob {d} removed by gc"
+        );
     }
-    let decided: Vec<_> = report.decisions.iter().map(|d| d.effect_id.clone()).collect();
-    assert_eq!(decided, outstanding, "one decision per outstanding effect, in creation order");
+    let decided: Vec<_> = report
+        .decisions
+        .iter()
+        .map(|d| d.effect_id.clone())
+        .collect();
+    assert_eq!(
+        decided, outstanding,
+        "one decision per outstanding effect, in creation order"
+    );
     let expected = expected_decision(point, kind, exit_before_receipt);
     match expected {
         Some(decision) => {
@@ -510,21 +661,45 @@ async fn crash_case_with(point: CrashPoint, kind: &'static str, exit_before_rece
             assert_eq!(report.decisions[0].kind, kind);
             let journaled = ctl.of_type(&w, "RecoveryDecision");
             assert_eq!(journaled.len(), 1);
-            assert_eq!(journaled[0]["decision"], serde_json::to_value(decision).unwrap());
-            assert_eq!(journaled[0]["effect_id"], serde_json::to_value(&outstanding[0]).unwrap());
+            assert_eq!(
+                journaled[0]["decision"],
+                serde_json::to_value(decision).unwrap()
+            );
+            assert_eq!(
+                journaled[0]["effect_id"],
+                serde_json::to_value(&outstanding[0]).unwrap()
+            );
         }
-        None => assert!(report.decisions.is_empty() && outstanding.is_empty(), "{report:?}"),
+        None => assert!(
+            report.decisions.is_empty() && outstanding.is_empty(),
+            "{report:?}"
+        ),
     }
     assert!(ctl.db.outstanding_effects(&w.task).unwrap().is_empty());
-    assert_eq!(workspace_digest(&w.ws()).unwrap(), ctl.db.task(&w.task).unwrap().workspace_digest, "journal and workspace agree");
+    assert_eq!(
+        workspace_digest(&w.ws()).unwrap(),
+        ctl.db.task(&w.task).unwrap().workspace_digest,
+        "journal and workspace agree"
+    );
 
-    assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Succeeded);
+    assert_eq!(
+        w.run(&ctl, &RunOptions::default()).await.unwrap(),
+        TaskState::Succeeded
+    );
 
     assert_eq!(summarize(&w, &ctl), baseline, "crash at {point} in {kind}");
     for tag in KINDS {
-        assert_eq!(w.counts.get(tag), expected_executions(point, kind, tag, exit_before_receipt), "executions of {tag}");
+        assert_eq!(
+            w.counts.get(tag),
+            expected_executions(point, kind, tag, exit_before_receipt),
+            "executions of {tag}"
+        );
     }
-    let lease = if expected == Some(Decision::Redispatch) { 2 } else { 1 };
+    let lease = if expected == Some(Decision::Redispatch) {
+        2
+    } else {
+        1
+    };
     assert_eq!(ctl.effect(&w, kind).lease_generation, lease);
     assert_journal_sound(&w, &ctl);
     assert_eq!(ctl.of_type(&w, "ReceiptIgnored").len(), 0);
@@ -532,7 +707,10 @@ async fn crash_case_with(point: CrashPoint, kind: &'static str, exit_before_rece
     // Recovering a recovered, finished task changes nothing.
     let events = ctl.events(&w);
     let again = ctl.recover(&w).await;
-    assert!(again.decisions.is_empty() && again.gc_removed == 0 && again.abandoned.is_empty(), "{again:?}");
+    assert!(
+        again.decisions.is_empty() && again.gc_removed == 0 && again.abandoned.is_empty(),
+        "{again:?}"
+    );
     assert_eq!(ctl.events(&w), events);
     assert_eq!(summarize(&w, &ctl), baseline);
     w.assert_no_live_process().await;
@@ -598,10 +776,14 @@ async fn baseline_is_reproducible_across_worlds() {
 async fn run_task_recovers_outstanding_effects_by_itself() {
     let baseline = baseline().await;
     let w = World::new();
-    w.crash_run(CrashHook::at(CrashPoint::AfterRegister, "apply_patch")).await;
+    w.crash_run(CrashHook::at(CrashPoint::AfterRegister, "apply_patch"))
+        .await;
     let ctl = w.open(None);
 
-    assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Succeeded);
+    assert_eq!(
+        w.run(&ctl, &RunOptions::default()).await.unwrap(),
+        TaskState::Succeeded
+    );
 
     assert_eq!(ctl.of_type(&w, "RecoveryDecision").len(), 1);
     assert_eq!(summarize(&w, &ctl), baseline);
@@ -611,16 +793,26 @@ async fn run_task_recovers_outstanding_effects_by_itself() {
 #[tokio::test]
 async fn recovering_twice_before_resuming_is_idempotent() {
     let w = World::new();
-    w.crash_run(CrashHook::at(CrashPoint::AfterDispatch, "apply_patch")).await;
+    w.crash_run(CrashHook::at(CrashPoint::AfterDispatch, "apply_patch"))
+        .await;
     let ctl = w.open(None);
     let first = ctl.recover(&w).await;
     assert_eq!(first.decisions.len(), 1);
-    let (events, effects, usage, blobs) =
-        (ctl.events(&w), ctl.effects(&w), ctl.db.usage_summary(&w.task).unwrap(), w.blobs_on_disk());
+    let (events, effects, usage, blobs) = (
+        ctl.events(&w),
+        ctl.effects(&w),
+        ctl.db.usage_summary(&w.task).unwrap(),
+        w.blobs_on_disk(),
+    );
 
-    let second = recover(&ctl.db, &ctl.blobs, &ctl.exec, &w.task).await.unwrap();
+    let second = recover(&ctl.db, &ctl.blobs, &ctl.exec, &w.task)
+        .await
+        .unwrap();
 
-    assert!(second.decisions.is_empty() && second.gc_removed == 0, "{second:?}");
+    assert!(
+        second.decisions.is_empty() && second.gc_removed == 0,
+        "{second:?}"
+    );
     assert_eq!(ctl.events(&w), events);
     assert_eq!(ctl.effects(&w), effects);
     assert_eq!(ctl.db.usage_summary(&w.task).unwrap(), usage);
@@ -632,21 +824,45 @@ async fn recovering_twice_before_resuming_is_idempotent() {
 async fn a_crash_during_recovery_still_converges() {
     let baseline = baseline().await;
     let w = World::new();
-    let hooked = ExecOpts { exit_before_receipt: Some("apply_patch"), ..ExecOpts::default() };
-    w.crash_run_with(CrashHook::at(CrashPoint::DuringExecute, "apply_patch"), &hooked).await;
+    let hooked = ExecOpts {
+        exit_before_receipt: Some("apply_patch"),
+        ..ExecOpts::default()
+    };
+    w.crash_run_with(
+        CrashHook::at(CrashPoint::DuringExecute, "apply_patch"),
+        &hooked,
+    )
+    .await;
     {
         // The first recovery reconciles the patch, then dies before completing it.
         let hook = CrashHook::at(CrashPoint::AfterRegister, "apply_patch");
         let ctl = w.open(Some(hook.clone()));
-        let err = recover_with(&ctl.db, &ctl.blobs, &ctl.exec, &w.task, &RunOptions::crash_with(hook)).await;
-        assert!(matches!(err, Err(EngineError::Crashed(CrashPoint::AfterRegister))), "{err:?}");
+        let err = recover_with(
+            &ctl.db,
+            &ctl.blobs,
+            &ctl.exec,
+            &w.task,
+            &RunOptions::crash_with(hook),
+        )
+        .await;
+        assert!(
+            matches!(err, Err(EngineError::Crashed(CrashPoint::AfterRegister))),
+            "{err:?}"
+        );
     }
     let ctl = w.open(None);
     let report = ctl.recover(&w).await;
     assert_eq!(report.decisions.len(), 1);
-    assert_eq!(report.decisions[0].decision, Decision::PublishRetained, "the reconciled outcome was retained");
+    assert_eq!(
+        report.decisions[0].decision,
+        Decision::PublishRetained,
+        "the reconciled outcome was retained"
+    );
 
-    assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Succeeded);
+    assert_eq!(
+        w.run(&ctl, &RunOptions::default()).await.unwrap(),
+        TaskState::Succeeded
+    );
     assert_eq!(summarize(&w, &ctl), baseline);
     assert_eq!(w.counts.get("apply_patch"), 1, "the patch ran once");
     assert_journal_sound(&w, &ctl);
@@ -656,22 +872,43 @@ async fn a_crash_during_recovery_still_converges() {
 async fn repeated_crashes_of_a_retried_verification_converge() {
     let baseline = baseline().await;
     let w = World::new();
-    w.crash_run(CrashHook::at(CrashPoint::AfterDispatch, "run_verification")).await;
+    w.crash_run(CrashHook::at(CrashPoint::AfterDispatch, "run_verification"))
+        .await;
     {
         // The redispatched attempt runs, but its supervisor dies before the receipt.
         let hook = CrashHook::at(CrashPoint::DuringExecute, "run_verification");
-        let hooked = ExecOpts { exit_before_receipt: Some("run_verification"), ..ExecOpts::default() };
+        let hooked = ExecOpts {
+            exit_before_receipt: Some("run_verification"),
+            ..ExecOpts::default()
+        };
         let ctl = w.open_with(Some(hook.clone()), &hooked);
-        let err = recover_with(&ctl.db, &ctl.blobs, &ctl.exec, &w.task, &RunOptions::crash_with(hook)).await;
-        assert!(matches!(err, Err(EngineError::Crashed(CrashPoint::DuringExecute))), "{err:?}");
+        let err = recover_with(
+            &ctl.db,
+            &ctl.blobs,
+            &ctl.exec,
+            &w.task,
+            &RunOptions::crash_with(hook),
+        )
+        .await;
+        assert!(
+            matches!(err, Err(EngineError::Crashed(CrashPoint::DuringExecute))),
+            "{err:?}"
+        );
     }
     let ctl = w.open(None);
     let report = ctl.recover(&w).await;
     assert_eq!(report.decisions[0].decision, Decision::Redispatch);
 
-    assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Succeeded);
+    assert_eq!(
+        w.run(&ctl, &RunOptions::default()).await.unwrap(),
+        TaskState::Succeeded
+    );
     assert_eq!(summarize(&w, &ctl), baseline);
-    assert_eq!(w.counts.get("run_verification"), 2, "the receipt-less attempt and the final one");
+    assert_eq!(
+        w.counts.get("run_verification"),
+        2,
+        "the receipt-less attempt and the final one"
+    );
     assert_eq!(ctl.effect(&w, "run_verification").lease_generation, 3);
     assert_eq!(ctl.of_type(&w, "RecoveryDecision").len(), 2);
     assert_journal_sound(&w, &ctl);
@@ -689,15 +926,27 @@ fn request(ctl: &Ctl, w: &World, rec: &EffectRecord) -> EffectRequest {
 }
 
 fn retained(ctl: &Ctl, effect: &EffectId) -> ExecOutcome {
-    ctl.exec.retained_outcome(effect).expect("the executor retained an outcome")
+    ctl.exec
+        .retained_outcome(effect)
+        .expect("the executor retained an outcome")
 }
 
 fn attempt(lease: u64) -> AttemptCtx {
-    AttemptCtx { attempt_id: AttemptId::new(), lease_generation: lease, worker: "zombie".into() }
+    AttemptCtx {
+        attempt_id: AttemptId::new(),
+        lease_generation: lease,
+        worker: "zombie".into(),
+    }
 }
 
 /// A job request for an attempt of `rec`, as the executor would write it.
-fn job_request(w: &World, ctl: &Ctl, rec: &EffectRecord, ctx: &AttemptCtx, lease_expiry_ms: i64) -> JobRequest {
+fn job_request(
+    w: &World,
+    ctl: &Ctl,
+    rec: &EffectRecord,
+    ctx: &AttemptCtx,
+    lease_expiry_ms: i64,
+) -> JobRequest {
     JobRequest {
         effect_id: rec.effect_id.clone(),
         task_id: w.task.clone(),
@@ -729,43 +978,101 @@ fn leave_receipt(w: &World, ctl: &Ctl, rec: &EffectRecord, out: &ExecOutcome) {
 async fn stale_and_duplicate_receipts_are_ignored_and_audited() {
     let baseline = baseline().await;
     let w = World::new();
-    w.crash_run(CrashHook::at(CrashPoint::AfterDispatch, "run_verification")).await;
+    w.crash_run(CrashHook::at(CrashPoint::AfterDispatch, "run_verification"))
+        .await;
     {
         // Recovery re-dispatches under lease 2, then dies before executing.
-        let hook = CrashHook::new(|p, ctx| p == CrashPoint::AfterDispatch && ctx.kind == Some("run_verification"));
+        let hook = CrashHook::new(|p, ctx| {
+            p == CrashPoint::AfterDispatch && ctx.kind == Some("run_verification")
+        });
         let ctl = w.open(Some(hook.clone()));
-        let err = recover_with(&ctl.db, &ctl.blobs, &ctl.exec, &w.task, &RunOptions::crash_with(hook)).await;
-        assert!(matches!(err, Err(EngineError::Crashed(CrashPoint::AfterDispatch))), "{err:?}");
+        let err = recover_with(
+            &ctl.db,
+            &ctl.blobs,
+            &ctl.exec,
+            &w.task,
+            &RunOptions::crash_with(hook),
+        )
+        .await;
+        assert!(
+            matches!(err, Err(EngineError::Crashed(CrashPoint::AfterDispatch))),
+            "{err:?}"
+        );
     }
     let ctl = w.open(None);
     let verify = ctl.effect(&w, "run_verification");
-    assert_eq!((verify.state, verify.lease_generation), (EffectState::Dispatched, 2));
+    assert_eq!(
+        (verify.state, verify.lease_generation),
+        (EffectState::Dispatched, 2)
+    );
 
     // A zombie of the first attempt (lease 1) reports directly, and another left a forged
     // receipt in a (dead) job directory of its own.
-    let zombie = ExecOutcome::success(&request(&ctl, &w, &verify), &attempt(1), b"{\"passed\": true}".to_vec());
-    let before = (ctl.db.task(&w.task).unwrap(), ctl.db.usage_summary(&w.task).unwrap());
-    let verdict = ctl.db.complete_effect(&verify.effect_id, &zombie.receipt, None, None).unwrap();
+    let zombie = ExecOutcome::success(
+        &request(&ctl, &w, &verify),
+        &attempt(1),
+        b"{\"passed\": true}".to_vec(),
+    );
+    let before = (
+        ctl.db.task(&w.task).unwrap(),
+        ctl.db.usage_summary(&w.task).unwrap(),
+    );
+    let verdict = ctl
+        .db
+        .complete_effect(&verify.effect_id, &zombie.receipt, None, None)
+        .unwrap();
     assert_eq!(verdict, ReceiptVerdict::StaleLeaseIgnored);
-    assert_eq!((ctl.db.task(&w.task).unwrap(), ctl.db.usage_summary(&w.task).unwrap()), before);
-    let forged_out = ExecOutcome::success(&request(&ctl, &w, &verify), &attempt(1), b"{\"passed\": true}".to_vec());
+    assert_eq!(
+        (
+            ctl.db.task(&w.task).unwrap(),
+            ctl.db.usage_summary(&w.task).unwrap()
+        ),
+        before
+    );
+    let forged_out = ExecOutcome::success(
+        &request(&ctl, &w, &verify),
+        &attempt(1),
+        b"{\"passed\": true}".to_vec(),
+    );
     leave_receipt(&w, &ctl, &verify, &forged_out);
 
     let report = ctl.recover(&w).await;
 
     assert_eq!(report.decisions.len(), 1);
-    assert_eq!(report.decisions[0].decision, Decision::Redispatch, "the stale receipt is not applied");
+    assert_eq!(
+        report.decisions[0].decision,
+        Decision::Redispatch,
+        "the stale receipt is not applied"
+    );
     let ignored = ctl.of_type(&w, "ReceiptIgnored");
-    assert_eq!(ignored.len(), 2, "the direct report and the stale retained one");
-    assert!(ignored.iter().all(|e| e["reason"] == "StaleLeaseIgnored"), "{ignored:?}");
-    assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Succeeded);
+    assert_eq!(
+        ignored.len(),
+        2,
+        "the direct report and the stale retained one"
+    );
+    assert!(
+        ignored.iter().all(|e| e["reason"] == "StaleLeaseIgnored"),
+        "{ignored:?}"
+    );
+    assert_eq!(
+        w.run(&ctl, &RunOptions::default()).await.unwrap(),
+        TaskState::Succeeded
+    );
     assert_eq!(summarize(&w, &ctl), baseline);
     assert_eq!(ctl.effect(&w, "run_verification").lease_generation, 3);
 
     // A duplicate of the applied receipt after the fact changes nothing either.
     let done = ctl.effect(&w, "run_verification");
     let applied = retained(&ctl, &done.effect_id);
-    let verdict = ctl.db.complete_effect(&done.effect_id, &applied.receipt, done.result_digest.as_ref(), None).unwrap();
+    let verdict = ctl
+        .db
+        .complete_effect(
+            &done.effect_id,
+            &applied.receipt,
+            done.result_digest.as_ref(),
+            None,
+        )
+        .unwrap();
     assert_eq!(verdict, ReceiptVerdict::DuplicateIgnored);
     assert_eq!(ctl.of_type(&w, "ReceiptIgnored").len(), 3);
     assert_eq!(summarize(&w, &ctl), baseline);
@@ -781,7 +1088,11 @@ async fn cancel_after_crash(point: CrashPoint, kind: &'static str) -> (World, Ct
     cancel_after_crash_with(point, kind, &ExecOpts::default()).await
 }
 
-async fn cancel_after_crash_with(point: CrashPoint, kind: &'static str, opts: &ExecOpts) -> (World, Ctl, RecoveryReport) {
+async fn cancel_after_crash_with(
+    point: CrashPoint,
+    kind: &'static str,
+    opts: &ExecOpts,
+) -> (World, Ctl, RecoveryReport) {
     let w = World::new();
     w.crash_run_with(CrashHook::at(point, kind), opts).await;
     let ctl = w.open(None);
@@ -792,7 +1103,10 @@ async fn cancel_after_crash_with(point: CrashPoint, kind: &'static str, opts: &E
     assert_eq!(ctl.of_type(&w, "CancelCompleted").len(), 1);
     // Nothing more happens on a further run.
     let n = ctl.events(&w).len();
-    assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Cancelled);
+    assert_eq!(
+        w.run(&ctl, &RunOptions::default()).await.unwrap(),
+        TaskState::Cancelled
+    );
     assert_eq!(ctl.events(&w).len(), n);
     assert_journal_sound(&w, &ctl);
     (w, ctl, report)
@@ -810,7 +1124,11 @@ async fn cancel_after_a_crash_abandons_a_patch_that_never_ran() {
         assert_eq!(workspace_digest(&w.ws()).unwrap(), w.base(), "{point}");
         let usage = ctl.db.usage_summary(&w.task).unwrap();
         assert_eq!(
-            (usage.reserved_tool_actions, usage.settled_tool_actions, usage.uncertain_tool_actions),
+            (
+                usage.reserved_tool_actions,
+                usage.settled_tool_actions,
+                usage.uncertain_tool_actions
+            ),
             (0, 1, 0),
             "{point}: only the snapshot's action is consumed; the patch's is released"
         );
@@ -820,12 +1138,19 @@ async fn cancel_after_a_crash_abandons_a_patch_that_never_ran() {
 
 #[tokio::test]
 async fn cancel_after_a_crash_completes_a_retained_verification_without_success() {
-    let (w, ctl, report) = cancel_after_crash(CrashPoint::AfterExecuteBeforePublish, "run_verification").await;
+    let (w, ctl, report) =
+        cancel_after_crash(CrashPoint::AfterExecuteBeforePublish, "run_verification").await;
     assert_eq!(report.decisions[0].decision, Decision::PublishRetained);
-    assert_eq!(ctl.effect(&w, "run_verification").state, EffectState::Completed);
+    assert_eq!(
+        ctl.effect(&w, "run_verification").state,
+        EffectState::Completed
+    );
     let rejected = ctl.of_type(&w, "TaskEventRejected");
     assert_eq!(rejected.len(), 1);
-    assert!(rejected[0]["event"].get("VerifyPassed").is_some(), "{rejected:?}");
+    assert!(
+        rejected[0]["event"].get("VerifyPassed").is_some(),
+        "{rejected:?}"
+    );
     assert_eq!(ctl.db.task(&w.task).unwrap().verified_digest, None);
     assert_eq!(w.counts.get("run_verification"), 1);
 }
@@ -833,13 +1158,25 @@ async fn cancel_after_a_crash_completes_a_retained_verification_without_success(
 #[tokio::test]
 async fn cancel_after_a_crash_leaves_an_unprovable_verification_unknown() {
     // The verification ran, but its supervisor died before the receipt.
-    let hooked = ExecOpts { exit_before_receipt: Some("run_verification"), ..ExecOpts::default() };
-    let (w, ctl, report) = cancel_after_crash_with(CrashPoint::DuringExecute, "run_verification", &hooked).await;
+    let hooked = ExecOpts {
+        exit_before_receipt: Some("run_verification"),
+        ..ExecOpts::default()
+    };
+    let (w, ctl, report) =
+        cancel_after_crash_with(CrashPoint::DuringExecute, "run_verification", &hooked).await;
     assert_eq!(report.decisions[0].decision, Decision::MarkUnknown);
     let verify = ctl.effect(&w, "run_verification");
-    assert_eq!(verify.state, EffectState::Unknown, "it ran and left no receipt: it may have happened");
+    assert_eq!(
+        verify.state,
+        EffectState::Unknown,
+        "it ran and left no receipt: it may have happened"
+    );
     assert_eq!(ctl.db.outstanding_effects(&w.task).unwrap(), vec![verify]);
-    assert_eq!(w.counts.get("run_verification"), 1, "not retried once cancel was requested");
+    assert_eq!(
+        w.counts.get("run_verification"),
+        1,
+        "not retried once cancel was requested"
+    );
     // Recovering again changes nothing.
     let n = ctl.events(&w).len();
     assert!(ctl.recover(&w).await.decisions.is_empty());
@@ -849,15 +1186,27 @@ async fn cancel_after_a_crash_leaves_an_unprovable_verification_unknown() {
 #[tokio::test]
 async fn an_unreconcilable_patch_fails_the_task_and_keeps_its_reservation_uncertain() {
     let w = World::new();
-    let hooked = ExecOpts { exit_before_receipt: Some("apply_patch"), ..ExecOpts::default() };
-    w.crash_run_with(CrashHook::at(CrashPoint::DuringExecute, "apply_patch"), &hooked).await;
+    let hooked = ExecOpts {
+        exit_before_receipt: Some("apply_patch"),
+        ..ExecOpts::default()
+    };
+    w.crash_run_with(
+        CrashHook::at(CrashPoint::DuringExecute, "apply_patch"),
+        &hooked,
+    )
+    .await;
     let ctl = w.open(None);
     // The patch job ends without a receipt ...
     let job = w.only_job(&ctl.effect(&w, "apply_patch").effect_id);
     wait_until("the patch job to end", || job.is_dead()).await;
     assert_eq!(job.read_receipt(), None);
     // ... and someone else touched the workspace too: it is neither the base nor base + patch.
-    write_in_workspace(w.dir.path(), &w.task, "src/__init__.py", "# changed by hand\n");
+    write_in_workspace(
+        w.dir.path(),
+        &w.task,
+        "src/__init__.py",
+        "# changed by hand\n",
+    );
 
     let report = ctl.recover(&w).await;
 
@@ -867,14 +1216,27 @@ async fn an_unreconcilable_patch_fails_the_task_and_keeps_its_reservation_uncert
     assert_eq!(patch.state, EffectState::Unknown);
     let failed = ctl.of_type(&w, "Failed");
     assert_eq!(failed.len(), 1);
-    assert_eq!(failed[0]["Failed"]["reason"], format!("unreconcilable effect {}", patch.effect_id));
+    assert_eq!(
+        failed[0]["Failed"]["reason"],
+        format!("unreconcilable effect {}", patch.effect_id)
+    );
     let usage = ctl.db.usage_summary(&w.task).unwrap();
-    assert_eq!((usage.uncertain_tool_actions, usage.reserved_tool_actions, usage.settled_tool_actions), (1, 0, 1));
+    assert_eq!(
+        (
+            usage.uncertain_tool_actions,
+            usage.reserved_tool_actions,
+            usage.settled_tool_actions
+        ),
+        (1, 0, 1)
+    );
     assert_eq!(ctl.db.outstanding_effects(&w.task).unwrap(), vec![patch]);
 
     let n = ctl.events(&w).len();
     assert!(ctl.recover(&w).await.decisions.is_empty());
-    assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Failed);
+    assert_eq!(
+        w.run(&ctl, &RunOptions::default()).await.unwrap(),
+        TaskState::Failed
+    );
     assert_eq!(ctl.events(&w).len(), n, "a failed task is left alone");
     assert_eq!(w.counts.get("apply_patch"), 1);
     assert_journal_sound(&w, &ctl);
@@ -883,18 +1245,28 @@ async fn an_unreconcilable_patch_fails_the_task_and_keeps_its_reservation_uncert
 #[tokio::test]
 async fn a_workspace_lost_with_a_patch_in_flight_fails_the_task_cleanly() {
     let w = World::new();
-    w.crash_run(CrashHook::at(CrashPoint::AfterDispatch, "apply_patch")).await;
+    w.crash_run(CrashHook::at(CrashPoint::AfterDispatch, "apply_patch"))
+        .await;
     lose_workspace(w.dir.path(), &w.task);
     let ctl = w.open(None);
 
-    assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Failed);
+    assert_eq!(
+        w.run(&ctl, &RunOptions::default()).await.unwrap(),
+        TaskState::Failed
+    );
 
     let patch = ctl.effect(&w, "apply_patch");
     assert_eq!(patch.state, EffectState::Unknown);
     let failed = ctl.of_type(&w, "Failed");
-    assert_eq!(failed[0]["Failed"]["reason"], format!("unreconcilable effect {}", patch.effect_id));
+    assert_eq!(
+        failed[0]["Failed"]["reason"],
+        format!("unreconcilable effect {}", patch.effect_id)
+    );
     let n = ctl.events(&w).len();
-    assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Failed);
+    assert_eq!(
+        w.run(&ctl, &RunOptions::default()).await.unwrap(),
+        TaskState::Failed
+    );
     assert_eq!(ctl.events(&w).len(), n);
     assert_eq!(w.counts.get("apply_patch"), 0);
 }
@@ -902,25 +1274,43 @@ async fn a_workspace_lost_with_a_patch_in_flight_fails_the_task_cleanly() {
 #[tokio::test]
 async fn a_workspace_lost_between_effects_fails_the_task_cleanly() {
     let w = World::new();
-    w.crash_run(CrashHook::at(CrashPoint::AfterComplete, "apply_patch")).await;
+    w.crash_run(CrashHook::at(CrashPoint::AfterComplete, "apply_patch"))
+        .await;
     lose_workspace(w.dir.path(), &w.task);
     let ctl = w.open(None);
 
-    assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Failed);
+    assert_eq!(
+        w.run(&ctl, &RunOptions::default()).await.unwrap(),
+        TaskState::Failed
+    );
 
     let failed = ctl.of_type(&w, "Failed");
     assert_eq!(failed.len(), 1);
-    assert!(failed[0]["Failed"]["reason"].as_str().unwrap().starts_with("workspace lost"), "{failed:?}");
-    assert_eq!(ctl.of_type(&w, "VerifyStarted").len(), 0, "no work on a workspace that is gone");
+    assert!(
+        failed[0]["Failed"]["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("workspace lost"),
+        "{failed:?}"
+    );
+    assert_eq!(
+        ctl.of_type(&w, "VerifyStarted").len(),
+        0,
+        "no work on a workspace that is gone"
+    );
     let n = ctl.events(&w).len();
-    assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Failed);
+    assert_eq!(
+        w.run(&ctl, &RunOptions::default()).await.unwrap(),
+        TaskState::Failed
+    );
     assert_eq!(ctl.events(&w).len(), n);
 }
 
 #[tokio::test]
 async fn a_paused_task_defers_recovery_of_work_it_cannot_dispatch() {
     let w = World::new();
-    w.crash_run(CrashHook::at(CrashPoint::AfterIntent, "apply_patch")).await;
+    w.crash_run(CrashHook::at(CrashPoint::AfterIntent, "apply_patch"))
+        .await;
     let ctl = w.open(None);
     ctl.db.append(&w.task, &TaskEvent::Paused).unwrap();
 
@@ -930,52 +1320,95 @@ async fn a_paused_task_defers_recovery_of_work_it_cannot_dispatch() {
     assert_eq!(report.deferred, vec![patch.effect_id.clone()]);
     assert!(report.decisions.is_empty());
     assert_eq!(patch.state, EffectState::Intended);
-    assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Paused);
+    assert_eq!(
+        w.run(&ctl, &RunOptions::default()).await.unwrap(),
+        TaskState::Paused
+    );
     assert_eq!(ctl.of_type(&w, "RecoveryDecision").len(), 0);
 
     ctl.db.append(&w.task, &TaskEvent::Resumed).unwrap();
     // A new session after the resume: the agent starts over from the current workspace.
     let mut agent = FakeAgent::scripted(vec![AgentAction::Verify, AgentAction::Finish]);
-    let state = run_task(&ctl.db, &ctl.blobs, &ctl.exec, &mut agent, &w.task).await.unwrap();
+    let state = run_task(&ctl.db, &ctl.blobs, &ctl.exec, &mut agent, &w.task)
+        .await
+        .unwrap();
     assert_eq!(state, TaskState::Succeeded);
     assert_eq!(ctl.effect(&w, "apply_patch").state, EffectState::Completed);
     assert_eq!(w.counts.get("apply_patch"), 1);
     let task = ctl.db.task(&w.task).unwrap();
-    assert_eq!(task.verified_digest, Some(workspace_digest(&w.ws()).unwrap()));
+    assert_eq!(
+        task.verified_digest,
+        Some(workspace_digest(&w.ws()).unwrap())
+    );
 }
 
 #[tokio::test]
 async fn an_agent_that_replays_differently_fails_the_task() {
     let w = World::new();
-    w.crash_run(CrashHook::at(CrashPoint::AfterComplete, "apply_patch")).await;
+    w.crash_run(CrashHook::at(CrashPoint::AfterComplete, "apply_patch"))
+        .await;
     let ctl = w.open(None);
     let mut other = FakeAgent::scripted(vec![AgentAction::ApplyPatch(comment_patch())]);
 
-    let err = run_task(&ctl.db, &ctl.blobs, &ctl.exec, &mut other, &w.task).await.unwrap_err();
+    let err = run_task(&ctl.db, &ctl.blobs, &ctl.exec, &mut other, &w.task)
+        .await
+        .unwrap_err();
 
-    assert!(matches!(err, EngineError::NondeterministicAgent { turn: 1, .. }), "{err:?}");
+    assert!(
+        matches!(err, EngineError::NondeterministicAgent { turn: 1, .. }),
+        "{err:?}"
+    );
     let failed = ctl.of_type(&w, "Failed");
     assert_eq!(failed.len(), 1);
-    assert!(failed[0]["Failed"]["reason"].as_str().unwrap().contains("replay"), "{failed:?}");
-    assert_eq!(w.counts.get("apply_patch"), 1, "nothing was executed for the divergent agent");
+    assert!(
+        failed[0]["Failed"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("replay"),
+        "{failed:?}"
+    );
+    assert_eq!(
+        w.counts.get("apply_patch"),
+        1,
+        "nothing was executed for the divergent agent"
+    );
 }
 
 #[tokio::test]
 async fn replay_feeds_the_journaled_observations_and_executes_nothing_twice() {
     let w = World::new();
-    w.crash_run(CrashHook::at(CrashPoint::AfterAgentTurnJournaled, "run_verification")).await;
+    w.crash_run(CrashHook::at(
+        CrashPoint::AfterAgentTurnJournaled,
+        "run_verification",
+    ))
+    .await;
     let ctl = w.open(None);
     let turns = ctl.of_type(&w, "AgentTurn");
     assert_eq!(turns.len(), 2);
     assert_eq!(turns[1]["action"], serde_json::json!("Verify"));
     let mut agent = FakeAgent::from_fixture_patch(fix_patch());
 
-    assert_eq!(run_task(&ctl.db, &ctl.blobs, &ctl.exec, &mut agent, &w.task).await.unwrap(), TaskState::Succeeded);
+    assert_eq!(
+        run_task(&ctl.db, &ctl.blobs, &ctl.exec, &mut agent, &w.task)
+            .await
+            .unwrap(),
+        TaskState::Succeeded
+    );
 
-    let journaled: Vec<_> =
-        turns.iter().map(|t| serde_json::from_value(t["observation"].clone()).unwrap()).collect::<Vec<_>>();
-    assert_eq!(agent.observations(), &journaled[..], "replayed exactly the journaled observations");
-    assert_eq!(ctl.of_type(&w, "AgentTurn").len(), 2, "replayed turns are not journaled again");
+    let journaled: Vec<_> = turns
+        .iter()
+        .map(|t| serde_json::from_value(t["observation"].clone()).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        agent.observations(),
+        &journaled[..],
+        "replayed exactly the journaled observations"
+    );
+    assert_eq!(
+        ctl.of_type(&w, "AgentTurn").len(),
+        2,
+        "replayed turns are not journaled again"
+    );
     assert_eq!(w.counts(), KINDS.iter().map(|k| (*k, 1)).collect());
 }
 
@@ -988,10 +1421,25 @@ async fn during_model_call_the_reservation_stays_uncertain() {
         let ctl = w.open(None);
         ctl.db.append(&w.task, &TaskEvent::Started).unwrap();
         let kind = EffectKind::ExportBundle;
-        let reserve = Reservation { tool_actions: 0, model_requests: 1 };
+        let reserve = Reservation {
+            tool_actions: 0,
+            model_requests: 1,
+        };
         let base = ctl.db.task(&w.task).unwrap().workspace_digest;
-        let rec = ctl.db.record_intent(&w.task, kind, Digest::of(b"prompt"), &base, reserve, &Resource::Task).unwrap();
-        ctl.db.mark_dispatched(&rec.effect_id, &AttemptId::new(), "model-broker", 1).unwrap();
+        let rec = ctl
+            .db
+            .record_intent(
+                &w.task,
+                kind,
+                Digest::of(b"prompt"),
+                &base,
+                reserve,
+                &Resource::Task,
+            )
+            .unwrap();
+        ctl.db
+            .mark_dispatched(&rec.effect_id, &AttemptId::new(), "model-broker", 1)
+            .unwrap();
         rec.effect_id
         // The controller dies with the model call in flight.
     };
@@ -1000,12 +1448,20 @@ async fn during_model_call_the_reservation_stays_uncertain() {
     let report = ctl.recover(&w).await;
 
     assert_eq!(report.decisions.len(), 1);
-    assert_eq!(report.decisions[0].decision, Decision::Unreconcilable, "ExportBundle cannot be retried blindly");
+    assert_eq!(
+        report.decisions[0].decision,
+        Decision::Unreconcilable,
+        "ExportBundle cannot be retried blindly"
+    );
     let rec = ctl.db.effect(&effect).unwrap();
     assert_eq!(rec.state, EffectState::Unknown);
     let usage = ctl.db.usage_summary(&w.task).unwrap();
     assert_eq!(
-        (usage.uncertain_model_requests, usage.reserved_model_requests, usage.settled_model_requests),
+        (
+            usage.uncertain_model_requests,
+            usage.reserved_model_requests,
+            usage.settled_model_requests
+        ),
         (1, 0, 0),
         "neither released nor doubled"
     );
@@ -1013,7 +1469,13 @@ async fn during_model_call_the_reservation_stays_uncertain() {
     assert_eq!(journaled.len(), 1);
     assert_eq!(journaled[0]["decision"], "Unreconcilable");
     assert_eq!(journaled[0]["found_state"], "Dispatched");
-    assert!(journaled[0]["reason"].as_str().unwrap().contains("ReconcileThenRetry"), "{journaled:?}");
+    assert!(
+        journaled[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("ReconcileThenRetry"),
+        "{journaled:?}"
+    );
     assert_eq!(ctl.db.task(&w.task).unwrap().state, TaskState::Failed);
 
     let events = ctl.events(&w);
@@ -1027,7 +1489,10 @@ async fn during_model_call_the_reservation_stays_uncertain() {
 async fn the_executor_retains_the_highest_lease_outcome() {
     let w = World::new();
     let ctl = w.open(None);
-    assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Succeeded);
+    assert_eq!(
+        w.run(&ctl, &RunOptions::default()).await.unwrap(),
+        TaskState::Succeeded
+    );
     let verify = ctl.effect(&w, "run_verification");
     let real = retained(&ctl, &verify.effect_id);
     assert_eq!(real.receipt.lease_generation, 1);
@@ -1058,11 +1523,18 @@ fn interrupt_at(w: &World, point: CrashPoint, kind: &'static str, event: TaskEve
 }
 
 /// Runs the fixture solution with an operator interrupt injected; it must end cleanly.
-async fn interrupted_run(point: CrashPoint, kind: &'static str, event: TaskEvent) -> (World, Ctl, TaskState) {
+async fn interrupted_run(
+    point: CrashPoint,
+    kind: &'static str,
+    event: TaskEvent,
+) -> (World, Ctl, TaskState) {
     let w = World::new();
     let ctl = w.open(None);
     let opts = interrupt_at(&w, point, kind, event);
-    let state = w.run(&ctl, &opts).await.unwrap_or_else(|e| panic!("{point} {kind}: the run must end cleanly, got {e:?}"));
+    let state = w
+        .run(&ctl, &opts)
+        .await
+        .unwrap_or_else(|e| panic!("{point} {kind}: the run must end cleanly, got {e:?}"));
     assert_journal_sound(&w, &ctl);
     (w, ctl, state)
 }
@@ -1070,18 +1542,28 @@ async fn interrupted_run(point: CrashPoint, kind: &'static str, event: TaskEvent
 async fn resume_with(w: &World, ctl: &Ctl, actions: Vec<AgentAction>) -> TaskState {
     ctl.db.append(&w.task, &TaskEvent::Resumed).unwrap();
     let mut agent = FakeAgent::scripted(actions);
-    run_task(&ctl.db, &ctl.blobs, &ctl.exec, &mut agent, &w.task).await.unwrap()
+    run_task(&ctl.db, &ctl.blobs, &ctl.exec, &mut agent, &w.task)
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
 async fn a_pause_landing_after_the_intent_stops_the_run_and_resume_completes_it() {
-    let (w, ctl, state) = interrupted_run(CrashPoint::AfterIntent, "apply_patch", TaskEvent::Paused).await;
+    let (w, ctl, state) =
+        interrupted_run(CrashPoint::AfterIntent, "apply_patch", TaskEvent::Paused).await;
     assert_eq!(state, TaskState::Paused);
-    assert_eq!(ctl.effect(&w, "apply_patch").state, EffectState::Intended, "not dispatched while paused");
+    assert_eq!(
+        ctl.effect(&w, "apply_patch").state,
+        EffectState::Intended,
+        "not dispatched while paused"
+    );
     assert_eq!(w.counts.get("apply_patch"), 0);
 
     // Resume: recovery dispatches the intended patch, a new session verifies it.
-    assert_eq!(resume_with(&w, &ctl, vec![AgentAction::Verify, AgentAction::Finish]).await, TaskState::Succeeded);
+    assert_eq!(
+        resume_with(&w, &ctl, vec![AgentAction::Verify, AgentAction::Finish]).await,
+        TaskState::Succeeded
+    );
     assert_eq!(ctl.effect(&w, "apply_patch").state, EffectState::Completed);
     assert_eq!(w.counts.get("apply_patch"), 1);
     assert_journal_sound(&w, &ctl);
@@ -1089,12 +1571,20 @@ async fn a_pause_landing_after_the_intent_stops_the_run_and_resume_completes_it(
 
 #[tokio::test]
 async fn a_cancel_landing_after_the_intent_cancels_and_releases_the_intent() {
-    let (w, ctl, state) = interrupted_run(CrashPoint::AfterIntent, "apply_patch", TaskEvent::CancelRequested).await;
+    let (w, ctl, state) = interrupted_run(
+        CrashPoint::AfterIntent,
+        "apply_patch",
+        TaskEvent::CancelRequested,
+    )
+    .await;
     assert_eq!(state, TaskState::Cancelled);
     assert_eq!(ctl.effect(&w, "apply_patch").state, EffectState::Abandoned);
     assert!(ctl.db.outstanding_effects(&w.task).unwrap().is_empty());
     let usage = ctl.db.usage_summary(&w.task).unwrap();
-    assert_eq!((usage.reserved_tool_actions, usage.settled_tool_actions), (0, 1));
+    assert_eq!(
+        (usage.reserved_tool_actions, usage.settled_tool_actions),
+        (0, 1)
+    );
     assert_eq!(workspace_digest(&w.ws()).unwrap(), w.base());
     assert!(ctl.recover(&w).await.decisions.is_empty());
 }
@@ -1102,35 +1592,68 @@ async fn a_cancel_landing_after_the_intent_cancels_and_releases_the_intent() {
 #[tokio::test]
 async fn a_pause_landing_after_a_journaled_patch_turn_stops_before_the_intent() {
     let baseline = baseline().await;
-    let (w, ctl, state) = interrupted_run(CrashPoint::AfterAgentTurnJournaled, "apply_patch", TaskEvent::Paused).await;
+    let (w, ctl, state) = interrupted_run(
+        CrashPoint::AfterAgentTurnJournaled,
+        "apply_patch",
+        TaskEvent::Paused,
+    )
+    .await;
     assert_eq!(state, TaskState::Paused);
-    assert!(ctl.effects(&w).iter().all(|e| e.kind.tag() == "read_snapshot"), "no patch effect");
+    assert!(
+        ctl.effects(&w)
+            .iter()
+            .all(|e| e.kind.tag() == "read_snapshot"),
+        "no patch effect"
+    );
 
     // The resumed session starts over from Start and runs the whole solution once.
     ctl.db.append(&w.task, &TaskEvent::Resumed).unwrap();
-    assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Succeeded);
+    assert_eq!(
+        w.run(&ctl, &RunOptions::default()).await.unwrap(),
+        TaskState::Succeeded
+    );
     assert_eq!(summarize(&w, &ctl), baseline);
     assert_eq!(w.counts(), KINDS.iter().map(|k| (*k, 1)).collect());
 }
 
 #[tokio::test]
 async fn a_cancel_landing_after_a_journaled_verify_turn_cancels_without_verifying() {
-    let (w, ctl, state) = interrupted_run(CrashPoint::AfterAgentTurnJournaled, "run_verification", TaskEvent::CancelRequested).await;
+    let (w, ctl, state) = interrupted_run(
+        CrashPoint::AfterAgentTurnJournaled,
+        "run_verification",
+        TaskEvent::CancelRequested,
+    )
+    .await;
     assert_eq!(state, TaskState::Cancelled);
     assert_eq!(ctl.of_type(&w, "VerifyStarted").len(), 0);
-    assert!(ctl.effects(&w).iter().all(|e| e.kind.tag() != "run_verification"));
+    assert!(
+        ctl.effects(&w)
+            .iter()
+            .all(|e| e.kind.tag() != "run_verification")
+    );
     assert_eq!(ctl.effect(&w, "apply_patch").state, EffectState::Completed);
 }
 
 #[tokio::test]
 async fn a_pause_landing_after_a_journaled_verify_turn_pauses_and_resume_verifies() {
-    let (w, ctl, state) = interrupted_run(CrashPoint::AfterAgentTurnJournaled, "run_verification", TaskEvent::Paused).await;
+    let (w, ctl, state) = interrupted_run(
+        CrashPoint::AfterAgentTurnJournaled,
+        "run_verification",
+        TaskEvent::Paused,
+    )
+    .await;
     assert_eq!(state, TaskState::Paused);
     assert_eq!(ctl.of_type(&w, "VerifyStarted").len(), 0);
 
-    assert_eq!(resume_with(&w, &ctl, vec![AgentAction::Verify]).await, TaskState::Succeeded);
+    assert_eq!(
+        resume_with(&w, &ctl, vec![AgentAction::Verify]).await,
+        TaskState::Succeeded
+    );
     let task = ctl.db.task(&w.task).unwrap();
-    assert_eq!(task.verified_digest, Some(workspace_digest(&w.ws()).unwrap()));
+    assert_eq!(
+        task.verified_digest,
+        Some(workspace_digest(&w.ws()).unwrap())
+    );
     assert_eq!(w.counts(), KINDS.iter().map(|k| (*k, 1)).collect());
 }
 
@@ -1141,7 +1664,11 @@ async fn recovery_waits_for_a_running_job_and_publishes_its_receipt_without_a_se
     let baseline = baseline().await;
     let w = World::new();
     w.slow_profile(2.5);
-    assert_eq!(w.crash_run(CrashHook::at(CrashPoint::DuringExecute, "run_verification")).await, CrashPoint::DuringExecute);
+    assert_eq!(
+        w.crash_run(CrashHook::at(CrashPoint::DuringExecute, "run_verification"))
+            .await,
+        CrashPoint::DuringExecute
+    );
     let ctl = w.open(None);
     let verify = ctl.effect(&w, "run_verification");
     let job = w.only_job(&verify.effect_id);
@@ -1156,12 +1683,24 @@ async fn recovery_waits_for_a_running_job_and_publishes_its_receipt_without_a_se
     assert!(report.decisions[0].reason.contains("waiting"), "{report:?}");
     assert_eq!(w.jobs(&verify.effect_id).len(), 1, "no second attempt");
     let verify = ctl.effect(&w, "run_verification");
-    assert_eq!((verify.state, verify.lease_generation), (EffectState::Completed, 1));
-    assert_eq!(verify.result_digest, Some(Digest::of(&job.read_receipt().unwrap().output)));
-    assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Succeeded);
+    assert_eq!(
+        (verify.state, verify.lease_generation),
+        (EffectState::Completed, 1)
+    );
+    assert_eq!(
+        verify.result_digest,
+        Some(Digest::of(&job.read_receipt().unwrap().output))
+    );
+    assert_eq!(
+        w.run(&ctl, &RunOptions::default()).await.unwrap(),
+        TaskState::Succeeded
+    );
     assert_eq!(ctl.db.usage_summary(&w.task).unwrap(), baseline.usage);
     let task = ctl.db.task(&w.task).unwrap();
-    assert_eq!(task.verified_digest, Some(workspace_digest(&w.ws()).unwrap()));
+    assert_eq!(
+        task.verified_digest,
+        Some(workspace_digest(&w.ws()).unwrap())
+    );
     assert_eq!(w.counts(), KINDS.iter().map(|k| (*k, 1)).collect());
     assert_journal_sound(&w, &ctl);
     w.assert_no_live_process().await;
@@ -1171,18 +1710,23 @@ async fn recovery_waits_for_a_running_job_and_publishes_its_receipt_without_a_se
 /// lock is free, so the job is dead, but its worker and check live on. Recovery kills them
 /// before it runs the verification again, so the two attempts never overlap.
 #[tokio::test]
-async fn recovery_after_a_supervisor_sigkill_redispatches_a_verification_after_fencing_the_orphan_worker() {
+async fn recovery_after_a_supervisor_sigkill_redispatches_a_verification_after_fencing_the_orphan_worker()
+ {
     let baseline = baseline().await;
     let w = World::new();
     w.slow_profile(30.0);
-    w.crash_run(CrashHook::at(CrashPoint::DuringExecute, "run_verification")).await;
+    w.crash_run(CrashHook::at(CrashPoint::DuringExecute, "run_verification"))
+        .await;
     let ctl = w.open(None);
     let verify = ctl.effect(&w, "run_verification");
     let first = w.only_job(&verify.effect_id);
     let supervisor = running_supervisor(&first).await;
     kill_process(Pid::from_raw(supervisor).unwrap(), Signal::KILL).unwrap();
     wait_until("the first job's lock to be free", || first.is_dead()).await;
-    assert!(!session_members(supervisor).is_empty(), "the orphaned worker outlived its supervisor");
+    assert!(
+        !session_members(supervisor).is_empty(),
+        "the orphaned worker outlived its supervisor"
+    );
     w.restore_profile();
 
     let report = ctl.recover(&w).await;
@@ -1192,10 +1736,17 @@ async fn recovery_after_a_supervisor_sigkill_redispatches_a_verification_after_f
     let jobs = w.jobs(&verify.effect_id);
     assert_eq!(jobs.len(), 2);
     assert!(jobs[0].is_dead() && jobs[0].read_receipt().is_none());
-    assert_eq!(session_members(supervisor), Vec::<i32>::new(), "a process of the first attempt lives");
+    assert_eq!(
+        session_members(supervisor),
+        Vec::<i32>::new(),
+        "a process of the first attempt lives"
+    );
     assert_eq!(processes_naming(&first.path), Vec::<i32>::new());
     assert_eq!(ctl.effect(&w, "run_verification").lease_generation, 2);
-    assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Succeeded);
+    assert_eq!(
+        w.run(&ctl, &RunOptions::default()).await.unwrap(),
+        TaskState::Succeeded
+    );
     assert_eq!(summarize(&w, &ctl), baseline);
     assert_eq!(w.counts.get("run_verification"), 2);
     assert_journal_sound(&w, &ctl);
@@ -1211,10 +1762,17 @@ async fn recovery_with_a_sigstopped_supervisor_fences_then_redispatches() {
     let w = World::new();
     w.slow_profile(30.0);
     let short = ExecOpts {
-        timeouts: Some(EffectTimeouts { verification: Duration::from_secs(2), other: Duration::from_secs(30) }),
+        timeouts: Some(EffectTimeouts {
+            verification: Duration::from_secs(2),
+            other: Duration::from_secs(30),
+        }),
         ..ExecOpts::default()
     };
-    w.crash_run_with(CrashHook::at(CrashPoint::DuringExecute, "run_verification"), &short).await;
+    w.crash_run_with(
+        CrashHook::at(CrashPoint::DuringExecute, "run_verification"),
+        &short,
+    )
+    .await;
     let ctl = w.open(None);
     let verify = ctl.effect(&w, "run_verification");
     let first = w.only_job(&verify.effect_id);
@@ -1226,20 +1784,37 @@ async fn recovery_with_a_sigstopped_supervisor_fences_then_redispatches() {
     let report = ctl.recover(&w).await;
 
     let lease_expiry = first.request().unwrap().lease_expiry_ms;
-    assert!(now_ms() >= lease_expiry + 5_000, "fenced only past the lease plus the grace");
+    assert!(
+        now_ms() >= lease_expiry + 5_000,
+        "fenced only past the lease plus the grace"
+    );
     assert!(started.elapsed() < PATIENCE);
     let decisions: Vec<_> = report.decisions.iter().map(|d| d.decision).collect();
-    assert_eq!(decisions, vec![Decision::WaitedForJob, Decision::Redispatch], "{report:?}");
+    assert_eq!(
+        decisions,
+        vec![Decision::WaitedForJob, Decision::Redispatch],
+        "{report:?}"
+    );
     let journaled = ctl.of_type(&w, "RecoveryDecision");
     assert_eq!(journaled.len(), 2);
     assert_eq!(journaled[0]["decision"], "WaitedForJob");
     let jobs = w.jobs(&verify.effect_id);
     assert_eq!(jobs.len(), 2);
-    assert!(jobs[0].is_dead() && jobs[0].read_receipt().is_none(), "killed mid-flight: no receipt");
+    assert!(
+        jobs[0].is_dead() && jobs[0].read_receipt().is_none(),
+        "killed mid-flight: no receipt"
+    );
     assert!(jobs[0].cancel_requested());
-    assert_eq!(session_members(supervisor), Vec::<i32>::new(), "a process of the first attempt lives");
+    assert_eq!(
+        session_members(supervisor),
+        Vec::<i32>::new(),
+        "a process of the first attempt lives"
+    );
     assert_eq!(ctl.effect(&w, "run_verification").lease_generation, 2);
-    assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Succeeded);
+    assert_eq!(
+        w.run(&ctl, &RunOptions::default()).await.unwrap(),
+        TaskState::Succeeded
+    );
     assert_eq!(summarize(&w, &ctl), baseline);
     assert_eq!(w.counts.get("run_verification"), 2);
     assert_journal_sound(&w, &ctl);
@@ -1251,31 +1826,67 @@ async fn recovery_with_a_sigstopped_supervisor_fences_then_redispatches() {
 #[tokio::test]
 async fn recovery_marks_unknown_when_fencing_cannot_free_the_lock() {
     let w = World::new();
-    w.crash_run(CrashHook::at(CrashPoint::AfterDispatch, "apply_patch")).await;
-    let ctl = w.open_with(None, &ExecOpts { fence: Fence::Fails, ..ExecOpts::default() });
+    w.crash_run(CrashHook::at(CrashPoint::AfterDispatch, "apply_patch"))
+        .await;
+    let ctl = w.open_with(
+        None,
+        &ExecOpts {
+            fence: Fence::Fails,
+            ..ExecOpts::default()
+        },
+    );
     let patch = ctl.effect(&w, "apply_patch");
     // A job of the dispatched attempt, past its lease, whose lock this test holds.
-    let ctx = AttemptCtx { attempt_id: AttemptId::new(), lease_generation: patch.lease_generation, worker: "w".into() };
-    let (_job, _lock) = JobDir::create(&w.path("jobs"), &job_request(&w, &ctl, &patch, &ctx, now_ms() - 60_000)).unwrap();
+    let ctx = AttemptCtx {
+        attempt_id: AttemptId::new(),
+        lease_generation: patch.lease_generation,
+        worker: "w".into(),
+    };
+    let (_job, _lock) = JobDir::create(
+        &w.path("jobs"),
+        &job_request(&w, &ctl, &patch, &ctx, now_ms() - 60_000),
+    )
+    .unwrap();
 
     let report = ctl.recover(&w).await;
 
     let decisions: Vec<_> = report.decisions.iter().map(|d| d.decision).collect();
-    assert_eq!(decisions, vec![Decision::WaitedForJob, Decision::FenceFailed], "{report:?}");
+    assert_eq!(
+        decisions,
+        vec![Decision::WaitedForJob, Decision::FenceFailed],
+        "{report:?}"
+    );
     assert_eq!(report.state, Some(TaskState::Failed));
     let journaled = ctl.of_type(&w, "RecoveryDecision");
     assert_eq!(journaled.len(), 2);
-    assert_eq!(journaled[0]["decision"], "WaitedForJob", "journaled before the fence");
+    assert_eq!(
+        journaled[0]["decision"], "WaitedForJob",
+        "journaled before the fence"
+    );
     assert_eq!(journaled[1]["decision"], "FenceFailed");
     let patch = ctl.effect(&w, "apply_patch");
     assert_eq!(patch.state, EffectState::Unknown);
     let failed = ctl.of_type(&w, "Failed");
     assert_eq!(failed.len(), 1);
-    assert_eq!(failed[0]["Failed"]["reason"], format!("unreconcilable effect {}", patch.effect_id));
+    assert_eq!(
+        failed[0]["Failed"]["reason"],
+        format!("unreconcilable effect {}", patch.effect_id)
+    );
     let usage = ctl.db.usage_summary(&w.task).unwrap();
-    assert_eq!((usage.uncertain_tool_actions, usage.reserved_tool_actions, usage.settled_tool_actions), (1, 0, 1));
+    assert_eq!(
+        (
+            usage.uncertain_tool_actions,
+            usage.reserved_tool_actions,
+            usage.settled_tool_actions
+        ),
+        (1, 0, 1)
+    );
     assert_eq!(ctl.db.outstanding_effects(&w.task).unwrap(), vec![patch]);
-    assert_eq!(workspace_digest(&w.ws()).unwrap(), w.base(), "nothing was reconciled or run");
+    assert_eq!(
+        workspace_digest(&w.ws()).unwrap(),
+        w.base(),
+        "nothing was reconciled or run"
+    );
 
     let n = ctl.events(&w).len();
     assert!(ctl.recover(&w).await.decisions.is_empty());
@@ -1291,13 +1902,21 @@ async fn no_live_process_remains_after_any_recovery_case() {
     for kind in KINDS {
         for exit_before_receipt in [false, true] {
             let w = World::new();
-            let opts = ExecOpts { exit_before_receipt: exit_before_receipt.then_some(kind), ..ExecOpts::default() };
-            w.crash_run_with(CrashHook::at(CrashPoint::DuringExecute, kind), &opts).await;
+            let opts = ExecOpts {
+                exit_before_receipt: exit_before_receipt.then_some(kind),
+                ..ExecOpts::default()
+            };
+            w.crash_run_with(CrashHook::at(CrashPoint::DuringExecute, kind), &opts)
+                .await;
             let ctl = w.open(None);
             ctl.recover(&w).await;
             w.assert_no_live_process().await;
             assert_job_sessions_empty(&w);
-            assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Succeeded, "{kind}");
+            assert_eq!(
+                w.run(&ctl, &RunOptions::default()).await.unwrap(),
+                TaskState::Succeeded,
+                "{kind}"
+            );
             w.assert_no_live_process().await;
             assert_job_sessions_empty(&w);
         }
@@ -1305,7 +1924,8 @@ async fn no_live_process_remains_after_any_recovery_case() {
     // An orphaned check whose supervisor was killed.
     let w = World::new();
     w.slow_profile(30.0);
-    w.crash_run(CrashHook::at(CrashPoint::DuringExecute, "run_verification")).await;
+    w.crash_run(CrashHook::at(CrashPoint::DuringExecute, "run_verification"))
+        .await;
     let ctl = w.open(None);
     let job = w.only_job(&ctl.effect(&w, "run_verification").effect_id);
     let supervisor = running_supervisor(&job).await;
@@ -1326,7 +1946,11 @@ fn intervals(dir: &Path) -> Vec<(u128, u128)> {
         if path.extension().is_some_and(|e| e == "start") {
             let start: u128 = fs::read_to_string(&path).unwrap().trim().parse().unwrap();
             let beats = fs::read_to_string(path.with_extension("beats")).unwrap_or_default();
-            let last = beats.lines().filter_map(|l| l.trim().parse().ok()).max().unwrap_or(start);
+            let last = beats
+                .lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .max()
+                .unwrap_or(start);
             found.push((start, last));
         }
     }
@@ -1344,25 +1968,48 @@ async fn two_attempts_of_the_same_effect_never_run_concurrently() {
         "f={}/$$; date +%s%N > $f.tmp && mv $f.tmp $f.start; i=0; while [ $i -lt 40 ]; do date +%s%N >> $f.beats; sleep 0.025; i=$((i+1)); done; echo checked",
         beats.display()
     );
-    let opts = ExecOpts { scripted_verification: Some(script), ..ExecOpts::default() };
-    w.crash_run_with(CrashHook::at(CrashPoint::DuringExecute, "run_verification"), &opts).await;
+    let opts = ExecOpts {
+        scripted_verification: Some(script),
+        ..ExecOpts::default()
+    };
+    w.crash_run_with(
+        CrashHook::at(CrashPoint::DuringExecute, "run_verification"),
+        &opts,
+    )
+    .await;
     let ctl = w.open_with(None, &opts);
     let verify = ctl.effect(&w, "run_verification");
     let first = w.only_job(&verify.effect_id);
     let supervisor = running_supervisor(&first).await;
-    wait_until("the first heartbeat", || intervals(&beats).first().is_some_and(|(s, l)| l > s)).await;
+    wait_until("the first heartbeat", || {
+        intervals(&beats).first().is_some_and(|(s, l)| l > s)
+    })
+    .await;
     kill_process(Pid::from_raw(supervisor).unwrap(), Signal::KILL).unwrap();
     wait_until("the first job's lock to be free", || first.is_dead()).await;
 
     let report = ctl.recover(&w).await;
 
-    assert_eq!(report.decisions.iter().map(|d| d.decision).collect::<Vec<_>>(), vec![Decision::Redispatch]);
-    assert_eq!(ctl.effect(&w, "run_verification").state, EffectState::Completed);
+    assert_eq!(
+        report
+            .decisions
+            .iter()
+            .map(|d| d.decision)
+            .collect::<Vec<_>>(),
+        vec![Decision::Redispatch]
+    );
+    assert_eq!(
+        ctl.effect(&w, "run_verification").state,
+        EffectState::Completed
+    );
     // Let a surviving first attempt (if any) show itself.
     tokio::time::sleep(Duration::from_millis(200)).await;
     let found = intervals(&beats);
     assert_eq!(found.len(), 2, "{found:?}");
-    assert!(found[0].1 < found[1].0, "the attempts overlapped: {found:?}");
+    assert!(
+        found[0].1 < found[1].0,
+        "the attempts overlapped: {found:?}"
+    );
     assert_eq!(w.counts.get("run_verification"), 2);
     w.assert_no_live_process().await;
 }
@@ -1375,12 +2022,25 @@ async fn recovery_never_fences_a_job_inside_its_own_lease_under_shorter_timeouts
     let w = World::new();
     // Longer than the recovering controller's own longest timeout plus the 5 s grace.
     w.slow_profile(6.5);
-    w.crash_run(CrashHook::at(CrashPoint::DuringExecute, "run_verification")).await;
-    let short = EffectTimeouts { verification: Duration::from_millis(100), other: Duration::from_millis(100) };
-    let ctl = w.open_with(None, &ExecOpts { timeouts: Some(short), ..ExecOpts::default() });
+    w.crash_run(CrashHook::at(CrashPoint::DuringExecute, "run_verification"))
+        .await;
+    let short = EffectTimeouts {
+        verification: Duration::from_millis(100),
+        other: Duration::from_millis(100),
+    };
+    let ctl = w.open_with(
+        None,
+        &ExecOpts {
+            timeouts: Some(short),
+            ..ExecOpts::default()
+        },
+    );
     let verify = ctl.effect(&w, "run_verification");
     let job = w.only_job(&verify.effect_id);
-    assert!(job.request().unwrap().lease_expiry_ms > now_ms() + 60_000, "launched under the 70 s lease");
+    assert!(
+        job.request().unwrap().lease_expiry_ms > now_ms() + 60_000,
+        "launched under the 70 s lease"
+    );
 
     let report = ctl.recover(&w).await;
 
@@ -1399,18 +2059,36 @@ async fn recovery_never_fences_a_job_inside_its_own_lease_under_shorter_timeouts
 async fn a_crash_during_the_fence_still_converges() {
     let baseline = baseline().await;
     let w = World::new();
-    w.crash_run(CrashHook::at(CrashPoint::AfterDispatch, "apply_patch")).await;
+    w.crash_run(CrashHook::at(CrashPoint::AfterDispatch, "apply_patch"))
+        .await;
     let lock = {
-        let ctl = w.open_with(None, &ExecOpts { fence: Fence::Hangs, ..ExecOpts::default() });
+        let ctl = w.open_with(
+            None,
+            &ExecOpts {
+                fence: Fence::Hangs,
+                ..ExecOpts::default()
+            },
+        );
         let patch = ctl.effect(&w, "apply_patch");
         // A job of the dispatched attempt, past its lease, whose lock this test holds.
-        let ctx = AttemptCtx { attempt_id: AttemptId::new(), lease_generation: patch.lease_generation, worker: "w".into() };
-        let (_job, lock) = JobDir::create(&w.path("jobs"), &job_request(&w, &ctl, &patch, &ctx, now_ms() - 60_000)).unwrap();
+        let ctx = AttemptCtx {
+            attempt_id: AttemptId::new(),
+            lease_generation: patch.lease_generation,
+            worker: "w".into(),
+        };
+        let (_job, lock) = JobDir::create(
+            &w.path("jobs"),
+            &job_request(&w, &ctl, &patch, &ctx, now_ms() - 60_000),
+        )
+        .unwrap();
         let died = tokio::time::timeout(Duration::from_secs(2), ctl.recover(&w)).await;
         assert!(died.is_err(), "the fence never returned");
         let journaled = ctl.of_type(&w, "RecoveryDecision");
         assert_eq!(journaled.len(), 1);
-        assert_eq!(journaled[0]["decision"], "WaitedForJob", "journaled before the fence ran");
+        assert_eq!(
+            journaled[0]["decision"], "WaitedForJob",
+            "journaled before the fence ran"
+        );
         assert_eq!(ctl.effect(&w, "apply_patch").state, EffectState::Dispatched);
         lock
     };
@@ -1422,7 +2100,10 @@ async fn a_crash_during_the_fence_still_converges() {
 
     let decisions: Vec<_> = report.decisions.iter().map(|d| d.decision).collect();
     assert_eq!(decisions, vec![Decision::Redispatch], "{report:?}");
-    assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Succeeded);
+    assert_eq!(
+        w.run(&ctl, &RunOptions::default()).await.unwrap(),
+        TaskState::Succeeded
+    );
     assert_eq!(summarize(&w, &ctl), baseline);
     assert_eq!(w.counts.get("apply_patch"), 1);
     assert_journal_sound(&w, &ctl);
@@ -1433,7 +2114,8 @@ async fn a_crash_during_the_fence_still_converges() {
 #[tokio::test]
 async fn an_unreadable_jobs_root_never_leads_to_a_redispatch() {
     let w = World::new();
-    w.crash_run(CrashHook::at(CrashPoint::AfterDispatch, "run_verification")).await;
+    w.crash_run(CrashHook::at(CrashPoint::AfterDispatch, "run_verification"))
+        .await;
     let ctl = w.open(None);
     fs::remove_dir_all(w.path("jobs")).unwrap();
     fs::write(w.path("jobs"), b"").unwrap();
@@ -1441,8 +2123,15 @@ async fn an_unreadable_jobs_root_never_leads_to_a_redispatch() {
     let report = ctl.recover(&w).await;
 
     let decisions: Vec<_> = report.decisions.iter().map(|d| d.decision).collect();
-    assert_eq!(decisions, vec![Decision::WaitedForJob, Decision::FenceFailed], "{report:?}");
-    assert_eq!(ctl.effect(&w, "run_verification").state, EffectState::Unknown);
+    assert_eq!(
+        decisions,
+        vec![Decision::WaitedForJob, Decision::FenceFailed],
+        "{report:?}"
+    );
+    assert_eq!(
+        ctl.effect(&w, "run_verification").state,
+        EffectState::Unknown
+    );
     assert_eq!(ctl.db.task(&w.task).unwrap().state, TaskState::Failed);
     assert_eq!(w.counts.get("run_verification"), 0);
 }
@@ -1456,10 +2145,17 @@ async fn a_fenced_patch_job_that_applied_its_patch_is_reconciled_not_failed() {
     let w = World::new();
     let opts = ExecOpts {
         slow_poll: Some("apply_patch"),
-        timeouts: Some(EffectTimeouts { verification: Duration::from_secs(70), other: Duration::from_secs(2) }),
+        timeouts: Some(EffectTimeouts {
+            verification: Duration::from_secs(70),
+            other: Duration::from_secs(2),
+        }),
         ..ExecOpts::default()
     };
-    w.crash_run_with(CrashHook::at(CrashPoint::DuringExecute, "apply_patch"), &opts).await;
+    w.crash_run_with(
+        CrashHook::at(CrashPoint::DuringExecute, "apply_patch"),
+        &opts,
+    )
+    .await;
     let ctl = w.open(None);
     let patch = ctl.effect(&w, "apply_patch");
     let job = w.only_job(&patch.effect_id);
@@ -1468,17 +2164,31 @@ async fn a_fenced_patch_job_that_applied_its_patch_is_reconciled_not_failed() {
     let supervisor = job.read_status().unwrap().supervisor_pid.unwrap() as i32;
     let _stopped = Stopped::stop(supervisor);
     assert_eq!(job.read_receipt(), None);
-    assert_ne!(workspace_digest(&w.ws()).unwrap(), w.base(), "the patch is applied");
+    assert_ne!(
+        workspace_digest(&w.ws()).unwrap(),
+        w.base(),
+        "the patch is applied"
+    );
 
     let report = ctl.recover(&w).await;
 
     let decisions: Vec<_> = report.decisions.iter().map(|d| d.decision).collect();
-    assert_eq!(decisions, vec![Decision::WaitedForJob, Decision::PublishReconciled], "{report:?}");
+    assert_eq!(
+        decisions,
+        vec![Decision::WaitedForJob, Decision::PublishReconciled],
+        "{report:?}"
+    );
     assert_eq!(ctl.of_type(&w, "EffectFailed").len(), 0);
     let patch = ctl.effect(&w, "apply_patch");
-    assert_eq!((patch.state, patch.lease_generation), (EffectState::Completed, 1));
+    assert_eq!(
+        (patch.state, patch.lease_generation),
+        (EffectState::Completed, 1)
+    );
     assert!(job.is_dead() && job.read_receipt().is_none());
-    assert_eq!(w.run(&ctl, &RunOptions::default()).await.unwrap(), TaskState::Succeeded);
+    assert_eq!(
+        w.run(&ctl, &RunOptions::default()).await.unwrap(),
+        TaskState::Succeeded
+    );
     assert_eq!(summarize(&w, &ctl), baseline);
     assert_eq!(w.counts.get("apply_patch"), 1);
     assert_journal_sound(&w, &ctl);

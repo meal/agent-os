@@ -71,7 +71,10 @@ pub enum TransitionError {
     #[error("task is in terminal state {0:?}")]
     Terminal(TaskState),
     #[error("event {event} is not valid in state {state:?}")]
-    InvalidTransition { state: TaskState, event: &'static str },
+    InvalidTransition {
+        state: TaskState,
+        event: &'static str,
+    },
     #[error("event {event} rejected: cancellation requested")]
     CancelRequested { event: &'static str },
     #[error("cancel completed without a cancel request")]
@@ -240,8 +243,16 @@ mod tests {
 
     #[test]
     fn labels_are_upper_case_variant_names() {
-        for s in [TaskState::Ready, TaskState::Running, TaskState::Waiting, TaskState::Paused,
-                  TaskState::Verifying, TaskState::Succeeded, TaskState::Failed, TaskState::Cancelled] {
+        for s in [
+            TaskState::Ready,
+            TaskState::Running,
+            TaskState::Waiting,
+            TaskState::Paused,
+            TaskState::Verifying,
+            TaskState::Succeeded,
+            TaskState::Failed,
+            TaskState::Cancelled,
+        ] {
             assert_eq!(s.label(), format!("{s:?}").to_uppercase());
         }
     }
@@ -304,10 +315,16 @@ mod tests {
     fn workspace_updated_only_in_running_or_paused() {
         let l = limits();
         for s in [TaskState::Ready, TaskState::Waiting, TaskState::Verifying] {
-            assert!(reduce(&at(s), &WorkspaceUpdated { digest: d("w") }, &l).is_err(), "{s:?}");
+            assert!(
+                reduce(&at(s), &WorkspaceUpdated { digest: d("w") }, &l).is_err(),
+                "{s:?}"
+            );
         }
         for s in [TaskState::Running, TaskState::Paused] {
-            let t = Task { verified_digest: Some(d("base")), ..at(s) };
+            let t = Task {
+                verified_digest: Some(d("base")),
+                ..at(s)
+            };
             let n = reduce(&t, &WorkspaceUpdated { digest: d("w") }, &l).unwrap();
             assert_eq!(n.state, s, "the update never changes the lifecycle state");
             assert_eq!(n.workspace_digest, d("w"));
@@ -323,13 +340,21 @@ mod tests {
         let t = reduce(&t, &WorkspaceUpdated { digest: d("w1") }, &l).unwrap();
         let t = reduce(&t, &Resumed, &l).unwrap();
         let t = reduce(&t, &VerifyStarted, &l).unwrap();
-        assert_eq!(reduce(&t, &VerifyPassed { digest: d("w1") }, &l).unwrap().state, TaskState::Succeeded);
+        assert_eq!(
+            reduce(&t, &VerifyPassed { digest: d("w1") }, &l)
+                .unwrap()
+                .state,
+            TaskState::Succeeded
+        );
     }
 
     #[test]
     fn workspace_updated_rejected_while_cancel_pending_even_when_paused() {
         let l = limits();
-        let t = Task { cancel_requested: true, ..at(TaskState::Paused) };
+        let t = Task {
+            cancel_requested: true,
+            ..at(TaskState::Paused)
+        };
         assert!(matches!(
             reduce(&t, &WorkspaceUpdated { digest: d("w") }, &l),
             Err(TransitionError::CancelRequested { .. })
@@ -352,29 +377,45 @@ mod tests {
             ("VerifyFailed", &[S::Verifying]),
             ("WorkspaceUpdated", &[S::Running, S::Paused]),
             ("ActionUsed", &[S::Running]),
-            ("CancelRequested", &[S::Ready, S::Running, S::Waiting, S::Paused, S::Verifying]),
+            (
+                "CancelRequested",
+                &[S::Ready, S::Running, S::Waiting, S::Paused, S::Verifying],
+            ),
             ("CancelCompleted", &[]),
-            ("Failed", &[S::Ready, S::Running, S::Waiting, S::Paused, S::Verifying]),
+            (
+                "Failed",
+                &[S::Ready, S::Running, S::Waiting, S::Paused, S::Verifying],
+            ),
         ];
         // all_events() uses the base digest for VerifyPassed, so it is acceptable from Verifying.
         for ev in all_events() {
             let (_, valid) = table.iter().find(|(n, _)| *n == ev.name()).unwrap();
             for s in [S::Ready, S::Running, S::Waiting, S::Paused, S::Verifying] {
-                assert_eq!(reduce(&at(s), &ev, &l).is_ok(), valid.contains(&s), "{s:?} {ev:?}");
+                assert_eq!(
+                    reduce(&at(s), &ev, &l).is_ok(),
+                    valid.contains(&s),
+                    "{s:?} {ev:?}"
+                );
             }
         }
     }
 
     #[test]
     fn failed_verification_returns_to_running_within_limits() {
-        let t = Task { actions_used: 2, ..at(TaskState::Verifying) };
+        let t = Task {
+            actions_used: 2,
+            ..at(TaskState::Verifying)
+        };
         let t = reduce(&t, &VerifyFailed, &limits()).unwrap();
         assert_eq!(t.state, TaskState::Running);
     }
 
     #[test]
     fn failed_verification_with_exhausted_limits_goes_failed() {
-        let t = Task { actions_used: 3, ..at(TaskState::Verifying) };
+        let t = Task {
+            actions_used: 3,
+            ..at(TaskState::Verifying)
+        };
         let t = reduce(&t, &VerifyFailed, &limits()).unwrap();
         assert_eq!(t.state, TaskState::Failed);
     }
@@ -392,7 +433,10 @@ mod tests {
             t = reduce(&t, &ActionUsed, &l).unwrap();
             assert_eq!(t.actions_used, i);
         }
-        assert_eq!(reduce(&t, &ActionUsed, &l), Err(TransitionError::ActionLimit(3)));
+        assert_eq!(
+            reduce(&t, &ActionUsed, &l),
+            Err(TransitionError::ActionLimit(3))
+        );
     }
 
     #[test]
@@ -416,16 +460,24 @@ mod tests {
         assert!(t.cancel_requested);
         assert!(!t.may_dispatch());
         assert_eq!(t.state, TaskState::Running);
-        assert_eq!(reduce(&t, &CancelCompleted, &l).unwrap().state, TaskState::Cancelled);
+        assert_eq!(
+            reduce(&t, &CancelCompleted, &l).unwrap().state,
+            TaskState::Cancelled
+        );
     }
 
     #[test]
     fn cancel_requested_accepts_only_cancel_and_failure_events() {
         let l = limits();
         for s in [TaskState::Running, TaskState::Verifying] {
-            let t = Task { cancel_requested: true, ..at(s) };
+            let t = Task {
+                cancel_requested: true,
+                ..at(s)
+            };
             let mut events = all_events();
-            events.push(VerifyPassed { digest: t.workspace_digest });
+            events.push(VerifyPassed {
+                digest: t.workspace_digest,
+            });
             for ev in events {
                 let allowed = matches!(ev, CancelRequested | CancelCompleted | Failed { .. });
                 let res = reduce(&t, &ev, &l);
@@ -465,7 +517,10 @@ mod tests {
 
     #[test]
     fn failed_still_allowed_while_cancel_pending() {
-        let t = Task { cancel_requested: true, ..running() };
+        let t = Task {
+            cancel_requested: true,
+            ..running()
+        };
         let f = reduce(&t, &Failed { reason: "x".into() }, &limits()).unwrap();
         assert_eq!(f.state, TaskState::Failed);
     }
@@ -502,18 +557,36 @@ mod tests {
             TaskState::Paused,
             TaskState::Verifying,
         ] {
-            let t = reduce(&at(s), &Failed { reason: "boom".into() }, &limits()).unwrap();
+            let t = reduce(
+                &at(s),
+                &Failed {
+                    reason: "boom".into(),
+                },
+                &limits(),
+            )
+            .unwrap();
             assert_eq!(t.state, TaskState::Failed);
         }
     }
 
     #[test]
     fn terminal_states_reject_every_event() {
-        for s in [TaskState::Succeeded, TaskState::Failed, TaskState::Cancelled] {
+        for s in [
+            TaskState::Succeeded,
+            TaskState::Failed,
+            TaskState::Cancelled,
+        ] {
             for cancel in [false, true] {
-                let t = Task { cancel_requested: cancel, ..at(s) };
+                let t = Task {
+                    cancel_requested: cancel,
+                    ..at(s)
+                };
                 for ev in all_events() {
-                    assert_eq!(reduce(&t, &ev, &limits()), Err(TransitionError::Terminal(s)), "{s:?} {ev:?}");
+                    assert_eq!(
+                        reduce(&t, &ev, &limits()),
+                        Err(TransitionError::Terminal(s)),
+                        "{s:?} {ev:?}"
+                    );
                 }
             }
         }
@@ -531,7 +604,10 @@ mod tests {
 
     #[test]
     fn step_and_actions_saturate_instead_of_panicking() {
-        let t = Task { step: u32::MAX, ..running() };
+        let t = Task {
+            step: u32::MAX,
+            ..running()
+        };
         assert_eq!(reduce(&t, &ActionUsed, &limits()).unwrap().step, u32::MAX);
     }
 }

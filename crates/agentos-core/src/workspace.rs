@@ -14,7 +14,9 @@ fn is_excluded(name: &OsStr) -> bool {
 
 /// True if any component of the repo-relative `rel` is excluded from [`workspace_digest`].
 pub fn has_excluded_component(rel: &str) -> bool {
-    Path::new(rel).components().any(|c| is_excluded(c.as_os_str()))
+    Path::new(rel)
+        .components()
+        .any(|c| is_excluded(c.as_os_str()))
 }
 
 /// Repo-relative paths of the excluded entries (`.git`, `__pycache__`, `*.pyc`) anywhere
@@ -25,7 +27,12 @@ pub fn excluded_entries(root: &Path) -> io::Result<Vec<String>> {
             let entry = entry?;
             let path = entry.path();
             if is_excluded(&entry.file_name()) {
-                out.push(path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned());
+                out.push(
+                    path.strip_prefix(root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
             } else if entry.file_type()?.is_dir() {
                 walk(root, &path, out)?;
             }
@@ -74,12 +81,19 @@ pub fn list_files(root: &Path) -> io::Result<Vec<(String, PathBuf)>> {
             } else if ty.is_dir() {
                 walk(root, &path, out)?;
             } else if ty.is_file() {
-                let rel = path.strip_prefix(root).map_err(|e| invalid(e.to_string()))?;
-                let parts: Option<Vec<&str>> = rel.components().map(|c| c.as_os_str().to_str()).collect();
-                let rel = parts.ok_or_else(|| invalid(format!("non-UTF-8 path: {}", path.display())))?;
+                let rel = path
+                    .strip_prefix(root)
+                    .map_err(|e| invalid(e.to_string()))?;
+                let parts: Option<Vec<&str>> =
+                    rel.components().map(|c| c.as_os_str().to_str()).collect();
+                let rel =
+                    parts.ok_or_else(|| invalid(format!("non-UTF-8 path: {}", path.display())))?;
                 out.push((rel.join("/"), path));
             } else {
-                return Err(invalid(format!("unsupported file type: {}", path.display())));
+                return Err(invalid(format!(
+                    "unsupported file type: {}",
+                    path.display()
+                )));
             }
         }
         Ok(())
@@ -123,12 +137,17 @@ pub fn symlink_on_path(ws: &Path, rel: &str) -> io::Result<Option<String>> {
     let mut cur = ws.to_path_buf();
     for comp in Path::new(rel).components() {
         let Component::Normal(name) = comp else {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("unexpected component in {rel}")));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unexpected component in {rel}"),
+            ));
         };
         cur.push(name);
         match std::fs::symlink_metadata(&cur) {
             Ok(m) if m.file_type().is_symlink() => {
-                return Ok(Some(cur.strip_prefix(ws).unwrap_or(&cur).display().to_string()));
+                return Ok(Some(
+                    cur.strip_prefix(ws).unwrap_or(&cur).display().to_string(),
+                ));
             }
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),

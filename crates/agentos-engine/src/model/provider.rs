@@ -15,7 +15,10 @@ pub struct Usage {
 /// The token usage a Messages response reports (a missing field counts 0).
 pub fn usage_of(response: &serde_json::Value) -> Usage {
     let n = |k: &str| response["usage"][k].as_u64().unwrap_or(0);
-    Usage { input_tokens: n("input_tokens"), output_tokens: n("output_tokens") }
+    Usage {
+        input_tokens: n("input_tokens"),
+        output_tokens: n("output_tokens"),
+    }
 }
 
 /// What one send of a model request came to.
@@ -26,7 +29,11 @@ pub enum ProviderResult {
     /// A non-2xx answer; the body is bounded.
     Rejected { status: u16, body: String },
     /// A definite rejection with the provider's parsed Retry-After timestamp.
-    RejectedWithRetryAfter { status: u16, body: String, retry_not_before_ts: i64 },
+    RejectedWithRetryAfter {
+        status: u16,
+        body: String,
+        retry_not_before_ts: i64,
+    },
     /// No answer arrived (connect failure, timeout, cut connection).
     Transport(String),
 }
@@ -67,7 +74,10 @@ mod tests {
 
     #[test]
     fn api_key_debug_is_redacted() {
-        assert_eq!(format!("{:?}", ApiKey::new("sk-ant-secret-123").unwrap()), "ApiKey(…)");
+        assert_eq!(
+            format!("{:?}", ApiKey::new("sk-ant-secret-123").unwrap()),
+            "ApiKey(…)"
+        );
         assert_eq!(ApiKey::new("  k \n").unwrap().expose(), "k");
         assert!(ApiKey::new(" ").is_err());
     }
@@ -75,10 +85,19 @@ mod tests {
     #[test]
     fn usage_of_tolerates_missing_fields() {
         assert_eq!(usage_of(&serde_json::json!({})), Usage::default());
-        assert_eq!(usage_of(&serde_json::json!({"usage": {"input_tokens": 7}})), Usage { input_tokens: 7, output_tokens: 0 });
+        assert_eq!(
+            usage_of(&serde_json::json!({"usage": {"input_tokens": 7}})),
+            Usage {
+                input_tokens: 7,
+                output_tokens: 0
+            }
+        );
         assert_eq!(
             usage_of(&serde_json::json!({"usage": {"input_tokens": 1, "output_tokens": 2}})),
-            Usage { input_tokens: 1, output_tokens: 2 }
+            Usage {
+                input_tokens: 1,
+                output_tokens: 2
+            }
         );
     }
 }

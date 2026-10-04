@@ -13,22 +13,25 @@ use agentos_engine::crash::CrashPoint;
 use agentos_engine::workspace::{copy_tree, workspace_digest};
 use assert_cmd::Command;
 use predicates::prelude::*;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
+/// The local fake of the Messages API, shared with the engine's tests.
+#[path = "../../agentos-engine/tests/common/http.rs"]
+#[allow(dead_code)]
+mod http;
 /// The KVM gate, shared with the engine's tests.
 #[path = "../../agentos-engine/tests/common/kvm.rs"]
 mod kvm;
 /// The Firecracker process scan, shared with the engine's tests.
 #[path = "../../agentos-engine/tests/common/procs.rs"]
 mod procs;
-/// The local fake of the Messages API, shared with the engine's tests.
-#[path = "../../agentos-engine/tests/common/http.rs"]
-#[allow(dead_code)]
-mod http;
 
 fn fixtures() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures").canonicalize().unwrap()
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures")
+        .canonicalize()
+        .unwrap()
 }
 
 fn fix_patch() -> PathBuf {
@@ -49,7 +52,9 @@ fn test_worker() -> &'static str {
         Err(_) | Ok("") | Ok("host") => "host",
         Ok("firecracker-fake") => "firecracker-fake",
         Ok("firecracker") => "firecracker",
-        Ok(other) => panic!("AGENTOS_TEST_WORKER={other:?}: the CLI tier knows host, firecracker-fake and firecracker"),
+        Ok(other) => panic!(
+            "AGENTOS_TEST_WORKER={other:?}: the CLI tier knows host, firecracker-fake and firecracker"
+        ),
     };
     if test_jail_fake() && worker != "firecracker-fake" {
         panic!("AGENTOS_TEST_JAIL=fake needs AGENTOS_TEST_WORKER=firecracker-fake");
@@ -139,13 +144,18 @@ impl Cli {
 
     /// A scratch home with nothing registered, whatever the tier.
     fn bare() -> Cli {
-        Cli { dir: tempfile::tempdir().unwrap() }
+        Cli {
+            dir: tempfile::tempdir().unwrap(),
+        }
     }
 
     /// Registers the dummy `python-stdlib-v1` image (the contracts' `profile`); returns its digest.
     fn register_guest_image(&self) -> String {
         let dir = fake_image_dir(self, "guest-image", "python-stdlib-v1", 0x68);
-        self.json_as(Mode::Plain, &["image", "register", dir.to_str().unwrap()])["digest"].as_str().unwrap().to_string()
+        self.json_as(Mode::Plain, &["image", "register", dir.to_str().unwrap()])["digest"]
+            .as_str()
+            .unwrap()
+            .to_string()
     }
 
     fn home(&self) -> PathBuf {
@@ -187,16 +197,23 @@ impl Cli {
         for var in SCRUBBED_ENV {
             cmd.env_remove(var);
         }
-        cmd.arg("--home").arg(self.home()).arg("--profiles").arg(profiles);
+        cmd.arg("--home")
+            .arg(self.home())
+            .arg("--profiles")
+            .arg(profiles);
         if mode == Mode::Fake {
             cmd.args(["--worker", "firecracker"]);
         }
         if mode == Mode::Real {
             let kvm = real_kvm();
-            cmd.args(["--worker", "firecracker", "--firecracker"]).arg(&kvm.firecracker_bin).arg("--jailer").arg(&kvm.jailer_bin);
+            cmd.args(["--worker", "firecracker", "--firecracker"])
+                .arg(&kvm.firecracker_bin)
+                .arg("--jailer")
+                .arg(&kvm.jailer_bin);
         }
         if matches!(mode, Mode::Fake | Mode::PlainFake) {
-            cmd.env("AGENTOS_TEST_WORKERS", "1").env("AGENTOS_TEST_FAKE_GUEST", "1");
+            cmd.env("AGENTOS_TEST_WORKERS", "1")
+                .env("AGENTOS_TEST_FAKE_GUEST", "1");
         }
         // The tier's jail setting applies to the tier's own commands only.
         if tier && mode == Mode::Fake && test_jail_fake() {
@@ -207,19 +224,52 @@ impl Cli {
     }
 
     fn json_as(&self, mode: Mode, args: &[&str]) -> Value {
-        let out = self.cmd_as(mode, args).assert().success().get_output().stdout.clone();
-        serde_json::from_slice(&out).unwrap_or_else(|e| panic!("stdout of {args:?} is not JSON ({e}): {}", String::from_utf8_lossy(&out)))
+        let out = self
+            .cmd_as(mode, args)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice(&out).unwrap_or_else(|e| {
+            panic!(
+                "stdout of {args:?} is not JSON ({e}): {}",
+                String::from_utf8_lossy(&out)
+            )
+        })
     }
 
     /// Runs a command that must succeed; returns its stdout parsed as one JSON value.
     fn json(&self, args: &[&str]) -> Value {
-        let out = self.cmd(args).assert().success().get_output().stdout.clone();
-        serde_json::from_slice(&out).unwrap_or_else(|e| panic!("stdout of {args:?} is not JSON ({e}): {}", String::from_utf8_lossy(&out)))
+        let out = self
+            .cmd(args)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice(&out).unwrap_or_else(|e| {
+            panic!(
+                "stdout of {args:?} is not JSON ({e}): {}",
+                String::from_utf8_lossy(&out)
+            )
+        })
     }
 
     fn json_with_profiles(&self, profiles: &Path, args: &[&str]) -> Value {
-        let out = self.cmd_with_profiles(profiles, args).assert().success().get_output().stdout.clone();
-        serde_json::from_slice(&out).unwrap_or_else(|e| panic!("stdout of {args:?} is not JSON ({e}): {}", String::from_utf8_lossy(&out)))
+        let out = self
+            .cmd_with_profiles(profiles, args)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice(&out).unwrap_or_else(|e| {
+            panic!(
+                "stdout of {args:?} is not JSON ({e}): {}",
+                String::from_utf8_lossy(&out)
+            )
+        })
     }
 
     fn write(&self, rel: &str, content: &str) -> String {
@@ -248,7 +298,10 @@ impl Cli {
                 "deadline_seconds": 600, "worker_vcpus": 1, "worker_memory_mib": 256
             }
         });
-        self.write(&format!("task-{}.json", Digest::of(contract.to_string().as_bytes())), &contract.to_string())
+        self.write(
+            &format!("task-{}.json", Digest::of(contract.to_string().as_bytes())),
+            &contract.to_string(),
+        )
     }
 
     fn contract(&self, source: &Path) -> String {
@@ -256,13 +309,27 @@ impl Cli {
     }
 
     fn submit_yes(&self, contract: &str, patch: &Path) -> Value {
-        self.json(&["submit", contract, "--yes", "--fake-agent-patch", patch.to_str().unwrap()])
+        self.json(&[
+            "submit",
+            contract,
+            "--yes",
+            "--fake-agent-patch",
+            patch.to_str().unwrap(),
+        ])
     }
 
     /// `submit --yes --crash-at spec`: must die with exit 75; returns the task id it reported.
     fn crash(&self, contract: &str, spec: &str) -> String {
         let assert = self
-            .cmd(&["submit", contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap(), "--crash-at", spec])
+            .cmd(&[
+                "submit",
+                contract,
+                "--yes",
+                "--fake-agent-patch",
+                fix_patch().to_str().unwrap(),
+                "--crash-at",
+                spec,
+            ])
             .assert()
             .code(75);
         let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
@@ -281,18 +348,32 @@ impl Cli {
     }
 
     fn events(&self, id: &str) -> Vec<Value> {
-        let out = self.cmd(&["events", id]).assert().success().get_output().stdout.clone();
-        String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+        let out = self
+            .cmd(&["events", id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
     }
 
     fn event_types(&self, id: &str) -> Vec<String> {
-        self.events(id).iter().map(|e| e["type"].as_str().unwrap().to_string()).collect()
+        self.events(id)
+            .iter()
+            .map(|e| e["type"].as_str().unwrap().to_string())
+            .collect()
     }
 
     fn export(&self, id: &str, name: &str) -> (PathBuf, Value) {
         let dir = self.path(name);
         let printed = self.json(&["export", id, dir.to_str().unwrap()]);
-        let manifest: Value = serde_json::from_slice(&fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(dir.join("manifest.json")).unwrap()).unwrap();
         assert_eq!(printed, manifest, "export prints the manifest it wrote");
         (dir, manifest)
     }
@@ -301,7 +382,10 @@ impl Cli {
 fn assert_subsequence(haystack: &[String], needles: &[&str]) {
     let mut it = haystack.iter();
     for n in needles {
-        assert!(it.any(|h| h == n), "missing {n:?} in order within {haystack:?}");
+        assert!(
+            it.any(|h| h == n),
+            "missing {n:?} in order within {haystack:?}"
+        );
     }
 }
 
@@ -336,8 +420,14 @@ fn assert_tier_worker(cli: &Cli, id: &str) {
         assert_eq!(submitted["jailed"], test_jail_fake(), "{submitted}");
     } else if real_mode() {
         assert_eq!(submitted["worker"], "firecracker", "{submitted}");
-        assert_eq!(submitted["firecracker_version"], "Firecracker v1.17.0", "{submitted}");
-        assert_eq!(submitted["jailed"], true, "the real tier always jails: {submitted}");
+        assert_eq!(
+            submitted["firecracker_version"], "Firecracker v1.17.0",
+            "{submitted}"
+        );
+        assert_eq!(
+            submitted["jailed"], true,
+            "the real tier always jails: {submitted}"
+        );
     } else {
         assert_eq!(submitted["worker"], "host", "{submitted}");
     }
@@ -346,9 +436,17 @@ fn assert_tier_worker(cli: &Cli, id: &str) {
 /// Nothing of a task was written: no home at all or, when the tier registered its guest
 /// image up front, a home holding only that registry.
 fn assert_nothing_recorded(cli: &Cli) {
-    let Ok(entries) = fs::read_dir(cli.home()) else { return };
-    let names: Vec<String> = entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
-    assert!((fake_mode() || real_mode()) && names == ["registry"], "the home holds {names:?}");
+    let Ok(entries) = fs::read_dir(cli.home()) else {
+        return;
+    };
+    let names: Vec<String> = entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        (fake_mode() || real_mode()) && names == ["registry"],
+        "the home holds {names:?}"
+    );
 }
 
 fn digest_of_file(path: &Path) -> String {
@@ -371,28 +469,61 @@ fn invalid_contract_exits_2_with_the_validation_message_and_writes_nothing() {
     let repo = cli.repo_copy();
     let bad = cli.contract_with(&repo, 0, "recorded-at-submission");
 
-    cli.cmd(&["submit", &bad]).assert().code(2).stdout("").stderr(predicate::str::contains("limit tool_actions must be > 0"));
+    cli.cmd(&["submit", &bad])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(predicate::str::contains("limit tool_actions must be > 0"));
     assert_nothing_recorded(&cli);
 
     let garbage = cli.write("garbage.json", "{ not json");
-    cli.cmd(&["submit", &garbage]).assert().code(2).stderr(predicate::str::contains("invalid contract json"));
-    let missing_profile = cli.write("p.json", &fs::read_to_string(cli.contract(&repo)).unwrap().replace("parser-checks-v1", "nope-v1"));
-    cli.cmd(&["submit", &missing_profile]).assert().code(2).stderr(predicate::str::contains("verification profile nope-v1"));
+    cli.cmd(&["submit", &garbage])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("invalid contract json"));
+    let missing_profile = cli.write(
+        "p.json",
+        &fs::read_to_string(cli.contract(&repo))
+            .unwrap()
+            .replace("parser-checks-v1", "nope-v1"),
+    );
+    cli.cmd(&["submit", &missing_profile])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("verification profile nope-v1"));
     // A profile id is one plain registry name: it can never reach outside the registry.
     let valid = fs::read_to_string(cli.contract(&repo)).unwrap();
-    for (i, bad) in ["../../tmp/x", "/abs/path", "a/b", "..", "", ".", "-x"].into_iter().enumerate() {
+    for (i, bad) in ["../../tmp/x", "/abs/path", "a/b", "..", "", ".", "-x"]
+        .into_iter()
+        .enumerate()
+    {
         let id = serde_json::to_string(bad).unwrap();
-        let file = cli.write(&format!("bad-profile-{i}.json"), &valid.replace("\"parser-checks-v1\"", &id));
-        cli.cmd(&["submit", &file, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()])
-            .assert()
-            .code(2)
-            .stdout("")
-            .stderr(predicate::str::contains("verification_profile"));
+        let file = cli.write(
+            &format!("bad-profile-{i}.json"),
+            &valid.replace("\"parser-checks-v1\"", &id),
+        );
+        cli.cmd(&[
+            "submit",
+            &file,
+            "--yes",
+            "--fake-agent-patch",
+            fix_patch().to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(predicate::str::contains("verification_profile"));
     }
     let wrong_rev = cli.contract_with(&repo, 10, &Digest::of(b"another tree").to_string());
-    cli.cmd(&["submit", &wrong_rev]).assert().code(2).stderr(predicate::str::contains("revision"));
+    cli.cmd(&["submit", &wrong_rev])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("revision"));
     let contract = cli.contract(&repo);
-    cli.cmd(&["submit", &contract, "--yes"]).assert().code(2).stderr(predicate::str::contains("--fake-agent-patch"));
+    cli.cmd(&["submit", &contract, "--yes"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--fake-agent-patch"));
     assert_nothing_recorded(&cli);
 }
 
@@ -417,47 +548,96 @@ fn full_flow_submit_status_events_export_and_the_patch_reproduces_the_fix() {
 
     let events = cli.events(id);
     let seqs: Vec<u64> = events.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
-    assert_eq!(seqs, (1..=events.len() as u64).collect::<Vec<_>>(), "gapless");
+    assert_eq!(
+        seqs,
+        (1..=events.len() as u64).collect::<Vec<_>>(),
+        "gapless"
+    );
     let types = cli.event_types(id);
-    assert_subsequence(&types, &["TaskCreated", "Submitted", "Started", "WorkspaceUpdated", "WorkspaceUpdated", "VerifyStarted", "VerifyPassed"]);
+    assert_subsequence(
+        &types,
+        &[
+            "TaskCreated",
+            "Submitted",
+            "Started",
+            "WorkspaceUpdated",
+            "WorkspaceUpdated",
+            "VerifyStarted",
+            "VerifyPassed",
+        ],
+    );
     let submitted_event = &events[1];
     assert_eq!(submitted_event["type"], "Submitted");
     let repo_digest = workspace_digest(&repo).unwrap().to_string();
-    let profile_digest = workspace_digest(&fixtures().join("profiles/parser-checks-v1")).unwrap().to_string();
+    let profile_digest = workspace_digest(&fixtures().join("profiles/parser-checks-v1"))
+        .unwrap()
+        .to_string();
     assert_eq!(submitted_event["payload"]["repository_digest"], repo_digest);
     assert_eq!(submitted_event["payload"]["profile_id"], "parser-checks-v1");
     assert_eq!(submitted_event["payload"]["profile_digest"], profile_digest);
     if fake_mode() || real_mode() {
         // The Firecracker worker records the registered image instead of the host's label.
-        assert_eq!(submitted_event["payload"]["guest_image_id"], "python-stdlib-v1");
+        assert_eq!(
+            submitted_event["payload"]["guest_image_id"],
+            "python-stdlib-v1"
+        );
         assert!(submitted_event["payload"].get("guest_image").is_none());
     } else {
-        assert_eq!(submitted_event["payload"]["guest_image"], "fixture-executor-v0");
+        assert_eq!(
+            submitted_event["payload"]["guest_image"],
+            "fixture-executor-v0"
+        );
     }
-    assert_eq!(submitted_event["payload"]["contract_digest"], events[0]["payload"]["contract_digest"]);
+    assert_eq!(
+        submitted_event["payload"]["contract_digest"],
+        events[0]["payload"]["contract_digest"]
+    );
 
     let (bundle, manifest) = cli.export(id, "bundle");
     assert_eq!(manifest["task_id"], id);
     assert_eq!(manifest["state"], "SUCCEEDED");
     assert_eq!(manifest["base_revision"], repo_digest);
     assert_eq!(manifest["base_workspace_digest"], repo_digest);
-    assert_eq!(manifest["final_workspace_digest"], status["workspace_digest"]);
+    assert_eq!(
+        manifest["final_workspace_digest"],
+        status["workspace_digest"]
+    );
     assert_eq!(manifest["verified_digest"], status["verified_digest"]);
     assert_eq!(manifest["verification_profile_digest"], profile_digest);
-    assert_eq!(manifest["contract_digest"], events[0]["payload"]["contract_digest"]);
+    assert_eq!(
+        manifest["contract_digest"],
+        events[0]["payload"]["contract_digest"]
+    );
     assert_eq!(manifest["usage_summary"], status["usage"]);
     assert_eq!(manifest["model"], "fake-agent");
-    assert_eq!(manifest["patch_digest"], digest_of_file(&bundle.join("patch.diff")));
-    assert_eq!(fs::read(bundle.join("patch.diff")).unwrap(), fs::read(fix_patch()).unwrap());
+    assert_eq!(
+        manifest["patch_digest"],
+        digest_of_file(&bundle.join("patch.diff"))
+    );
+    assert_eq!(
+        fs::read(bundle.join("patch.diff")).unwrap(),
+        fs::read(fix_patch()).unwrap()
+    );
     let results = manifest["verification_results"].as_array().unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["passed"], true);
     assert_eq!(results[0]["workspace_digest"], status["verified_digest"]);
     let evidence = results[0]["evidence_digest"].as_str().unwrap();
-    assert_eq!(digest_of_file(&bundle.join(format!("evidence/{evidence}.json"))), evidence);
+    assert_eq!(
+        digest_of_file(&bundle.join(format!("evidence/{evidence}.json"))),
+        evidence
+    );
     // The evidence digest is the one the journal recorded for the verification effect.
-    let completed: Vec<&Value> = events.iter().filter(|e| e["type"] == "EffectCompleted").collect();
-    assert!(completed.iter().any(|e| e["payload"].to_string().contains(evidence)), "evidence digest is journaled");
+    let completed: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["type"] == "EffectCompleted")
+        .collect();
+    assert!(
+        completed
+            .iter()
+            .any(|e| e["payload"].to_string().contains(evidence)),
+        "evidence digest is journaled"
+    );
 
     // patch.diff turns a pristine copy of the fixture into the verified workspace.
     let pristine = tempfile::tempdir().unwrap();
@@ -474,8 +654,16 @@ fn full_flow_submit_status_events_export_and_the_patch_reproduces_the_fix() {
             .arg("apply")
             .arg(bundle.join("patch.diff")),
     );
-    assert_eq!(json!(workspace_digest(&ws).unwrap()), manifest["final_workspace_digest"]);
-    run_ok(StdCommand::new("python3").current_dir(&ws).env("PYTHONDONTWRITEBYTECODE", "1").args(["-m", "unittest"]));
+    assert_eq!(
+        json!(workspace_digest(&ws).unwrap()),
+        manifest["final_workspace_digest"]
+    );
+    run_ok(
+        StdCommand::new("python3")
+            .current_dir(&ws)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .args(["-m", "unittest"]),
+    );
     run_ok(
         StdCommand::new("python3")
             .current_dir(fixtures().join("profiles/parser-checks-v1"))
@@ -489,19 +677,28 @@ fn full_flow_submit_status_events_export_and_the_patch_reproduces_the_fix() {
 fn export_of_an_unfinished_task_fails_and_leaves_no_directory() {
     let cli = Cli::new();
     let contract = cli.contract(&cli.repo_copy());
-    let ready = cli.json(&["submit", &contract])["task_id"].as_str().unwrap().to_string();
+    let ready = cli.json(&["submit", &contract])["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let running = cli.crash(&contract, "after-dispatch:apply_patch");
     let paused = cli.crash(&contract, "after-dispatch:apply_patch");
     assert_eq!(cli.json(&["pause", &paused])["state"], "PAUSED");
 
-    for (id, state) in [(&ready, "READY"), (&running, "RUNNING"), (&paused, "PAUSED")] {
+    for (id, state) in [
+        (&ready, "READY"),
+        (&running, "RUNNING"),
+        (&paused, "PAUSED"),
+    ] {
         assert_eq!(cli.status(id)["state"], state);
         let out = cli.path(&format!("bundle-{state}"));
         cli.cmd(&["export", id, out.to_str().unwrap()])
             .assert()
             .code(1)
             .stdout("")
-            .stderr(predicate::str::contains(format!("task is {state}, only finished tasks can be exported")));
+            .stderr(predicate::str::contains(format!(
+                "task is {state}, only finished tasks can be exported"
+            )));
         assert!(!out.exists());
     }
     let leftovers: Vec<_> = fs::read_dir(cli.dir.path())
@@ -517,34 +714,69 @@ fn submit_without_yes_waits_for_approval_and_resume_runs_it() {
     let cli = Cli::new();
     let contract = cli.contract(&cli.repo_copy());
 
-    let assert = cli.cmd(&["submit", &contract, "--fake-agent-patch", fix_patch().to_str().unwrap()]).assert().success();
+    let assert = cli
+        .cmd(&[
+            "submit",
+            &contract,
+            "--fake-agent-patch",
+            fix_patch().to_str().unwrap(),
+        ])
+        .assert()
+        .success();
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
-    for shown in ["snapshot.read", "workspace.apply_patch", "src/**", "parser-checks-v1", "tool_actions"] {
-        assert!(stderr.contains(shown), "permission summary shows {shown}: {stderr}");
+    for shown in [
+        "snapshot.read",
+        "workspace.apply_patch",
+        "src/**",
+        "parser-checks-v1",
+        "tool_actions",
+    ] {
+        assert!(
+            stderr.contains(shown),
+            "permission summary shows {shown}: {stderr}"
+        );
     }
     let out: Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
     assert_eq!(out["state"], "READY");
     assert!(out["note"].as_str().unwrap().contains("agentos resume"));
     let id = out["task_id"].as_str().unwrap();
     assert_eq!(cli.status(id)["state"], "READY");
-    assert_eq!(cli.event_types(id), vec!["TaskCreated", "Submitted"], "nothing ran before approval");
+    assert_eq!(
+        cli.event_types(id),
+        vec!["TaskCreated", "Submitted"],
+        "nothing ran before approval"
+    );
 
     // The patch given at submission is used; no flag needed.
     let resumed = cli.json(&["resume", id]);
     assert_eq!(resumed, json!({ "task_id": id, "state": "SUCCEEDED" }));
     assert_eq!(cli.status(id)["state"], "SUCCEEDED");
     // Resuming a finished task only reports it.
-    assert_eq!(cli.json(&["resume", id]), json!({ "task_id": id, "state": "SUCCEEDED" }));
+    assert_eq!(
+        cli.json(&["resume", id]),
+        json!({ "task_id": id, "state": "SUCCEEDED" })
+    );
 }
 
 #[test]
 fn resume_without_any_agent_patch_is_a_usage_error() {
     let cli = Cli::new();
     let contract = cli.contract(&cli.repo_copy());
-    let id = cli.json(&["submit", &contract])["task_id"].as_str().unwrap().to_string();
-    cli.cmd(&["resume", &id]).assert().code(2).stderr(predicate::str::contains("--fake-agent-patch"));
+    let id = cli.json(&["submit", &contract])["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    cli.cmd(&["resume", &id])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--fake-agent-patch"));
     assert_eq!(cli.status(&id)["state"], "READY");
-    let done = cli.json(&["resume", &id, "--fake-agent-patch", fix_patch().to_str().unwrap()]);
+    let done = cli.json(&[
+        "resume",
+        &id,
+        "--fake-agent-patch",
+        fix_patch().to_str().unwrap(),
+    ]);
     assert_eq!(done["state"], "SUCCEEDED");
 }
 
@@ -561,17 +793,28 @@ fn crash_restart_recover_export(spec: &str) {
     let id = cli.crash(&contract, spec);
     assert_tier_worker(&cli, &id);
     let stuck = cli.status(&id);
-    assert!(!TERMINAL.contains(&stuck["state"].as_str().unwrap()), "{spec}: crashed task is unfinished: {stuck}");
+    assert!(
+        !TERMINAL.contains(&stuck["state"].as_str().unwrap()),
+        "{spec}: crashed task is unfinished: {stuck}"
+    );
     assert_crashed_on_kind(&cli, &id, spec, &stuck);
 
     let resumed = cli.json(&["resume", &id]);
-    assert_eq!(resumed, json!({ "task_id": id, "state": "SUCCEEDED" }), "{spec}");
+    assert_eq!(
+        resumed,
+        json!({ "task_id": id, "state": "SUCCEEDED" }),
+        "{spec}"
+    );
     let status = cli.status(&id);
     assert_eq!(status["verified_digest"], status["workspace_digest"]);
     assert_eq!(status["outstanding_effects"], json!([]));
     let (_, manifest) = cli.export(&id, "recovered");
     assert_eq!(manifest["task_id"], id.as_str());
-    assert_eq!(normalized(&manifest), normalized(&expected), "{spec}: recovered bundle equals the uncrashed one");
+    assert_eq!(
+        normalized(&manifest),
+        normalized(&expected),
+        "{spec}: recovered bundle equals the uncrashed one"
+    );
 }
 
 /// The crash happened on an effect of the spec's KIND: the last intended effect (or, for a
@@ -587,19 +830,35 @@ fn assert_crashed_on_kind(cli: &Cli, id: &str, spec: &str, status: &Value) {
         other => panic!("table row without a kind: {other}"),
     };
     let events = cli.events(id);
-    let outstanding: Vec<&str> =
-        status["outstanding_effects"].as_array().unwrap().iter().map(|e| e["kind"].as_str().unwrap()).collect();
+    let outstanding: Vec<&str> = status["outstanding_effects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
     if point == "after-agent-turn-journaled" {
         let last = events.last().unwrap();
         assert_eq!(last["type"], "AgentTurn", "{spec}");
         let action = &last["payload"]["action"];
-        assert!(action == variant || action.get(variant).is_some() || (kind == "run_verification" && action == "Verify"), "{spec}: {action}");
+        assert!(
+            action == variant
+                || action.get(variant).is_some()
+                || (kind == "run_verification" && action == "Verify"),
+            "{spec}: {action}"
+        );
         assert!(outstanding.is_empty(), "{spec}: {outstanding:?}");
         return;
     }
-    let intended = events.iter().rev().find(|e| e["type"] == "EffectIntended").expect("an effect was intended");
+    let intended = events
+        .iter()
+        .rev()
+        .find(|e| e["type"] == "EffectIntended")
+        .expect("an effect was intended");
     let k = &intended["payload"]["kind"];
-    assert!(k == variant || k.get(variant).is_some(), "{spec}: last intended effect is {k}");
+    assert!(
+        k == variant || k.get(variant).is_some(),
+        "{spec}: last intended effect is {k}"
+    );
     if point == "after-complete" {
         assert!(outstanding.is_empty(), "{spec}: {outstanding:?}");
     } else {
@@ -626,7 +885,10 @@ const DEMO: [&str; 10] = [
 
 #[test]
 fn demo_table_covers_every_crash_point() {
-    let covered: BTreeSet<String> = DEMO.iter().map(|s| s.split(':').next().unwrap().to_string()).collect();
+    let covered: BTreeSet<String> = DEMO
+        .iter()
+        .map(|s| s.split(':').next().unwrap().to_string())
+        .collect();
     let all: BTreeSet<String> = CrashPoint::ALL.iter().map(|p| point_name(*p)).collect();
     assert_eq!(covered, all);
 }
@@ -655,13 +917,32 @@ fn a_crash_spec_that_never_fires_runs_to_completion() {
     let cli = Cli::new();
     let contract = cli.contract(&cli.repo_copy());
     let out = cli.json(&[
-        "submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap(), "--crash-at", "after-dispatch:apply_patch:2",
+        "submit",
+        &contract,
+        "--yes",
+        "--fake-agent-patch",
+        fix_patch().to_str().unwrap(),
+        "--crash-at",
+        "after-dispatch:apply_patch:2",
     ]);
     assert_eq!(out["state"], "SUCCEEDED");
-    for bad in ["nowhere", "after-dispatch:teleport", "after-dispatch:apply_patch:0", "after-dispatch:1:2"] {
-        cli.cmd(&["submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap(), "--crash-at", bad])
-            .assert()
-            .code(2);
+    for bad in [
+        "nowhere",
+        "after-dispatch:teleport",
+        "after-dispatch:apply_patch:0",
+        "after-dispatch:1:2",
+    ] {
+        cli.cmd(&[
+            "submit",
+            &contract,
+            "--yes",
+            "--fake-agent-patch",
+            fix_patch().to_str().unwrap(),
+            "--crash-at",
+            bad,
+        ])
+        .assert()
+        .code(2);
     }
 }
 
@@ -669,25 +950,54 @@ fn a_crash_spec_that_never_fires_runs_to_completion() {
 fn pause_then_resume() {
     let cli = Cli::new();
     let contract = cli.contract(&cli.repo_copy());
-    let ready = cli.json(&["submit", &contract])["task_id"].as_str().unwrap().to_string();
-    cli.cmd(&["pause", &ready]).assert().code(1).stderr(predicate::str::contains("READY"));
+    let ready = cli.json(&["submit", &contract])["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    cli.cmd(&["pause", &ready])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("READY"));
 
     let id = cli.crash(&contract, "after-dispatch:apply_patch");
     assert_eq!(cli.status(&id)["state"], "RUNNING");
-    assert_eq!(cli.json(&["pause", &id]), json!({ "task_id": id, "state": "PAUSED" }));
-    assert_eq!(cli.json(&["pause", &id])["state"], "PAUSED", "pausing twice is harmless");
+    assert_eq!(
+        cli.json(&["pause", &id]),
+        json!({ "task_id": id, "state": "PAUSED" })
+    );
+    assert_eq!(
+        cli.json(&["pause", &id])["state"],
+        "PAUSED",
+        "pausing twice is harmless"
+    );
     let status = cli.status(&id);
     assert_eq!(status["state"], "PAUSED");
-    assert_eq!(status["outstanding_effects"].as_array().unwrap().len(), 1, "the in-flight patch waits for the resume");
+    assert_eq!(
+        status["outstanding_effects"].as_array().unwrap().len(),
+        1,
+        "the in-flight patch waits for the resume"
+    );
 
     assert_eq!(cli.json(&["resume", &id])["state"], "SUCCEEDED");
-    assert_subsequence(&cli.event_types(&id), &["Started", "Paused", "Resumed", "RecoveryDecision", "VerifyPassed"]);
+    assert_subsequence(
+        &cli.event_types(&id),
+        &[
+            "Started",
+            "Paused",
+            "Resumed",
+            "RecoveryDecision",
+            "VerifyPassed",
+        ],
+    );
     assert_eq!(cli.status(&id)["outstanding_effects"], json!([]));
     // The new session's agent re-sent its patch, which no longer applied (a FAILED effect):
     // only the patch that really applied is in the bundle.
     assert!(cli.event_types(&id).contains(&"EffectFailed".to_string()));
     let (bundle, manifest) = cli.export(&id, "bundle");
-    assert_eq!(fs::read(bundle.join("patch.diff")).unwrap(), fs::read(fix_patch()).unwrap());
+    assert_eq!(
+        fs::read(bundle.join("patch.diff")).unwrap(),
+        fs::read(fix_patch()).unwrap()
+    );
     assert_eq!(manifest["patches"].as_array().unwrap().len(), 1);
 }
 
@@ -696,7 +1006,13 @@ fn cancel_after_a_crash_reconciles_the_in_flight_effect_and_cancels() {
     let cli = Cli::new();
     let contract = cli.contract(&cli.repo_copy());
     let id = cli.crash(&contract, "after-dispatch:apply_patch");
-    assert_eq!(cli.status(&id)["outstanding_effects"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        cli.status(&id)["outstanding_effects"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
 
     let out = cli.json(&["cancel", &id]);
     assert_eq!(out["task_id"], id.as_str());
@@ -706,19 +1022,43 @@ fn cancel_after_a_crash_reconciles_the_in_flight_effect_and_cancels() {
     assert_eq!(status["state"], "CANCELLED");
     assert_eq!(status["cancel_requested"], true);
     assert_eq!(status["verified_digest"], Value::Null);
-    assert_eq!(status["outstanding_effects"], json!([]), "no leaked effects");
+    assert_eq!(
+        status["outstanding_effects"],
+        json!([]),
+        "no leaked effects"
+    );
     assert_eq!(status["usage"]["uncertain_tool_actions"], 0);
     let events = cli.events(&id);
-    let decision = events.iter().find(|e| e["type"] == "RecoveryDecision").expect("the in-flight patch was decided");
+    let decision = events
+        .iter()
+        .find(|e| e["type"] == "RecoveryDecision")
+        .expect("the in-flight patch was decided");
     assert_eq!(decision["payload"]["kind"], "apply_patch");
-    assert_eq!(decision["payload"]["decision"], "Abandon", "the patch never ran: reconciliation proves it");
-    assert_subsequence(&cli.event_types(&id), &["CancelRequested", "RecoveryDecision", "CancelCompleted"]);
+    assert_eq!(
+        decision["payload"]["decision"], "Abandon",
+        "the patch never ran: reconciliation proves it"
+    );
+    assert_subsequence(
+        &cli.event_types(&id),
+        &["CancelRequested", "RecoveryDecision", "CancelCompleted"],
+    );
 
     // Cancelling again only reports; a READY task cancels at once.
     assert_eq!(cli.json(&["cancel", &id])["state"], "CANCELLED");
-    let ready = cli.json(&["submit", &contract])["task_id"].as_str().unwrap().to_string();
+    let ready = cli.json(&["submit", &contract])["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert_eq!(cli.json(&["cancel", &ready])["state"], "CANCELLED");
-    assert_eq!(cli.event_types(&ready), vec!["TaskCreated", "Submitted", "CancelRequested", "CancelCompleted"]);
+    assert_eq!(
+        cli.event_types(&ready),
+        vec![
+            "TaskCreated",
+            "Submitted",
+            "CancelRequested",
+            "CancelCompleted"
+        ]
+    );
 
     let (_, manifest) = cli.export(&id, "cancelled");
     assert_eq!(manifest["state"], "CANCELLED");
@@ -739,7 +1079,11 @@ fn unknown_task_ids_are_reported() {
         vec!["cancel", unknown],
         vec!["export", unknown, out.to_str().unwrap()],
     ] {
-        cli.cmd(&args).assert().code(1).stdout("").stderr(predicate::str::contains(format!("unknown task {unknown}")));
+        cli.cmd(&args)
+            .assert()
+            .code(1)
+            .stdout("")
+            .stderr(predicate::str::contains(format!("unknown task {unknown}")));
     }
     assert!(!out.exists());
 }
@@ -760,7 +1104,11 @@ fn a_failed_task_exports_without_any_success_claim() {
     let results = manifest["verification_results"].as_array().unwrap();
     assert!(!results.is_empty());
     assert!(results.iter().all(|r| r["passed"] == false), "{results:?}");
-    assert_eq!(fs::read_to_string(bundle.join("patch.diff")).unwrap(), COMMENT_PATCH, "the applied patch, honestly");
+    assert_eq!(
+        fs::read_to_string(bundle.join("patch.diff")).unwrap(),
+        COMMENT_PATCH,
+        "the applied patch, honestly"
+    );
     assert!(!manifest.to_string().contains("SUCCEEDED"));
 }
 
@@ -770,7 +1118,10 @@ fn while_another_process_drives_cancel_only_requests_and_resume_waits() {
     let contract = cli.contract(&cli.repo_copy());
     let id = cli.crash(&contract, "after-dispatch:apply_patch");
     // Stand in for a live driver: hold the home's driver lock in this process.
-    let lock = fs::File::options().write(true).open(cli.home().join("driver.lock")).unwrap();
+    let lock = fs::File::options()
+        .write(true)
+        .open(cli.home().join("driver.lock"))
+        .unwrap();
     lock.lock().unwrap();
     // As every real holder does on acquiring it: forget what a previous (dead) holder drove.
     lock.set_len(0).unwrap();
@@ -779,16 +1130,36 @@ fn while_another_process_drives_cancel_only_requests_and_resume_waits() {
     assert_eq!(out["state"], "RUNNING");
     assert_eq!(out["cancel_requested"], true);
     let note = out["note"].as_str().unwrap();
-    assert!(note.contains(&format!("next `agentos resume {id}` or `agentos cancel {id}`")), "{note}");
+    assert!(
+        note.contains(&format!(
+            "next `agentos resume {id}` or `agentos cancel {id}`"
+        )),
+        "{note}"
+    );
     // When the lock holder says it drives this very task, its runner completes the cancel.
     fs::write(cli.home().join("driver.lock"), &id).unwrap();
-    let note = cli.json(&["cancel", &id])["note"].as_str().unwrap().to_string();
-    assert!(note.contains("is driving this task; it completes the cancel at its next step"), "{note}");
+    let note = cli.json(&["cancel", &id])["note"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        note.contains("is driving this task; it completes the cancel at its next step"),
+        "{note}"
+    );
     fs::write(cli.home().join("driver.lock"), "").unwrap();
-    cli.cmd(&["resume", &id]).assert().code(1).stderr(predicate::str::contains("another agentos process is driving"));
+    cli.cmd(&["resume", &id])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "another agentos process is driving",
+        ));
     let status = cli.status(&id);
     assert_eq!(status["state"], "RUNNING");
-    assert_eq!(status["outstanding_effects"].as_array().unwrap().len(), 1, "nothing was recovered under someone else's lock");
+    assert_eq!(
+        status["outstanding_effects"].as_array().unwrap().len(),
+        1,
+        "nothing was recovered under someone else's lock"
+    );
 
     // The driver goes away; whoever drives next completes the cancel.
     drop(lock);
@@ -803,35 +1174,85 @@ fn recovery_itself_can_be_killed_and_resumed_again() {
     let id = cli.crash(&contract, "after-dispatch:apply_patch");
 
     // The restarted controller re-dispatches the patch and dies right there, again.
-    let assert = cli.cmd(&["resume", &id, "--crash-at", "after-dispatch:apply_patch"]).assert().code(75);
+    let assert = cli
+        .cmd(&["resume", &id, "--crash-at", "after-dispatch:apply_patch"])
+        .assert()
+        .code(75);
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
-    assert!(stderr.contains(&format!(r#"{{"crashed":"after-dispatch","task_id":"{id}"}}"#)), "{stderr}");
-    assert!(!stderr.contains('\u{1b}'), "no terminal colours when stderr is not a terminal");
+    assert!(
+        stderr.contains(&format!(
+            r#"{{"crashed":"after-dispatch","task_id":"{id}"}}"#
+        )),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "no terminal colours when stderr is not a terminal"
+    );
     assert_eq!(cli.status(&id)["state"], "RUNNING");
 
     assert_eq!(cli.json(&["resume", &id])["state"], "SUCCEEDED");
-    let decisions: Vec<Value> =
-        cli.events(&id).into_iter().filter(|e| e["type"] == "RecoveryDecision").map(|e| e["payload"].clone()).collect();
-    assert_eq!(decisions.len(), 2, "one decision per restart: {decisions:?}");
-    assert!(decisions.iter().all(|d| d["kind"] == "apply_patch" && d["decision"] == "Redispatch"));
-    assert_eq!(decisions[1]["lease_generation"], 2, "the second restart found the second lease in flight");
+    let decisions: Vec<Value> = cli
+        .events(&id)
+        .into_iter()
+        .filter(|e| e["type"] == "RecoveryDecision")
+        .map(|e| e["payload"].clone())
+        .collect();
+    assert_eq!(
+        decisions.len(),
+        2,
+        "one decision per restart: {decisions:?}"
+    );
+    assert!(
+        decisions
+            .iter()
+            .all(|d| d["kind"] == "apply_patch" && d["decision"] == "Redispatch")
+    );
+    assert_eq!(
+        decisions[1]["lease_generation"], 2,
+        "the second restart found the second lease in flight"
+    );
 }
 
 #[test]
 fn a_registry_entry_that_links_outside_the_registry_is_refused() {
     let cli = Cli::new();
     let registry = cli.path("profiles");
-    copy_tree(&fixtures().join("profiles/parser-checks-v1"), &registry.join("parser-checks-v1")).unwrap();
+    copy_tree(
+        &fixtures().join("profiles/parser-checks-v1"),
+        &registry.join("parser-checks-v1"),
+    )
+    .unwrap();
     let outside = cli.path("outside");
     copy_tree(&fixtures().join("profiles/parser-checks-v1"), &outside).unwrap();
     std::os::unix::fs::symlink(&outside, registry.join("evil")).unwrap();
     let contract = cli.contract(&cli.repo_copy());
-    let evil = cli.write("evil.json", &fs::read_to_string(&contract).unwrap().replace("\"parser-checks-v1\"", "\"evil\""));
+    let evil = cli.write(
+        "evil.json",
+        &fs::read_to_string(&contract)
+            .unwrap()
+            .replace("\"parser-checks-v1\"", "\"evil\""),
+    );
 
-    cli.cmd_with_profiles(&registry, &["submit", &evil]).assert().code(2).stderr(predicate::str::contains("outside the profile registry"));
+    cli.cmd_with_profiles(&registry, &["submit", &evil])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("outside the profile registry"));
     assert_nothing_recorded(&cli);
     // A real registry entry still works.
-    let out = cli.cmd_with_profiles(&registry, &["submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()]).assert().success();
+    let out = cli
+        .cmd_with_profiles(
+            &registry,
+            &[
+                "submit",
+                &contract,
+                "--yes",
+                "--fake-agent-patch",
+                fix_patch().to_str().unwrap(),
+            ],
+        )
+        .assert()
+        .success();
     let out: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(out["state"], "SUCCEEDED");
 }
@@ -840,19 +1261,34 @@ fn a_registry_entry_that_links_outside_the_registry_is_refused() {
 fn every_export_is_journaled_and_a_refused_one_is_not() {
     let cli = Cli::new();
     let contract = cli.contract(&cli.repo_copy());
-    let id = cli.submit_yes(&contract, &fix_patch())["task_id"].as_str().unwrap().to_string();
+    let id = cli.submit_yes(&contract, &fix_patch())["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let exported = |cli: &Cli| -> Vec<Value> {
-        cli.events(&id).into_iter().filter(|e| e["type"] == "Exported").map(|e| e["payload"].clone()).collect()
+        cli.events(&id)
+            .into_iter()
+            .filter(|e| e["type"] == "Exported")
+            .map(|e| e["payload"].clone())
+            .collect()
     };
 
     let (bundle, _) = cli.export(&id, "one");
     let events = exported(&cli);
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0]["manifest_digest"], digest_of_file(&bundle.join("manifest.json")));
+    assert_eq!(
+        events[0]["manifest_digest"],
+        digest_of_file(&bundle.join("manifest.json"))
+    );
     assert_eq!(events[0]["dir"], bundle.to_str().unwrap());
-    assert_eq!(events[0]["files"], 5, "manifest, patch.diff, one patch, two evidence files");
+    assert_eq!(
+        events[0]["files"], 5,
+        "manifest, patch.diff, one patch, two evidence files"
+    );
 
-    cli.cmd(&["export", &id, bundle.to_str().unwrap()]).assert().code(1);
+    cli.cmd(&["export", &id, bundle.to_str().unwrap()])
+        .assert()
+        .code(1);
     assert_eq!(exported(&cli).len(), 1, "a refused export journals nothing");
     cli.export(&id, "two");
     assert_eq!(exported(&cli).len(), 2);
@@ -866,20 +1302,49 @@ fn tampered_inputs_after_a_crash_fail_the_task_without_stranding_its_in_flight_e
     let stuck = cli.status(&id);
     assert_eq!(stuck["outstanding_effects"][0]["state"], "Dispatched");
     assert_eq!(stuck["usage"]["reserved_tool_actions"], 1);
-    fs::write(cli.home().join("tasks").join(&id).join("snapshot/src/parser.py"), "tampered = True\n").unwrap();
+    fs::write(
+        cli.home()
+            .join("tasks")
+            .join(&id)
+            .join("snapshot/src/parser.py"),
+        "tampered = True\n",
+    )
+    .unwrap();
 
     let resumed = cli.json(&["resume", &id]);
 
     assert_eq!(resumed["state"], "FAILED");
     let status = cli.status(&id);
-    let failed = cli.events(&id).into_iter().find(|e| e["type"] == "Failed").unwrap();
-    assert!(failed["payload"]["Failed"]["reason"].as_str().unwrap().contains("recorded snapshot changed"), "{failed}");
+    let failed = cli
+        .events(&id)
+        .into_iter()
+        .find(|e| e["type"] == "Failed")
+        .unwrap();
+    assert!(
+        failed["payload"]["Failed"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("recorded snapshot changed"),
+        "{failed}"
+    );
     // The in-flight snapshot was reconciled, not left DISPATCHED with a live reservation.
     let outstanding = status["outstanding_effects"].as_array().unwrap();
-    assert!(outstanding.iter().all(|e| e["state"] != "Dispatched" && e["state"] != "Intended"), "{status}");
+    assert!(
+        outstanding
+            .iter()
+            .all(|e| e["state"] != "Dispatched" && e["state"] != "Intended"),
+        "{status}"
+    );
     assert_eq!(status["usage"]["reserved_tool_actions"], 0, "{status}");
-    assert_eq!(status["usage"]["uncertain_tool_actions"], 1, "it may have run: the reservation stays visible");
-    assert!(cli.events(&id).iter().any(|e| e["type"] == "RecoveryDecision"));
+    assert_eq!(
+        status["usage"]["uncertain_tool_actions"], 1,
+        "it may have run: the reservation stays visible"
+    );
+    assert!(
+        cli.events(&id)
+            .iter()
+            .any(|e| e["type"] == "RecoveryDecision")
+    );
     // Nothing changes on a further resume.
     let n = cli.events(&id).len();
     assert_eq!(cli.json(&["resume", &id])["state"], "FAILED");
@@ -890,12 +1355,14 @@ impl Cli {
     /// The task's capability grants, read straight from the home's store.
     fn grants(&self, id: &str) -> Vec<agentos_core::broker::CapabilityGrant> {
         let db = agentos_store::db::Db::open(&self.home().join("agentos.db")).unwrap();
-        db.grants(&serde_json::from_value(json!(id)).unwrap()).unwrap()
+        db.grants(&serde_json::from_value(json!(id)).unwrap())
+            .unwrap()
     }
 
     fn deadline_ts(&self, id: &str) -> i64 {
         let db = agentos_store::db::Db::open(&self.home().join("agentos.db")).unwrap();
-        db.deadline_ts(&serde_json::from_value(json!(id)).unwrap()).unwrap()
+        db.deadline_ts(&serde_json::from_value(json!(id)).unwrap())
+            .unwrap()
     }
 }
 
@@ -903,24 +1370,49 @@ impl Cli {
 fn submit_without_yes_issues_no_handles_and_resume_approves() {
     let cli = Cli::new();
     let contract = cli.contract(&cli.repo_copy());
-    let out = cli.json(&["submit", &contract, "--fake-agent-patch", fix_patch().to_str().unwrap()]);
+    let out = cli.json(&[
+        "submit",
+        &contract,
+        "--fake-agent-patch",
+        fix_patch().to_str().unwrap(),
+    ]);
     let id = out["task_id"].as_str().unwrap();
     assert!(cli.grants(id).is_empty(), "no handles before approval");
     assert_eq!(cli.deadline_ts(id), 0, "the deadline has not started");
-    assert!(!cli.event_types(id).contains(&"CapabilitiesIssued".to_string()));
+    assert!(
+        !cli.event_types(id)
+            .contains(&"CapabilitiesIssued".to_string())
+    );
 
     assert_eq!(cli.json(&["resume", id])["state"], "SUCCEEDED");
     let grants = cli.grants(id);
     assert_eq!(grants.len(), 4, "one handle per contract capability");
     assert!(cli.deadline_ts(id) > 0);
     let types = cli.event_types(id);
-    assert_eq!(types.iter().filter(|t| *t == "CapabilitiesIssued").count(), 1);
-    assert_subsequence(&types, &["TaskCreated", "Submitted", "CapabilitiesIssued", "Started"]);
+    assert_eq!(
+        types.iter().filter(|t| *t == "CapabilitiesIssued").count(),
+        1
+    );
+    assert_subsequence(
+        &types,
+        &["TaskCreated", "Submitted", "CapabilitiesIssued", "Started"],
+    );
     // The journal shows prefixes only.
-    let printed = String::from_utf8(cli.cmd(&["events", id]).assert().success().get_output().stdout.clone()).unwrap();
+    let printed = String::from_utf8(
+        cli.cmd(&["events", id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
     for g in &grants {
         assert!(printed.contains(g.handle.prefix()));
-        assert!(!printed.contains(&g.handle.to_string()), "full handle in `agentos events`");
+        assert!(
+            !printed.contains(&g.handle.to_string()),
+            "full handle in `agentos events`"
+        );
     }
     // A finished task is not approved again.
     cli.json(&["resume", id]);
@@ -936,14 +1428,29 @@ fn submit_yes_approves_before_driving() {
     assert_eq!(out["state"], "SUCCEEDED");
     assert_eq!(cli.grants(id).len(), 4);
     let types = cli.event_types(id);
-    assert_eq!(types.iter().filter(|t| *t == "CapabilitiesIssued").count(), 1);
-    assert_subsequence(&types, &["TaskCreated", "Submitted", "CapabilitiesIssued", "Started", "CapabilityGranted", "EffectIntended"]);
+    assert_eq!(
+        types.iter().filter(|t| *t == "CapabilitiesIssued").count(),
+        1
+    );
+    assert_subsequence(
+        &types,
+        &[
+            "TaskCreated",
+            "Submitted",
+            "CapabilitiesIssued",
+            "Started",
+            "CapabilityGranted",
+            "EffectIntended",
+        ],
+    );
 }
 
 /// Job directories under the home, as (effect id, directory name): names are
 /// `<effect_id>-<attempt_id>` and effect ids are 64 hex digits.
 fn job_dirs(cli: &Cli) -> Vec<(String, String)> {
-    let Ok(entries) = fs::read_dir(cli.home().join("jobs")) else { return Vec::new() };
+    let Ok(entries) = fs::read_dir(cli.home().join("jobs")) else {
+        return Vec::new();
+    };
     let mut dirs: Vec<(String, String)> = entries
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -957,7 +1464,11 @@ fn assert_one_job_per_effect(cli: &Cli, what: &str) {
     let dirs = job_dirs(cli);
     assert!(!dirs.is_empty(), "{what}: no job directories");
     let effects: BTreeSet<&String> = dirs.iter().map(|(e, _)| e).collect();
-    assert_eq!(effects.len(), dirs.len(), "{what}: more than one job for an effect: {dirs:?}");
+    assert_eq!(
+        effects.len(),
+        dirs.len(),
+        "{what}: more than one job for an effect: {dirs:?}"
+    );
 }
 
 /// Pids of processes whose command line mentions `needle`.
@@ -968,7 +1479,9 @@ fn processes_mentioning(needle: &str) -> Vec<String> {
         if !name.chars().all(|c| c.is_ascii_digit()) {
             continue;
         }
-        let Ok(cmdline) = fs::read(entry.path().join("cmdline")) else { continue };
+        let Ok(cmdline) = fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
         if String::from_utf8_lossy(&cmdline).contains(needle) {
             found.push(name);
         }
@@ -979,7 +1492,13 @@ fn processes_mentioning(needle: &str) -> Vec<String> {
 #[test]
 fn supervise_subcommands_are_hidden_from_help() {
     let cli = Cli::new();
-    let out = cli.cmd(&["--help"]).assert().success().get_output().stdout.clone();
+    let out = cli
+        .cmd(&["--help"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
     assert!(!String::from_utf8_lossy(&out).contains("supervise"));
 }
 
@@ -987,7 +1506,10 @@ fn supervise_subcommands_are_hidden_from_help() {
 fn home_has_no_receipts_dir() {
     let cli = Cli::new();
     let contract = cli.contract(&cli.repo_copy());
-    assert_eq!(cli.submit_yes(&contract, &fix_patch())["state"], "SUCCEEDED");
+    assert_eq!(
+        cli.submit_yes(&contract, &fix_patch())["state"],
+        "SUCCEEDED"
+    );
     assert!(!cli.home().join("receipts").exists());
     assert!(cli.home().join("jobs").is_dir());
     assert_one_job_per_effect(&cli, "clean run");
@@ -995,7 +1517,10 @@ fn home_has_no_receipts_dir() {
 
 #[test]
 fn during_execute_rows_resume_by_publishing_the_receipt_with_one_job_per_effect() {
-    for spec in ["during-execute:apply_patch", "during-execute:run_verification"] {
+    for spec in [
+        "during-execute:apply_patch",
+        "during-execute:run_verification",
+    ] {
         let cli = Cli::new();
         let contract = cli.contract(&fixtures().join("parser-repo"));
         let clean = cli.submit_yes(&contract, &fix_patch());
@@ -1004,8 +1529,15 @@ fn during_execute_rows_resume_by_publishing_the_receipt_with_one_job_per_effect(
 
         let id = cli.crash(&contract, spec);
         assert_tier_worker(&cli, &id);
-        assert!(job_dirs(&cli).len() > before, "{spec}: the crashed run launched its job");
-        assert_eq!(cli.json(&["resume", &id]), json!({ "task_id": id, "state": "SUCCEEDED" }), "{spec}");
+        assert!(
+            job_dirs(&cli).len() > before,
+            "{spec}: the crashed run launched its job"
+        );
+        assert_eq!(
+            cli.json(&["resume", &id]),
+            json!({ "task_id": id, "state": "SUCCEEDED" }),
+            "{spec}"
+        );
         // Resume published the crashed effect's receipt instead of launching it again: the
         // two runs together have exactly two jobs per effect of one clean run.
         assert_eq!(job_dirs(&cli).len(), 2 * before, "{spec}");
@@ -1027,9 +1559,15 @@ fn status_shows_job_state_for_outstanding_effects() {
     assert_eq!(jobs.len(), 1, "{status}");
     assert_eq!(jobs[0]["effect_id"], outstanding[0]["effect_id"]);
     // The controller died right after the launch: the job is either still running or done.
-    assert!(jobs[0]["alive"] == true || jobs[0]["receipt"] == true, "{status}");
+    assert!(
+        jobs[0]["alive"] == true || jobs[0]["receipt"] == true,
+        "{status}"
+    );
     // A job that has not written its first status yet has no state; a finished one has.
-    assert!(jobs[0]["state"].is_string() || jobs[0]["receipt"] == false, "{status}");
+    assert!(
+        jobs[0]["state"].is_string() || jobs[0]["receipt"] == false,
+        "{status}"
+    );
     cli.json(&["resume", &id]);
     assert_eq!(cli.status(&id)["jobs"], json!([]));
 }
@@ -1042,19 +1580,39 @@ fn slow_world(cli: &Cli) -> (PathBuf, String) {
     let slow = profiles.join("slow-checks-v1");
     copy_tree(&profiles.join("parser-checks-v1"), &slow).unwrap();
     let script = fs::read_to_string(slow.join("check_parser.py")).unwrap();
-    fs::write(slow.join("check_parser.py"), format!("import time\ntime.sleep(30)\n{script}")).unwrap();
+    fs::write(
+        slow.join("check_parser.py"),
+        format!("import time\ntime.sleep(30)\n{script}"),
+    )
+    .unwrap();
     fs::write(slow.join("profile.json"), r#"{ "id": "slow-checks-v1", "command": ["python3", "check_parser.py"], "protected": true }"#).unwrap();
-    let contract = cli.write("slow.json", &fs::read_to_string(cli.contract(&cli.repo_copy())).unwrap().replace("parser-checks-v1", "slow-checks-v1"));
+    let contract = cli.write(
+        "slow.json",
+        &fs::read_to_string(cli.contract(&cli.repo_copy()))
+            .unwrap()
+            .replace("parser-checks-v1", "slow-checks-v1"),
+    );
     (profiles, contract)
 }
 
 /// `submit --yes` as a background process.
 fn spawn_submit(cli: &Cli, profiles: &Path, contract: &str) -> std::process::Child {
-    cli.std_cmd(Cli::mode(), true, profiles, &["submit", contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap()
+    cli.std_cmd(
+        Cli::mode(),
+        true,
+        profiles,
+        &[
+            "submit",
+            contract,
+            "--yes",
+            "--fake-agent-patch",
+            fix_patch().to_str().unwrap(),
+        ],
+    )
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .spawn()
+    .unwrap()
 }
 
 /// Waits until the verification job's supervisor is up (it has written a status). Before
@@ -1063,13 +1621,22 @@ fn spawn_submit(cli: &Cli, profiles: &Path, contract: &str) -> std::process::Chi
 fn wait_for_verification_job(cli: &Cli) {
     let started = std::time::Instant::now();
     loop {
-        let up = fs::read_dir(cli.home().join("jobs")).into_iter().flatten().flatten().any(|e| {
-            e.path().join("status.json").is_file() && fs::read_to_string(e.path().join("request.json")).is_ok_and(|r| r.contains("RunVerification"))
-        });
+        let up = fs::read_dir(cli.home().join("jobs"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|e| {
+                e.path().join("status.json").is_file()
+                    && fs::read_to_string(e.path().join("request.json"))
+                        .is_ok_and(|r| r.contains("RunVerification"))
+            });
         if up {
             return;
         }
-        assert!(started.elapsed() < std::time::Duration::from_secs(60), "the verification job never started");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "the verification job never started"
+        );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
@@ -1077,14 +1644,25 @@ fn wait_for_verification_job(cli: &Cli) {
 /// No supervisor, worker, check or (fake) guest is left: each names the home on its command
 /// line (`<home>/jobs/…`, or the fake guest's `<home>/work/<task>`).
 fn assert_no_job_processes(cli: &Cli) {
-    assert_eq!(processes_mentioning(cli.home().to_str().unwrap()), Vec::<String>::new(), "no supervisor, worker or guest left");
-    assert_eq!(home_vms(cli), Vec::<String>::new(), "no Firecracker of this home left");
+    assert_eq!(
+        processes_mentioning(cli.home().to_str().unwrap()),
+        Vec::<String>::new(),
+        "no supervisor, worker or guest left"
+    );
+    assert_eq!(
+        home_vms(cli),
+        Vec::<String>::new(),
+        "no Firecracker of this home left"
+    );
 }
 
 /// Live `firecracker` processes of this home (matched by `--id`: a jailed one's command
 /// line names no host path).
 fn home_vms(cli: &Cli) -> Vec<String> {
-    procs::home_firecrackers(&cli.home()).into_iter().map(|p| p.cmdline.join(" ")).collect()
+    procs::home_firecrackers(&cli.home())
+        .into_iter()
+        .map(|p| p.cmdline.join(" "))
+        .collect()
 }
 
 #[test]
@@ -1093,7 +1671,13 @@ fn controller_sigkill_while_a_slow_verification_runs_then_resume_publishes_the_r
     let (profiles, contract) = slow_world(&cli);
     // Shorten the check: the 30 s sleep becomes 3 s.
     let script = profiles.join("slow-checks-v1/check_parser.py");
-    fs::write(&script, fs::read_to_string(&script).unwrap().replace("sleep(30)", "sleep(3)")).unwrap();
+    fs::write(
+        &script,
+        fs::read_to_string(&script)
+            .unwrap()
+            .replace("sleep(30)", "sleep(3)"),
+    )
+    .unwrap();
     let mut child = spawn_submit(&cli, &profiles, &contract);
     wait_for_verification_job(&cli);
     child.kill().unwrap();
@@ -1101,13 +1685,28 @@ fn controller_sigkill_while_a_slow_verification_runs_then_resume_publishes_the_r
 
     let id = first_task(&cli);
     assert_tier_worker(&cli, &id);
-    let resumed = cli.cmd_with_profiles(&profiles, &["resume", &id]).assert().success().get_output().stdout.clone();
-    assert_eq!(serde_json::from_slice::<Value>(&resumed).unwrap(), json!({ "task_id": id, "state": "SUCCEEDED" }));
+    let resumed = cli
+        .cmd_with_profiles(&profiles, &["resume", &id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&resumed).unwrap(),
+        json!({ "task_id": id, "state": "SUCCEEDED" })
+    );
     let verifications = job_dirs(&cli)
         .into_iter()
-        .filter(|(_, name)| fs::read_to_string(cli.home().join("jobs").join(name).join("request.json")).is_ok_and(|r| r.contains("RunVerification")))
+        .filter(|(_, name)| {
+            fs::read_to_string(cli.home().join("jobs").join(name).join("request.json"))
+                .is_ok_and(|r| r.contains("RunVerification"))
+        })
         .count();
-    assert_eq!(verifications, 1, "exactly one job for the verification effect");
+    assert_eq!(
+        verifications, 1,
+        "exactly one job for the verification effect"
+    );
     assert_one_job_per_effect(&cli, "after sigkill");
     assert_no_job_processes(&cli);
 }
@@ -1118,7 +1717,10 @@ fn revoke_unknown_capability_name_exits_2() {
     let contract = cli.contract(&cli.repo_copy());
     let done = cli.submit_yes(&contract, &fix_patch());
     let id = done["task_id"].as_str().unwrap();
-    cli.cmd(&["revoke", id, "--capability", "teleport.now"]).assert().code(2).stderr(predicate::str::contains("unknown capability"));
+    cli.cmd(&["revoke", id, "--capability", "teleport.now"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("unknown capability"));
 }
 
 #[test]
@@ -1128,12 +1730,24 @@ fn revoke_on_a_terminal_task_is_allowed_and_cancels_nothing() {
     let done = cli.submit_yes(&contract, &fix_patch());
     let id = done["task_id"].as_str().unwrap();
     let out = cli.json(&["revoke", id, "--capability", "verification.run"]);
-    assert_eq!(out, json!({ "task_id": id, "revoked": ["verification.run"], "cancelled_jobs": 0 }));
+    assert_eq!(
+        out,
+        json!({ "task_id": id, "revoked": ["verification.run"], "cancelled_jobs": 0 })
+    );
     // Revoking again changes nothing.
-    assert_eq!(cli.json(&["revoke", id, "--capability", "verification.run"])["revoked"], json!([]));
+    assert_eq!(
+        cli.json(&["revoke", id, "--capability", "verification.run"])["revoked"],
+        json!([])
+    );
     assert_eq!(cli.status(id)["state"], "SUCCEEDED");
-    assert!(cli.event_types(id).contains(&"CapabilityRevoked".to_string()));
-    cli.cmd(&["revoke", "00000000-0000-4000-8000-000000000000"]).assert().code(1).stderr(predicate::str::contains("unknown task"));
+    assert!(
+        cli.event_types(id)
+            .contains(&"CapabilityRevoked".to_string())
+    );
+    cli.cmd(&["revoke", "00000000-0000-4000-8000-000000000000"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("unknown task"));
 }
 
 #[test]
@@ -1145,14 +1759,45 @@ fn revoke_verification_run_stops_the_running_check_from_another_process() {
     wait_for_verification_job(&cli);
     let id = first_task(&cli);
     assert_tier_worker(&cli, &id);
-    let out = cli.cmd_with_profiles(&profiles, &["revoke", &id, "--capability", "verification.run"]).assert().success().get_output().stdout.clone();
-    assert_eq!(serde_json::from_slice::<Value>(&out).unwrap(), json!({ "task_id": id, "revoked": ["verification.run"], "cancelled_jobs": 1 }));
-    assert!(child.wait().unwrap().success(), "the driver finished the task");
-    assert!(started.elapsed() < std::time::Duration::from_secs(25), "the 30 s check was stopped, took {:?}", started.elapsed());
+    let out = cli
+        .cmd_with_profiles(
+            &profiles,
+            &["revoke", &id, "--capability", "verification.run"],
+        )
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out).unwrap(),
+        json!({ "task_id": id, "revoked": ["verification.run"], "cancelled_jobs": 1 })
+    );
+    assert!(
+        child.wait().unwrap().success(),
+        "the driver finished the task"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(25),
+        "the 30 s check was stopped, took {:?}",
+        started.elapsed()
+    );
     assert_eq!(cli.status(&id)["state"], "FAILED");
     let events = cli.events(&id);
-    assert!(events.iter().any(|e| e["type"] == "EffectFailed" && e["payload"].to_string().contains("cancelled")), "the killed check is a recorded failure");
-    assert_eq!(events.iter().filter(|e| e["type"] == "EffectCompleted").count(), 2, "earlier results stay");
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"] == "EffectFailed" && e["payload"].to_string().contains("cancelled")),
+        "the killed check is a recorded failure"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["type"] == "EffectCompleted")
+            .count(),
+        2,
+        "earlier results stay"
+    );
     assert_no_job_processes(&cli);
 }
 
@@ -1167,17 +1812,34 @@ fn cancel_drops_markers_for_running_jobs_and_ends_cancelled_with_no_live_process
     assert_tier_worker(&cli, &id);
     // Another process drives the task: the cancel is only requested, but the running job is
     // told to stop at once, so the driver does not wait out the check.
-    let out = cli.cmd_with_profiles(&profiles, &["cancel", &id]).assert().success().get_output().stdout.clone();
-    assert_eq!(serde_json::from_slice::<Value>(&out).unwrap()["cancel_requested"], true);
+    let out = cli
+        .cmd_with_profiles(&profiles, &["cancel", &id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out).unwrap()["cancel_requested"],
+        true
+    );
     child.wait().unwrap();
-    assert!(started.elapsed() < std::time::Duration::from_secs(25), "took {:?}", started.elapsed());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(25),
+        "took {:?}",
+        started.elapsed()
+    );
     assert_eq!(cli.status(&id)["state"], "CANCELLED");
     assert_no_job_processes(&cli);
 }
 
 /// The id of the only task in the home.
 fn first_task(cli: &Cli) -> String {
-    let mut ids: Vec<String> = fs::read_dir(cli.home().join("tasks")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    let mut ids: Vec<String> = fs::read_dir(cli.home().join("tasks"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
     assert_eq!(ids.len(), 1, "{ids:?}");
     ids.remove(0)
 }
@@ -1188,16 +1850,31 @@ fn profile_variant(cli: &Cli, name: &str, id: &str, check_prefix: &str) -> PathB
     let dir = cli.path(name);
     copy_tree(&fixtures().join("profiles/parser-checks-v1"), &dir).unwrap();
     let script = fs::read_to_string(dir.join("check_parser.py")).unwrap();
-    fs::write(dir.join("check_parser.py"), format!("{check_prefix}{script}")).unwrap();
-    fs::write(dir.join("profile.json"), json!({ "id": id, "command": ["python3", "check_parser.py"], "protected": true }).to_string()).unwrap();
+    fs::write(
+        dir.join("check_parser.py"),
+        format!("{check_prefix}{script}"),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("profile.json"),
+        json!({ "id": id, "command": ["python3", "check_parser.py"], "protected": true })
+            .to_string(),
+    )
+    .unwrap();
     dir
 }
 
 /// The profile registry's entries (`<home>/registry/*`; the image registry `images/` beside
 /// them is not one).
 fn profile_registry_entries(cli: &Cli) -> Vec<String> {
-    let Ok(entries) = fs::read_dir(cli.home().join("registry")) else { return Vec::new() };
-    entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n != "images").collect()
+    let Ok(entries) = fs::read_dir(cli.home().join("registry")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "images")
+        .collect()
 }
 
 fn register(cli: &Cli, dir: &Path) -> Value {
@@ -1206,12 +1883,19 @@ fn register(cli: &Cli, dir: &Path) -> Value {
 
 /// A contract over a repository copy, naming `verification_profile` and optionally pinning it.
 fn contract_for_profile(cli: &Cli, id: &str, pin: Option<&str>) -> String {
-    let mut contract: Value = serde_json::from_str(&fs::read_to_string(cli.contract(&cli.repo_copy())).unwrap()).unwrap();
+    let mut contract: Value =
+        serde_json::from_str(&fs::read_to_string(cli.contract(&cli.repo_copy())).unwrap()).unwrap();
     contract["verification_profile"] = json!(id);
     if let Some(pin) = pin {
         contract["profile_digest"] = json!(pin);
     }
-    cli.write(&format!("pinned-{}.json", Digest::of(contract.to_string().as_bytes())), &contract.to_string())
+    cli.write(
+        &format!(
+            "pinned-{}.json",
+            Digest::of(contract.to_string().as_bytes())
+        ),
+        &contract.to_string(),
+    )
 }
 
 /// `--profiles` pointing at an empty directory: only the registry can supply a profile.
@@ -1222,7 +1906,13 @@ fn no_legacy(cli: &Cli) -> PathBuf {
 }
 
 fn submitted_profile_digest(cli: &Cli, id: &str) -> String {
-    cli.events(id).iter().find(|e| e["type"] == "Submitted").unwrap()["payload"]["profile_digest"].as_str().unwrap().to_string()
+    cli.events(id)
+        .iter()
+        .find(|e| e["type"] == "Submitted")
+        .unwrap()["payload"]["profile_digest"]
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
 #[test]
@@ -1246,37 +1936,73 @@ fn register_twice_is_a_noop_and_changed_bytes_are_a_new_entry() {
 fn registered_entries_have_no_write_bits() {
     use std::os::unix::fs::PermissionsExt;
     let cli = Cli::new();
-    let digest = register(&cli, &profile_variant(&cli, "p1", "ro-v1", ""))["digest"].as_str().unwrap().to_string();
+    let digest = register(&cli, &profile_variant(&cli, "p1", "ro-v1", ""))["digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let entry = cli.home().join("registry").join(format!("ro-v1@{digest}"));
-    for path in [entry.clone(), entry.join("profile.json"), entry.join("check_parser.py")] {
+    for path in [
+        entry.clone(),
+        entry.join("profile.json"),
+        entry.join("check_parser.py"),
+    ] {
         let mode = fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o222, 0, "{} is writable: {mode:o}", path.display());
     }
-    assert!(cli.home().join("registry").join(format!("ro-v1@{digest}.meta.json")).is_file());
+    assert!(
+        cli.home()
+            .join("registry")
+            .join(format!("ro-v1@{digest}.meta.json"))
+            .is_file()
+    );
 }
 
 #[test]
 fn ids_with_at_sign_or_traversal_are_rejected_at_register() {
     let cli = Cli::new();
-    for (i, id) in ["a@b", "../x", "a/b", "..", "", "-x"].into_iter().enumerate() {
+    for (i, id) in ["a@b", "../x", "a/b", "..", "", "-x"]
+        .into_iter()
+        .enumerate()
+    {
         let dir = profile_variant(&cli, &format!("bad-{i}"), id, "");
-        cli.cmd(&["profile", "register", dir.to_str().unwrap()]).assert().code(2).stderr(predicate::str::contains("plain name"));
+        cli.cmd(&["profile", "register", dir.to_str().unwrap()])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("plain name"));
     }
     assert_eq!(profile_registry_entries(&cli), Vec::<String>::new());
     let empty = cli.path("empty-command");
     fs::create_dir_all(&empty).unwrap();
     fs::write(empty.join("profile.json"), r#"{"id":"e-v1","command":[]}"#).unwrap();
-    cli.cmd(&["profile", "register", empty.to_str().unwrap()]).assert().code(2).stderr(predicate::str::contains("command"));
+    cli.cmd(&["profile", "register", empty.to_str().unwrap()])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("command"));
 }
 
 #[test]
 fn registered_profile_runs_end_to_end() {
     let cli = Cli::new();
-    let digest = register(&cli, &fixtures().join("profiles/parser-checks-v1"))["digest"].as_str().unwrap().to_string();
+    let digest = register(&cli, &fixtures().join("profiles/parser-checks-v1"))["digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let contract = contract_for_profile(&cli, "parser-checks-v1", None);
-    let out = cli.json_with_profiles(&no_legacy(&cli), &["submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()]);
+    let out = cli.json_with_profiles(
+        &no_legacy(&cli),
+        &[
+            "submit",
+            &contract,
+            "--yes",
+            "--fake-agent-patch",
+            fix_patch().to_str().unwrap(),
+        ],
+    );
     assert_eq!(out["state"], "SUCCEEDED");
-    assert_eq!(submitted_profile_digest(&cli, out["task_id"].as_str().unwrap()), digest);
+    assert_eq!(
+        submitted_profile_digest(&cli, out["task_id"].as_str().unwrap()),
+        digest
+    );
 }
 
 #[test]
@@ -1284,35 +2010,77 @@ fn submit_with_a_pin_for_a_missing_digest_exits_2() {
     let cli = Cli::new();
     register(&cli, &fixtures().join("profiles/parser-checks-v1"));
     let contract = contract_for_profile(&cli, "parser-checks-v1", Some(&"0".repeat(64)));
-    cli.cmd(&["submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()])
-        .assert()
-        .code(2)
-        .stderr(predicate::str::contains("is not in the registry"));
+    cli.cmd(&[
+        "submit",
+        &contract,
+        "--yes",
+        "--fake-agent-patch",
+        fix_patch().to_str().unwrap(),
+    ])
+    .assert()
+    .code(2)
+    .stderr(predicate::str::contains("is not in the registry"));
 }
 
 #[test]
 fn submit_with_the_pin_uses_exactly_that_digest_even_if_a_newer_entry_exists() {
     let cli = Cli::new();
-    let older = register(&cli, &profile_variant(&cli, "p1", "pin-v1", ""))["digest"].as_str().unwrap().to_string();
+    let older = register(&cli, &profile_variant(&cli, "p1", "pin-v1", ""))["digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
     // Registration times are milliseconds: make sure the second entry is strictly newer.
     std::thread::sleep(std::time::Duration::from_millis(20));
-    let newer = register(&cli, &profile_variant(&cli, "p2", "pin-v1", "# newer\n"))["digest"].as_str().unwrap().to_string();
+    let newer = register(&cli, &profile_variant(&cli, "p2", "pin-v1", "# newer\n"))["digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert_ne!(older, newer);
 
     let pinned = contract_for_profile(&cli, "pin-v1", Some(&older));
-    let out = cli.json_with_profiles(&no_legacy(&cli), &["submit", &pinned, "--fake-agent-patch", fix_patch().to_str().unwrap()]);
-    assert_eq!(submitted_profile_digest(&cli, out["task_id"].as_str().unwrap()), older);
+    let out = cli.json_with_profiles(
+        &no_legacy(&cli),
+        &[
+            "submit",
+            &pinned,
+            "--fake-agent-patch",
+            fix_patch().to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        submitted_profile_digest(&cli, out["task_id"].as_str().unwrap()),
+        older
+    );
     let unpinned = contract_for_profile(&cli, "pin-v1", None);
-    let out = cli.json_with_profiles(&no_legacy(&cli), &["submit", &unpinned, "--fake-agent-patch", fix_patch().to_str().unwrap()]);
-    assert_eq!(submitted_profile_digest(&cli, out["task_id"].as_str().unwrap()), newer, "no pin: the newest entry");
+    let out = cli.json_with_profiles(
+        &no_legacy(&cli),
+        &[
+            "submit",
+            &unpinned,
+            "--fake-agent-patch",
+            fix_patch().to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        submitted_profile_digest(&cli, out["task_id"].as_str().unwrap()),
+        newer,
+        "no pin: the newest entry"
+    );
 }
 
 #[test]
 fn legacy_profiles_dir_still_works_with_the_profiles_flag() {
     let cli = Cli::new();
     let contract = cli.contract(&cli.repo_copy());
-    assert_eq!(profile_registry_entries(&cli), Vec::<String>::new(), "no registered profile");
-    assert_eq!(cli.submit_yes(&contract, &fix_patch())["state"], "SUCCEEDED");
+    assert_eq!(
+        profile_registry_entries(&cli),
+        Vec::<String>::new(),
+        "no registered profile"
+    );
+    assert_eq!(
+        cli.submit_yes(&contract, &fix_patch())["state"],
+        "SUCCEEDED"
+    );
 }
 
 #[test]
@@ -1320,66 +2088,132 @@ fn registry_wins_over_legacy_when_both_exist() {
     let cli = Cli::new();
     // The registry's parser-checks-v1 rejects everything; the legacy one (the fixture) is right.
     let strict = profile_variant(&cli, "p1", "parser-checks-v1", "import sys\nsys.exit(1)\n");
-    let digest = register(&cli, &strict)["digest"].as_str().unwrap().to_string();
+    let digest = register(&cli, &strict)["digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let contract = contract_for_profile(&cli, "parser-checks-v1", None);
-    let out = cli.json(&["submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()]);
-    assert_eq!(out["state"], "FAILED", "the registry entry was used, not the legacy directory");
-    assert_eq!(submitted_profile_digest(&cli, out["task_id"].as_str().unwrap()), digest);
+    let out = cli.json(&[
+        "submit",
+        &contract,
+        "--yes",
+        "--fake-agent-patch",
+        fix_patch().to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out["state"], "FAILED",
+        "the registry entry was used, not the legacy directory"
+    );
+    assert_eq!(
+        submitted_profile_digest(&cli, out["task_id"].as_str().unwrap()),
+        digest
+    );
 }
 
 #[test]
 fn cli_tampered_staged_profile_fails_the_task_before_any_verification() {
     let cli = Cli::new();
     let contract = cli.contract(&cli.repo_copy());
-    let ready = cli.json(&["submit", &contract, "--fake-agent-patch", fix_patch().to_str().unwrap()]);
+    let ready = cli.json(&[
+        "submit",
+        &contract,
+        "--fake-agent-patch",
+        fix_patch().to_str().unwrap(),
+    ]);
     let id = ready["task_id"].as_str().unwrap();
-    let staged = cli.home().join("tasks").join(id).join("profile/check_parser.py");
+    let staged = cli
+        .home()
+        .join("tasks")
+        .join(id)
+        .join("profile/check_parser.py");
     fs::write(&staged, "import sys\nsys.exit(0)\n").unwrap();
 
     assert_eq!(cli.json(&["resume", id])["state"], "FAILED");
     let events = cli.events(id);
     let reason = events.iter().find(|e| e["type"] == "Failed").unwrap()["payload"].to_string();
     assert!(reason.contains("recorded profile changed"), "{reason}");
-    assert!(!events.iter().any(|e| e["type"] == "EffectIntended"), "nothing ran on the tampered profile");
+    assert!(
+        !events.iter().any(|e| e["type"] == "EffectIntended"),
+        "nothing ran on the tampered profile"
+    );
     assert!(job_dirs(&cli).is_empty());
 }
 
 /// Every full handle of the task, read from the database (they appear nowhere else).
 fn full_handles(cli: &Cli, id: &str) -> Vec<String> {
     let conn = rusqlite::Connection::open(cli.home().join("agentos.db")).unwrap();
-    let mut stmt = conn.prepare("SELECT id FROM capabilities WHERE task_id = ?1").unwrap();
-    stmt.query_map([id], |r| r.get::<_, String>(0)).unwrap().map(|r| r.unwrap()).collect()
+    let mut stmt = conn
+        .prepare("SELECT id FROM capabilities WHERE task_id = ?1")
+        .unwrap();
+    stmt.query_map([id], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
 }
 
 fn denials(cli: &Cli, id: &str) -> Vec<Value> {
-    cli.events(id).into_iter().filter(|e| e["type"] == "CapabilityDenied").map(|e| e["payload"].clone()).collect()
+    cli.events(id)
+        .into_iter()
+        .filter(|e| e["type"] == "CapabilityDenied")
+        .map(|e| e["payload"].clone())
+        .collect()
 }
 
 #[test]
 fn export_journals_the_granted_decision() {
     let cli = Cli::new();
     let contract = cli.contract(&cli.repo_copy());
-    let id = cli.submit_yes(&contract, &fix_patch())["task_id"].as_str().unwrap().to_string();
+    let id = cli.submit_yes(&contract, &fix_patch())["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     cli.export(&id, "bundle");
-    let granted: Vec<Value> = cli.events(&id).into_iter().filter(|e| e["type"] == "CapabilityGranted" && e["payload"]["operation"] == "artifact.export").collect();
+    let granted: Vec<Value> = cli
+        .events(&id)
+        .into_iter()
+        .filter(|e| {
+            e["type"] == "CapabilityGranted" && e["payload"]["operation"] == "artifact.export"
+        })
+        .collect();
     assert_eq!(granted.len(), 1, "{granted:?}");
-    assert!(granted[0]["payload"]["handle_prefix"].as_str().unwrap().len() == 8);
+    assert!(
+        granted[0]["payload"]["handle_prefix"]
+            .as_str()
+            .unwrap()
+            .len()
+            == 8
+    );
 }
 
 #[test]
 fn export_without_artifact_export_capability_exits_1_writes_nothing_and_journals_the_denial() {
     let cli = Cli::new();
     let repo = cli.repo_copy();
-    let mut contract: Value = serde_json::from_str(&fs::read_to_string(cli.contract(&repo)).unwrap()).unwrap();
-    contract["capabilities"] = json!(["snapshot.read", "workspace.apply_patch", "verification.run"]);
+    let mut contract: Value =
+        serde_json::from_str(&fs::read_to_string(cli.contract(&repo)).unwrap()).unwrap();
+    contract["capabilities"] =
+        json!(["snapshot.read", "workspace.apply_patch", "verification.run"]);
     let file = cli.write("no-export.json", &contract.to_string());
-    let id = cli.submit_yes(&file, &fix_patch())["task_id"].as_str().unwrap().to_string();
+    let id = cli.submit_yes(&file, &fix_patch())["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let dir = cli.path("bundle");
-    cli.cmd(&["export", &id, dir.to_str().unwrap()]).assert().code(1).stdout("").stderr(predicate::str::contains("export denied"));
+    cli.cmd(&["export", &id, dir.to_str().unwrap()])
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr(predicate::str::contains("export denied"));
     assert!(!dir.exists(), "nothing written");
     let denied = denials(&cli, &id);
     assert_eq!(denied.len(), 1, "{denied:?}");
-    assert_eq!((denied[0]["operation"].as_str(), denied[0]["reason"].as_str()), (Some("artifact.export"), Some("unknown_handle")));
+    assert_eq!(
+        (
+            denied[0]["operation"].as_str(),
+            denied[0]["reason"].as_str()
+        ),
+        (Some("artifact.export"), Some("unknown_handle"))
+    );
     assert!(!cli.event_types(&id).contains(&"Exported".to_string()));
 }
 
@@ -1387,10 +2221,16 @@ fn export_without_artifact_export_capability_exits_1_writes_nothing_and_journals
 fn export_after_revoking_artifact_export_is_denied_revoked() {
     let cli = Cli::new();
     let contract = cli.contract(&cli.repo_copy());
-    let id = cli.submit_yes(&contract, &fix_patch())["task_id"].as_str().unwrap().to_string();
+    let id = cli.submit_yes(&contract, &fix_patch())["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     cli.json(&["revoke", &id, "--capability", "artifact.export"]);
     let dir = cli.path("bundle");
-    cli.cmd(&["export", &id, dir.to_str().unwrap()]).assert().code(1).stderr(predicate::str::contains("revoked"));
+    cli.cmd(&["export", &id, dir.to_str().unwrap()])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("revoked"));
     assert!(!dir.exists());
     assert_eq!(denials(&cli, &id)[0]["reason"], "revoked");
 }
@@ -1403,11 +2243,27 @@ fn a_task_failed_on_its_deadline_can_still_be_exported() {
     let mut contract: Value = serde_json::from_str(&fs::read_to_string(&slow).unwrap()).unwrap();
     contract["limits"]["deadline_seconds"] = json!(3);
     let file = cli.write("slow-deadline.json", &contract.to_string());
-    let out = cli.json_with_profiles(&profiles, &["submit", &file, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()]);
+    let out = cli.json_with_profiles(
+        &profiles,
+        &[
+            "submit",
+            &file,
+            "--yes",
+            "--fake-agent-patch",
+            fix_patch().to_str().unwrap(),
+        ],
+    );
     assert_eq!(out["state"], "FAILED");
     let id = out["task_id"].as_str().unwrap();
-    let failed = cli.events(id).into_iter().find(|e| e["type"] == "Failed").unwrap();
-    assert!(failed["payload"].to_string().contains("deadline exceeded"), "{failed}");
+    let failed = cli
+        .events(id)
+        .into_iter()
+        .find(|e| e["type"] == "Failed")
+        .unwrap();
+    assert!(
+        failed["payload"].to_string().contains("deadline exceeded"),
+        "{failed}"
+    );
     assert_no_job_processes(&cli);
     let (_, manifest) = cli.export(id, "bundle");
     assert_eq!(manifest["state"], "FAILED");
@@ -1418,11 +2274,17 @@ fn a_task_failed_on_its_deadline_can_still_be_exported() {
 fn manifest_lists_capabilities_with_prefixes_only() {
     let cli = Cli::new();
     let contract = cli.contract(&cli.repo_copy());
-    let id = cli.submit_yes(&contract, &fix_patch())["task_id"].as_str().unwrap().to_string();
+    let id = cli.submit_yes(&contract, &fix_patch())["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let (dir, manifest) = cli.export(&id, "bundle");
     let caps = manifest["capabilities"].as_array().unwrap();
     assert_eq!(caps.len(), 4);
-    assert!(caps.iter().all(|c| c["handle_prefix"].as_str().unwrap().len() == 8 && c["revoked"] == false));
+    assert!(
+        caps.iter()
+            .all(|c| c["handle_prefix"].as_str().unwrap().len() == 8 && c["revoked"] == false)
+    );
     let handles = full_handles(&cli, &id);
     assert_eq!(handles.len(), 4);
     let mut everything = String::new();
@@ -1434,7 +2296,10 @@ fn manifest_lists_capabilities_with_prefixes_only() {
         everything.push_str(&e.to_string());
     }
     for handle in &handles {
-        assert!(!everything.contains(handle.as_str()), "a full handle leaked");
+        assert!(
+            !everything.contains(handle.as_str()),
+            "a full handle leaked"
+        );
         assert!(everything.contains(&handle[..8]), "its prefix is shown");
     }
 }
@@ -1443,14 +2308,24 @@ fn manifest_lists_capabilities_with_prefixes_only() {
 fn status_lists_capabilities_without_full_handles() {
     let cli = Cli::new();
     let contract = cli.contract(&cli.repo_copy());
-    let id = cli.submit_yes(&contract, &fix_patch())["task_id"].as_str().unwrap().to_string();
+    let id = cli.submit_yes(&contract, &fix_patch())["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     cli.json(&["revoke", &id, "--capability", "verification.run"]);
     let status = cli.status(&id);
     let caps = status["capabilities"].as_array().unwrap();
     assert_eq!(caps.len(), 4);
-    let revoked: Vec<&str> = caps.iter().filter(|c| c["revoked"] == true).map(|c| c["operation"].as_str().unwrap()).collect();
+    let revoked: Vec<&str> = caps
+        .iter()
+        .filter(|c| c["revoked"] == true)
+        .map(|c| c["operation"].as_str().unwrap())
+        .collect();
     assert_eq!(revoked, vec!["verification.run"]);
-    let export = caps.iter().find(|c| c["operation"] == "artifact.export").unwrap();
+    let export = caps
+        .iter()
+        .find(|c| c["operation"] == "artifact.export")
+        .unwrap();
     assert!(export["expires_ts"].is_null(), "export never expires");
     let text = status.to_string();
     for handle in full_handles(&cli, &id) {
@@ -1507,7 +2382,10 @@ fn image_register_twice_is_a_noop_and_changed_bytes_are_a_new_entry() {
     let second = register_image(&cli, &fake_image_dir(&cli, "i2", "img-v1", 0x69));
     assert_ne!(second["digest"], first["digest"]);
     assert_eq!(cli.json(&["image", "list"]).as_array().unwrap().len(), 2);
-    let entry = cli.home().join("registry/images").join(format!("img-v1@{}", first["digest"].as_str().unwrap()));
+    let entry = cli
+        .home()
+        .join("registry/images")
+        .join(format!("img-v1@{}", first["digest"].as_str().unwrap()));
     assert!(entry.join("vmlinux").is_file() && entry.join("image.json").is_file());
 }
 
@@ -1516,23 +2394,44 @@ fn image_register_refuses_a_bad_manifest() {
     let cli = Cli::bare();
     let dir = fake_image_dir(&cli, "i1", "img-v1", 0x68);
     let manifest = fs::read_to_string(dir.join("image.json")).unwrap();
-    fs::write(dir.join("image.json"), manifest.replace("\"protocol\":1", "\"protocol\":2")).unwrap();
-    cli.cmd(&["image", "register", dir.to_str().unwrap()]).assert().code(2).stderr(predicate::str::contains("protocol"));
+    fs::write(
+        dir.join("image.json"),
+        manifest.replace("\"protocol\":1", "\"protocol\":2"),
+    )
+    .unwrap();
+    cli.cmd(&["image", "register", dir.to_str().unwrap()])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("protocol"));
 
     let dir = fake_image_dir(&cli, "i2", "img-v1", 0x68);
     fs::remove_file(dir.join("vmlinux")).unwrap();
-    cli.cmd(&["image", "register", dir.to_str().unwrap()]).assert().code(2).stderr(predicate::str::contains("vmlinux"));
+    cli.cmd(&["image", "register", dir.to_str().unwrap()])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("vmlinux"));
 
-    cli.cmd(&["image", "register", cli.path("nope").to_str().unwrap()]).assert().code(2);
-    assert!(!cli.home().join("registry/images").exists() || cli.json(&["image", "list"]).as_array().unwrap().is_empty());
+    cli.cmd(&["image", "register", cli.path("nope").to_str().unwrap()])
+        .assert()
+        .code(2);
+    assert!(
+        !cli.home().join("registry/images").exists()
+            || cli.json(&["image", "list"]).as_array().unwrap().is_empty()
+    );
 }
 
 #[test]
 fn image_ids_with_at_sign_or_traversal_are_rejected_at_register() {
     let cli = Cli::bare();
-    for (i, id) in ["a@b", "../x", "a/b", "..", "", "-x"].into_iter().enumerate() {
+    for (i, id) in ["a@b", "../x", "a/b", "..", "", "-x"]
+        .into_iter()
+        .enumerate()
+    {
         let dir = fake_image_dir(&cli, &format!("bad-{i}"), id, 0x68);
-        cli.cmd(&["image", "register", dir.to_str().unwrap()]).assert().code(2).stderr(predicate::str::contains("plain name"));
+        cli.cmd(&["image", "register", dir.to_str().unwrap()])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("plain name"));
     }
     assert!(cli.json(&["image", "list"]).as_array().unwrap().is_empty());
 }
@@ -1541,14 +2440,25 @@ fn image_ids_with_at_sign_or_traversal_are_rejected_at_register() {
 fn registered_images_have_no_write_bits() {
     use std::os::unix::fs::PermissionsExt;
     let cli = Cli::bare();
-    let digest = register_image(&cli, &fake_image_dir(&cli, "i1", "ro-v1", 0x68))["digest"].as_str().unwrap().to_string();
-    let entry = cli.home().join("registry/images").join(format!("ro-v1@{digest}"));
+    let digest = register_image(&cli, &fake_image_dir(&cli, "i1", "ro-v1", 0x68))["digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let entry = cli
+        .home()
+        .join("registry/images")
+        .join(format!("ro-v1@{digest}"));
     let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&entry), 0o555);
     for file in ["image.json", "vmlinux", "rootfs.squashfs"] {
         assert_eq!(mode(&entry.join(file)), 0o444, "{file}");
     }
-    assert!(cli.home().join("registry/images").join(format!("ro-v1@{digest}.meta.json")).is_file());
+    assert!(
+        cli.home()
+            .join("registry/images")
+            .join(format!("ro-v1@{digest}.meta.json"))
+            .is_file()
+    );
 }
 
 #[test]
@@ -1558,7 +2468,12 @@ fn image_list_shows_entries_sorted() {
     register_image(&cli, &fake_image_dir(&cli, "i2", "alpha-v1", 0x68));
     let listed = cli.json(&["image", "list"]);
     let rows = listed.as_array().unwrap();
-    assert_eq!(rows.iter().map(|r| r["id"].as_str().unwrap()).collect::<Vec<_>>(), ["alpha-v1", "zeta-v1"]);
+    assert_eq!(
+        rows.iter()
+            .map(|r| r["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["alpha-v1", "zeta-v1"]
+    );
     for row in rows {
         assert_eq!(row["digest"].as_str().unwrap().len(), 64);
         assert!(row["registered_ms"].as_i64().unwrap() > 0);
@@ -1581,19 +2496,38 @@ fn images_do_not_leak_into_the_profile_list_and_back() {
 #[test]
 fn profile_register_and_list_are_unchanged_by_the_shared_code() {
     let cli = Cli::new();
-    let digest = register(&cli, &profile_variant(&cli, "p1", "shape-v1", ""))["digest"].as_str().unwrap().to_string();
-    let out = cli.cmd(&["profile", "list"]).assert().success().get_output().stdout.clone();
+    let digest = register(&cli, &profile_variant(&cli, "p1", "shape-v1", ""))["digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let out = cli
+        .cmd(&["profile", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
     let text = String::from_utf8(out).unwrap();
     let row = &serde_json::from_str::<Value>(&text).unwrap()[0];
     let ms = row["registered_ms"].as_i64().unwrap();
-    assert_eq!(text, format!("[{{\"digest\":\"{digest}\",\"id\":\"shape-v1\",\"registered_ms\":{ms}}}]\n"));
+    assert_eq!(
+        text,
+        format!("[{{\"digest\":\"{digest}\",\"id\":\"shape-v1\",\"registered_ms\":{ms}}}]\n")
+    );
 }
 
 #[test]
 fn image_help_lists_register_and_list() {
     let cli = Cli::new();
-    cli.cmd(&["image", "--help"]).assert().success().stdout(predicate::str::contains("register")).stdout(predicate::str::contains("list"));
-    cli.cmd(&["--help"]).assert().success().stdout(predicate::str::contains("image"));
+    cli.cmd(&["image", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("register"))
+        .stdout(predicate::str::contains("list"));
+    cli.cmd(&["--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("image"));
 }
 
 // ---- the Firecracker worker over the fake guest: selection, preflight, jail, records ----
@@ -1603,21 +2537,43 @@ const NEEDS_ROOT: &str = "needs root (euid 0), running as uid 1000";
 impl Cli {
     fn submit_fc(&self, contract: &str, extra: &[&str]) -> Value {
         let patch = fix_patch();
-        let mut args = vec!["submit", contract, "--yes", "--fake-agent-patch", patch.to_str().unwrap()];
+        let mut args = vec![
+            "submit",
+            contract,
+            "--yes",
+            "--fake-agent-patch",
+            patch.to_str().unwrap(),
+        ];
         args.extend_from_slice(extra);
         self.json_as(Mode::Fake, &args)
     }
 
     /// The `Submitted` payload of task `id`, whatever its worker (no `--worker` flag).
     fn submitted(&self, id: &str) -> Value {
-        let out = self.cmd_as(Mode::Plain, &["events", id]).assert().success().get_output().stdout.clone();
-        let events: Vec<Value> = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-        events.into_iter().find(|e| e["type"] == "Submitted").unwrap()["payload"].clone()
+        let out = self
+            .cmd_as(Mode::Plain, &["events", id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let events: Vec<Value> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        events
+            .into_iter()
+            .find(|e| e["type"] == "Submitted")
+            .unwrap()["payload"]
+            .clone()
     }
 
     /// `<home>/registry/images/python-stdlib-v1@<digest>/`.
     fn image_entry(&self, digest: &str) -> PathBuf {
-        self.home().join("registry/images").join(format!("python-stdlib-v1@{digest}"))
+        self.home()
+            .join("registry/images")
+            .join(format!("python-stdlib-v1@{digest}"))
     }
 
     /// Changes one byte of the registered `rootfs.squashfs` (the registry is read-only: the
@@ -1637,12 +2593,21 @@ impl Cli {
     /// rows in the journal, read straight from the database.
     fn task_footprint(&self) -> (Vec<String>, i64) {
         let dirs = fs::read_dir(self.home().join("tasks"))
-            .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+            .map(|d| {
+                d.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
             .unwrap_or_default();
         let db = self.home().join("agentos.db");
         let rows = if db.exists() {
             let conn = rusqlite::Connection::open(db).unwrap();
-            conn.query_row("SELECT COUNT(*) FROM events WHERE type = 'TaskCreated'", [], |r| r.get(0)).unwrap()
+            conn.query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'TaskCreated'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
         } else {
             0
         };
@@ -1650,7 +2615,11 @@ impl Cli {
     }
 
     fn assert_no_task(&self) {
-        assert_eq!(self.task_footprint(), (Vec::new(), 0), "a refused submission left a task behind");
+        assert_eq!(
+            self.task_footprint(),
+            (Vec::new(), 0),
+            "a refused submission left a task behind"
+        );
     }
 }
 
@@ -1671,7 +2640,10 @@ fn submit_with_worker_firecracker_records_the_worker_image_version_and_host_kern
     assert_eq!(s["firecracker_version"], "fake");
     assert!(!s["host_kernel"].as_str().unwrap().is_empty(), "{s}");
     assert_eq!(s["jailed"], false);
-    assert!(s.get("guest_image").is_none(), "the host worker's label is not recorded for a VM: {s}");
+    assert!(
+        s.get("guest_image").is_none(),
+        "the host worker's label is not recorded for a VM: {s}"
+    );
 }
 
 #[test]
@@ -1679,12 +2651,32 @@ fn fake_launcher_records_jailed_false() {
     let cli = Cli::bare();
     cli.register_guest_image();
     let contract = cli.contract(&cli.repo_copy());
-    let assert = cli.cmd_as(Mode::Fake, &["submit", &contract, "--fake-agent-patch", fix_patch().to_str().unwrap()]).assert().success();
+    let assert = cli
+        .cmd_as(
+            Mode::Fake,
+            &[
+                "submit",
+                &contract,
+                "--fake-agent-patch",
+                fix_patch().to_str().unwrap(),
+            ],
+        )
+        .assert()
+        .success();
     let stderr = stderr_of(&assert);
-    assert!(!stderr.contains("warning"), "no probe, no warning: {stderr}");
-    let id = serde_json::from_slice::<Value>(&assert.get_output().stdout).unwrap()["task_id"].as_str().unwrap().to_string();
+    assert!(
+        !stderr.contains("warning"),
+        "no probe, no warning: {stderr}"
+    );
+    let id = serde_json::from_slice::<Value>(&assert.get_output().stdout).unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert_eq!(cli.submitted(&id)["jailed"], false);
-    let assert = cli.cmd_as(Mode::PlainFake, &["resume", &id]).assert().success();
+    let assert = cli
+        .cmd_as(Mode::PlainFake, &["resume", &id])
+        .assert()
+        .success();
     assert!(!stderr_of(&assert).contains("warning"));
     assert_eq!(cli.status(&id)["state"], "SUCCEEDED");
 }
@@ -1705,12 +2697,20 @@ fn submit_refuses_when_the_jailer_is_unavailable_and_the_task_is_untouched() {
         .stderr(predicate::str::contains(format!(
             "firecracker worker unavailable: jailer unavailable: {NEEDS_ROOT}; pass --allow-unjailed to run Firecracker without a jail as the current user"
         )));
-    assert_eq!(cli.task_footprint(), before, "no task directory, no TaskCreated row");
+    assert_eq!(
+        cli.task_footprint(),
+        before,
+        "no task directory, no TaskCreated row"
+    );
     // On a fresh home: no task at all.
     let fresh = Cli::bare();
     fresh.register_guest_image();
     let contract = fresh.contract(&fresh.repo_copy());
-    fresh.cmd_as(Mode::Fake, &["submit", &contract]).env("AGENTOS_TEST_JAIL_PROBE", format!("fail:{NEEDS_ROOT}")).assert().code(1);
+    fresh
+        .cmd_as(Mode::Fake, &["submit", &contract])
+        .env("AGENTOS_TEST_JAIL_PROBE", format!("fail:{NEEDS_ROOT}"))
+        .assert()
+        .code(1);
     fresh.assert_no_task();
 }
 
@@ -1720,15 +2720,37 @@ fn allow_unjailed_records_jailed_false_and_warns() {
     cli.register_guest_image();
     let contract = cli.contract(&cli.repo_copy());
     let assert = cli
-        .cmd_as(Mode::Fake, &["submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap(), "--allow-unjailed"])
+        .cmd_as(
+            Mode::Fake,
+            &[
+                "submit",
+                &contract,
+                "--yes",
+                "--fake-agent-patch",
+                fix_patch().to_str().unwrap(),
+                "--allow-unjailed",
+            ],
+        )
         .env("AGENTOS_TEST_JAIL_PROBE", format!("fail:{NEEDS_ROOT}"))
         .assert()
         .success();
-    let warnings: Vec<String> = stderr_of(&assert).lines().filter(|l| l.starts_with("warning:")).map(str::to_string).collect();
-    assert_eq!(warnings, [format!("warning: running Firecracker unjailed: {NEEDS_ROOT}")]);
+    let warnings: Vec<String> = stderr_of(&assert)
+        .lines()
+        .filter(|l| l.starts_with("warning:"))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        warnings,
+        [format!(
+            "warning: running Firecracker unjailed: {NEEDS_ROOT}"
+        )]
+    );
     let out: Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
     assert_eq!(out["state"], "SUCCEEDED");
-    assert_eq!(cli.submitted(out["task_id"].as_str().unwrap())["jailed"], false);
+    assert_eq!(
+        cli.submitted(out["task_id"].as_str().unwrap())["jailed"],
+        false
+    );
 }
 
 #[test]
@@ -1737,12 +2759,24 @@ fn agentos_allow_unjailed_env_is_the_flag() {
     cli.register_guest_image();
     let contract = cli.contract(&cli.repo_copy());
     let probe = format!("fail:{NEEDS_ROOT}");
-    let assert = cli.cmd_as(Mode::Fake, &["submit", &contract]).env("AGENTOS_TEST_JAIL_PROBE", &probe).env("AGENTOS_ALLOW_UNJAILED", "1").assert().success();
+    let assert = cli
+        .cmd_as(Mode::Fake, &["submit", &contract])
+        .env("AGENTOS_TEST_JAIL_PROBE", &probe)
+        .env("AGENTOS_ALLOW_UNJAILED", "1")
+        .assert()
+        .success();
     assert!(stderr_of(&assert).contains("warning: running Firecracker unjailed"));
-    let id = serde_json::from_slice::<Value>(&assert.get_output().stdout).unwrap()["task_id"].as_str().unwrap().to_string();
+    let id = serde_json::from_slice::<Value>(&assert.get_output().stdout).unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert_eq!(cli.submitted(&id)["jailed"], false);
     // `0` is not the flag.
-    cli.cmd_as(Mode::Fake, &["submit", &contract]).env("AGENTOS_TEST_JAIL_PROBE", &probe).env("AGENTOS_ALLOW_UNJAILED", "0").assert().code(1);
+    cli.cmd_as(Mode::Fake, &["submit", &contract])
+        .env("AGENTOS_TEST_JAIL_PROBE", &probe)
+        .env("AGENTOS_ALLOW_UNJAILED", "0")
+        .assert()
+        .code(1);
 }
 
 #[test]
@@ -1753,14 +2787,26 @@ fn a_probe_that_passes_records_jailed_true() {
     // The launcher is still the fake guest (nothing is really jailed): the record reflects the
     // decision, which is what this pins.
     let assert = cli
-        .cmd_as(Mode::Fake, &["submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()])
+        .cmd_as(
+            Mode::Fake,
+            &[
+                "submit",
+                &contract,
+                "--yes",
+                "--fake-agent-patch",
+                fix_patch().to_str().unwrap(),
+            ],
+        )
         .env("AGENTOS_TEST_JAIL_PROBE", "ok")
         .assert()
         .success();
     assert!(!stderr_of(&assert).contains("warning"));
     let out: Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
     assert_eq!(out["state"], "SUCCEEDED");
-    assert_eq!(cli.submitted(out["task_id"].as_str().unwrap())["jailed"], true);
+    assert_eq!(
+        cli.submitted(out["task_id"].as_str().unwrap())["jailed"],
+        true
+    );
 }
 
 #[test]
@@ -1768,8 +2814,23 @@ fn a_task_submitted_jailed_refuses_to_run_unjailed_later() {
     let cli = Cli::bare();
     cli.register_guest_image();
     let contract = cli.contract(&cli.repo_copy());
-    let out = cli.cmd_as(Mode::Fake, &["submit", &contract, "--fake-agent-patch", fix_patch().to_str().unwrap()]).env("AGENTOS_TEST_JAIL_PROBE", "ok").assert().success();
-    let id = serde_json::from_slice::<Value>(&out.get_output().stdout).unwrap()["task_id"].as_str().unwrap().to_string();
+    let out = cli
+        .cmd_as(
+            Mode::Fake,
+            &[
+                "submit",
+                &contract,
+                "--fake-agent-patch",
+                fix_patch().to_str().unwrap(),
+            ],
+        )
+        .env("AGENTOS_TEST_JAIL_PROBE", "ok")
+        .assert()
+        .success();
+    let id = serde_json::from_slice::<Value>(&out.get_output().stdout).unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert_eq!(cli.submitted(&id)["jailed"], true);
     let events = cli.events(&id);
 
@@ -1780,18 +2841,34 @@ fn a_task_submitted_jailed_refuses_to_run_unjailed_later() {
         }
         let assert = cmd.assert().code(1).stdout("");
         let stderr = stderr_of(&assert);
-        assert!(stderr.contains("task was submitted jailed: jailer unavailable: "), "{stderr}");
+        assert!(
+            stderr.contains("task was submitted jailed: jailer unavailable: "),
+            "{stderr}"
+        );
         if probe.is_some() {
-            assert!(stderr.contains("task was submitted jailed: jailer unavailable: jailer gone"), "{stderr}");
+            assert!(
+                stderr.contains("task was submitted jailed: jailer unavailable: jailer gone"),
+                "{stderr}"
+            );
         }
         assert_eq!(cli.events(&id), events, "the task is untouched");
         assert_eq!(cli.status(&id)["state"], "READY");
         assert!(job_dirs(&cli).is_empty());
     }
-    cli.cmd_as(Mode::PlainFake, &["cancel", &id]).env("AGENTOS_TEST_JAIL_PROBE", "fail:jailer gone").assert().success();
+    cli.cmd_as(Mode::PlainFake, &["cancel", &id])
+        .env("AGENTOS_TEST_JAIL_PROBE", "fail:jailer gone")
+        .assert()
+        .success();
     // Cancelling a READY task needs no worker; the refusal is about running.
-    let ok = cli.cmd_as(Mode::PlainFake, &["resume", &id]).env("AGENTOS_TEST_JAIL_PROBE", "ok").assert().success();
-    assert_eq!(serde_json::from_slice::<Value>(&ok.get_output().stdout).unwrap()["state"], "CANCELLED");
+    let ok = cli
+        .cmd_as(Mode::PlainFake, &["resume", &id])
+        .env("AGENTOS_TEST_JAIL_PROBE", "ok")
+        .assert()
+        .success();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&ok.get_output().stdout).unwrap()["state"],
+        "CANCELLED"
+    );
 }
 
 #[test]
@@ -1801,15 +2878,37 @@ fn a_task_submitted_unjailed_resumes_without_the_flag() {
     let contract = cli.contract(&cli.repo_copy());
     let probe = format!("fail:{NEEDS_ROOT}");
     let out = cli
-        .cmd_as(Mode::Fake, &["submit", &contract, "--fake-agent-patch", fix_patch().to_str().unwrap(), "--allow-unjailed"])
+        .cmd_as(
+            Mode::Fake,
+            &[
+                "submit",
+                &contract,
+                "--fake-agent-patch",
+                fix_patch().to_str().unwrap(),
+                "--allow-unjailed",
+            ],
+        )
         .env("AGENTOS_TEST_JAIL_PROBE", &probe)
         .assert()
         .success();
-    let id = serde_json::from_slice::<Value>(&out.get_output().stdout).unwrap()["task_id"].as_str().unwrap().to_string();
+    let id = serde_json::from_slice::<Value>(&out.get_output().stdout).unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert_eq!(cli.submitted(&id)["jailed"], false);
-    let assert = cli.cmd_as(Mode::PlainFake, &["resume", &id]).env("AGENTOS_TEST_JAIL_PROBE", &probe).assert().success();
-    assert!(!stderr_of(&assert).contains("warning"), "the acknowledgement was given at submit");
-    assert_eq!(serde_json::from_slice::<Value>(&assert.get_output().stdout).unwrap()["state"], "SUCCEEDED");
+    let assert = cli
+        .cmd_as(Mode::PlainFake, &["resume", &id])
+        .env("AGENTOS_TEST_JAIL_PROBE", &probe)
+        .assert()
+        .success();
+    assert!(
+        !stderr_of(&assert).contains("warning"),
+        "the acknowledgement was given at submit"
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&assert.get_output().stdout).unwrap()["state"],
+        "SUCCEEDED"
+    );
 }
 
 #[test]
@@ -1817,11 +2916,21 @@ fn status_prints_jailed() {
     let cli = Cli::bare();
     cli.register_guest_image();
     let contract = cli.contract(&cli.repo_copy());
-    for (probe, flag, jailed) in [("ok", None, true), ("fail:no jailer", Some("--allow-unjailed"), false)] {
+    for (probe, flag, jailed) in [
+        ("ok", None, true),
+        ("fail:no jailer", Some("--allow-unjailed"), false),
+    ] {
         let mut args = vec!["submit", contract.as_str()];
         args.extend(flag);
-        let out = cli.cmd_as(Mode::Fake, &args).env("AGENTOS_TEST_JAIL_PROBE", probe).assert().success();
-        let id = serde_json::from_slice::<Value>(&out.get_output().stdout).unwrap()["task_id"].as_str().unwrap().to_string();
+        let out = cli
+            .cmd_as(Mode::Fake, &args)
+            .env("AGENTOS_TEST_JAIL_PROBE", probe)
+            .assert()
+            .success();
+        let id = serde_json::from_slice::<Value>(&out.get_output().stdout).unwrap()["task_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
         assert_eq!(cli.json_as(Mode::Plain, &["status", &id])["jailed"], jailed);
     }
 }
@@ -1833,9 +2942,24 @@ fn submit_without_the_flag_records_worker_host_and_no_image_fields() {
     let s = cli.submitted(out["task_id"].as_str().unwrap());
     let keys: BTreeSet<&str> = s.as_object().unwrap().keys().map(String::as_str).collect();
     let three_a = [
-        "contract_digest", "repository_source", "repository_digest", "profile_id", "profile_digest", "guest_image", "model", "fake_agent_patch_digest",
+        "contract_digest",
+        "repository_source",
+        "repository_digest",
+        "profile_id",
+        "profile_digest",
+        "guest_image",
+        "model",
+        "fake_agent_patch_digest",
     ];
-    let expected: BTreeSet<&str> = three_a.into_iter().chain(["worker", "model_endpoint", "model_limits_version", "model_policy_version"]).collect();
+    let expected: BTreeSet<&str> = three_a
+        .into_iter()
+        .chain([
+            "worker",
+            "model_endpoint",
+            "model_limits_version",
+            "model_policy_version",
+        ])
+        .collect();
     assert_eq!(keys, expected, "submission provenance, no image fields");
     assert_eq!(s["worker"], "host");
     assert_eq!(s["guest_image"], "fixture-executor-v0");
@@ -1847,11 +2971,21 @@ fn agentos_worker_env_selects_the_worker() {
     cli.register_guest_image();
     let contract = cli.contract(&cli.repo_copy());
     for (worker, expected) in [("firecracker", "firecracker"), ("host", "host")] {
-        let out = cli.cmd_as(Mode::PlainFake, &["submit", &contract]).env("AGENTOS_WORKER", worker).assert().success();
-        let id = serde_json::from_slice::<Value>(&out.get_output().stdout).unwrap()["task_id"].as_str().unwrap().to_string();
+        let out = cli
+            .cmd_as(Mode::PlainFake, &["submit", &contract])
+            .env("AGENTOS_WORKER", worker)
+            .assert()
+            .success();
+        let id = serde_json::from_slice::<Value>(&out.get_output().stdout).unwrap()["task_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
         assert_eq!(cli.submitted(&id)["worker"], expected);
     }
-    cli.cmd_as(Mode::Plain, &["submit", &contract]).env("AGENTOS_WORKER", "qemu").assert().code(2);
+    cli.cmd_as(Mode::Plain, &["submit", &contract])
+        .env("AGENTOS_WORKER", "qemu")
+        .assert()
+        .code(2);
 }
 
 #[test]
@@ -1859,7 +2993,15 @@ fn later_commands_use_the_recorded_worker_and_a_disagreeing_flag_exits_2() {
     let cli = Cli::bare();
     cli.register_guest_image();
     let contract = cli.contract(&cli.repo_copy());
-    let ready = cli.json_as(Mode::Fake, &["submit", &contract, "--fake-agent-patch", fix_patch().to_str().unwrap()]);
+    let ready = cli.json_as(
+        Mode::Fake,
+        &[
+            "submit",
+            &contract,
+            "--fake-agent-patch",
+            fix_patch().to_str().unwrap(),
+        ],
+    );
     let id = ready["task_id"].as_str().unwrap().to_string();
     let events = cli.events(&id);
     let bundle = cli.path("refused-bundle");
@@ -1874,28 +3016,69 @@ fn later_commands_use_the_recorded_worker_and_a_disagreeing_flag_exits_2() {
     ] {
         let mut args: Vec<&str> = args;
         args.extend(["--worker", "host"]);
-        cli.cmd_as(Mode::PlainFake, &args).assert().code(2).stdout("").stderr(predicate::str::contains("task was submitted with worker firecracker"));
+        cli.cmd_as(Mode::PlainFake, &args)
+            .assert()
+            .code(2)
+            .stdout("")
+            .stderr(predicate::str::contains(
+                "task was submitted with worker firecracker",
+            ));
     }
     assert_eq!(cli.events(&id), events, "the task is untouched");
     assert!(!bundle.exists());
-    assert!(cli.grants(&id).is_empty(), "nothing approved, nothing revoked");
+    assert!(
+        cli.grants(&id).is_empty(),
+        "nothing approved, nothing revoked"
+    );
     // Without the flag every command uses the record.
-    assert_eq!(cli.json_as(Mode::PlainFake, &["resume", &id])["state"], "SUCCEEDED");
-    assert_eq!(cli.json_as(Mode::Plain, &["status", &id])["worker"], "firecracker");
-    assert!(!cli.cmd_as(Mode::Plain, &["events", &id]).assert().success().get_output().stdout.is_empty());
-    assert_eq!(cli.json_as(Mode::Fake, &["status", &id])["state"], "SUCCEEDED", "an agreeing flag is fine");
+    assert_eq!(
+        cli.json_as(Mode::PlainFake, &["resume", &id])["state"],
+        "SUCCEEDED"
+    );
+    assert_eq!(
+        cli.json_as(Mode::Plain, &["status", &id])["worker"],
+        "firecracker"
+    );
+    assert!(
+        !cli.cmd_as(Mode::Plain, &["events", &id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .is_empty()
+    );
+    assert_eq!(
+        cli.json_as(Mode::Fake, &["status", &id])["state"],
+        "SUCCEEDED",
+        "an agreeing flag is fine"
+    );
     let dir = cli.path("bundle");
-    assert_eq!(cli.json_as(Mode::Plain, &["export", &id, dir.to_str().unwrap()])["state"], "SUCCEEDED");
+    assert_eq!(
+        cli.json_as(Mode::Plain, &["export", &id, dir.to_str().unwrap()])["state"],
+        "SUCCEEDED"
+    );
     // And the other way round.
-    let host = cli.json_as(Mode::Plain, &["submit", &contract])["task_id"].as_str().unwrap().to_string();
-    cli.cmd_as(Mode::Fake, &["resume", &host]).assert().code(2).stderr(predicate::str::contains("task was submitted with worker host"));
+    let host = cli.json_as(Mode::Plain, &["submit", &contract])["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    cli.cmd_as(Mode::Fake, &["resume", &host])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "task was submitted with worker host",
+        ));
 }
 
 fn contract_with_limits(cli: &Cli, vcpus: u32, memory: u32) -> String {
-    let mut contract: Value = serde_json::from_str(&fs::read_to_string(cli.contract(&cli.repo_copy())).unwrap()).unwrap();
+    let mut contract: Value =
+        serde_json::from_str(&fs::read_to_string(cli.contract(&cli.repo_copy())).unwrap()).unwrap();
     contract["limits"]["worker_vcpus"] = json!(vcpus);
     contract["limits"]["worker_memory_mib"] = json!(memory);
-    cli.write(&format!("limits-{vcpus}-{memory}.json"), &contract.to_string())
+    cli.write(
+        &format!("limits-{vcpus}-{memory}.json"),
+        &contract.to_string(),
+    )
 }
 
 #[test]
@@ -1903,23 +3086,55 @@ fn firecracker_limits_are_validated_at_submit() {
     let cli = Cli::bare();
     cli.register_guest_image();
     for (vcpus, memory, message) in [
-        (33, 256, "limit worker_vcpus must be at most 32 for the firecracker worker"),
-        (1, 127, "limit worker_memory_mib must be at least 128 for the firecracker worker"),
+        (
+            33,
+            256,
+            "limit worker_vcpus must be at most 32 for the firecracker worker",
+        ),
+        (
+            1,
+            127,
+            "limit worker_memory_mib must be at least 128 for the firecracker worker",
+        ),
     ] {
         let contract = contract_with_limits(&cli, vcpus, memory);
         let before = cli.task_footprint();
-        cli.cmd_as(Mode::Fake, &["submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()])
-            .assert()
-            .code(2)
-            .stdout("")
-            .stderr(predicate::str::contains(message));
+        cli.cmd_as(
+            Mode::Fake,
+            &[
+                "submit",
+                &contract,
+                "--yes",
+                "--fake-agent-patch",
+                fix_patch().to_str().unwrap(),
+            ],
+        )
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(predicate::str::contains(message));
         // Even where the preflight itself cannot pass (no /dev/kvm), a limit is a usage error.
-        cli.cmd_as(Mode::Plain, &["--worker", "firecracker", "submit", &contract]).assert().code(2).stderr(predicate::str::contains(message));
+        cli.cmd_as(
+            Mode::Plain,
+            &["--worker", "firecracker", "submit", &contract],
+        )
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(message));
         assert_eq!(cli.task_footprint(), before, "no task left behind");
         // The host worker accepts both.
-        assert_eq!(cli.json_as(Mode::Plain, &["submit", &contract])["state"], "READY");
+        assert_eq!(
+            cli.json_as(Mode::Plain, &["submit", &contract])["state"],
+            "READY"
+        );
     }
-    assert_eq!(cli.json_as(Mode::Fake, &["submit", &contract_with_limits(&cli, 32, 128)])["state"], "READY");
+    assert_eq!(
+        cli.json_as(
+            Mode::Fake,
+            &["submit", &contract_with_limits(&cli, 32, 128)]
+        )["state"],
+        "READY"
+    );
 }
 
 #[test]
@@ -1929,14 +3144,17 @@ fn submit_without_a_registered_image_exits_2() {
     cli.cmd_as(Mode::Fake, &["submit", &contract])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("guest image python-stdlib-v1 not found in the registry"))
+        .stderr(predicate::str::contains(
+            "guest image python-stdlib-v1 not found in the registry",
+        ))
         .stderr(predicate::str::contains("build and register it first"));
     cli.assert_no_task();
 }
 
 /// A contract over a repository copy pinning the guest image to `pin`.
 fn contract_pinning_image(cli: &Cli, pin: &str) -> String {
-    let mut contract: Value = serde_json::from_str(&fs::read_to_string(cli.contract(&cli.repo_copy())).unwrap()).unwrap();
+    let mut contract: Value =
+        serde_json::from_str(&fs::read_to_string(cli.contract(&cli.repo_copy())).unwrap()).unwrap();
     contract["guest_image_digest"] = json!(pin);
     cli.write(&format!("image-pin-{pin}.json"), &contract.to_string())
 }
@@ -1946,11 +3164,17 @@ fn a_pinned_guest_image_digest_must_be_registered() {
     let cli = Cli::bare();
     let digest = cli.register_guest_image();
     let missing = contract_pinning_image(&cli, &"0".repeat(64));
-    cli.cmd_as(Mode::Fake, &["submit", &missing]).assert().code(2).stderr(predicate::str::contains("is not in the registry"));
+    cli.cmd_as(Mode::Fake, &["submit", &missing])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("is not in the registry"));
     cli.assert_no_task();
     let out = cli.submit_fc(&contract_pinning_image(&cli, &digest), &[]);
     assert_eq!(out["state"], "SUCCEEDED");
-    assert_eq!(cli.submitted(out["task_id"].as_str().unwrap())["guest_image_digest"], digest.as_str());
+    assert_eq!(
+        cli.submitted(out["task_id"].as_str().unwrap())["guest_image_digest"],
+        digest.as_str()
+    );
 }
 
 #[test]
@@ -1960,14 +3184,24 @@ fn submit_with_a_pin_uses_exactly_that_image_even_if_a_newer_entry_exists() {
     // Registration times are milliseconds: make sure the second entry is strictly newer.
     std::thread::sleep(std::time::Duration::from_millis(20));
     let newer_dir = fake_image_dir(&cli, "guest-image-2", "python-stdlib-v1", 0x69);
-    let newer = register_image(&cli, &newer_dir)["digest"].as_str().unwrap().to_string();
+    let newer = register_image(&cli, &newer_dir)["digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert_ne!(older, newer);
 
     let pinned = cli.submit_fc(&contract_pinning_image(&cli, &older), &[]);
     assert_eq!(pinned["state"], "SUCCEEDED");
-    assert_eq!(cli.submitted(pinned["task_id"].as_str().unwrap())["guest_image_digest"], older.as_str());
+    assert_eq!(
+        cli.submitted(pinned["task_id"].as_str().unwrap())["guest_image_digest"],
+        older.as_str()
+    );
     let unpinned = cli.json_as(Mode::Fake, &["submit", &cli.contract(&cli.repo_copy())]);
-    assert_eq!(cli.submitted(unpinned["task_id"].as_str().unwrap())["guest_image_digest"], newer.as_str(), "no pin: the newest entry");
+    assert_eq!(
+        cli.submitted(unpinned["task_id"].as_str().unwrap())["guest_image_digest"],
+        newer.as_str(),
+        "no pin: the newest entry"
+    );
 }
 
 #[test]
@@ -1976,15 +3210,31 @@ fn preflight_failure_exits_1_before_the_task_is_touched() {
     let digest = cli.register_guest_image();
     cli.tamper_image(&digest);
     let contract = cli.contract(&cli.repo_copy());
-    cli.cmd_as(Mode::Fake, &["submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()])
-        .assert()
-        .code(1)
-        .stdout("")
-        .stderr(predicate::str::contains("firecracker worker unavailable: guest image digest mismatch"));
+    cli.cmd_as(
+        Mode::Fake,
+        &[
+            "submit",
+            &contract,
+            "--yes",
+            "--fake-agent-patch",
+            fix_patch().to_str().unwrap(),
+        ],
+    )
+    .assert()
+    .code(1)
+    .stdout("")
+    .stderr(predicate::str::contains(
+        "firecracker worker unavailable: guest image digest mismatch",
+    ));
     cli.assert_no_task();
 
     // The real launcher, without /dev/kvm.
-    if fs::File::options().read(true).write(true).open("/dev/kvm").is_ok() {
+    if fs::File::options()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm")
+        .is_ok()
+    {
         println!("SKIPPED the /dev/kvm variant: /dev/kvm is usable here");
         return;
     }
@@ -1992,12 +3242,25 @@ fn preflight_failure_exits_1_before_the_task_is_touched() {
     fresh.register_guest_image();
     let contract = fresh.contract(&fresh.repo_copy());
     fresh
-        .cmd_as(Mode::Plain, &["--worker", "firecracker", "submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()])
+        .cmd_as(
+            Mode::Plain,
+            &[
+                "--worker",
+                "firecracker",
+                "submit",
+                &contract,
+                "--yes",
+                "--fake-agent-patch",
+                fix_patch().to_str().unwrap(),
+            ],
+        )
         .env("AGENTOS_TEST_WORKERS", "1")
         .assert()
         .code(1)
         .stdout("")
-        .stderr(predicate::str::contains("firecracker worker unavailable: /dev/kvm: "));
+        .stderr(predicate::str::contains(
+            "firecracker worker unavailable: /dev/kvm: ",
+        ));
     fresh.assert_no_task();
 }
 
@@ -2006,7 +3269,18 @@ fn a_tampered_registered_image_fails_the_preflight_before_the_task_is_touched() 
     let cli = Cli::bare();
     let digest = cli.register_guest_image();
     let contract = cli.contract(&cli.repo_copy());
-    let id = cli.json_as(Mode::Fake, &["submit", &contract, "--fake-agent-patch", fix_patch().to_str().unwrap()])["task_id"].as_str().unwrap().to_string();
+    let id = cli.json_as(
+        Mode::Fake,
+        &[
+            "submit",
+            &contract,
+            "--fake-agent-patch",
+            fix_patch().to_str().unwrap(),
+        ],
+    )["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let events = cli.events(&id);
     cli.tamper_image(&digest);
 
@@ -2014,7 +3288,9 @@ fn a_tampered_registered_image_fails_the_preflight_before_the_task_is_touched() 
         .assert()
         .code(1)
         .stdout("")
-        .stderr(predicate::str::contains(format!("firecracker worker unavailable: guest image digest mismatch: pinned {digest}")));
+        .stderr(predicate::str::contains(format!(
+            "firecracker worker unavailable: guest image digest mismatch: pinned {digest}"
+        )));
     assert_eq!(cli.status(&id)["state"], "READY");
     assert_eq!(cli.events(&id), events, "no new events");
     assert!(cli.grants(&id).is_empty(), "not even approved");
@@ -2027,7 +3303,18 @@ fn a_recorded_image_that_is_no_longer_registered_fails_before_the_task_is_touche
     let cli = Cli::bare();
     let digest = cli.register_guest_image();
     let contract = cli.contract(&cli.repo_copy());
-    let id = cli.json_as(Mode::Fake, &["submit", &contract, "--fake-agent-patch", fix_patch().to_str().unwrap()])["task_id"].as_str().unwrap().to_string();
+    let id = cli.json_as(
+        Mode::Fake,
+        &[
+            "submit",
+            &contract,
+            "--fake-agent-patch",
+            fix_patch().to_str().unwrap(),
+        ],
+    )["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let events = cli.events(&id);
     let entry = cli.image_entry(&digest);
     fs::set_permissions(&entry, fs::Permissions::from_mode(0o755)).unwrap();
@@ -2035,7 +3322,9 @@ fn a_recorded_image_that_is_no_longer_registered_fails_before_the_task_is_touche
     cli.cmd_as(Mode::PlainFake, &["resume", &id])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains(format!("recorded guest image python-stdlib-v1@{digest} is no longer registered")));
+        .stderr(predicate::str::contains(format!(
+            "recorded guest image python-stdlib-v1@{digest} is no longer registered"
+        )));
     assert_eq!(cli.events(&id), events);
 }
 
@@ -2044,15 +3333,27 @@ fn status_prints_worker_and_guest_image() {
     let cli = Cli::bare();
     let digest = cli.register_guest_image();
     let contract = cli.contract(&cli.repo_copy());
-    let fc = cli.submit_fc(&contract, &[])["task_id"].as_str().unwrap().to_string();
+    let fc = cli.submit_fc(&contract, &[])["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let status = cli.json_as(Mode::Plain, &["status", &fc]);
     assert_eq!(status["worker"], "firecracker");
-    assert_eq!(status["guest_image"], json!({ "id": "python-stdlib-v1", "digest": digest }));
+    assert_eq!(
+        status["guest_image"],
+        json!({ "id": "python-stdlib-v1", "digest": digest })
+    );
     assert_eq!(status["jailed"], false);
-    let host = cli.json_as(Mode::Plain, &["submit", &contract])["task_id"].as_str().unwrap().to_string();
+    let host = cli.json_as(Mode::Plain, &["submit", &contract])["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let status = cli.json_as(Mode::Plain, &["status", &host]);
     assert_eq!(status["worker"], "host");
-    assert!(status.get("guest_image").is_none() && status.get("jailed").is_none(), "{status}");
+    assert!(
+        status.get("guest_image").is_none() && status.get("jailed").is_none(),
+        "{status}"
+    );
 }
 
 #[test]
@@ -2060,22 +3361,39 @@ fn manifest_names_the_guest_image_for_firecracker_tasks_and_omits_it_for_host_ta
     let cli = Cli::bare();
     let digest = cli.register_guest_image();
     let contract = cli.contract(&cli.repo_copy());
-    let fc = cli.submit_fc(&contract, &[])["task_id"].as_str().unwrap().to_string();
+    let fc = cli.submit_fc(&contract, &[])["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let dir = cli.path("fc-bundle");
     let manifest = cli.json_as(Mode::Plain, &["export", &fc, dir.to_str().unwrap()]);
     assert_eq!(manifest["guest_image_digest"], digest.as_str());
-    let host = cli.json_as(Mode::Plain, &["submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()])["task_id"]
+    let host = cli.json_as(
+        Mode::Plain,
+        &[
+            "submit",
+            &contract,
+            "--yes",
+            "--fake-agent-patch",
+            fix_patch().to_str().unwrap(),
+        ],
+    )["task_id"]
         .as_str()
         .unwrap()
         .to_string();
     let dir = cli.path("host-bundle");
     let manifest = cli.json_as(Mode::Plain, &["export", &host, dir.to_str().unwrap()]);
     assert!(manifest.get("guest_image_digest").is_none(), "{manifest}");
-    assert!(!fs::read_to_string(dir.join("manifest.json")).unwrap().contains("guest_image_digest"));
+    assert!(
+        !fs::read_to_string(dir.join("manifest.json"))
+            .unwrap()
+            .contains("guest_image_digest")
+    );
 }
 
 #[test]
-fn firecracker_task_runs_to_succeeded_with_the_fake_guest_and_host_paths_do_not_appear_in_evidence() {
+fn firecracker_task_runs_to_succeeded_with_the_fake_guest_and_host_paths_do_not_appear_in_evidence()
+{
     let cli = Cli::bare();
     cli.register_guest_image();
     let out = cli.submit_fc(&cli.contract(&cli.repo_copy()), &[]);
@@ -2090,7 +3408,11 @@ fn firecracker_task_runs_to_succeeded_with_the_fake_guest_and_host_paths_do_not_
         let evidence: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
         for stream in ["stdout", "stderr"] {
             if let Some(text) = evidence.get(stream).and_then(Value::as_str) {
-                assert!(!text.contains(&home), "{stream} of {} names the home: {text}", file.display());
+                assert!(
+                    !text.contains(&home),
+                    "{stream} of {} names the home: {text}",
+                    file.display()
+                );
                 checked += 1;
             }
         }
@@ -2104,7 +3426,11 @@ fn firecracker_task_runs_to_succeeded_with_the_fake_guest_and_host_paths_do_not_
 fn wait_for_no_home_processes(cli: &Cli, bound: std::time::Duration) {
     let started = std::time::Instant::now();
     while !processes_mentioning(cli.home().to_str().unwrap()).is_empty() {
-        assert!(started.elapsed() < bound, "processes still name the home after {bound:?}: {:?}", processes_mentioning(cli.home().to_str().unwrap()));
+        assert!(
+            started.elapsed() < bound,
+            "processes still name the home after {bound:?}: {:?}",
+            processes_mentioning(cli.home().to_str().unwrap())
+        );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
@@ -2112,14 +3438,25 @@ fn wait_for_no_home_processes(cli: &Cli, bound: std::time::Duration) {
 /// A Firecracker task (fake guest) whose controller died right after launching a 30 s
 /// verification: the supervisor and the guest outlive it. `probe` is the jail probe answer at
 /// submission. Returns the profiles registry, the task id and the image digest.
-fn fc_task_with_a_running_slow_verification(cli: &Cli, probe: Option<&str>) -> (PathBuf, String, String) {
+fn fc_task_with_a_running_slow_verification(
+    cli: &Cli,
+    probe: Option<&str>,
+) -> (PathBuf, String, String) {
     let digest = cli.register_guest_image();
     let (profiles, contract) = slow_world(cli);
     let mut cmd = Command::from_std(cli.std_cmd(
         Mode::Fake,
         false,
         &profiles,
-        &["submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap(), "--crash-at", "during-execute:run_verification"],
+        &[
+            "submit",
+            &contract,
+            "--yes",
+            "--fake-agent-patch",
+            fix_patch().to_str().unwrap(),
+            "--crash-at",
+            "during-execute:run_verification",
+        ],
     ));
     if let Some(p) = probe {
         cmd.env("AGENTOS_TEST_JAIL_PROBE", p);
@@ -2128,7 +3465,10 @@ fn fc_task_with_a_running_slow_verification(cli: &Cli, probe: Option<&str>) -> (
     wait_for_verification_job(cli);
     let id = first_task(cli);
     assert_eq!(cli.submitted(&id)["worker"], "firecracker");
-    assert!(!processes_mentioning(cli.home().to_str().unwrap()).is_empty(), "the verification job outlived its controller");
+    assert!(
+        !processes_mentioning(cli.home().to_str().unwrap()).is_empty(),
+        "the verification job outlived its controller"
+    );
     (profiles, id, digest)
 }
 
@@ -2139,27 +3479,53 @@ fn cancel_records_its_intent_and_stops_running_jobs_even_when_the_worker_cannot_
     let cli = Cli::bare();
     let (profiles, id, digest) = fc_task_with_a_running_slow_verification(&cli, None);
     cli.tamper_image(&digest);
-    let assert = Command::from_std(cli.std_cmd(Mode::PlainFake, false, &profiles, &["cancel", &id])).assert().code(1).stdout("");
+    let assert =
+        Command::from_std(cli.std_cmd(Mode::PlainFake, false, &profiles, &["cancel", &id]))
+            .assert()
+            .code(1)
+            .stdout("");
     let stderr = stderr_of(&assert);
-    assert!(stderr.contains("firecracker worker unavailable: guest image digest mismatch"), "{stderr}");
-    assert!(stderr.contains("the cancel is requested and completes on a later"), "{stderr}");
+    assert!(
+        stderr.contains("firecracker worker unavailable: guest image digest mismatch"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("the cancel is requested and completes on a later"),
+        "{stderr}"
+    );
     let status = cli.json_as(Mode::Plain, &["status", &id]);
     assert_eq!(status["cancel_requested"], true, "{status}");
-    assert!(!TERMINAL.contains(&status["state"].as_str().unwrap()), "{status}");
-    assert!(cli.event_types(&id).contains(&"CancelRequested".to_string()));
+    assert!(
+        !TERMINAL.contains(&status["state"].as_str().unwrap()),
+        "{status}"
+    );
+    assert!(
+        cli.event_types(&id)
+            .contains(&"CancelRequested".to_string())
+    );
     wait_for_no_home_processes(&cli, std::time::Duration::from_secs(15));
 
     // Recorded jailed, jailer gone: the jail recheck fails.
     let cli = Cli::bare();
     let (profiles, id, _) = fc_task_with_a_running_slow_verification(&cli, Some("ok"));
-    let assert = Command::from_std(cli.std_cmd(Mode::PlainFake, false, &profiles, &["cancel", &id]))
-        .env("AGENTOS_TEST_JAIL_PROBE", "fail:jailer gone")
-        .assert()
-        .code(1);
-    assert!(stderr_of(&assert).contains("task was submitted jailed: jailer unavailable: jailer gone"));
-    assert_eq!(cli.json_as(Mode::Plain, &["status", &id])["cancel_requested"], true);
+    let assert =
+        Command::from_std(cli.std_cmd(Mode::PlainFake, false, &profiles, &["cancel", &id]))
+            .env("AGENTOS_TEST_JAIL_PROBE", "fail:jailer gone")
+            .assert()
+            .code(1);
+    assert!(
+        stderr_of(&assert).contains("task was submitted jailed: jailer unavailable: jailer gone")
+    );
+    assert_eq!(
+        cli.json_as(Mode::Plain, &["status", &id])["cancel_requested"],
+        true
+    );
     wait_for_no_home_processes(&cli, std::time::Duration::from_secs(15));
-    assert!(started.elapsed() < std::time::Duration::from_secs(50), "the 30 s checks were stopped, took {:?}", started.elapsed());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(50),
+        "the 30 s checks were stopped, took {:?}",
+        started.elapsed()
+    );
 }
 
 #[test]
@@ -2168,16 +3534,28 @@ fn revoke_stops_a_running_job_even_when_the_worker_cannot_run() {
     let cli = Cli::bare();
     let (profiles, id, digest) = fc_task_with_a_running_slow_verification(&cli, Some("ok"));
     cli.tamper_image(&digest);
-    let out = Command::from_std(cli.std_cmd(Mode::PlainFake, false, &profiles, &["revoke", &id, "--capability", "verification.run"]))
-        .env("AGENTOS_TEST_JAIL_PROBE", "fail:jailer gone")
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    assert_eq!(serde_json::from_slice::<Value>(&out).unwrap(), json!({ "task_id": id, "revoked": ["verification.run"], "cancelled_jobs": 1 }));
+    let out = Command::from_std(cli.std_cmd(
+        Mode::PlainFake,
+        false,
+        &profiles,
+        &["revoke", &id, "--capability", "verification.run"],
+    ))
+    .env("AGENTOS_TEST_JAIL_PROBE", "fail:jailer gone")
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out).unwrap(),
+        json!({ "task_id": id, "revoked": ["verification.run"], "cancelled_jobs": 1 })
+    );
     wait_for_no_home_processes(&cli, std::time::Duration::from_secs(15));
-    assert!(started.elapsed() < std::time::Duration::from_secs(25), "the 30 s check was stopped, took {:?}", started.elapsed());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(25),
+        "the 30 s check was stopped, took {:?}",
+        started.elapsed()
+    );
 }
 
 // ---------------------------------------------------------------------------------------
@@ -2190,12 +3568,29 @@ fn revoke_stops_a_running_job_even_when_the_worker_cannot_run() {
 fn jailer_unavailable_refuses_before_the_task_is_touched() {
     let Some(kvm) = kvm::require() else { return };
     let cli = Cli::bare();
-    cli.json_as(Mode::Plain, &["image", "register", kvm.image_dir.to_str().unwrap()]);
+    cli.json_as(
+        Mode::Plain,
+        &["image", "register", kvm.image_dir.to_str().unwrap()],
+    );
     let contract = cli.contract(&cli.repo_copy());
     let patch = fix_patch();
     let submit = |extra: &[&str]| {
-        let mut cmd = cli.cmd_as(Mode::Plain, &["--worker", "firecracker", "submit", &contract, "--yes", "--fake-agent-patch", patch.to_str().unwrap()]);
-        cmd.arg("--firecracker").arg(&kvm.firecracker_bin).args(["--jailer", "/nonexistent/jailer"]).args(extra);
+        let mut cmd = cli.cmd_as(
+            Mode::Plain,
+            &[
+                "--worker",
+                "firecracker",
+                "submit",
+                &contract,
+                "--yes",
+                "--fake-agent-patch",
+                patch.to_str().unwrap(),
+            ],
+        );
+        cmd.arg("--firecracker")
+            .arg(&kvm.firecracker_bin)
+            .args(["--jailer", "/nonexistent/jailer"])
+            .args(extra);
         cmd
     };
     submit(&[]).assert().code(1).stdout("").stderr(predicate::str::contains(
@@ -2203,16 +3598,32 @@ fn jailer_unavailable_refuses_before_the_task_is_touched() {
     ));
     assert_nothing_recorded_but_the_registry(&cli);
 
-    let out = submit(&["--allow-unjailed"]).assert().success().get_output().stdout.clone();
+    let out = submit(&["--allow-unjailed"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
     let done: Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(done["state"], "SUCCEEDED", "{done}");
     let submitted = cli.submitted(done["task_id"].as_str().unwrap());
-    assert_eq!((submitted["jailed"].clone(), submitted["firecracker_version"].clone()), (json!(false), json!("Firecracker v1.17.0")), "{submitted}");
+    assert_eq!(
+        (
+            submitted["jailed"].clone(),
+            submitted["firecracker_version"].clone()
+        ),
+        (json!(false), json!("Firecracker v1.17.0")),
+        "{submitted}"
+    );
     assert_no_job_processes(&cli);
 }
 
 fn assert_nothing_recorded_but_the_registry(cli: &Cli) {
-    let names: Vec<String> = fs::read_dir(cli.home()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    let names: Vec<String> = fs::read_dir(cli.home())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
     assert_eq!(names, ["registry"], "the home holds {names:?}");
 }
 
@@ -2223,37 +3634,110 @@ fn assert_nothing_recorded_but_the_registry(cli: &Cli) {
 fn cli_jailed_submit_status_export_then_kill_and_resume_on_the_real_worker() {
     let Some(kvm) = kvm::require() else { return };
     let cli = Cli::bare();
-    cli.json_as(Mode::Plain, &["image", "register", kvm.image_dir.to_str().unwrap()]);
+    cli.json_as(
+        Mode::Plain,
+        &["image", "register", kvm.image_dir.to_str().unwrap()],
+    );
     let contract = cli.contract(&fixtures().join("parser-repo"));
     let patch = fix_patch();
     let real = |args: &[&str]| cli.cmd_as(Mode::Real, args);
 
-    let out = real(&["submit", &contract, "--yes", "--fake-agent-patch", patch.to_str().unwrap()]).assert().success().get_output().stdout.clone();
+    let out = real(&[
+        "submit",
+        &contract,
+        "--yes",
+        "--fake-agent-patch",
+        patch.to_str().unwrap(),
+    ])
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
     let done: Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(done["state"], "SUCCEEDED", "{done}");
     let id = done["task_id"].as_str().unwrap().to_string();
     let submitted = cli.submitted(&id);
-    assert_eq!((submitted["worker"].clone(), submitted["jailed"].clone()), (json!("firecracker"), json!(true)), "{submitted}");
-    let status: Value = serde_json::from_slice(&real(&["status", &id]).assert().success().get_output().stdout.clone()).unwrap();
-    assert_eq!((status["state"].clone(), status["jailed"].clone()), (json!("SUCCEEDED"), json!(true)), "{status}");
+    assert_eq!(
+        (submitted["worker"].clone(), submitted["jailed"].clone()),
+        (json!("firecracker"), json!(true)),
+        "{submitted}"
+    );
+    let status: Value = serde_json::from_slice(
+        &real(&["status", &id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        (status["state"].clone(), status["jailed"].clone()),
+        (json!("SUCCEEDED"), json!(true)),
+        "{status}"
+    );
     assert_eq!(status["verified_digest"], status["workspace_digest"]);
     let clean = cli.path("clean");
-    let expected: Value = serde_json::from_slice(&real(&["export", &id, clean.to_str().unwrap()]).assert().success().get_output().stdout.clone()).unwrap();
-    assert_eq!(expected["guest_image_digest"], submitted["guest_image_digest"], "{expected}");
+    let expected: Value = serde_json::from_slice(
+        &real(&["export", &id, clean.to_str().unwrap()])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        expected["guest_image_digest"], submitted["guest_image_digest"],
+        "{expected}"
+    );
 
-    let crashed = real(&["submit", &contract, "--yes", "--fake-agent-patch", patch.to_str().unwrap(), "--crash-at", "during-execute:apply_patch"])
-        .assert()
-        .code(75)
-        .get_output()
-        .stderr
-        .clone();
-    let crashed: Value = String::from_utf8_lossy(&crashed).lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).find(|v| v.get("crashed").is_some()).unwrap();
+    let crashed = real(&[
+        "submit",
+        &contract,
+        "--yes",
+        "--fake-agent-patch",
+        patch.to_str().unwrap(),
+        "--crash-at",
+        "during-execute:apply_patch",
+    ])
+    .assert()
+    .code(75)
+    .get_output()
+    .stderr
+    .clone();
+    let crashed: Value = String::from_utf8_lossy(&crashed)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v.get("crashed").is_some())
+        .unwrap();
     let id = crashed["task_id"].as_str().unwrap().to_string();
-    let resumed: Value = serde_json::from_slice(&real(&["resume", &id]).assert().success().get_output().stdout.clone()).unwrap();
+    let resumed: Value = serde_json::from_slice(
+        &real(&["resume", &id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
     assert_eq!(resumed, json!({ "task_id": id, "state": "SUCCEEDED" }));
     let recovered = cli.path("recovered");
-    let manifest: Value = serde_json::from_slice(&real(&["export", &id, recovered.to_str().unwrap()]).assert().success().get_output().stdout.clone()).unwrap();
-    assert_eq!(normalized(&manifest), normalized(&expected), "the recovered bundle equals the uncrashed one");
+    let manifest: Value = serde_json::from_slice(
+        &real(&["export", &id, recovered.to_str().unwrap()])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        normalized(&manifest),
+        normalized(&expected),
+        "the recovered bundle equals the uncrashed one"
+    );
     assert_one_job_per_effect(&cli, "after the controller's kill");
     assert_no_job_processes(&cli);
 }
@@ -2263,7 +3747,11 @@ fn cli_jailed_submit_status_export_then_kill_and_resume_on_the_real_worker() {
 /// `dump`, then runs the real check.
 fn env_dump_profiles(cli: &Cli, dump: &Path) -> PathBuf {
     let profiles = cli.path("env-dump-profiles");
-    copy_tree(&fixtures().join("profiles/parser-checks-v1"), &profiles.join("parser-checks-v1")).unwrap();
+    copy_tree(
+        &fixtures().join("profiles/parser-checks-v1"),
+        &profiles.join("parser-checks-v1"),
+    )
+    .unwrap();
     let script = format!(
         r#"p=$PPID; : > {d}
 while [ "$p" -gt 1 ]; do
@@ -2275,7 +3763,11 @@ exec python3 check_parser.py "$1""#,
         d = dump.display()
     );
     let profile = json!({ "id": "parser-checks-v1", "command": ["sh", "-c", script, "sh"], "protected": true });
-    fs::write(profiles.join("parser-checks-v1/profile.json"), profile.to_string()).unwrap();
+    fs::write(
+        profiles.join("parser-checks-v1/profile.json"),
+        profile.to_string(),
+    )
+    .unwrap();
     profiles
 }
 
@@ -2291,24 +3783,48 @@ fn test_switches_reach_the_supervisor_only_through_the_forwarding() {
         Mode::PlainFake,
         false,
         &profiles,
-        &["submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap()],
+        &[
+            "submit",
+            &contract,
+            "--yes",
+            "--fake-agent-patch",
+            fix_patch().to_str().unwrap(),
+        ],
     ));
     // The secret reaches the controller (a `Command::env`, never `set_var`).
     cmd.env("CARGO_CANARY", "sk-ant-canary-0123456789");
     cmd.assert().success();
     let text = fs::read_to_string(&dump).expect("the verification wrote its environment dump");
     let sections: Vec<&str> = text.split("@@@ ").filter(|s| !s.is_empty()).collect();
-    assert!(sections.len() >= 3, "worker, supervisor and controller expected:\n{text}");
+    assert!(
+        sections.len() >= 3,
+        "worker, supervisor and controller expected:\n{text}"
+    );
     let (controller, children) = sections.split_last().unwrap();
-    assert!(controller.contains("CARGO_CANARY=sk-ant-canary-0123456789"), "control: the controller holds the canary:\n{text}");
+    assert!(
+        controller.contains("CARGO_CANARY=sk-ant-canary-0123456789"),
+        "control: the controller holds the canary:\n{text}"
+    );
     for child in children {
-        assert!(!child.contains("CARGO_CANARY") && !child.contains("sk-ant-canary"), "a child inherited the controller's environment:\n{child}");
-        assert!(!child.contains("HOME=") && !child.contains("CARGO_MANIFEST_DIR="), "a child inherited the controller's environment:\n{child}");
+        assert!(
+            !child.contains("CARGO_CANARY") && !child.contains("sk-ant-canary"),
+            "a child inherited the controller's environment:\n{child}"
+        );
+        assert!(
+            !child.contains("HOME=") && !child.contains("CARGO_MANIFEST_DIR="),
+            "a child inherited the controller's environment:\n{child}"
+        );
         assert!(child.lines().any(|l| l.starts_with("PATH=")), "{child}");
     }
-    let supervisor = children.iter().find(|c| c.contains("supervise")).expect("a supervisor among the ancestors");
+    let supervisor = children
+        .iter()
+        .find(|c| c.contains("supervise"))
+        .expect("a supervisor among the ancestors");
     for want in ["AGENTOS_TEST_WORKERS=1", "AGENTOS_TEST_FAKE_GUEST=1"] {
-        assert!(supervisor.lines().any(|l| l == want), "the supervisor lacks {want}:\n{supervisor}");
+        assert!(
+            supervisor.lines().any(|l| l == want),
+            "the supervisor lacks {want}:\n{supervisor}"
+        );
     }
 }
 
@@ -2344,14 +3860,29 @@ impl Cli {
                 "deadline_seconds": 600, "worker_vcpus": 1, "worker_memory_mib": 256
             }
         });
-        self.write(&format!("model-task-{}.json", Digest::of(contract.to_string().as_bytes())), &contract.to_string())
+        self.write(
+            &format!(
+                "model-task-{}.json",
+                Digest::of(contract.to_string().as_bytes())
+            ),
+            &contract.to_string(),
+        )
     }
 
     /// `model_contract` naming the verification profile `id` instead.
     fn model_contract_for_profile(&self, id: &str) -> String {
-        let mut contract: Value = serde_json::from_str(&fs::read_to_string(self.model_contract(&self.repo_copy(), 12, 10)).unwrap()).unwrap();
+        let mut contract: Value = serde_json::from_str(
+            &fs::read_to_string(self.model_contract(&self.repo_copy(), 12, 10)).unwrap(),
+        )
+        .unwrap();
         contract["verification_profile"] = json!(id);
-        self.write(&format!("model-env-{}.json", Digest::of(contract.to_string().as_bytes())), &contract.to_string())
+        self.write(
+            &format!(
+                "model-env-{}.json",
+                Digest::of(contract.to_string().as_bytes())
+            ),
+            &contract.to_string(),
+        )
     }
 
     /// `submit --yes --model <spec>` with the key in the environment; the task id.
@@ -2361,14 +3892,29 @@ impl Cli {
 
     /// `Cli::crash` for a model task.
     fn crash_model(&self, contract: &str, spec: &str, point: &str) -> String {
-        let assert = self.cmd(&["submit", contract, "--yes", "--model", spec, "--crash-at", point]).assert().code(75);
+        let assert = self
+            .cmd(&[
+                "submit",
+                contract,
+                "--yes",
+                "--model",
+                spec,
+                "--crash-at",
+                point,
+            ])
+            .assert()
+            .code(75);
         let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
         let crashed: Value = stderr
             .lines()
             .filter_map(|l| serde_json::from_str::<Value>(l).ok())
             .find(|v| v.get("crashed").is_some())
             .unwrap_or_else(|| panic!("no crash report on stderr: {stderr}"));
-        assert_eq!(crashed["crashed"], point.split(':').next().unwrap(), "{stderr}");
+        assert_eq!(
+            crashed["crashed"],
+            point.split(':').next().unwrap(),
+            "{stderr}"
+        );
         crashed["task_id"].as_str().unwrap().to_string()
     }
 }
@@ -2378,13 +3924,20 @@ impl Cli {
 fn env_dump_profile(cli: &Cli) -> String {
     let dir = profile_variant(cli, "env-dump", "env-dump-v1", "");
     let command = "p=$PPID; tr '\\0' '\\n' < /proc/$p/environ; echo ---; tr '\\0' '\\n' < /proc/$(awk '/^PPid:/{print $2}' /proc/$p/status)/environ; exit 0";
-    fs::write(dir.join("profile.json"), json!({ "id": "env-dump-v1", "command": ["sh", "-c", command], "protected": true }).to_string()).unwrap();
+    fs::write(
+        dir.join("profile.json"),
+        json!({ "id": "env-dump-v1", "command": ["sh", "-c", command], "protected": true })
+            .to_string(),
+    )
+    .unwrap();
     register(cli, &dir);
     "env-dump-v1".to_string()
 }
 
 fn status_usage(status: &Value, field: &str) -> u64 {
-    status["usage"][field].as_u64().unwrap_or_else(|| panic!("no usage.{field} in {status}"))
+    status["usage"][field]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no usage.{field} in {status}"))
 }
 
 fn events_of<'a>(events: &'a [Value], ty: &str) -> Vec<&'a Value> {
@@ -2392,18 +3945,31 @@ fn events_of<'a>(events: &'a [Value], ty: &str) -> Vec<&'a Value> {
 }
 
 fn model_dirs(cli: &Cli) -> Vec<String> {
-    let Ok(entries) = fs::read_dir(cli.home().join("model")) else { return Vec::new() };
-    entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()
+    let Ok(entries) = fs::read_dir(cli.home().join("model")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect()
 }
 
 /// Every file of the home, wherever it is (database and its WAL included), must be free of
 /// `needle`.
 fn assert_home_free_of(cli: &Cli, needle: &str, what: &str) {
     let files = walk(&cli.home());
-    assert!(files.len() > 5, "the scan saw only {} files: {files:?}", files.len());
+    assert!(
+        files.len() > 5,
+        "the scan saw only {} files: {files:?}",
+        files.len()
+    );
     for file in files {
         let bytes = fs::read(&file).unwrap_or_default();
-        assert!(!bytes.windows(needle.len()).any(|w| w == needle.as_bytes()), "{what}: {needle} found in {}", file.display());
+        assert!(
+            !bytes.windows(needle.len()).any(|w| w == needle.as_bytes()),
+            "{what}: {needle} found in {}",
+            file.display()
+        );
     }
 }
 
@@ -2420,21 +3986,40 @@ fn submit_with_a_fake_transcript_runs_the_model_agent_to_success() {
     let id = done["task_id"].as_str().unwrap();
     let status = cli.status(id);
     assert_eq!(status["model"], "fake:parser-fix.json", "{status}");
-    assert_eq!(status_usage(&status, "settled_model_requests"), 6, "{status}");
+    assert_eq!(
+        status_usage(&status, "settled_model_requests"),
+        6,
+        "{status}"
+    );
     let events = cli.events(id);
-    let intended = events_of(&events, "EffectIntended").into_iter().filter(|e| e["payload"]["kind"].get("ModelCall").is_some()).count();
+    let intended = events_of(&events, "EffectIntended")
+        .into_iter()
+        .filter(|e| e["payload"]["kind"].get("ModelCall").is_some())
+        .count();
     assert_eq!(intended, 6, "{events:?}");
     let submitted = cli.submitted(id);
     assert_eq!(submitted["model"], "fake:parser-fix.json");
-    assert_eq!(submitted["transcript_digest"], digest_of_file(&transcript("parser-fix.json")));
-    assert_eq!(digest_of_file(&cli.home().join("tasks").join(id).join("transcript.json")), digest_of_file(&transcript("parser-fix.json")));
+    assert_eq!(
+        submitted["transcript_digest"],
+        digest_of_file(&transcript("parser-fix.json"))
+    );
+    assert_eq!(
+        digest_of_file(&cli.home().join("tasks").join(id).join("transcript.json")),
+        digest_of_file(&transcript("parser-fix.json"))
+    );
     let (dir, manifest) = cli.export(id, "bundle");
     assert_eq!(manifest["model"], "fake:parser-fix.json");
     let calls = manifest["model_calls"].as_array().unwrap();
     assert_eq!(calls.len(), 6, "{manifest}");
     for call in calls {
-        assert!(dir.join(call["request_file"].as_str().unwrap()).is_file(), "{call}");
-        assert!(dir.join(call["response_file"].as_str().unwrap()).is_file(), "{call}");
+        assert!(
+            dir.join(call["request_file"].as_str().unwrap()).is_file(),
+            "{call}"
+        );
+        assert!(
+            dir.join(call["response_file"].as_str().unwrap()).is_file(),
+            "{call}"
+        );
     }
     assert_eq!(model_dirs(&cli).len(), 6, "{:?}", model_dirs(&cli));
 }
@@ -2446,7 +4031,15 @@ fn submit_with_anthropic_against_the_local_api_fixes_the_fixture() {
     let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
     let done = {
         let out = cli
-            .cmd(&["submit", &contract, "--yes", "--model", "anthropic:claude-opus-5-5", "--anthropic-base-url", &api.url()])
+            .cmd(&[
+                "submit",
+                &contract,
+                "--yes",
+                "--model",
+                "anthropic:claude-opus-5-5",
+                "--anthropic-base-url",
+                &api.url(),
+            ])
             .env("ANTHROPIC_API_KEY", CANARY)
             .assert()
             .success()
@@ -2458,14 +4051,23 @@ fn submit_with_anthropic_against_the_local_api_fixes_the_fixture() {
     assert_eq!(done["state"], "SUCCEEDED", "{done}");
     assert_eq!(api.hits(), 4);
     for request in api.requests() {
-        let header = |name: &str| request.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+        let header = |name: &str| {
+            request
+                .headers
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        };
         assert_eq!(header("x-api-key").as_deref(), Some(CANARY));
         assert_eq!(header("anthropic-version").as_deref(), Some("2023-06-01"));
         let body: Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(body["model"], "claude-opus-5-5");
         assert_eq!(body["max_tokens"], 1000);
     }
-    assert_eq!(cli.submitted(done["task_id"].as_str().unwrap())["model"], "anthropic:claude-opus-5-5");
+    assert_eq!(
+        cli.submitted(done["task_id"].as_str().unwrap())["model"],
+        "anthropic:claude-opus-5-5"
+    );
 }
 
 #[test]
@@ -2479,7 +4081,15 @@ fn api_key_reaches_only_the_provider_and_never_the_journal_blobs_home_or_job_env
     let mut seen_requests = 0;
     for (round, via_file) in [false, true].into_iter().enumerate() {
         let key_file = cli.write("key.txt", &format!("{CANARY}\n"));
-        let mut args = vec!["submit", contract.as_str(), "--yes", "--model", "anthropic:claude-opus-5-5", "--anthropic-base-url", url.as_str()];
+        let mut args = vec![
+            "submit",
+            contract.as_str(),
+            "--yes",
+            "--model",
+            "anthropic:claude-opus-5-5",
+            "--anthropic-base-url",
+            url.as_str(),
+        ];
         if via_file {
             args.extend(["--api-key-file", key_file.as_str()]);
         }
@@ -2488,16 +4098,30 @@ fn api_key_reaches_only_the_provider_and_never_the_journal_blobs_home_or_job_env
             cmd.env("ANTHROPIC_API_KEY", CANARY);
         }
         let out = cmd.assert().success().get_output().clone();
-        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned());
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        );
         let done: Value = serde_json::from_str(&stdout).unwrap();
         assert_eq!(done["state"], "SUCCEEDED", "round {round}: {done}");
         let id = done["task_id"].as_str().unwrap().to_string();
 
         // Positive control: the key really travelled, in the header of the provider's own request.
         let requests = api.requests();
-        assert!(requests.len() > seen_requests, "round {round}: the fake API saw no request");
+        assert!(
+            requests.len() > seen_requests,
+            "round {round}: the fake API saw no request"
+        );
         let first = &requests[seen_requests];
-        assert_eq!(first.headers.iter().find(|(k, _)| k == "x-api-key").map(|(_, v)| v.as_str()), Some(CANARY), "round {round}");
+        assert_eq!(
+            first
+                .headers
+                .iter()
+                .find(|(k, _)| k == "x-api-key")
+                .map(|(_, v)| v.as_str()),
+            Some(CANARY),
+            "round {round}"
+        );
         seen_requests = requests.len();
 
         // Negative scan: everything the controller wrote or printed.
@@ -2511,26 +4135,43 @@ fn api_key_reaches_only_the_provider_and_never_the_journal_blobs_home_or_job_env
         assert_text_free_of(&manifest.to_string(), "SECRET", "the manifest");
         for file in walk(&bundle) {
             let bytes = fs::read(&file).unwrap();
-            assert!(!bytes.windows(6).any(|w| w == b"SECRET"), "the export bundle file {} leaks the key", file.display());
+            assert!(
+                !bytes.windows(6).any(|w| w == b"SECRET"),
+                "the export bundle file {} leaks the key",
+                file.display()
+            );
         }
         assert_home_free_of(&cli, "SECRET", "the home");
         for sub in ["blobs", "jobs", "model", "tasks"] {
-            assert!(cli.home().join(sub).is_dir(), "round {round}: {sub} should exist so its scan is not vacuous");
+            assert!(
+                cli.home().join(sub).is_dir(),
+                "round {round}: {sub} should exist so its scan is not vacuous"
+            );
         }
 
         // The verification evidence holds the worker's and the supervisor's environments.
         let mut dumps = 0;
         for file in walk(&cli.home().join("blobs")) {
-            let Ok(blob) = serde_json::from_slice::<Value>(&fs::read(&file).unwrap()) else { continue };
-            let Some(stdout) = blob.get("stdout").and_then(Value::as_str) else { continue };
+            let Ok(blob) = serde_json::from_slice::<Value>(&fs::read(&file).unwrap()) else {
+                continue;
+            };
+            let Some(stdout) = blob.get("stdout").and_then(Value::as_str) else {
+                continue;
+            };
             if !stdout.contains("---") {
                 continue;
             }
             dumps += 1;
             assert!(stdout.contains("PATH="), "round {round}: {stdout}");
-            assert!(!stdout.contains("ANTHROPIC_API_KEY") && !stdout.contains("SECRET"), "round {round}: a job environment holds the key:\n{stdout}");
+            assert!(
+                !stdout.contains("ANTHROPIC_API_KEY") && !stdout.contains("SECRET"),
+                "round {round}: a job environment holds the key:\n{stdout}"
+            );
         }
-        assert!(dumps >= 1, "round {round}: no environment dump among the evidence blobs");
+        assert!(
+            dumps >= 1,
+            "round {round}: no environment dump among the evidence blobs"
+        );
     }
 }
 
@@ -2541,7 +4182,9 @@ fn missing_key_is_a_usage_error_before_anything_is_written() {
     cli.cmd(&["submit", &contract, "--yes", "--model", "anthropic:x"])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("no API key: pass --api-key-file FILE or set ANTHROPIC_API_KEY"));
+        .stderr(predicate::str::contains(
+            "no API key: pass --api-key-file FILE or set ANTHROPIC_API_KEY",
+        ));
     assert_nothing_recorded(&cli);
 }
 
@@ -2550,12 +4193,30 @@ fn an_unreadable_key_file_exits_2() {
     let cli = Cli::new();
     let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
     let missing = cli.path("no-such-key");
-    cli.cmd(&["submit", &contract, "--yes", "--model", "anthropic:x", "--api-key-file", missing.to_str().unwrap()])
-        .assert()
-        .code(2)
-        .stderr(predicate::str::contains("cannot read"));
+    cli.cmd(&[
+        "submit",
+        &contract,
+        "--yes",
+        "--model",
+        "anthropic:x",
+        "--api-key-file",
+        missing.to_str().unwrap(),
+    ])
+    .assert()
+    .code(2)
+    .stderr(predicate::str::contains("cannot read"));
     let empty = cli.write("empty-key", "  \n");
-    cli.cmd(&["submit", &contract, "--yes", "--model", "anthropic:x", "--api-key-file", &empty]).assert().code(2);
+    cli.cmd(&[
+        "submit",
+        &contract,
+        "--yes",
+        "--model",
+        "anthropic:x",
+        "--api-key-file",
+        &empty,
+    ])
+    .assert()
+    .code(2);
     assert_nothing_recorded(&cli);
 }
 
@@ -2563,13 +4224,40 @@ fn an_unreadable_key_file_exits_2() {
 fn unknown_model_spec_exits_2() {
     let cli = Cli::new();
     let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
-    cli.cmd(&["submit", &contract, "--yes", "--model", "gpt:4"]).assert().code(2).stderr(predicate::str::contains("unknown model spec"));
-    for bad in ["anthropic:", "anthropic:a/b", &format!("anthropic:{}", "m".repeat(200)), "fake:"] {
-        cli.cmd(&["submit", &contract, "--yes", "--model", bad]).env("ANTHROPIC_API_KEY", CANARY).assert().code(2);
+    cli.cmd(&["submit", &contract, "--yes", "--model", "gpt:4"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("unknown model spec"));
+    for bad in [
+        "anthropic:",
+        "anthropic:a/b",
+        &format!("anthropic:{}", "m".repeat(200)),
+        "fake:",
+    ] {
+        cli.cmd(&["submit", &contract, "--yes", "--model", bad])
+            .env("ANTHROPIC_API_KEY", CANARY)
+            .assert()
+            .code(2);
     }
-    cli.cmd(&["submit", &contract, "--yes", "--model", "fake:/no/such/transcript.json"]).assert().code(2);
+    cli.cmd(&[
+        "submit",
+        &contract,
+        "--yes",
+        "--model",
+        "fake:/no/such/transcript.json",
+    ])
+    .assert()
+    .code(2);
     let bad = cli.write("bad-transcript.json", "{\"responses\": 3}");
-    cli.cmd(&["submit", &contract, "--yes", "--model", &format!("fake:{bad}")]).assert().code(2);
+    cli.cmd(&[
+        "submit",
+        &contract,
+        "--yes",
+        "--model",
+        &format!("fake:{bad}"),
+    ])
+    .assert()
+    .code(2);
     assert_nothing_recorded(&cli);
 }
 
@@ -2579,9 +4267,20 @@ fn an_oversized_key_file_fails_before_submission_without_quoting_the_key() {
     let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
     let key = cli.write("oversized-key", &CANARY.repeat(300));
     let api = fake_api("parser-fix-direct.json");
-    let result = cli.cmd(&["submit", &contract, "--yes", "--model", "anthropic:x",
-        "--api-key-file", &key, "--anthropic-base-url", &api.url()])
-        .assert().code(2);
+    let result = cli
+        .cmd(&[
+            "submit",
+            &contract,
+            "--yes",
+            "--model",
+            "anthropic:x",
+            "--api-key-file",
+            &key,
+            "--anthropic-base-url",
+            &api.url(),
+        ])
+        .assert()
+        .code(2);
     let stderr = String::from_utf8_lossy(&result.get_output().stderr);
     assert!(stderr.contains("exceeds 4096 bytes"), "{stderr}");
     assert!(!stderr.contains("SECRET"), "{stderr}");
@@ -2596,7 +4295,9 @@ fn yes_without_patch_or_model_exits_2_with_the_new_text() {
     cli.cmd(&["submit", &contract, "--yes"])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("--yes needs --fake-agent-patch FILE or --model anthropic:<model>|fake:<transcript>"));
+        .stderr(predicate::str::contains(
+            "--yes needs --fake-agent-patch FILE or --model anthropic:<model>|fake:<transcript>",
+        ));
     assert_nothing_recorded(&cli);
 }
 
@@ -2604,10 +4305,20 @@ fn yes_without_patch_or_model_exits_2_with_the_new_text() {
 fn patch_and_model_together_exit_2() {
     let cli = Cli::new();
     let contract = cli.contract(&cli.repo_copy());
-    cli.cmd(&["submit", &contract, "--yes", "--fake-agent-patch", fix_patch().to_str().unwrap(), "--model", &fake_spec("parser-fix.json")])
-        .assert()
-        .code(2)
-        .stderr(predicate::str::contains("pass either --fake-agent-patch or --model"));
+    cli.cmd(&[
+        "submit",
+        &contract,
+        "--yes",
+        "--fake-agent-patch",
+        fix_patch().to_str().unwrap(),
+        "--model",
+        &fake_spec("parser-fix.json"),
+    ])
+    .assert()
+    .code(2)
+    .stderr(predicate::str::contains(
+        "pass either --fake-agent-patch or --model",
+    ));
     assert_nothing_recorded(&cli);
 }
 
@@ -2615,26 +4326,66 @@ fn patch_and_model_together_exit_2() {
 fn resume_of_a_model_task_needs_no_patch_and_refuses_one() {
     let cli = Cli::new();
     let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
-    let id = cli.json(&["submit", &contract, "--model", &fake_spec("parser-fix.json")])["task_id"].as_str().unwrap().to_string();
+    let id = cli.json(&[
+        "submit",
+        &contract,
+        "--model",
+        &fake_spec("parser-fix.json"),
+    ])["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert_eq!(cli.status(&id)["state"], "READY");
-    assert_eq!(cli.json(&["resume", &id]), json!({ "task_id": id, "state": "SUCCEEDED" }));
+    assert_eq!(
+        cli.json(&["resume", &id]),
+        json!({ "task_id": id, "state": "SUCCEEDED" })
+    );
 
     let other = cli.model_contract(&cli.repo_copy(), 12, 11);
-    let id = cli.json(&["submit", &other, "--model", &fake_spec("parser-fix.json")])["task_id"].as_str().unwrap().to_string();
-    cli.cmd(&["resume", &id, "--fake-agent-patch", fix_patch().to_str().unwrap()])
-        .assert()
-        .code(2)
-        .stderr(predicate::str::contains(format!("task {id} runs a model, not the fake agent")));
-    assert_eq!(cli.status(&id)["state"], "READY", "the refusal changed nothing");
+    let id = cli.json(&["submit", &other, "--model", &fake_spec("parser-fix.json")])["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    cli.cmd(&[
+        "resume",
+        &id,
+        "--fake-agent-patch",
+        fix_patch().to_str().unwrap(),
+    ])
+    .assert()
+    .code(2)
+    .stderr(predicate::str::contains(format!(
+        "task {id} runs a model, not the fake agent"
+    )));
+    assert_eq!(
+        cli.status(&id)["state"],
+        "READY",
+        "the refusal changed nothing"
+    );
 }
 
 #[test]
 fn a_replaced_transcript_fails_the_resume_instead_of_replaying_another_file() {
     let cli = Cli::new();
     let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
-    let id = cli.json(&["submit", &contract, "--model", &fake_spec("parser-fix.json")])["task_id"].as_str().unwrap().to_string();
-    fs::write(cli.home().join("tasks").join(&id).join("transcript.json"), fs::read(transcript("parser-fix-direct.json")).unwrap()).unwrap();
-    cli.cmd(&["resume", &id]).assert().code(1).stderr(predicate::str::contains("transcript"));
+    let id = cli.json(&[
+        "submit",
+        &contract,
+        "--model",
+        &fake_spec("parser-fix.json"),
+    ])["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    fs::write(
+        cli.home().join("tasks").join(&id).join("transcript.json"),
+        fs::read(transcript("parser-fix-direct.json")).unwrap(),
+    )
+    .unwrap();
+    cli.cmd(&["resume", &id])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("transcript"));
     assert_eq!(cli.status(&id)["state"], "READY");
 }
 
@@ -2642,8 +4393,16 @@ fn a_replaced_transcript_fails_the_resume_instead_of_replaying_another_file() {
 fn resume_of_an_anthropic_task_without_a_key_is_a_usage_error_and_changes_nothing() {
     let cli = Cli::new();
     let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
-    let id = cli.json(&["submit", &contract, "--model", "anthropic:claude-opus-5-5"])["task_id"].as_str().unwrap().to_string();
-    cli.cmd(&["resume", &id]).assert().code(2).stderr(predicate::str::contains("no API key: pass --api-key-file FILE or set ANTHROPIC_API_KEY"));
+    let id = cli.json(&["submit", &contract, "--model", "anthropic:claude-opus-5-5"])["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    cli.cmd(&["resume", &id])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "no API key: pass --api-key-file FILE or set ANTHROPIC_API_KEY",
+        ));
     assert_eq!(cli.status(&id)["state"], "READY");
     assert_eq!(cli.status(&id)["model"], "anthropic:claude-opus-5-5");
 }
@@ -2653,8 +4412,17 @@ fn resume_uses_the_recorded_endpoint_and_rejects_overrides_before_key_reads() {
     let cli = Cli::new();
     let api = fake_api("parser-fix-direct.json");
     let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
-    let id = cli.json(&["submit", &contract, "--model", "anthropic:x", "--anthropic-base-url", &api.url()])["task_id"]
-        .as_str().unwrap().to_string();
+    let id = cli.json(&[
+        "submit",
+        &contract,
+        "--model",
+        "anthropic:x",
+        "--anthropic-base-url",
+        &api.url(),
+    ])["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let status = cli.status(&id);
     assert_eq!(status["model_endpoint"], api.url());
     assert_eq!(status["model_policy_version"], 1);
@@ -2668,15 +4436,23 @@ fn resume_uses_the_recorded_endpoint_and_rejects_overrides_before_key_reads() {
         } else {
             command.args(["--anthropic-base-url", "http://127.0.0.1:1"]);
         }
-        command.assert().code(2).stderr(predicate::str::contains("differs from the recorded endpoint"));
+        command.assert().code(2).stderr(predicate::str::contains(
+            "differs from the recorded endpoint",
+        ));
         assert_eq!(cli.events(&id), before);
     }
-    cli.cmd(&["resume", &id]).env("ANTHROPIC_API_KEY", CANARY).assert().success();
+    cli.cmd(&["resume", &id])
+        .env("ANTHROPIC_API_KEY", CANARY)
+        .assert()
+        .success();
     assert_eq!(cli.status(&id)["state"], "SUCCEEDED");
     assert_eq!(api.hits(), 4);
     let export = cli.path("endpoint-export");
-    cli.cmd(&["export", &id, export.to_str().unwrap()]).assert().success();
-    let manifest: Value = serde_json::from_slice(&fs::read(export.join("manifest.json")).unwrap()).unwrap();
+    cli.cmd(&["export", &id, export.to_str().unwrap()])
+        .assert()
+        .success();
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(export.join("manifest.json")).unwrap()).unwrap();
     assert_eq!(manifest["model_endpoint"], api.url());
     assert_eq!(manifest["model_policy_version"], 1);
 }
@@ -2685,13 +4461,20 @@ fn resume_uses_the_recorded_endpoint_and_rejects_overrides_before_key_reads() {
 fn legacy_missing_endpoint_allows_only_the_official_provider() {
     let cli = Cli::new();
     let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
-    let id = cli.json(&["submit", &contract, "--model", "anthropic:x"])["task_id"].as_str().unwrap().to_string();
+    let id = cli.json(&["submit", &contract, "--model", "anthropic:x"])["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     rusqlite::Connection::open(cli.home().join("agentos.db")).unwrap().execute(
         "UPDATE events SET payload=json_remove(payload, '$.model_endpoint', '$.model_policy_version', '$.model_limits_version')
          WHERE task_id=?1 AND type='Submitted'", [&id]).unwrap();
     let before = cli.events(&id);
     cli.cmd(&["resume", &id, "--anthropic-base-url", "http://127.0.0.1:1"])
-        .assert().code(2).stderr(predicate::str::contains("differs from the recorded endpoint"));
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "differs from the recorded endpoint",
+        ));
     assert_eq!(cli.events(&id), before);
     let status = cli.status(&id);
     assert_eq!(status["model_endpoint"], "https://api.anthropic.com");
@@ -2703,7 +4486,11 @@ fn a_crash_on_the_model_call_resumes_with_a_forfeit_and_no_second_charge() {
     for (point, decision, uncertain) in [
         ("after-dispatch:model_call", "Forfeit", 1),
         ("during-execute:model_call", "Forfeit", 1),
-        ("after-execute-before-publish:model_call", "PublishRetained", 0),
+        (
+            "after-execute-before-publish:model_call",
+            "PublishRetained",
+            0,
+        ),
     ] {
         let cli = Cli::new();
         let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
@@ -2712,22 +4499,62 @@ fn a_crash_on_the_model_call_resumes_with_a_forfeit_and_no_second_charge() {
             let status = cli.status(&id);
             let outstanding = status["outstanding_effects"].as_array().unwrap();
             assert_eq!(outstanding.len(), 1, "{status}");
-            assert_eq!((outstanding[0]["kind"].clone(), outstanding[0]["state"].clone()), (json!("model_call"), json!("Dispatched")), "{status}");
-            assert_eq!(status_usage(&status, "reserved_model_requests"), 1, "{status}");
+            assert_eq!(
+                (
+                    outstanding[0]["kind"].clone(),
+                    outstanding[0]["state"].clone()
+                ),
+                (json!("model_call"), json!("Dispatched")),
+                "{status}"
+            );
+            assert_eq!(
+                status_usage(&status, "reserved_model_requests"),
+                1,
+                "{status}"
+            );
         }
-        assert_eq!(cli.json(&["resume", &id]), json!({ "task_id": id, "state": "SUCCEEDED" }), "{point}");
+        assert_eq!(
+            cli.json(&["resume", &id]),
+            json!({ "task_id": id, "state": "SUCCEEDED" }),
+            "{point}"
+        );
         let events = cli.events(&id);
-        let decisions: Vec<&str> = events_of(&events, "RecoveryDecision").iter().map(|e| e["payload"]["decision"].as_str().unwrap()).collect();
+        let decisions: Vec<&str> = events_of(&events, "RecoveryDecision")
+            .iter()
+            .map(|e| e["payload"]["decision"].as_str().unwrap())
+            .collect();
         assert_eq!(decisions, [decision], "{point}: {events:?}");
-        assert_eq!(events_of(&events, "EffectForfeited").len(), usize::from(decision == "Forfeit"), "{point}");
+        assert_eq!(
+            events_of(&events, "EffectForfeited").len(),
+            usize::from(decision == "Forfeit"),
+            "{point}"
+        );
         let status = cli.status(&id);
-        assert_eq!(status_usage(&status, "settled_model_requests"), 4, "{point}: {status}");
-        assert_eq!(status_usage(&status, "uncertain_model_requests"), uncertain, "{point}: {status}");
-        assert_eq!(status_usage(&status, "reserved_model_requests"), 0, "{point}: {status}");
+        assert_eq!(
+            status_usage(&status, "settled_model_requests"),
+            4,
+            "{point}: {status}"
+        );
+        assert_eq!(
+            status_usage(&status, "uncertain_model_requests"),
+            uncertain,
+            "{point}: {status}"
+        );
+        assert_eq!(
+            status_usage(&status, "reserved_model_requests"),
+            0,
+            "{point}: {status}"
+        );
         for e in events_of(&events, "EffectDispatched") {
-            let is_model = events_of(&events, "EffectIntended").iter().any(|i| i["payload"]["effect_id"] == e["payload"]["effect_id"] && i["payload"]["kind"].get("ModelCall").is_some());
+            let is_model = events_of(&events, "EffectIntended").iter().any(|i| {
+                i["payload"]["effect_id"] == e["payload"]["effect_id"]
+                    && i["payload"]["kind"].get("ModelCall").is_some()
+            });
             if is_model {
-                assert_eq!(e["payload"]["lease_generation"], 1, "{point}: a model call was dispatched again: {e}");
+                assert_eq!(
+                    e["payload"]["lease_generation"], 1,
+                    "{point}: a model call was dispatched again: {e}"
+                );
             }
         }
     }
@@ -2739,7 +4566,15 @@ fn a_permanent_4xx_is_journaled_bounded_and_stops_after_one_send() {
     let api = http::serve(http::Reply::Status(400, "x".repeat(100_000)));
     let contract = cli.model_contract(&cli.repo_copy(), 2, 10);
     let out = cli
-        .cmd(&["submit", &contract, "--yes", "--model", "anthropic:claude-opus-5-5", "--anthropic-base-url", &api.url()])
+        .cmd(&[
+            "submit",
+            &contract,
+            "--yes",
+            "--model",
+            "anthropic:claude-opus-5-5",
+            "--anthropic-base-url",
+            &api.url(),
+        ])
         .env("ANTHROPIC_API_KEY", CANARY)
         .assert()
         .success()
@@ -2751,7 +4586,12 @@ fn a_permanent_4xx_is_journaled_bounded_and_stops_after_one_send() {
     let id = done["task_id"].as_str().unwrap();
     assert_eq!(api.hits(), 1);
     let events = cli.events(id);
-    assert!(events_of(&events, "Failed")[0]["payload"]["Failed"]["reason"].as_str().unwrap().starts_with("http 400: "));
+    assert!(
+        events_of(&events, "Failed")[0]["payload"]["Failed"]["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("http 400: ")
+    );
     let reasons: Vec<String> = walk(&cli.home().join("blobs"))
         .iter()
         .filter_map(|f| serde_json::from_slice::<Value>(&fs::read(f).unwrap()).ok())
@@ -2759,7 +4599,11 @@ fn a_permanent_4xx_is_journaled_bounded_and_stops_after_one_send() {
         .filter(|r| r.starts_with("http 400: "))
         .collect();
     assert_eq!(reasons.len(), 1, "{reasons:?}");
-    assert!(reasons.iter().all(|r| r.len() <= 600), "{:?}", reasons.iter().map(String::len).collect::<Vec<_>>());
+    assert!(
+        reasons.iter().all(|r| r.len() <= 600),
+        "{:?}",
+        reasons.iter().map(String::len).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -2786,7 +4630,10 @@ fn model_tasks_run_on_the_firecracker_worker_too() {
     assert_eq!(done["state"], "SUCCEEDED", "{done}");
     let id = done["task_id"].as_str().unwrap();
     assert_tier_worker(&cli, id);
-    assert!(cli.home().join("tasks").join(id).join("shadow").is_dir(), "the reads were served from the host-side shadow workspace");
+    assert!(
+        cli.home().join("tasks").join(id).join("shadow").is_dir(),
+        "the reads were served from the host-side shadow workspace"
+    );
     assert_eq!(cli.status(id)["model"], "fake:parser-fix.json");
 }
 
@@ -2801,7 +4648,15 @@ fn api_key_never_reaches_the_guest() {
     let api = fake_api("parser-fix-direct.json");
     let contract = cli.model_contract_for_profile(&profile);
     let out = cli
-        .cmd(&["submit", &contract, "--yes", "--model", "anthropic:claude-opus-5-5", "--anthropic-base-url", &api.url()])
+        .cmd(&[
+            "submit",
+            &contract,
+            "--yes",
+            "--model",
+            "anthropic:claude-opus-5-5",
+            "--anthropic-base-url",
+            &api.url(),
+        ])
         .env("ANTHROPIC_API_KEY", CANARY)
         .assert()
         .success()
@@ -2810,8 +4665,18 @@ fn api_key_never_reaches_the_guest() {
         .clone();
     let done: Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(done["state"], "SUCCEEDED", "{done}");
-    assert!(api.requests().iter().all(|r| r.headers.iter().any(|(k, v)| k == "x-api-key" && v == CANARY)), "positive control");
-    assert_home_free_of(&cli, "SECRET", "the home, job directories (console.log, firecracker.log, vm.json) included");
+    assert!(
+        api.requests().iter().all(|r| r
+            .headers
+            .iter()
+            .any(|(k, v)| k == "x-api-key" && v == CANARY)),
+        "positive control"
+    );
+    assert_home_free_of(
+        &cli,
+        "SECRET",
+        "the home, job directories (console.log, firecracker.log, vm.json) included",
+    );
 }
 
 /// The key is never an argument (it would show in `/proc/*/cmdline`): there is no flag for it,
@@ -2820,18 +4685,44 @@ fn api_key_never_reaches_the_guest() {
 fn there_is_no_flag_that_takes_the_key_itself() {
     let cli = Cli::bare();
     let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
-    cli.cmd(&["submit", &contract, "--yes", "--model", "anthropic:x", "--api-key", CANARY]).assert().code(2).stderr(predicate::str::contains("unexpected argument"));
-    let help = String::from_utf8(cli.cmd(&["submit", "--help"]).assert().success().get_output().stdout.clone()).unwrap();
-    assert!(help.contains("--api-key-file") && !help.contains("--api-key <"), "{help}");
+    cli.cmd(&[
+        "submit",
+        &contract,
+        "--yes",
+        "--model",
+        "anthropic:x",
+        "--api-key",
+        CANARY,
+    ])
+    .assert()
+    .code(2)
+    .stderr(predicate::str::contains("unexpected argument"));
+    let help = String::from_utf8(
+        cli.cmd(&["submit", "--help"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        help.contains("--api-key-file") && !help.contains("--api-key <"),
+        "{help}"
+    );
     assert_nothing_recorded_or_bare(&cli);
 }
 
 fn assert_nothing_recorded_or_bare(cli: &Cli) {
-    assert!(!cli.home().join("agentos.db").exists() || cli.task_footprint() == (Vec::new(), 0), "a refused invocation left a task behind");
+    assert!(
+        !cli.home().join("agentos.db").exists() || cli.task_footprint() == (Vec::new(), 0),
+        "a refused invocation left a task behind"
+    );
 }
 
 #[test]
-fn a_cleartext_non_loopback_base_url_is_refused_before_anything_is_written_and_never_leaks_the_key() {
+fn a_cleartext_non_loopback_base_url_is_refused_before_anything_is_written_and_never_leaks_the_key()
+{
     let cli = Cli::new();
     let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
     for url in ["http://example.com", "https://user:pw@api.example/?k=v"] {
@@ -2843,10 +4734,16 @@ fn a_cleartext_non_loopback_base_url_is_refused_before_anything_is_written_and_n
             .code(2)
             .get_output()
             .clone();
-        let (o, e) = (String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned());
+        let (o, e) = (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        );
         assert!(e.contains("invalid --anthropic-base-url"), "{e}");
         for text in [&o, &e] {
-            assert!(!text.contains("SECRET") && !text.contains("pw") && !text.contains("k=v"), "{text}");
+            assert!(
+                !text.contains("SECRET") && !text.contains("pw") && !text.contains("k=v"),
+                "{text}"
+            );
         }
         assert_nothing_recorded(&cli);
     }
@@ -2858,15 +4755,45 @@ fn resume_refuses_a_bad_base_url_but_cancel_still_works() {
     let api = fake_api("parser-fix-direct.json");
     let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
     let assert = cli
-        .cmd(&["submit", &contract, "--yes", "--model", "anthropic:claude-opus-5-5", "--anthropic-base-url", &api.url(), "--crash-at", "after-dispatch:model_call"])
+        .cmd(&[
+            "submit",
+            &contract,
+            "--yes",
+            "--model",
+            "anthropic:claude-opus-5-5",
+            "--anthropic-base-url",
+            &api.url(),
+            "--crash-at",
+            "after-dispatch:model_call",
+        ])
         .env("ANTHROPIC_API_KEY", CANARY)
         .assert()
         .code(75);
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
-    let id = stderr.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).find_map(|v| v["task_id"].as_str().map(str::to_string)).unwrap();
-    cli.cmd(&["resume", &id]).env("AGENTOS_ANTHROPIC_BASE_URL", "http://example.com").env("ANTHROPIC_API_KEY", CANARY).assert().code(2).stderr(predicate::str::contains("invalid --anthropic-base-url"));
+    let id = stderr
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find_map(|v| v["task_id"].as_str().map(str::to_string))
+        .unwrap();
+    cli.cmd(&["resume", &id])
+        .env("AGENTOS_ANTHROPIC_BASE_URL", "http://example.com")
+        .env("ANTHROPIC_API_KEY", CANARY)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("invalid --anthropic-base-url"));
     assert_ne!(cli.status(&id)["state"], "SUCCEEDED");
-    let cancelled = cli.cmd(&["cancel", &id]).env("AGENTOS_ANTHROPIC_BASE_URL", "http://example.com").env("ANTHROPIC_API_KEY", CANARY).assert().success().get_output().stdout.clone();
-    assert_eq!(serde_json::from_slice::<Value>(&cancelled).unwrap()["state"], "CANCELLED");
+    let cancelled = cli
+        .cmd(&["cancel", &id])
+        .env("AGENTOS_ANTHROPIC_BASE_URL", "http://example.com")
+        .env("ANTHROPIC_API_KEY", CANARY)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&cancelled).unwrap()["state"],
+        "CANCELLED"
+    );
     assert_eq!(api.hits(), 0, "the crash came before the send");
 }

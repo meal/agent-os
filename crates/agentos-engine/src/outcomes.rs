@@ -23,7 +23,12 @@ pub(crate) struct Check {
 }
 
 /// `ReadSnapshot`: `{"files","workspace_digest"}`.
-pub(crate) fn snapshot_manifest(req: &EffectRequest, ctx: &AttemptCtx, files: Vec<String>, digest: Digest) -> ExecOutcome {
+pub(crate) fn snapshot_manifest(
+    req: &EffectRequest,
+    ctx: &AttemptCtx,
+    files: Vec<String>,
+    digest: Digest,
+) -> ExecOutcome {
     let output = json!({ "files": files, "workspace_digest": digest });
     let mut out = ExecOutcome::success(req, ctx, output.to_string().into_bytes());
     out.new_workspace = Some(digest);
@@ -32,7 +37,12 @@ pub(crate) fn snapshot_manifest(req: &EffectRequest, ctx: &AttemptCtx, files: Ve
 
 /// `ApplyPatch`: `{"applied":true,"paths","workspace_digest"}`; reconciliation rebuilds the
 /// same bytes.
-pub(crate) fn patch_applied(req: &EffectRequest, ctx: &AttemptCtx, paths: Vec<String>, digest: Digest) -> ExecOutcome {
+pub(crate) fn patch_applied(
+    req: &EffectRequest,
+    ctx: &AttemptCtx,
+    paths: Vec<String>,
+    digest: Digest,
+) -> ExecOutcome {
     let output = json!({ "applied": true, "paths": paths, "workspace_digest": digest });
     let mut out = ExecOutcome::success(req, ctx, output.to_string().into_bytes());
     out.new_workspace = Some(digest);
@@ -65,6 +75,10 @@ pub(crate) fn evidence(req: &EffectRequest, ctx: &AttemptCtx, check: &Check) -> 
         "stderr_truncated": check.stderr_truncated,
     });
     let mut out = ExecOutcome::success(req, ctx, evidence.to_string().into_bytes());
-    out.verification = Some(VerificationReport { passed, workspace: check.workspace_digest, summary });
+    out.verification = Some(VerificationReport {
+        passed,
+        workspace: check.workspace_digest,
+        summary,
+    });
     out
 }

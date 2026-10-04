@@ -16,14 +16,16 @@ use agentos_core::effect::{AttemptId, EffectId, EffectKind, Outcome};
 use agentos_core::guest::{Message, Mode, SCRATCH_IMAGE_BYTES};
 use agentos_core::ids::{Digest, TaskId};
 use agentos_engine::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor};
-use agentos_engine::firecracker::{render_vm_json, Answer, FirecrackerConfig, FirecrackerWorker, Inspector, Query, WorkerResult};
+use agentos_engine::firecracker::{
+    Answer, FirecrackerConfig, FirecrackerWorker, Inspector, Query, WorkerResult, render_vm_json,
+};
 use agentos_engine::fixture::FixtureExecutor;
 use agentos_engine::guestlink::GuestLink;
 use agentos_engine::jail::{self, JailConfig, JailMode, StageSources};
 use agentos_engine::job::{JobDir, JobRequest, WorkerConfig};
 use agentos_engine::worker::Worker;
 use common::{contract, copy_dir, fix_patch, fixtures, jailed_fake_firecracker_config};
-use rustix::process::{kill_process, Pid, Signal};
+use rustix::process::{Pid, Signal, kill_process};
 use tempfile::TempDir;
 
 struct Fx {
@@ -47,7 +49,11 @@ fn env_with(extra: &[(&str, &str)]) -> Vec<(String, String)> {
 }
 
 fn ctx() -> AttemptCtx {
-    AttemptCtx { attempt_id: AttemptId::new(), lease_generation: 1, worker: "test".into() }
+    AttemptCtx {
+        attempt_id: AttemptId::new(),
+        lease_generation: 1,
+        worker: "test".into(),
+    }
 }
 
 impl Fx {
@@ -57,10 +63,21 @@ impl Fx {
 
     fn for_task(task: TaskId) -> Fx {
         let dir = tempfile::tempdir().unwrap();
-        copy_dir(&fixtures().join("parser-repo"), &dir.path().join("snapshot"));
-        copy_dir(&fixtures().join("profiles/parser-checks-v1"), &dir.path().join("profile"));
+        copy_dir(
+            &fixtures().join("parser-repo"),
+            &dir.path().join("snapshot"),
+        );
+        copy_dir(
+            &fixtures().join("profiles/parser-checks-v1"),
+            &dir.path().join("profile"),
+        );
         let cfg = jailed_fake_firecracker_config(dir.path());
-        Fx { dir, cfg, task, contract: contract(10).0 }
+        Fx {
+            dir,
+            cfg,
+            task,
+            contract: contract(10).0,
+        }
     }
 
     fn jail(&self) -> JailConfig {
@@ -116,19 +133,32 @@ impl Fx {
     }
 
     async fn snapshot(&self) -> Digest {
-        let (out, _) = self.run_with(&self.request(EffectKind::ReadSnapshot, b""), &ctx()).await;
+        let (out, _) = self
+            .run_with(&self.request(EffectKind::ReadSnapshot, b""), &ctx())
+            .await;
         succeeded(&out);
         out.new_workspace.unwrap()
     }
 
     /// The plan the worker makes for `job` (the attempt id is the jail id).
     fn plan(&self, job: &JobDir, ctx: &AttemptCtx) -> jail::JailPlan {
-        jail::plan(&self.jail(), &self.cfg.firecracker_bin, &job.path, &ctx.attempt_id.to_string()).unwrap()
+        jail::plan(
+            &self.jail(),
+            &self.cfg.firecracker_bin,
+            &job.path,
+            &ctx.attempt_id.to_string(),
+        )
+        .unwrap()
     }
 }
 
 fn succeeded(out: &ExecOutcome) {
-    assert_eq!(out.receipt.outcome, Outcome::Success, "{}", String::from_utf8_lossy(&out.output));
+    assert_eq!(
+        out.receipt.outcome,
+        Outcome::Success,
+        "{}",
+        String::from_utf8_lossy(&out.output)
+    );
 }
 
 /// Pids (other than ours) whose command line contains `needle`.
@@ -136,12 +166,23 @@ fn pids_with(needle: &str) -> Vec<i32> {
     let me = std::process::id() as i32;
     let mut found = Vec::new();
     for entry in fs::read_dir("/proc").unwrap().flatten() {
-        let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<i32>().ok()) else { continue };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<i32>().ok())
+        else {
+            continue;
+        };
         if pid == me {
             continue;
         }
-        let Ok(cmdline) = fs::read(entry.path().join("cmdline")) else { continue };
-        if String::from_utf8_lossy(&cmdline).replace('\0', " ").contains(needle) {
+        let Ok(cmdline) = fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        if String::from_utf8_lossy(&cmdline)
+            .replace('\0', " ")
+            .contains(needle)
+        {
             found.push(pid);
         }
     }
@@ -154,7 +195,10 @@ fn wait_for_pid(needle: &str, within: Duration) -> i32 {
         if let Some(pid) = pids_with(needle).first() {
             return *pid;
         }
-        assert!(Instant::now() < until, "no process with {needle:?} appeared");
+        assert!(
+            Instant::now() < until,
+            "no process with {needle:?} appeared"
+        );
         thread::sleep(Duration::from_millis(20));
     }
 }
@@ -180,7 +224,10 @@ async fn held(fx: &Fx, observe: impl FnOnce(&JobDir, &AttemptCtx)) -> (WorkerRes
     let running = tokio::spawn(async move { worker.run_job(&req2, &c2).await });
     wait_for_pid(&marker, Duration::from_secs(20));
     observe(&job, &c);
-    assert!(!running.is_finished(), "the job ended while it was observed");
+    assert!(
+        !running.is_finished(),
+        "the job ended while it was observed"
+    );
     fs::write(&release, b"").unwrap();
     let res = running.await.unwrap();
     (res, job)
@@ -209,7 +256,9 @@ impl Staging {
     fn new() -> Staging {
         let root = tempfile::tempdir().unwrap();
         let fc = jailed_fake_firecracker_config(root.path());
-        let JailMode::Jailed(mut cfg) = fc.jail.clone() else { unreachable!() };
+        let JailMode::Jailed(mut cfg) = fc.jail.clone() else {
+            unreachable!()
+        };
         // As root (the `test` service), stage to the real jail ids, so a chown that reached
         // a registry inode would show; otherwise only our own ids are possible.
         if as_root() {
@@ -221,10 +270,27 @@ impl Staging {
         fs::create_dir_all(ws_img.parent().unwrap()).unwrap();
         fs::File::create(&ws_img).unwrap().set_len(1 << 20).unwrap();
         let scratch = job.join("scratch.img");
-        fs::File::create(&scratch).unwrap().set_len(SCRATCH_IMAGE_BYTES).unwrap();
-        let plan = jail::plan(&cfg, &fc.firecracker_bin, &job, "0b8a5f3e-7c1d-4e2a-9f6b-3d5c7e9a1b2c").unwrap();
+        fs::File::create(&scratch)
+            .unwrap()
+            .set_len(SCRATCH_IMAGE_BYTES)
+            .unwrap();
+        let plan = jail::plan(
+            &cfg,
+            &fc.firecracker_bin,
+            &job,
+            "0b8a5f3e-7c1d-4e2a-9f6b-3d5c7e9a1b2c",
+        )
+        .unwrap();
         let vm_json = render_vm_json(&fc, &jail::chroot_view(&plan));
-        Staging { image: fc.image_dir.clone(), root, cfg, plan, ws_img, scratch, vm_json }
+        Staging {
+            image: fc.image_dir.clone(),
+            root,
+            cfg,
+            plan,
+            ws_img,
+            scratch,
+            vm_json,
+        }
     }
 
     fn job(&self) -> PathBuf {
@@ -262,7 +328,10 @@ fn owner(path: &Path) -> (u32, u32) {
 }
 
 fn sorted_names(dir: &Path) -> Vec<String> {
-    let mut names: Vec<String> = fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
     names.sort();
     names
 }
@@ -304,23 +373,50 @@ async fn stage_hard_links_and_marker_over_a_temp_home() {
     let jc = fx.jail();
     let (res, _job) = held(&fx, |job, c| {
         let plan = fx.plan(job, c);
-        for name in ["vmlinux", "rootfs.squashfs", "ws.img", "scratch.img", "firecracker.log"] {
+        for name in [
+            "vmlinux",
+            "rootfs.squashfs",
+            "ws.img",
+            "scratch.img",
+            "firecracker.log",
+        ] {
             let meta = fs::metadata(plan.chroot.join(name)).unwrap();
             assert_eq!(meta.nlink(), 2, "{name}");
         }
         let ws = fs::metadata(plan.chroot.join("ws.img")).unwrap();
         assert_eq!(ws.mode() & 0o7777, 0o600);
         assert_eq!(ws.uid(), jc.uid);
-        assert_eq!(ws.ino(), fs::metadata(fx.task_dir().join("ws.img")).unwrap().ino());
         assert_eq!(
-            fs::metadata(plan.chroot.join("firecracker.log")).unwrap().ino(),
-            fs::metadata(job.path.join("firecracker.log")).unwrap().ino()
+            ws.ino(),
+            fs::metadata(fx.task_dir().join("ws.img")).unwrap().ino()
+        );
+        assert_eq!(
+            fs::metadata(plan.chroot.join("firecracker.log"))
+                .unwrap()
+                .ino(),
+            fs::metadata(job.path.join("firecracker.log"))
+                .unwrap()
+                .ino()
         );
         let marker = fs::read_to_string(job.path.join("jail/cgroup")).unwrap();
-        assert_eq!(marker, format!("{}\n", fx.path("cgroup/agentos").join(c.attempt_id.to_string()).display()));
-        assert!(fx.path("cgroup/agentos").join(c.attempt_id.to_string()).is_dir(), "the fake jailer made the cgroup");
+        assert_eq!(
+            marker,
+            format!(
+                "{}\n",
+                fx.path("cgroup/agentos")
+                    .join(c.attempt_id.to_string())
+                    .display()
+            )
+        );
+        assert!(
+            fx.path("cgroup/agentos")
+                .join(c.attempt_id.to_string())
+                .is_dir(),
+            "the fake jailer made the cgroup"
+        );
         // The chroot's vm.json is the chroot view, and no host vm.json is written.
-        let vm: serde_json::Value = serde_json::from_slice(&fs::read(plan.chroot.join("vm.json")).unwrap()).unwrap();
+        let vm: serde_json::Value =
+            serde_json::from_slice(&fs::read(plan.chroot.join("vm.json")).unwrap()).unwrap();
         assert_eq!(vm, render_vm_json(&fx.cfg, &jail::chroot_view(&plan)));
         assert!(!job.path.join("vm.json").exists());
     })
@@ -334,32 +430,56 @@ fn stage_links_only_the_documented_files_and_nothing_else() {
     s.stage().unwrap();
     assert_eq!(
         sorted_names(&s.plan.chroot),
-        ["firecracker.log", "rootfs.squashfs", "scratch.img", "vm.json", "vmlinux", "ws.img"]
+        [
+            "firecracker.log",
+            "rootfs.squashfs",
+            "scratch.img",
+            "vm.json",
+            "vmlinux",
+            "ws.img"
+        ]
     );
     assert_eq!(sorted_names(&s.plan.base), ["cgroup", "firecracker"]);
-    let vm: serde_json::Value = serde_json::from_slice(&fs::read(s.plan.chroot.join("vm.json")).unwrap()).unwrap();
+    let vm: serde_json::Value =
+        serde_json::from_slice(&fs::read(s.plan.chroot.join("vm.json")).unwrap()).unwrap();
     assert_eq!(vm, s.vm_json);
     let meta = fs::metadata(s.plan.chroot.join("vm.json")).unwrap();
     assert_eq!((meta.mode() & 0o7777, meta.uid()), (0o644, s.cfg.uid));
     let log = fs::metadata(s.plan.chroot.join("firecracker.log")).unwrap();
-    assert_eq!((log.len(), log.mode() & 0o7777, log.uid(), log.nlink()), (0, 0o600, s.cfg.uid, 2));
+    assert_eq!(
+        (log.len(), log.mode() & 0o7777, log.uid(), log.nlink()),
+        (0, 0o600, s.cfg.uid, 2)
+    );
     let scratch = fs::metadata(s.plan.chroot.join("scratch.img")).unwrap();
     assert_eq!((scratch.mode() & 0o7777, scratch.uid()), (0o600, s.cfg.uid));
-    assert_eq!(fs::read_to_string(s.job().join("jail/cgroup")).unwrap(), format!("{}\n", s.plan.cgroup.display()));
+    assert_eq!(
+        fs::read_to_string(s.job().join("jail/cgroup")).unwrap(),
+        format!("{}\n", s.plan.cgroup.display())
+    );
 
     // What the jail uid owns, at the chroot link and at the original path (one inode).
     let jail_ids = (s.cfg.uid, s.cfg.gid);
     let handed = [
         (s.plan.chroot.join("ws.img"), Some(s.ws_img.clone())),
         (s.plan.chroot.join("scratch.img"), Some(s.scratch.clone())),
-        (s.plan.chroot.join("firecracker.log"), Some(s.job().join("firecracker.log"))),
+        (
+            s.plan.chroot.join("firecracker.log"),
+            Some(s.job().join("firecracker.log")),
+        ),
         (s.plan.chroot.join("vm.json"), None),
     ];
     if as_root() {
-        println!("ownership branch: root, staged to {}:{}", jail::JAIL_UID, jail::JAIL_GID);
+        println!(
+            "ownership branch: root, staged to {}:{}",
+            jail::JAIL_UID,
+            jail::JAIL_GID
+        );
         assert_eq!(jail_ids, (jail::JAIL_UID, jail::JAIL_GID));
     } else {
-        println!("ownership branch: not root, staged to the test's own {}:{} (chown cannot be observed)", jail_ids.0, jail_ids.1);
+        println!(
+            "ownership branch: not root, staged to the test's own {}:{} (chown cannot be observed)",
+            jail_ids.0, jail_ids.1
+        );
     }
     for (link, original) in handed {
         assert_eq!(owner(&link), jail_ids, "{}", link.display());
@@ -378,11 +498,17 @@ fn registry_files_stay_root_owned_and_read_only_after_staging() {
     }
     let before: Vec<(u32, u32)> = files.iter().map(|f| owner(f)).collect();
     if as_root() {
-        println!("ownership branch: root, registry 0:0, staged to {}:{}", s.cfg.uid, s.cfg.gid);
+        println!(
+            "ownership branch: root, registry 0:0, staged to {}:{}",
+            s.cfg.uid, s.cfg.gid
+        );
         assert!(before.iter().all(|o| *o == (0, 0)), "{before:?}");
         assert_eq!((s.cfg.uid, s.cfg.gid), (jail::JAIL_UID, jail::JAIL_GID));
     } else {
-        println!("ownership branch: not root, registry owned by {:?}, staged to the same ids (chown cannot be observed)", before[0]);
+        println!(
+            "ownership branch: not root, registry owned by {:?}, staged to the same ids (chown cannot be observed)",
+            before[0]
+        );
     }
     s.stage().unwrap();
     for (f, was) in files.iter().zip(before) {
@@ -397,7 +523,12 @@ fn registry_files_stay_root_owned_and_read_only_after_staging() {
     // ws.img and scratch.img changed hands; the registry did not.
     for img in [&s.ws_img, &s.scratch] {
         let meta = fs::metadata(img).unwrap();
-        assert_eq!((meta.mode() & 0o7777, meta.uid(), meta.gid()), (0o600, s.cfg.uid, s.cfg.gid), "{}", img.display());
+        assert_eq!(
+            (meta.mode() & 0o7777, meta.uid(), meta.gid()),
+            (0o600, s.cfg.uid, s.cfg.gid),
+            "{}",
+            img.display()
+        );
     }
 }
 
@@ -411,20 +542,42 @@ fn stage_refuses_a_symlinked_or_non_regular_source() {
     fs::remove_file(&s.ws_img).unwrap();
     std::os::unix::fs::symlink(&target, &s.ws_img).unwrap();
     let err = s.stage().unwrap_err();
-    assert_eq!(err, format!("cannot prepare the jail: {} is not a regular file", s.ws_img.display()));
-    assert_eq!((owner(&target), fs::metadata(&target).unwrap().mode()), before, "the symlink target was touched");
+    assert_eq!(
+        err,
+        format!(
+            "cannot prepare the jail: {} is not a regular file",
+            s.ws_img.display()
+        )
+    );
+    assert_eq!(
+        (owner(&target), fs::metadata(&target).unwrap().mode()),
+        before,
+        "the symlink target was touched"
+    );
     assert!(!s.plan.chroot.join("ws.img").exists());
 
     // A directory as scratch.img, and a symlinked registry kernel.
     let s = Staging::new();
     fs::remove_file(&s.scratch).unwrap();
     fs::create_dir(&s.scratch).unwrap();
-    assert_eq!(s.stage().unwrap_err(), format!("cannot prepare the jail: {} is not a regular file", s.scratch.display()));
+    assert_eq!(
+        s.stage().unwrap_err(),
+        format!(
+            "cannot prepare the jail: {} is not a regular file",
+            s.scratch.display()
+        )
+    );
     let s = Staging::new();
     let kernel = s.image.join("vmlinux");
     fs::rename(&kernel, s.root.path().join("vmlinux.real")).unwrap();
     std::os::unix::fs::symlink(s.root.path().join("vmlinux.real"), &kernel).unwrap();
-    assert_eq!(s.stage().unwrap_err(), format!("cannot prepare the jail: {} is not a regular file", kernel.display()));
+    assert_eq!(
+        s.stage().unwrap_err(),
+        format!(
+            "cannot prepare the jail: {} is not a regular file",
+            kernel.display()
+        )
+    );
 }
 
 #[test]
@@ -460,19 +613,39 @@ fn stale_exec_copy_in_the_chroot_is_refused() {
     let stale = s.plan.chroot.join("firecracker");
     fs::write(&stale, b"old copy").unwrap();
     let err = s.stage().unwrap_err();
-    assert!(err.contains(&format!("stale jail: {} exists", stale.display())), "{err}");
-    assert_eq!(sorted_names(&s.plan.chroot), ["firecracker"], "nothing was staged");
+    assert!(
+        err.contains(&format!("stale jail: {} exists", stale.display())),
+        "{err}"
+    );
+    assert_eq!(
+        sorted_names(&s.plan.chroot),
+        ["firecracker"],
+        "nothing was staged"
+    );
 }
 
 // ---------------------------------------------------------------------------------------
 // The jailed worker end to end.
 
 /// Snapshot, fix patch and verification, with the same requests and attempt contexts.
-async fn three_kinds(run: impl AsyncFn(EffectRequest, AttemptCtx) -> ExecOutcome, fx_req: &dyn Fn(EffectKind, &[u8]) -> EffectRequest, ctxs: &[AttemptCtx; 3]) -> Vec<ExecOutcome> {
+async fn three_kinds(
+    run: impl AsyncFn(EffectRequest, AttemptCtx) -> ExecOutcome,
+    fx_req: &dyn Fn(EffectKind, &[u8]) -> EffectRequest,
+    ctxs: &[AttemptCtx; 3],
+) -> Vec<ExecOutcome> {
     let snap = run(fx_req(EffectKind::ReadSnapshot, b""), ctxs[0].clone()).await;
     succeeded(&snap);
     let base = snap.new_workspace.unwrap();
-    let applied = run(fx_req(EffectKind::ApplyPatch { expected_base: base }, fix_patch().as_bytes()), ctxs[1].clone()).await;
+    let applied = run(
+        fx_req(
+            EffectKind::ApplyPatch {
+                expected_base: base,
+            },
+            fix_patch().as_bytes(),
+        ),
+        ctxs[1].clone(),
+    )
+    .await;
     succeeded(&applied);
     let verified = run(fx_req(EffectKind::RunVerification, b""), ctxs[2].clone()).await;
     succeeded(&verified);
@@ -484,11 +657,28 @@ async fn jailed_worker_runs_all_three_effects_through_the_fake_jailer_with_ident
     let task = TaskId::new();
     let (fc, host) = (Fx::for_task(task.clone()), Fx::for_task(task));
     let ctxs = [ctx(), ctx(), ctx()];
-    let exec = FixtureExecutor::new(host.path("snapshot"), host.path("profile"), host.path("work"));
-    let direct = three_kinds(async |req, c| exec.run(&req, &c).await, &|k, p| host.request(k, p), &ctxs).await;
-    let jailed = three_kinds(async |req, c| fc.run_with(&req, &c).await.0, &|k, p| fc.request(k, p), &ctxs).await;
+    let exec = FixtureExecutor::new(
+        host.path("snapshot"),
+        host.path("profile"),
+        host.path("work"),
+    );
+    let direct = three_kinds(
+        async |req, c| exec.run(&req, &c).await,
+        &|k, p| host.request(k, p),
+        &ctxs,
+    )
+    .await;
+    let jailed = three_kinds(
+        async |req, c| fc.run_with(&req, &c).await.0,
+        &|k, p| fc.request(k, p),
+        &ctxs,
+    )
+    .await;
     for (j, d) in jailed.iter().zip(&direct) {
-        assert_eq!(String::from_utf8_lossy(&j.output), String::from_utf8_lossy(&d.output));
+        assert_eq!(
+            String::from_utf8_lossy(&j.output),
+            String::from_utf8_lossy(&d.output)
+        );
         assert_eq!(j.new_workspace, d.new_workspace);
         assert_eq!(j.verification, d.verification);
         assert_eq!(j, d);
@@ -501,12 +691,19 @@ async fn jailed_worker_connects_to_the_chroot_socket_not_the_job_socket() {
     let fx = Fx::new();
     let (res, job) = held(&fx, |job, c| {
         let chroot_sock = jail::host_uds(&fx.plan(job, c));
-        assert!(fs::metadata(&chroot_sock).unwrap().file_type().is_socket(), "{}", chroot_sock.display());
+        assert!(
+            fs::metadata(&chroot_sock).unwrap().file_type().is_socket(),
+            "{}",
+            chroot_sock.display()
+        );
         assert!(!job.path.join("v.sock").exists());
     })
     .await;
     succeeded(&outcome(res));
-    assert!(!job.path.join("v.sock").exists(), "<job>/v.sock never exists jailed");
+    assert!(
+        !job.path.join("v.sock").exists(),
+        "<job>/v.sock never exists jailed"
+    );
 }
 
 #[tokio::test]
@@ -515,7 +712,10 @@ async fn staged_ws_img_is_owned_by_the_jail_uid_and_still_inspectable() {
     let jc = fx.jail();
     let digest = fx.snapshot().await;
     let ws = fs::metadata(fx.task_dir().join("ws.img")).unwrap();
-    assert_eq!((ws.uid(), ws.gid(), ws.mode() & 0o7777), (jc.uid, jc.gid, 0o600));
+    assert_eq!(
+        (ws.uid(), ws.gid(), ws.mode() & 0o7777),
+        (jc.uid, jc.gid, 0o600)
+    );
 
     // A second fake-jailed launch, as the inspector makes it (Task 7): its own directory
     // outside the work root, id `inspect-<uuid>`, the task's ws.img staged again.
@@ -523,8 +723,17 @@ async fn staged_ws_img_is_owned_by_the_jail_uid_and_still_inspectable() {
     let dir = fx.path("inspect").join(fx.task.as_str()).join(&uuid);
     fs::create_dir_all(&dir).unwrap();
     let scratch = dir.join("scratch.img");
-    fs::File::create(&scratch).unwrap().set_len(SCRATCH_IMAGE_BYTES).unwrap();
-    let plan = jail::plan(&jc, &fx.cfg.firecracker_bin, &dir, &format!("inspect-{uuid}")).unwrap();
+    fs::File::create(&scratch)
+        .unwrap()
+        .set_len(SCRATCH_IMAGE_BYTES)
+        .unwrap();
+    let plan = jail::plan(
+        &jc,
+        &fx.cfg.firecracker_bin,
+        &dir,
+        &format!("inspect-{uuid}"),
+    )
+    .unwrap();
     let vm_json = render_vm_json(&fx.cfg, &jail::chroot_view(&plan));
     jail::stage(
         &jc,
@@ -540,7 +749,13 @@ async fn staged_ws_img_is_owned_by_the_jail_uid_and_still_inspectable() {
     )
     .unwrap();
     let mut child = Command::new(&jc.jailer_bin)
-        .args(jail::jailer_args(&jc, &plan, &fx.cfg.firecracker_bin, fx.cfg.vcpus, fx.cfg.memory_mib))
+        .args(jail::jailer_args(
+            &jc,
+            &plan,
+            &fx.cfg.firecracker_bin,
+            fx.cfg.vcpus,
+            fx.cfg.memory_mib,
+        ))
         .env_clear()
         .envs(test_env())
         .current_dir(&dir)
@@ -560,20 +775,37 @@ async fn staged_ws_img_is_owned_by_the_jail_uid_and_still_inspectable() {
         lease_generation: 0,
         mode: Mode::Inspect,
     };
-    assert!(matches!(link.hello(hello, until).unwrap(), Message::Ready { mode: Mode::Inspect, .. }));
+    assert!(matches!(
+        link.hello(hello, until).unwrap(),
+        Message::Ready {
+            mode: Mode::Inspect,
+            ..
+        }
+    ));
     link.send(&Message::Digest).unwrap();
-    assert_eq!(link.recv(until).unwrap(), Message::DigestIs { workspace_digest: digest });
+    assert_eq!(
+        link.recv(until).unwrap(),
+        Message::DigestIs {
+            workspace_digest: digest
+        }
+    );
     link.send(&Message::Shutdown).unwrap();
     let _ = link.recv(until);
     drop(link);
     let status = wait_or_kill(&mut child, Duration::from_secs(5));
     assert!(status.success(), "{status}");
     let collected = jail::collect(&dir, &jc.cgroup_root).unwrap();
-    assert_eq!((collected.cgroup_removed, collected.jail_removed), (true, true));
+    assert_eq!(
+        (collected.cgroup_removed, collected.jail_removed),
+        (true, true)
+    );
 
     // The inspector itself (Task 7) reads the jail-owned image through the same jailer, and
     // collects the hand-made inspection above as a dead one first.
-    let answer = Inspector::new(fx.cfg.clone(), fx.path("inspect")).with_env(test_env()).query(&fx.task, Query::Digest).unwrap();
+    let answer = Inspector::new(fx.cfg.clone(), fx.path("inspect"))
+        .with_env(test_env())
+        .query(&fx.task, Query::Digest)
+        .unwrap();
     assert_eq!(answer, Answer::Digest(digest));
     assert!(!dir.exists(), "the earlier inspect directory is collected");
     let ws = fs::metadata(fx.task_dir().join("ws.img")).unwrap();
@@ -601,9 +833,20 @@ async fn collect_removes_the_cgroup_dir_and_the_jail_tree() {
     let (req, c) = (fx.request(EffectKind::ReadSnapshot, b""), ctx());
     let (out, job) = fx.run_with(&req, &c).await;
     succeeded(&out);
-    assert!(!job.path.join("jail").exists(), "the jail tree was left behind");
-    assert!(!fx.path("cgroup/agentos").join(c.attempt_id.to_string()).exists(), "the cgroup was left behind");
-    assert!(fx.path("cgroup/agentos").is_dir(), "only the VM's own cgroup is removed");
+    assert!(
+        !job.path.join("jail").exists(),
+        "the jail tree was left behind"
+    );
+    assert!(
+        !fx.path("cgroup/agentos")
+            .join(c.attempt_id.to_string())
+            .exists(),
+        "the cgroup was left behind"
+    );
+    assert!(
+        fx.path("cgroup/agentos").is_dir(),
+        "only the VM's own cgroup is removed"
+    );
     let log = fs::metadata(job.path.join("firecracker.log")).unwrap();
     assert_eq!(log.nlink(), 1);
     assert!(!job.path.join("scratch.img").exists());
@@ -618,25 +861,40 @@ fn collect_tolerates_a_missing_cgroup_and_reports_a_busy_one() {
     s.stage().unwrap();
     // The marker names a cgroup that was never created (the jailer never ran).
     let collected = jail::collect(&s.job(), &s.cfg.cgroup_root).unwrap();
-    assert_eq!((collected.cgroup_removed, collected.jail_removed), (false, true));
+    assert_eq!(
+        (collected.cgroup_removed, collected.jail_removed),
+        (false, true)
+    );
     assert!(!s.job().join("jail").exists());
-    assert!(s.job().join("firecracker.log").is_file(), "the job's log link stays");
+    assert!(
+        s.job().join("firecracker.log").is_file(),
+        "the job's log link stays"
+    );
 
     // A non-empty cgroup directory stands in for one with a process in it.
     fs::remove_file(s.job().join("firecracker.log")).unwrap();
     s.stage().unwrap();
     fs::create_dir_all(s.plan.cgroup.join("child")).unwrap();
     let err = jail::collect(&s.job(), &s.cfg.cgroup_root).unwrap_err();
-    assert_eq!(err, format!("cgroup {} still has processes", s.plan.cgroup.display()));
+    assert_eq!(
+        err,
+        format!("cgroup {} still has processes", s.plan.cgroup.display())
+    );
     assert!(s.plan.chroot.join("ws.img").exists(), "jail/ was touched");
     assert!(s.plan.cgroup.is_dir());
 
     // Emptied, it goes; no marker and no jail is nothing to do.
     fs::remove_dir(s.plan.cgroup.join("child")).unwrap();
     let collected = jail::collect(&s.job(), &s.cfg.cgroup_root).unwrap();
-    assert_eq!((collected.cgroup_removed, collected.jail_removed), (true, true));
+    assert_eq!(
+        (collected.cgroup_removed, collected.jail_removed),
+        (true, true)
+    );
     let collected = jail::collect(&s.job(), &s.cfg.cgroup_root).unwrap();
-    assert_eq!((collected.cgroup_removed, collected.jail_removed), (false, false));
+    assert_eq!(
+        (collected.cgroup_removed, collected.jail_removed),
+        (false, false)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -650,12 +908,18 @@ async fn collect_never_runs_before_settlement() {
         let cg = fx.path("cgroup/agentos").join(c.attempt_id.to_string());
         assert!(cg.is_dir());
         thread::sleep(Duration::from_millis(300));
-        assert!(job.path.join("jail/argv.txt").is_file(), "the jail was collected under a live VM");
+        assert!(
+            job.path.join("jail/argv.txt").is_file(),
+            "the jail was collected under a live VM"
+        );
         *cgroup.lock().unwrap() = cg;
     })
     .await;
     succeeded(&outcome(res));
-    assert!(!job.path.join("jail").exists(), "collected once the VM was reaped");
+    assert!(
+        !job.path.join("jail").exists(),
+        "collected once the VM was reaped"
+    );
     assert!(!cgroup.lock().unwrap().exists());
 }
 
@@ -663,17 +927,33 @@ async fn collect_never_runs_before_settlement() {
 async fn eof_after_apply_patch_in_jailed_mode_yields_no_outcome_and_leaves_the_jail() {
     let fx = Fx::new();
     let base = fx.snapshot().await;
-    let (req, c) = (fx.request(EffectKind::ApplyPatch { expected_base: base }, fix_patch().as_bytes()), ctx());
+    let (req, c) = (
+        fx.request(
+            EffectKind::ApplyPatch {
+                expected_base: base,
+            },
+            fix_patch().as_bytes(),
+        ),
+        ctx(),
+    );
     let job = fx.job(&req, &c);
     let env = env_with(&[("AGENTOS_TEST_KILL_VM_AFTER_REQUEST", "1")]);
     let res = fx.worker(&job, env).run_job(&req, &c).await;
-    let WorkerResult::NoOutcome(why) = res else { panic!("expected no outcome, got {res:?}") };
-    assert_eq!(why, "guest exited before reporting: firecracker killed by signal 9");
+    let WorkerResult::NoOutcome(why) = res else {
+        panic!("expected no outcome, got {res:?}")
+    };
+    assert_eq!(
+        why,
+        "guest exited before reporting: firecracker killed by signal 9"
+    );
     // The controller collects after settlement (Task 7/8), not the worker.
     assert!(job.path.join("jail/cgroup").is_file());
     assert!(fx.plan(&job, &c).chroot.join("ws.img").is_file());
     let collected = jail::collect(&job.path, &fx.jail().cgroup_root).unwrap();
-    assert_eq!((collected.cgroup_removed, collected.jail_removed), (true, true));
+    assert_eq!(
+        (collected.cgroup_removed, collected.jail_removed),
+        (true, true)
+    );
     assert!(!job.path.join("jail").exists());
 }
 
@@ -688,9 +968,16 @@ fn probe_result_is_consistent_with_the_environment() {
     fs::write(&jailer, "#!/bin/sh\necho 'Jailer v1.17.0'\n").unwrap();
     fs::set_permissions(&jailer, fs::Permissions::from_mode(0o755)).unwrap();
     // The root the controller configures is the one /proc/mounts names (as the CLI builds it).
-    let cgroup_root = jail::find_cgroup2_root(&fs::read_to_string("/proc/mounts").unwrap()).unwrap_or_else(|| "/sys/fs/cgroup".into());
-    let cfg = JailConfig { jailer_bin: jailer, uid: 61000, gid: 61000, cgroup_root };
-    let [jobs, inspect, work, image] = ["jobs", "inspect", "work", "image"].map(|n| dir.path().join(n));
+    let cgroup_root = jail::find_cgroup2_root(&fs::read_to_string("/proc/mounts").unwrap())
+        .unwrap_or_else(|| "/sys/fs/cgroup".into());
+    let cfg = JailConfig {
+        jailer_bin: jailer,
+        uid: 61000,
+        gid: 61000,
+        cgroup_root,
+    };
+    let [jobs, inspect, work, image] =
+        ["jobs", "inspect", "work", "image"].map(|n| dir.path().join(n));
     for d in [&jobs, &work, &image] {
         fs::create_dir_all(d).unwrap();
     }
@@ -704,10 +991,16 @@ fn probe_result_is_consistent_with_the_environment() {
         .is_some_and(|f| f[3].split(',').any(|o| o == "ro"));
     if euid != 0 {
         println!("probe branch: not root (uid {euid}) => {result:?}");
-        assert!(result.as_ref().unwrap_err().contains("needs root"), "{result:?}");
+        assert!(
+            result.as_ref().unwrap_err().contains("needs root"),
+            "{result:?}"
+        );
     } else if cgroup_ro {
         println!("probe branch: root with a read-only cgroup tree => {result:?}");
-        assert!(result.as_ref().unwrap_err().contains("read-only"), "{result:?}");
+        assert!(
+            result.as_ref().unwrap_err().contains("read-only"),
+            "{result:?}"
+        );
     } else {
         println!("probe branch: root with a writable cgroup tree => {result:?}");
         assert_eq!(result, Ok(()));
@@ -723,8 +1016,14 @@ fn probe_refuses_a_cgroup_root_that_disagrees_with_proc_mounts() {
     fs::write(&jailer, "#!/bin/sh\necho 'Jailer v1.17.0'\n").unwrap();
     fs::set_permissions(&jailer, fs::Permissions::from_mode(0o755)).unwrap();
     let elsewhere = dir.path().join("not-the-cgroup-root");
-    let cfg = JailConfig { jailer_bin: jailer, uid: 61000, gid: 61000, cgroup_root: elsewhere.clone() };
-    let [jobs, inspect, work, image] = ["jobs", "inspect", "work", "image"].map(|n| dir.path().join(n));
+    let cfg = JailConfig {
+        jailer_bin: jailer,
+        uid: 61000,
+        gid: 61000,
+        cgroup_root: elsewhere.clone(),
+    };
+    let [jobs, inspect, work, image] =
+        ["jobs", "inspect", "work", "image"].map(|n| dir.path().join(n));
     for d in [&jobs, &work, &image] {
         fs::create_dir_all(d).unwrap();
     }
@@ -733,9 +1032,16 @@ fn probe_refuses_a_cgroup_root_that_disagrees_with_proc_mounts() {
     let euid = rustix::process::geteuid().as_raw();
     match (euid, found) {
         (0, Some(found)) => {
-            let expected = format!("the jail is configured for cgroup root {}, but the cgroup v2 hierarchy in /proc/mounts is {}", elsewhere.display(), found.display());
+            let expected = format!(
+                "the jail is configured for cgroup root {}, but the cgroup v2 hierarchy in /proc/mounts is {}",
+                elsewhere.display(),
+                found.display()
+            );
             assert_eq!(result, Err(expected));
-            assert!(!elsewhere.exists(), "nothing was written under the configured root");
+            assert!(
+                !elsewhere.exists(),
+                "nothing was written under the configured root"
+            );
         }
         (0, None) => assert_eq!(result, Err("no cgroup v2 hierarchy in /proc/mounts".into())),
         _ => {
@@ -751,8 +1057,13 @@ fn relative_jailer_bin_or_cgroup_root_is_rejected_by_job_dir_create() {
     let (req, c) = (fx.request(EffectKind::ReadSnapshot, b""), ctx());
     let jobs = fx.path("jobs-relative");
     for (name, edit) in [
-        ("jailer_bin", (|j: &mut JailConfig| j.jailer_bin = "jailer".into()) as fn(&mut JailConfig)),
-        ("cgroup_root", |j: &mut JailConfig| j.cgroup_root = "sys/fs/cgroup".into()),
+        (
+            "jailer_bin",
+            (|j: &mut JailConfig| j.jailer_bin = "jailer".into()) as fn(&mut JailConfig),
+        ),
+        ("cgroup_root", |j: &mut JailConfig| {
+            j.cgroup_root = "sys/fs/cgroup".into()
+        }),
     ] {
         let mut jc = fx.jail();
         edit(&mut jc);
@@ -773,7 +1084,13 @@ fn relative_jailer_bin_or_cgroup_root_is_rejected_by_job_dir_create() {
         let err = JobDir::create(&jobs, &request).err().unwrap();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{name}");
         assert!(err.to_string().starts_with(name), "{err}");
-        assert!(WorkerConfig::Firecracker(cfg).check_paths().is_err(), "{name}");
+        assert!(
+            WorkerConfig::Firecracker(cfg).check_paths().is_err(),
+            "{name}"
+        );
     }
-    assert!(!jobs.exists() || fs::read_dir(&jobs).unwrap().count() == 0, "nothing was created");
+    assert!(
+        !jobs.exists() || fs::read_dir(&jobs).unwrap().count() == 0,
+        "nothing was created"
+    );
 }

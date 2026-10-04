@@ -14,8 +14,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use agentos_core::guest::{
-    raw_frames_for, read_frame, write_frame, Frame, FrameError, Message, FILE_LIMIT, GUEST_PROTOCOL, PATCH_LIMIT, RAW_FRAME_LIMIT,
-    SNAPSHOT_BYTES_LIMIT, SNAPSHOT_FILES_LIMIT, VSOCK_PORT,
+    FILE_LIMIT, Frame, FrameError, GUEST_PROTOCOL, Message, PATCH_LIMIT, RAW_FRAME_LIMIT,
+    SNAPSHOT_BYTES_LIMIT, SNAPSHOT_FILES_LIMIT, VSOCK_PORT, raw_frames_for, read_frame,
+    write_frame,
 };
 use agentos_core::workspace::list_files;
 use serde::{Deserialize, Serialize};
@@ -24,8 +25,13 @@ use serde::{Deserialize, Serialize};
 /// that runs `agentos_guest::fake::serve`, invoked as `program prefix_args… fake-guest UDS ROOT`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GuestLauncher {
-    Real { firecracker_bin: PathBuf },
-    Fake { program: PathBuf, prefix_args: Vec<String> },
+    Real {
+        firecracker_bin: PathBuf,
+    },
+    Fake {
+        program: PathBuf,
+        prefix_args: Vec<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -41,7 +47,9 @@ pub enum LinkError {
 impl fmt::Display for LinkError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LinkError::BootTimeout => f.write_str("guest did not come up: no connection before the boot deadline"),
+            LinkError::BootTimeout => {
+                f.write_str("guest did not come up: no connection before the boot deadline")
+            }
             LinkError::Exited(how) => write!(f, "guest did not come up: {how}"),
             LinkError::Lost(e) => write!(f, "guest connection lost: {e}"),
             LinkError::Protocol(why) => write!(f, "guest protocol violation: {why}"),
@@ -66,7 +74,10 @@ pub fn socket_path(uds: &Path) -> io::Result<(PathBuf, Option<File>)> {
         return Ok((uds.to_path_buf(), None));
     }
     let (Some(dir), Some(name)) = (uds.parent(), uds.file_name()) else {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{} is not a socket path", uds.display())));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a socket path", uds.display()),
+        ));
     };
     let dir = File::open(dir)?;
     let alias = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())).join(name);
@@ -124,7 +135,9 @@ pub fn guest_text(s: &str) -> String {
 }
 
 fn remaining(until: Instant) -> Duration {
-    until.saturating_duration_since(Instant::now()).max(Duration::from_millis(1))
+    until
+        .saturating_duration_since(Instant::now())
+        .max(Duration::from_millis(1))
 }
 
 /// A stalled read surfaces as `TimedOut` with a plain message, not "Resource temporarily
@@ -161,7 +174,10 @@ fn read_line(stream: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
     let mut byte = [0u8; 1];
     while line.last() != Some(&b'\n') {
         if line.len() >= MAX_HANDSHAKE_LINE {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "handshake reply too long"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "handshake reply too long",
+            ));
         }
         match stream.read(&mut byte) {
             Ok(0) => return Ok(None),
@@ -174,7 +190,10 @@ fn read_line(stream: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
 }
 
 fn is_timeout(e: &io::Error) -> bool {
-    matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
 }
 
 struct Entry {
@@ -224,22 +243,32 @@ impl GuestLink {
                 continue;
             };
             let reply = match stream.write_all(format!("CONNECT {VSOCK_PORT}\n").as_bytes()) {
-                Ok(()) => read_line(&mut DeadlineReader { stream: &stream, until: deadline }),
+                Ok(()) => read_line(&mut DeadlineReader {
+                    stream: &stream,
+                    until: deadline,
+                }),
                 Err(e) => Err(e),
             };
             match reply {
                 Ok(Some(line)) => {
                     let text = String::from_utf8_lossy(&line);
                     let text = text.trim_end();
-                    if !text.strip_prefix("OK ").is_some_and(|n| n.parse::<u32>().is_ok()) {
-                        return Err(LinkError::Protocol(format!("unexpected handshake reply {text:?}")));
+                    if !text
+                        .strip_prefix("OK ")
+                        .is_some_and(|n| n.parse::<u32>().is_ok())
+                    {
+                        return Err(LinkError::Protocol(format!(
+                            "unexpected handshake reply {text:?}"
+                        )));
                     }
                     stream.set_read_timeout(None).map_err(lost)?;
                     return Ok(GuestLink { stream });
                 }
                 Ok(None) => thread::sleep(RETRY_PAUSE),
                 Err(e) if is_timeout(&e) => return Err(LinkError::BootTimeout),
-                Err(e) if matches!(e.kind(), io::ErrorKind::InvalidData) => return Err(LinkError::Protocol(e.to_string())),
+                Err(e) if matches!(e.kind(), io::ErrorKind::InvalidData) => {
+                    return Err(LinkError::Protocol(e.to_string()));
+                }
                 Err(_) => thread::sleep(RETRY_PAUSE),
             }
         }
@@ -263,7 +292,10 @@ impl GuestLink {
     /// `PatchState`, which the guest reads as one frame of at most `PATCH_LIMIT` bytes).
     pub fn send_patch(&mut self, bytes: &[u8]) -> Result<(), LinkError> {
         if bytes.len() > PATCH_LIMIT {
-            return Err(LinkError::Protocol(format!("patch of {} bytes, over the {PATCH_LIMIT} limit", bytes.len())));
+            return Err(LinkError::Protocol(format!(
+                "patch of {} bytes, over the {PATCH_LIMIT} limit",
+                bytes.len()
+            )));
         }
         write_frame(&mut self.stream, &Frame::Raw(bytes.to_vec())).map_err(lost)
     }
@@ -276,9 +308,19 @@ impl GuestLink {
     /// The next message, waiting at most until `until`. A timeout is `Lost`; a raw frame
     /// where a message is expected is `Protocol`.
     pub fn recv(&mut self, until: Instant) -> Result<Message, LinkError> {
-        match read_frame(&mut DeadlineReader { stream: &self.stream, until }, 0).map_err(frame_error)? {
+        match read_frame(
+            &mut DeadlineReader {
+                stream: &self.stream,
+                until,
+            },
+            0,
+        )
+        .map_err(frame_error)?
+        {
             Frame::Json(m) => Ok(m),
-            Frame::Raw(_) => Err(LinkError::Protocol("raw frame where a message was expected".into())),
+            Frame::Raw(_) => Err(LinkError::Protocol(
+                "raw frame where a message was expected".into(),
+            )),
         }
     }
 
@@ -286,10 +328,18 @@ impl GuestLink {
     pub fn hello(&mut self, hello: Message, until: Instant) -> Result<Message, LinkError> {
         self.send(&hello)?;
         match self.recv(until)? {
-            ready @ Message::Ready { protocol: GUEST_PROTOCOL, .. } => Ok(ready),
-            Message::Ready { protocol, .. } => Err(LinkError::Protocol(format!("guest speaks protocol {protocol}, expected {GUEST_PROTOCOL}"))),
+            ready @ Message::Ready {
+                protocol: GUEST_PROTOCOL,
+                ..
+            } => Ok(ready),
+            Message::Ready { protocol, .. } => Err(LinkError::Protocol(format!(
+                "guest speaks protocol {protocol}, expected {GUEST_PROTOCOL}"
+            ))),
             Message::Refused { reason } => Err(LinkError::Refused(reason)),
-            other => Err(LinkError::Protocol(format!("expected Ready, got {}", type_name(&other)))),
+            other => Err(LinkError::Protocol(format!(
+                "expected Ready, got {}",
+                type_name(&other)
+            ))),
         }
     }
 
@@ -302,25 +352,40 @@ impl GuestLink {
     /// `count_tree`) first. Any error from a link means the stream may be desynchronised:
     /// drop the link, never reuse it.
     pub fn send_tree(&mut self, root: &Path) -> Result<(u64, u64), LinkError> {
-        let entries = scan(root).map_err(|e| LinkError::Protocol(format!("cannot read {}: {e}", root.display())))?;
+        let entries = scan(root)
+            .map_err(|e| LinkError::Protocol(format!("cannot read {}: {e}", root.display())))?;
         let files = entries.len() as u64;
         let bytes: u64 = entries.iter().map(|e| e.len).sum();
         if files > SNAPSHOT_FILES_LIMIT {
-            return Err(LinkError::Protocol(format!("tree has {files} files, over the {SNAPSHOT_FILES_LIMIT} limit")));
+            return Err(LinkError::Protocol(format!(
+                "tree has {files} files, over the {SNAPSHOT_FILES_LIMIT} limit"
+            )));
         }
         if bytes > SNAPSHOT_BYTES_LIMIT {
-            return Err(LinkError::Protocol(format!("tree has {bytes} bytes, over the {SNAPSHOT_BYTES_LIMIT} limit")));
+            return Err(LinkError::Protocol(format!(
+                "tree has {bytes} bytes, over the {SNAPSHOT_BYTES_LIMIT} limit"
+            )));
         }
         if let Some(big) = entries.iter().find(|e| e.len > FILE_LIMIT) {
-            return Err(LinkError::Protocol(format!("file {} is {} bytes, over the {FILE_LIMIT} limit", big.rel, big.len)));
+            return Err(LinkError::Protocol(format!(
+                "file {} is {} bytes, over the {FILE_LIMIT} limit",
+                big.rel, big.len
+            )));
         }
         for e in &entries {
-            self.send(&Message::File { path: e.rel.clone(), len: e.len })?;
-            let mut file = File::open(&e.path).map_err(|err| LinkError::Protocol(format!("cannot read {}: {err}", e.rel)))?;
+            self.send(&Message::File {
+                path: e.rel.clone(),
+                len: e.len,
+            })?;
+            let mut file = File::open(&e.path)
+                .map_err(|err| LinkError::Protocol(format!("cannot read {}: {err}", e.rel)))?;
             for i in 0..raw_frames_for(e.len) {
-                let size = (e.len - i * RAW_FRAME_LIMIT as u64).min(RAW_FRAME_LIMIT as u64) as usize;
+                let size =
+                    (e.len - i * RAW_FRAME_LIMIT as u64).min(RAW_FRAME_LIMIT as u64) as usize;
                 let mut chunk = vec![0u8; size];
-                file.read_exact(&mut chunk).map_err(|err| LinkError::Protocol(format!("{} changed while it was sent: {err}", e.rel)))?;
+                file.read_exact(&mut chunk).map_err(|err| {
+                    LinkError::Protocol(format!("{} changed while it was sent: {err}", e.rel))
+                })?;
                 write_frame(&mut self.stream, &Frame::Raw(chunk)).map_err(lost)?;
             }
         }
@@ -349,19 +414,44 @@ pub(crate) fn type_name(m: &Message) -> String {
 /// socket's file name (as Firecracker binds its relative `uds_path`, so a long directory
 /// never exceeds the socket address limit). The environment is cleared apart from `PATH`
 /// and `env`. The caller kills and reaps the child explicitly.
-pub fn spawn_fake(launcher: &GuestLauncher, uds: &Path, root: &Path, env: &[(String, String)]) -> io::Result<Child> {
+pub fn spawn_fake(
+    launcher: &GuestLauncher,
+    uds: &Path,
+    root: &Path,
+    env: &[(String, String)],
+) -> io::Result<Child> {
     fake_command(launcher, uds, root, env)?.spawn()
 }
 
 /// The command `spawn_fake` spawns, for a caller that adds to it (the inspector puts the
 /// fake guest in a process group of its own).
-pub fn fake_command(launcher: &GuestLauncher, uds: &Path, root: &Path, env: &[(String, String)]) -> io::Result<Command> {
-    let GuestLauncher::Fake { program, prefix_args } = launcher else {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "spawn_fake needs a Fake launcher"));
+pub fn fake_command(
+    launcher: &GuestLauncher,
+    uds: &Path,
+    root: &Path,
+    env: &[(String, String)],
+) -> io::Result<Command> {
+    let GuestLauncher::Fake {
+        program,
+        prefix_args,
+    } = launcher
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "spawn_fake needs a Fake launcher",
+        ));
     };
     let mut cmd = Command::new(program);
-    match (uds.parent().filter(|d| !d.as_os_str().is_empty()), uds.file_name()) {
-        (Some(dir), Some(name)) => cmd.current_dir(dir).args(prefix_args).arg("fake-guest").arg(name).arg(root),
+    match (
+        uds.parent().filter(|d| !d.as_os_str().is_empty()),
+        uds.file_name(),
+    ) {
+        (Some(dir), Some(name)) => cmd
+            .current_dir(dir)
+            .args(prefix_args)
+            .arg("fake-guest")
+            .arg(name)
+            .arg(root),
         _ => cmd.args(prefix_args).arg("fake-guest").arg(uds).arg(root),
     };
     cmd.env_clear();
@@ -371,6 +461,8 @@ pub fn fake_command(launcher: &GuestLauncher, uds: &Path, root: &Path, env: &[(S
     for (k, v) in env {
         cmd.env(k, v);
     }
-    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     Ok(cmd)
 }

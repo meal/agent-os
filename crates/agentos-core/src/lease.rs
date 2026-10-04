@@ -9,7 +9,10 @@ pub struct EffectTimeouts {
 
 impl Default for EffectTimeouts {
     fn default() -> Self {
-        EffectTimeouts { verification: Duration::from_secs(70), other: Duration::from_secs(30) }
+        EffectTimeouts {
+            verification: Duration::from_secs(70),
+            other: Duration::from_secs(30),
+        }
     }
 }
 
@@ -47,7 +50,10 @@ mod tests {
         assert_eq!(lease_expiry_ms(i64::MAX, 70_000, 0), i64::MAX);
         assert_eq!(lease_expiry_ms(1_000_000, i64::MAX, 0), i64::MAX);
         assert_eq!(lease_expiry_ms(1_000_000, i64::MAX, i64::MAX), i64::MAX);
-        assert_eq!(lease_expiry_ms(i64::MIN, 70_000, i64::MAX), i64::MIN + 70_000);
+        assert_eq!(
+            lease_expiry_ms(i64::MIN, 70_000, i64::MAX),
+            i64::MIN + 70_000
+        );
     }
 
     #[test]

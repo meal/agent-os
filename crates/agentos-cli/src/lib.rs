@@ -14,16 +14,24 @@ use clap::Parser;
 
 /// Runs the command line; returns the process exit code.
 pub fn run() -> i32 {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into());
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into());
     let ansi = std::io::IsTerminal::is_terminal(&std::io::stderr());
-    tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).with_ansi(ansi).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(ansi)
+        .init();
     let args = args::Args::parse();
     // The supervisor and its worker are plain synchronous processes (the worker builds its
     // own runtime), so they are entered before ours exists.
     if let args::Command::Supervise { verb, args } = &args.command {
         return commands::supervise::run(verb, args);
     }
-    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("agentos: cannot start the runtime: {e}");

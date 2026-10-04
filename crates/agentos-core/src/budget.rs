@@ -60,7 +60,11 @@ impl UsageTotals {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
 pub enum BudgetError {
     #[error("model request limit {limit} exceeded: {committed} committed, {requested} requested")]
-    ModelRequests { limit: u32, committed: u64, requested: u32 },
+    ModelRequests {
+        limit: u32,
+        committed: u64,
+        requested: u32,
+    },
     #[error("tool action limit of {limit} exhausted")]
     ToolActions { limit: u32 },
 }
@@ -72,7 +76,9 @@ pub fn check_model_budget(
     limits: &Limits,
 ) -> Result<(), BudgetError> {
     let committed = totals.committed();
-    if committed.saturating_add(u64::from(reserve.model_requests)) > u64::from(limits.model_requests) {
+    if committed.saturating_add(u64::from(reserve.model_requests))
+        > u64::from(limits.model_requests)
+    {
         return Err(BudgetError::ModelRequests {
             limit: limits.model_requests,
             committed,
@@ -107,13 +113,22 @@ mod tests {
     }
 
     fn req(n: u32) -> Reservation {
-        Reservation { tool_actions: 0, model_requests: n }
+        Reservation {
+            tool_actions: 0,
+            model_requests: n,
+        }
     }
 
     #[test]
     fn exactly_reaching_the_limit_is_allowed() {
-        assert_eq!(check_model_budget(&totals(1, 1, 1), &req(2), &limits(5)), Ok(()));
-        assert_eq!(check_model_budget(&UsageTotals::default(), &req(5), &limits(5)), Ok(()));
+        assert_eq!(
+            check_model_budget(&totals(1, 1, 1), &req(2), &limits(5)),
+            Ok(())
+        );
+        assert_eq!(
+            check_model_budget(&UsageTotals::default(), &req(5), &limits(5)),
+            Ok(())
+        );
     }
 
     #[test]
@@ -121,7 +136,11 @@ mod tests {
         for t in [totals(5, 0, 0), totals(0, 5, 0), totals(0, 0, 5)] {
             assert_eq!(
                 check_model_budget(&t, &req(1), &limits(5)),
-                Err(BudgetError::ModelRequests { limit: 5, committed: 5, requested: 1 }),
+                Err(BudgetError::ModelRequests {
+                    limit: 5,
+                    committed: 5,
+                    requested: 1
+                }),
                 "{t:?}"
             );
         }
@@ -129,7 +148,10 @@ mod tests {
 
     #[test]
     fn zero_request_reservation_fits_a_full_budget() {
-        assert_eq!(check_model_budget(&totals(2, 2, 1), &req(0), &limits(5)), Ok(()));
+        assert_eq!(
+            check_model_budget(&totals(2, 2, 1), &req(0), &limits(5)),
+            Ok(())
+        );
     }
 
     #[test]
@@ -143,12 +165,24 @@ mod tests {
     fn tool_actions_and_model_requests_per_kind() {
         let d = Digest::of(b"x");
         assert_eq!(tool_actions_for(&EffectKind::ReadSnapshot), 1);
-        assert_eq!(tool_actions_for(&EffectKind::ApplyPatch { expected_base: d }), 1);
+        assert_eq!(
+            tool_actions_for(&EffectKind::ApplyPatch { expected_base: d }),
+            1
+        );
         assert_eq!(tool_actions_for(&EffectKind::RunVerification), 0);
         assert_eq!(tool_actions_for(&EffectKind::ExportBundle), 0);
-        let mc = EffectKind::ModelCall { model: "m".into(), turn: 1 };
+        let mc = EffectKind::ModelCall {
+            model: "m".into(),
+            turn: 1,
+        };
         assert_eq!(tool_actions_for(&EffectKind::ListFiles { turn: 0 }), 1);
-        assert_eq!(tool_actions_for(&EffectKind::ReadFile { path: "p".into(), turn: 0 }), 1);
+        assert_eq!(
+            tool_actions_for(&EffectKind::ReadFile {
+                path: "p".into(),
+                turn: 0
+            }),
+            1
+        );
         assert_eq!(tool_actions_for(&mc), 0);
         assert_eq!(model_requests_for(&mc), 1);
         for k in [
@@ -157,17 +191,26 @@ mod tests {
             EffectKind::RunVerification,
             EffectKind::ExportBundle,
             EffectKind::ListFiles { turn: 0 },
-            EffectKind::ReadFile { path: "p".into(), turn: 0 },
+            EffectKind::ReadFile {
+                path: "p".into(),
+                turn: 0,
+            },
         ] {
             assert_eq!(model_requests_for(&k), 0, "{k:?}");
         }
         assert_eq!(
             Reservation::for_kind(&mc, 1),
-            Reservation { tool_actions: 0, model_requests: 1 }
+            Reservation {
+                tool_actions: 0,
+                model_requests: 1
+            }
         );
         assert_eq!(
             Reservation::for_kind(&EffectKind::ReadSnapshot, 3),
-            Reservation { tool_actions: 1, model_requests: 3 }
+            Reservation {
+                tool_actions: 1,
+                model_requests: 3
+            }
         );
     }
 }

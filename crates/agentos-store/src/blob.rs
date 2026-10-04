@@ -95,7 +95,9 @@ impl BlobStore {
         for shard in fs::read_dir(&self.objects)? {
             let shard = shard?;
             let shard_name = shard.file_name();
-            let Some(shard_name) = shard_name.to_str() else { continue };
+            let Some(shard_name) = shard_name.to_str() else {
+                continue;
+            };
             if !is_lower_hex(shard_name, 2) || !shard.file_type()?.is_dir() {
                 continue;
             }
@@ -267,7 +269,11 @@ mod tests {
             })
             .collect();
         let digests: Vec<Digest> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        assert!(digests.iter().all(|d| *d == Digest::of(b"contended payload")));
+        assert!(
+            digests
+                .iter()
+                .all(|d| *d == Digest::of(b"contended payload"))
+        );
         assert_eq!(count_objects(t.path()), 1);
         assert_eq!(fs::read_dir(t.path().join("tmp")).unwrap().count(), 0);
         assert_eq!(s.get(&digests[0]).unwrap(), b"contended payload");

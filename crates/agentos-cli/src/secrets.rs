@@ -7,22 +7,34 @@ pub(crate) const KEY_FILE_LIMIT: usize = 4096;
 
 pub(crate) fn read_key_file(path: &Path) -> io::Result<String> {
     let flags = rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK;
-    let file = OpenOptions::new().read(true).custom_flags(flags.bits() as i32).open(path)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(flags.bits() as i32)
+        .open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "API key path must be a regular file"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "API key path must be a regular file",
+        ));
     }
     if metadata.len() > KEY_FILE_LIMIT as u64 {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "API key file exceeds 4096 bytes"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "API key file exceeds 4096 bytes",
+        ));
     }
     let mut bytes = Vec::new();
-    file.take((KEY_FILE_LIMIT + 1) as u64).read_to_end(&mut bytes)?;
+    file.take((KEY_FILE_LIMIT + 1) as u64)
+        .read_to_end(&mut bytes)?;
     if bytes.len() > KEY_FILE_LIMIT {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "API key file exceeds 4096 bytes"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "API key file exceeds 4096 bytes",
+        ));
     }
-    String::from_utf8(bytes).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidData, "API key file must be UTF-8")
-    })
+    String::from_utf8(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "API key file must be UTF-8"))
 }
 
 #[cfg(test)]
@@ -53,8 +65,19 @@ mod tests {
         let link = dir.path().join("link");
         symlink(&key, &link).unwrap();
         let fifo = dir.path().join("fifo");
-        assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
-        for path in [link.as_path(), fifo.as_path(), dir.path(), std::path::Path::new("/dev/null")] {
+        assert!(
+            Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        for path in [
+            link.as_path(),
+            fifo.as_path(),
+            dir.path(),
+            std::path::Path::new("/dev/null"),
+        ] {
             let started = Instant::now();
             assert!(read_key_file(path).is_err(), "{}", path.display());
             assert!(started.elapsed() < Duration::from_secs(1));

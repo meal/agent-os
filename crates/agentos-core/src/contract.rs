@@ -88,7 +88,10 @@ impl Contract {
         let l = &self.limits;
         let limits = [
             ("model_requests", l.model_requests),
-            ("max_output_tokens_per_request", l.max_output_tokens_per_request),
+            (
+                "max_output_tokens_per_request",
+                l.max_output_tokens_per_request,
+            ),
             ("tool_actions", l.tool_actions),
             ("deadline_seconds", l.deadline_seconds),
             ("worker_vcpus", l.worker_vcpus),
@@ -124,7 +127,9 @@ impl Contract {
             }
         }
         if self.editable_paths.is_empty() {
-            return Err(ContractError::Invalid("editable_paths must not be empty".into()));
+            return Err(ContractError::Invalid(
+                "editable_paths must not be empty".into(),
+            ));
         }
         for p in &self.editable_paths {
             if p.starts_with('/') || has_parent_component(p) {
@@ -166,48 +171,93 @@ mod tests {
 
     #[test]
     fn model_request_capability_parses_and_serializes_as_model_dot_request() {
-        let j = OK.replace("\"artifact.export\"]", "\"artifact.export\",\"model.request\"]");
+        let j = OK.replace(
+            "\"artifact.export\"]",
+            "\"artifact.export\",\"model.request\"]",
+        );
         assert_ne!(j, OK);
         let c = Contract::parse(&j).unwrap();
         assert!(c.capabilities.contains(&Capability::ModelRequest));
-        assert_eq!(serde_json::to_value(Capability::ModelRequest).unwrap(), serde_json::json!("model.request"));
+        assert_eq!(
+            serde_json::to_value(Capability::ModelRequest).unwrap(),
+            serde_json::json!("model.request")
+        );
         let ok = Contract::parse(OK).unwrap();
         let out = serde_json::to_string(&ok).unwrap();
-        assert_eq!(serde_json::to_string(&Contract::parse(&out).unwrap()).unwrap(), out);
+        assert_eq!(
+            serde_json::to_string(&Contract::parse(&out).unwrap()).unwrap(),
+            out
+        );
     }
 
-    #[test] fn parses_spec_example() { assert!(Contract::parse(OK).is_ok()); }
-    #[test] fn rejects_unknown_field() {
+    #[test]
+    fn parses_spec_example() {
+        assert!(Contract::parse(OK).is_ok());
+    }
+    #[test]
+    fn rejects_unknown_field() {
         let j = OK.replacen("{\"goal\"", "{\"extra\":1,\"goal\"", 1);
         assert!(Contract::parse(&j).is_err());
     }
-    #[test] fn rejects_zero_limit() {
+    #[test]
+    fn rejects_zero_limit() {
         assert!(Contract::parse(&OK.replace("\"tool_actions\":50", "\"tool_actions\":0")).is_err());
     }
-    #[test] fn rejects_empty_editable_paths() {
+    #[test]
+    fn rejects_empty_editable_paths() {
         assert!(Contract::parse(&OK.replace("[\"src/**\"]", "[]")).is_err());
     }
-    #[test] fn rejects_escaping_glob() {
+    #[test]
+    fn rejects_escaping_glob() {
         assert!(Contract::parse(&OK.replace("src/**", "../x/**")).is_err());
         assert!(Contract::parse(&OK.replace("src/**", "/etc/**")).is_err());
     }
-    #[test] fn rejects_profile_ids_that_are_not_one_plain_name() {
-        for bad in ["../../tmp/x", "/abs/path", "a/b", "..", "", ".", "-rf", "a\\b", "a\u{0}b", "x/", "./x"] {
+    #[test]
+    fn rejects_profile_ids_that_are_not_one_plain_name() {
+        for bad in [
+            "../../tmp/x",
+            "/abs/path",
+            "a/b",
+            "..",
+            "",
+            ".",
+            "-rf",
+            "a\\b",
+            "a\u{0}b",
+            "x/",
+            "./x",
+        ] {
             let id = serde_json::to_string(bad).unwrap();
-            let vp = OK.replace("\"verification_profile\":\"parser-checks-v1\"", &format!("\"verification_profile\":{id}"));
+            let vp = OK.replace(
+                "\"verification_profile\":\"parser-checks-v1\"",
+                &format!("\"verification_profile\":{id}"),
+            );
             assert_ne!(vp, OK);
             let err = Contract::parse(&vp).unwrap_err().to_string();
             assert!(err.contains("verification_profile"), "{bad:?}: {err}");
-            let p = OK.replace("\"profile\":\"python-stdlib-v1\"", &format!("\"profile\":{id}"));
+            let p = OK.replace(
+                "\"profile\":\"python-stdlib-v1\"",
+                &format!("\"profile\":{id}"),
+            );
             assert_ne!(p, OK);
-            assert!(Contract::parse(&p).unwrap_err().to_string().contains("profile"), "{bad:?}");
+            assert!(
+                Contract::parse(&p)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("profile"),
+                "{bad:?}"
+            );
         }
         for good in ["parser-checks-v1", "p", "a.b_c-2"] {
             let id = serde_json::to_string(good).unwrap();
-            assert!(Contract::parse(&OK.replace("\"parser-checks-v1\"", &id)).is_ok(), "{good:?}");
+            assert!(
+                Contract::parse(&OK.replace("\"parser-checks-v1\"", &id)).is_ok(),
+                "{good:?}"
+            );
         }
     }
-    #[test] fn path_allowed_matches_glob_and_blocks_traversal() {
+    #[test]
+    fn path_allowed_matches_glob_and_blocks_traversal() {
         let c = Contract::parse(OK).unwrap();
         assert!(c.path_allowed("src/parser.py"));
         assert!(!c.path_allowed("tests/test_parser.py"));
@@ -215,17 +265,29 @@ mod tests {
     }
     const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     fn with_digest(d: &str) -> String {
-        OK.replace("\"verification_profile\"", &format!("\"profile_digest\":\"{d}\",\"verification_profile\""))
+        OK.replace(
+            "\"verification_profile\"",
+            &format!("\"profile_digest\":\"{d}\",\"verification_profile\""),
+        )
     }
-    #[test] fn profile_digest_must_be_64_hex_when_present() {
+    #[test]
+    fn profile_digest_must_be_64_hex_when_present() {
         let c = Contract::parse(&with_digest(DIGEST)).unwrap();
         assert_eq!(c.profile_digest.as_deref(), Some(DIGEST));
-        for bad in ["", "abc", &DIGEST[..63], &format!("{DIGEST}0"), &DIGEST.to_uppercase(), &format!("{}g", &DIGEST[..63])] {
+        for bad in [
+            "",
+            "abc",
+            &DIGEST[..63],
+            &format!("{DIGEST}0"),
+            &DIGEST.to_uppercase(),
+            &format!("{}g", &DIGEST[..63]),
+        ] {
             let err = Contract::parse(&with_digest(bad)).unwrap_err().to_string();
             assert!(err.contains("profile_digest"), "{bad:?}: {err}");
         }
     }
-    #[test] fn contract_without_profile_digest_parses_and_reserializes_byte_identically() {
+    #[test]
+    fn contract_without_profile_digest_parses_and_reserializes_byte_identically() {
         let c = Contract::parse(OK).unwrap();
         assert!(c.profile_digest.is_none());
         let out = serde_json::to_string(&c).unwrap();
@@ -235,15 +297,28 @@ mod tests {
         let with = serde_json::to_string(&Contract::parse(&with_digest(DIGEST)).unwrap()).unwrap();
         assert!(with.contains("profile_digest"));
     }
-    #[test] fn verification_profile_with_at_sign_is_rejected() {
-        let err = Contract::parse(&OK.replace("parser-checks-v1", "parser@checks")).unwrap_err().to_string();
-        assert!(err.contains("verification_profile") && err.contains('@'), "{err}");
+    #[test]
+    fn verification_profile_with_at_sign_is_rejected() {
+        let err = Contract::parse(&OK.replace("parser-checks-v1", "parser@checks"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("verification_profile") && err.contains('@'),
+            "{err}"
+        );
     }
-    #[test] fn path_matches_is_shared_with_path_allowed() {
+    #[test]
+    fn path_matches_is_shared_with_path_allowed() {
         let pats = vec!["src/**".to_string(), "README.md".to_string()];
         let table = [
-            ("src/a/b.py", true), ("README.md", true), ("src/../x", false), ("/src/a", false),
-            ("srcfoo/x", false), ("src", false), ("README.mdx", false), ("tests/x", false),
+            ("src/a/b.py", true),
+            ("README.md", true),
+            ("src/../x", false),
+            ("/src/a", false),
+            ("srcfoo/x", false),
+            ("src", false),
+            ("README.mdx", false),
+            ("tests/x", false),
         ];
         let c = Contract::parse(&OK.replace("[\"src/**\"]", "[\"src/**\",\"README.md\"]")).unwrap();
         for (p, want) in table {
@@ -251,20 +326,37 @@ mod tests {
             assert_eq!(c.path_allowed(p), want, "{p}");
         }
     }
-    #[test] fn guest_image_digest_must_be_64_hex_when_present() {
-        let with = |d: &str| OK.replace("\"verification_profile\"", &format!("\"guest_image_digest\":\"{d}\",\"verification_profile\""));
+    #[test]
+    fn guest_image_digest_must_be_64_hex_when_present() {
+        let with = |d: &str| {
+            OK.replace(
+                "\"verification_profile\"",
+                &format!("\"guest_image_digest\":\"{d}\",\"verification_profile\""),
+            )
+        };
         let c = Contract::parse(&with(DIGEST)).unwrap();
         assert_eq!(c.guest_image_digest.as_deref(), Some(DIGEST));
-        for bad in ["", "abc", &DIGEST[..63], &format!("{DIGEST}0"), &DIGEST.to_uppercase(), &format!("{}g", &DIGEST[..63])] {
+        for bad in [
+            "",
+            "abc",
+            &DIGEST[..63],
+            &format!("{DIGEST}0"),
+            &DIGEST.to_uppercase(),
+            &format!("{}g", &DIGEST[..63]),
+        ] {
             let err = Contract::parse(&with(bad)).unwrap_err().to_string();
             assert!(err.contains("guest_image_digest"), "{bad:?}: {err}");
         }
     }
-    #[test] fn contract_without_guest_image_digest_reserializes_byte_identically() {
+    #[test]
+    fn contract_without_guest_image_digest_reserializes_byte_identically() {
         let c = Contract::parse(OK).unwrap();
         assert!(c.guest_image_digest.is_none());
         let out = serde_json::to_string(&c).unwrap();
         assert!(!out.contains("guest_image_digest"));
-        assert_eq!(out, r#"{"goal":"g","repository":{"source":"/r","revision":"abc"},"profile":"python-stdlib-v1","editable_paths":["src/**"],"verification_profile":"parser-checks-v1","capabilities":["snapshot.read","workspace.apply_patch","verification.run","artifact.export"],"limits":{"model_requests":12,"max_output_tokens_per_request":4096,"tool_actions":50,"deadline_seconds":1200,"worker_vcpus":2,"worker_memory_mib":2048}}"#);
+        assert_eq!(
+            out,
+            r#"{"goal":"g","repository":{"source":"/r","revision":"abc"},"profile":"python-stdlib-v1","editable_paths":["src/**"],"verification_profile":"parser-checks-v1","capabilities":["snapshot.read","workspace.apply_patch","verification.run","artifact.export"],"limits":{"model_requests":12,"max_output_tokens_per_request":4096,"tool_actions":50,"deadline_seconds":1200,"worker_vcpus":2,"worker_memory_mib":2048}}"#
+        );
     }
 }

@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use agentos_core::guest::{HELLO_WATCHDOG, VSOCK_PORT};
 
-use crate::agent::{spawn_watchdog, Exit, Session};
+use crate::agent::{Exit, Session, spawn_watchdog};
 use crate::backend::FakeBackend;
 
 /// The longest handshake line accepted (`CONNECT 5200\n` is 13 bytes).
@@ -20,7 +20,8 @@ const MAX_CONNECT_LINE: usize = 32;
 
 /// A test hook: `name=1` together with `AGENTOS_TEST_WORKERS=1`.
 pub(crate) fn test_hook(name: &str) -> bool {
-    std::env::var_os("AGENTOS_TEST_WORKERS").is_some_and(|v| v == "1") && std::env::var_os(name).is_some_and(|v| v == "1")
+    std::env::var_os("AGENTOS_TEST_WORKERS").is_some_and(|v| v == "1")
+        && std::env::var_os(name).is_some_and(|v| v == "1")
 }
 
 /// The boot watchdog's delay: `HELLO_WATCHDOG`, or `AGENTOS_TEST_FAKE_GUEST_WATCHDOG_MS`
@@ -40,7 +41,10 @@ fn read_connect_line(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
     let mut byte = [0u8; 1];
     while line.last() != Some(&b'\n') {
         if line.len() >= MAX_CONNECT_LINE {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "handshake line too long"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "handshake line too long",
+            ));
         }
         stream.read_exact(&mut byte)?;
         line.push(byte[0]);
@@ -54,7 +58,10 @@ fn handle(mut stream: UnixStream, mut backend: FakeBackend) {
         Ok(line) if line == expected.as_bytes() => {}
         _ => return,
     }
-    if stream.write_all(format!("OK {VSOCK_PORT}\n").as_bytes()).is_err() {
+    if stream
+        .write_all(format!("OK {VSOCK_PORT}\n").as_bytes())
+        .is_err()
+    {
         return;
     }
     match Session::serve(&mut backend, stream, None) {

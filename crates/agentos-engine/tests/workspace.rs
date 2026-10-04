@@ -18,7 +18,10 @@ fn digest_is_independent_of_creation_order() {
     write(b.path(), "z.txt", "z");
     write(b.path(), "src/y.py", "y");
     write(b.path(), "src/x.py", "x");
-    assert_eq!(workspace_digest(a.path()).unwrap(), workspace_digest(b.path()).unwrap());
+    assert_eq!(
+        workspace_digest(a.path()).unwrap(),
+        workspace_digest(b.path()).unwrap()
+    );
 }
 
 #[test]
@@ -40,7 +43,10 @@ fn moving_a_file_between_directories_changes_the_digest() {
     let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     write(a.path(), "ab/c", "1");
     write(b.path(), "a/bc", "1");
-    assert_ne!(workspace_digest(a.path()).unwrap(), workspace_digest(b.path()).unwrap());
+    assert_ne!(
+        workspace_digest(a.path()).unwrap(),
+        workspace_digest(b.path()).unwrap()
+    );
 }
 
 #[test]
@@ -82,10 +88,16 @@ fn copy_tree_skips_excluded_entries_and_preserves_the_digest() {
     write(from.path(), ".git/HEAD", "h");
     let dest = to.path().join("ws");
     let files = copy_tree(from.path(), &dest).unwrap();
-    assert_eq!(files, vec!["src/x.py".to_string(), "tests/t.py".to_string()]);
+    assert_eq!(
+        files,
+        vec!["src/x.py".to_string(), "tests/t.py".to_string()]
+    );
     assert!(!dest.join(".git").exists());
     assert!(!dest.join("src/__pycache__").exists());
-    assert_eq!(workspace_digest(&dest).unwrap(), workspace_digest(from.path()).unwrap());
+    assert_eq!(
+        workspace_digest(&dest).unwrap(),
+        workspace_digest(from.path()).unwrap()
+    );
 }
 
 #[test]
@@ -121,6 +133,10 @@ fn patch_denial_predicate_matches_digest_exclusions() {
         let base = workspace_digest(d.path()).unwrap();
         write(d.path(), rel, "payload");
         let after = workspace_digest(d.path()).unwrap();
-        assert_eq!(after == base, *excluded, "digest exclusion disagrees for {rel}");
+        assert_eq!(
+            after == base,
+            *excluded,
+            "digest exclusion disagrees for {rel}"
+        );
     }
 }

@@ -13,18 +13,20 @@ use std::time::{Duration, Instant};
 
 use agentos_core::contract::Contract;
 use agentos_core::effect::{AttemptId, EffectId, EffectKind, Outcome};
-use agentos_core::guest::{b64, read_frame, write_frame, Frame, Message, Mode, RAW_FRAME_LIMIT, WS_IMAGE_BYTES};
+use agentos_core::guest::{
+    Frame, Message, Mode, RAW_FRAME_LIMIT, WS_IMAGE_BYTES, b64, read_frame, write_frame,
+};
 use agentos_core::ids::{Digest, TaskId};
 use agentos_engine::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor};
-use agentos_engine::firecracker::{preflight, FirecrackerConfig, FirecrackerWorker, WorkerResult};
+use agentos_engine::firecracker::{FirecrackerConfig, FirecrackerWorker, WorkerResult, preflight};
 use agentos_engine::fixture::FixtureExecutor;
-use agentos_engine::guestlink::{socket_path, GuestLauncher};
+use agentos_engine::guestlink::{GuestLauncher, socket_path};
 use agentos_engine::job::{JobDir, JobRequest, WorkerConfig};
 use agentos_engine::worker::Worker;
 use agentos_engine::workspace::workspace_digest;
 use agentos_store::db::Db;
 use common::{contract, copy_dir, fake_firecracker_config, fix_patch, fixtures};
-use rustix::process::{kill_process, Pid, Signal};
+use rustix::process::{Pid, Signal, kill_process};
 use tempfile::TempDir;
 
 struct Fx {
@@ -45,7 +47,11 @@ fn env_with(extra: &[(&str, &str)]) -> Vec<(String, String)> {
 }
 
 fn ctx() -> AttemptCtx {
-    AttemptCtx { attempt_id: AttemptId::new(), lease_generation: 1, worker: "test".into() }
+    AttemptCtx {
+        attempt_id: AttemptId::new(),
+        lease_generation: 1,
+        worker: "test".into(),
+    }
 }
 
 impl Fx {
@@ -55,17 +61,31 @@ impl Fx {
 
     fn for_task(task: TaskId) -> Fx {
         let dir = tempfile::tempdir().unwrap();
-        copy_dir(&fixtures().join("parser-repo"), &dir.path().join("snapshot"));
-        copy_dir(&fixtures().join("profiles/parser-checks-v1"), &dir.path().join("profile"));
+        copy_dir(
+            &fixtures().join("parser-repo"),
+            &dir.path().join("snapshot"),
+        );
+        copy_dir(
+            &fixtures().join("profiles/parser-checks-v1"),
+            &dir.path().join("profile"),
+        );
         let cfg = fake_firecracker_config(dir.path());
-        Fx { dir, cfg, task, contract: contract(10).0 }
+        Fx {
+            dir,
+            cfg,
+            task,
+            contract: contract(10).0,
+        }
     }
 
     /// A fixture whose launcher spawns nothing that matters (`/bin/true`): a test peer
     /// bound to the job's `v.sock` plays the guest.
     fn with_peer() -> Fx {
         let mut fx = Fx::new();
-        fx.cfg.launcher = GuestLauncher::Fake { program: "/bin/true".into(), prefix_args: vec![] };
+        fx.cfg.launcher = GuestLauncher::Fake {
+            program: "/bin/true".into(),
+            prefix_args: vec![],
+        };
         fx
     }
 
@@ -118,17 +138,28 @@ impl Fx {
         FirecrackerWorker::new(&self.cfg, job).with_env(env)
     }
 
-    async fn run_with(&self, req: &EffectRequest, ctx: &AttemptCtx, env: Vec<(String, String)>) -> (ExecOutcome, JobDir) {
+    async fn run_with(
+        &self,
+        req: &EffectRequest,
+        ctx: &AttemptCtx,
+        env: Vec<(String, String)>,
+    ) -> (ExecOutcome, JobDir) {
         let job = self.job(req, ctx);
         let out = self.worker(&job, env).run(req, ctx).await;
         (out, job)
     }
 
     async fn run(&self, kind: EffectKind, payload: &[u8]) -> (ExecOutcome, JobDir) {
-        self.run_with(&self.request(kind, payload), &ctx(), test_env()).await
+        self.run_with(&self.request(kind, payload), &ctx(), test_env())
+            .await
     }
 
-    async fn run_job(&self, kind: EffectKind, payload: &[u8], env: Vec<(String, String)>) -> (WorkerResult, JobDir) {
+    async fn run_job(
+        &self,
+        kind: EffectKind,
+        payload: &[u8],
+        env: Vec<(String, String)>,
+    ) -> (WorkerResult, JobDir) {
         let (req, ctx) = (self.request(kind, payload), ctx());
         let job = self.job(&req, &ctx);
         let res = self.worker(&job, env).run_job(&req, &ctx).await;
@@ -148,13 +179,21 @@ impl Fx {
 }
 
 fn succeeded(out: &ExecOutcome) {
-    assert_eq!(out.receipt.outcome, Outcome::Success, "{}", String::from_utf8_lossy(&out.output));
+    assert_eq!(
+        out.receipt.outcome,
+        Outcome::Success,
+        "{}",
+        String::from_utf8_lossy(&out.output)
+    );
 }
 
 fn reason(out: &ExecOutcome) -> String {
     match &out.receipt.outcome {
         Outcome::Failure(r) => r.clone(),
-        Outcome::Success => panic!("expected failure, got success: {}", String::from_utf8_lossy(&out.output)),
+        Outcome::Success => panic!(
+            "expected failure, got success: {}",
+            String::from_utf8_lossy(&out.output)
+        ),
     }
 }
 
@@ -167,12 +206,23 @@ fn pids_with(needle: &str) -> Vec<i32> {
     let me = std::process::id() as i32;
     let mut found = Vec::new();
     for entry in fs::read_dir("/proc").unwrap().flatten() {
-        let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<i32>().ok()) else { continue };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<i32>().ok())
+        else {
+            continue;
+        };
         if pid == me {
             continue;
         }
-        let Ok(cmdline) = fs::read(entry.path().join("cmdline")) else { continue };
-        if String::from_utf8_lossy(&cmdline).replace('\0', " ").contains(needle) {
+        let Ok(cmdline) = fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        if String::from_utf8_lossy(&cmdline)
+            .replace('\0', " ")
+            .contains(needle)
+        {
             found.push(pid);
         }
     }
@@ -185,7 +235,10 @@ fn wait_for_pid(needle: &str, within: Duration) -> i32 {
         if let Some(pid) = pids_with(needle).first() {
             return *pid;
         }
-        assert!(Instant::now() < until, "no process with {needle:?} appeared");
+        assert!(
+            Instant::now() < until,
+            "no process with {needle:?} appeared"
+        );
         thread::sleep(Duration::from_millis(20));
     }
 }
@@ -200,7 +253,13 @@ fn pids_in(dir: &Path) -> Vec<i32> {
     let me = std::process::id() as i32;
     let mut found = Vec::new();
     for entry in fs::read_dir("/proc").unwrap().flatten() {
-        let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<i32>().ok()) else { continue };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<i32>().ok())
+        else {
+            continue;
+        };
         if pid != me && fs::read_link(entry.path().join("cwd")).is_ok_and(|cwd| cwd == dir) {
             found.push(pid);
         }
@@ -235,7 +294,13 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
 // the guest's side.
 
 fn ready() -> Message {
-    Message::Ready { protocol: 1, agent_version: "0.1.0".into(), mode: Mode::Job, vcpus: 1, memory_mib: 256 }
+    Message::Ready {
+        protocol: 1,
+        agent_version: "0.1.0".into(),
+        mode: Mode::Job,
+        vcpus: 1,
+        memory_mib: 256,
+    }
 }
 
 fn send(s: &mut UnixStream, m: Message) {
@@ -255,7 +320,10 @@ fn drain_files(s: &mut UnixStream) {
 /// Binds `<job>/v.sock`, then on its own thread accepts one connection, performs the
 /// `CONNECT`/`OK` handshake, answers `Hello` with `Ready`, reads the request and runs
 /// `script` with it.
-fn peer(job: &JobDir, script: impl FnOnce(&mut UnixStream, Message) + Send + 'static) -> thread::JoinHandle<()> {
+fn peer(
+    job: &JobDir,
+    script: impl FnOnce(&mut UnixStream, Message) + Send + 'static,
+) -> thread::JoinHandle<()> {
     let (path, _dir) = socket_path(&job.path.join("v.sock")).unwrap();
     let listener = UnixListener::bind(path).unwrap();
     thread::spawn(move || {
@@ -268,9 +336,13 @@ fn peer(job: &JobDir, script: impl FnOnce(&mut UnixStream, Message) + Send + 'st
         }
         assert_eq!(line, b"CONNECT 5200\n");
         s.write_all(b"OK 5200\n").unwrap();
-        let Frame::Json(Message::Hello { .. }) = read_frame(&mut s, 0).unwrap() else { panic!("expected Hello") };
+        let Frame::Json(Message::Hello { .. }) = read_frame(&mut s, 0).unwrap() else {
+            panic!("expected Hello")
+        };
         send(&mut s, ready());
-        let Frame::Json(request) = read_frame(&mut s, 0).unwrap() else { panic!("expected a request") };
+        let Frame::Json(request) = read_frame(&mut s, 0).unwrap() else {
+            panic!("expected a request")
+        };
         script(&mut s, request);
     })
 }
@@ -292,13 +364,20 @@ fn preflight_in_fake_mode_checks_the_program_and_the_image() {
 
     let mut missing = fx.cfg.clone();
     let nope = fx.path("no-such-guest");
-    missing.launcher = GuestLauncher::Fake { program: nope.clone(), prefix_args: vec![] };
+    missing.launcher = GuestLauncher::Fake {
+        program: nope.clone(),
+        prefix_args: vec![],
+    };
     let err = preflight(&missing).unwrap_err();
     assert!(err.contains(&nope.display().to_string()), "{err}");
 
     let image_json = fx.cfg.image_dir.join("image.json");
     let original = fs::read_to_string(&image_json).unwrap();
-    fs::write(&image_json, original.replace("\"protocol\":1", "\"protocol\":2")).unwrap();
+    fs::write(
+        &image_json,
+        original.replace("\"protocol\":1", "\"protocol\":2"),
+    )
+    .unwrap();
     let err = preflight(&fx.cfg).unwrap_err();
     assert!(err.contains("protocol 2"), "{err}");
     fs::write(&image_json, &original).unwrap();
@@ -310,7 +389,13 @@ fn preflight_in_fake_mode_checks_the_program_and_the_image() {
     fs::write(&rootfs, bytes).unwrap();
     let found = workspace_digest(&fx.cfg.image_dir).unwrap();
     let err = preflight(&fx.cfg).unwrap_err();
-    assert_eq!(err, format!("guest image digest mismatch: pinned {}, found {found}", fx.cfg.image_digest));
+    assert_eq!(
+        err,
+        format!(
+            "guest image digest mismatch: pinned {}, found {found}",
+            fx.cfg.image_digest
+        )
+    );
 }
 
 #[tokio::test]
@@ -320,7 +405,10 @@ async fn the_worker_refuses_to_launch_when_the_image_digest_moved() {
     fs::write(fx.cfg.image_dir.join("vmlinux"), b"another kernel!!").unwrap();
     let (out, job) = fx.run(EffectKind::ReadSnapshot, b"").await;
     let why = reason(&out);
-    assert!(why.starts_with("firecracker worker unavailable: guest image digest mismatch: pinned "), "{why}");
+    assert!(
+        why.starts_with("firecracker worker unavailable: guest image digest mismatch: pinned "),
+        "{why}"
+    );
     for name in ["vm.json", "scratch.img", "console.log", "v.sock"] {
         assert!(!job.path.join(name).exists(), "{name} was created");
     }
@@ -331,9 +419,15 @@ async fn the_worker_refuses_to_launch_when_the_image_digest_moved() {
 #[tokio::test]
 async fn the_fake_launcher_needs_the_test_workers_switch() {
     let fx = Fx::new();
-    let (out, job) = fx.run_with(&fx.request(EffectKind::ReadSnapshot, b""), &ctx(), vec![]).await;
+    let (out, job) = fx
+        .run_with(&fx.request(EffectKind::ReadSnapshot, b""), &ctx(), vec![])
+        .await;
     let why = reason(&out);
-    assert!(why.starts_with("firecracker worker unavailable: ") && why.contains("AGENTOS_TEST_WORKERS=1"), "{why}");
+    assert!(
+        why.starts_with("firecracker worker unavailable: ")
+            && why.contains("AGENTOS_TEST_WORKERS=1"),
+        "{why}"
+    );
     assert!(!job.path.join("vm.json").exists());
 }
 
@@ -349,10 +443,18 @@ async fn read_snapshot_creates_the_sparse_image_and_reports_the_host_bytes() {
 
     let img = fs::metadata(fx.task_dir().join("ws.img")).unwrap();
     assert_eq!(img.len(), WS_IMAGE_BYTES);
-    assert!(img.blocks() * 512 < 1 << 20, "ws.img is not sparse: {} blocks", img.blocks());
+    assert!(
+        img.blocks() * 512 < 1 << 20,
+        "ws.img is not sparse: {} blocks",
+        img.blocks()
+    );
 
     let host = tempfile::tempdir().unwrap();
-    let exec = FixtureExecutor::new(fx.path("snapshot"), fx.path("profile"), host.path().join("work"));
+    let exec = FixtureExecutor::new(
+        fx.path("snapshot"),
+        fx.path("profile"),
+        host.path().join("work"),
+    );
     let expected = exec.run(&req, &c).await;
     assert_eq!(out.output, expected.output);
     assert_eq!(out.new_workspace, expected.new_workspace);
@@ -361,11 +463,24 @@ async fn read_snapshot_creates_the_sparse_image_and_reports_the_host_bytes() {
 }
 
 /// Snapshot, fix patch and verification, with the same requests and attempt contexts.
-async fn three_kinds(run: impl AsyncFn(EffectRequest, AttemptCtx) -> ExecOutcome, fx_req: &dyn Fn(EffectKind, &[u8]) -> EffectRequest, ctxs: &[AttemptCtx; 3]) -> Vec<ExecOutcome> {
+async fn three_kinds(
+    run: impl AsyncFn(EffectRequest, AttemptCtx) -> ExecOutcome,
+    fx_req: &dyn Fn(EffectKind, &[u8]) -> EffectRequest,
+    ctxs: &[AttemptCtx; 3],
+) -> Vec<ExecOutcome> {
     let snap = run(fx_req(EffectKind::ReadSnapshot, b""), ctxs[0].clone()).await;
     succeeded(&snap);
     let base = snap.new_workspace.unwrap();
-    let applied = run(fx_req(EffectKind::ApplyPatch { expected_base: base }, fix_patch().as_bytes()), ctxs[1].clone()).await;
+    let applied = run(
+        fx_req(
+            EffectKind::ApplyPatch {
+                expected_base: base,
+            },
+            fix_patch().as_bytes(),
+        ),
+        ctxs[1].clone(),
+    )
+    .await;
     succeeded(&applied);
     let verified = run(fx_req(EffectKind::RunVerification, b""), ctxs[2].clone()).await;
     succeeded(&verified);
@@ -377,8 +492,17 @@ async fn apply_patch_and_verify_produce_byte_identical_outcomes_to_the_host_work
     let task = TaskId::new();
     let (fc, host) = (Fx::for_task(task.clone()), Fx::for_task(task));
     let ctxs = [ctx(), ctx(), ctx()];
-    let exec = FixtureExecutor::new(host.path("snapshot"), host.path("profile"), host.path("work"));
-    let direct = three_kinds(async |req, c| exec.run(&req, &c).await, &|k, p| host.request(k, p), &ctxs).await;
+    let exec = FixtureExecutor::new(
+        host.path("snapshot"),
+        host.path("profile"),
+        host.path("work"),
+    );
+    let direct = three_kinds(
+        async |req, c| exec.run(&req, &c).await,
+        &|k, p| host.request(k, p),
+        &ctxs,
+    )
+    .await;
     let guest = three_kinds(
         async |req, c| fc.run_with(&req, &c, test_env()).await.0,
         &|k, p| fc.request(k, p),
@@ -386,7 +510,10 @@ async fn apply_patch_and_verify_produce_byte_identical_outcomes_to_the_host_work
     )
     .await;
     for (g, d) in guest.iter().zip(&direct) {
-        assert_eq!(String::from_utf8_lossy(&g.output), String::from_utf8_lossy(&d.output));
+        assert_eq!(
+            String::from_utf8_lossy(&g.output),
+            String::from_utf8_lossy(&d.output)
+        );
         assert_eq!(g.new_workspace, d.new_workspace);
         assert_eq!(g.verification, d.verification);
         assert_eq!(g, d);
@@ -399,15 +526,26 @@ async fn apply_and_verify_without_a_snapshot_are_refused_with_the_3a_wording() {
     let fx = Fx::new();
     let base = Digest::of(b"base");
     for (kind, payload) in [
-        (EffectKind::ApplyPatch { expected_base: base }, fix_patch().into_bytes()),
+        (
+            EffectKind::ApplyPatch {
+                expected_base: base,
+            },
+            fix_patch().into_bytes(),
+        ),
         (EffectKind::RunVerification, Vec::new()),
     ] {
         let (out, job) = fx.run(kind, &payload).await;
         assert_eq!(reason(&out), "workspace missing: no snapshot was read");
         assert!(!out.unresolved);
-        assert!(!job.path.join("vm.json").exists(), "nothing is launched for a missing workspace");
+        assert!(
+            !job.path.join("vm.json").exists(),
+            "nothing is launched for a missing workspace"
+        );
     }
-    assert!(!fx.task_dir().join("ws.img").exists(), "only ReadSnapshot creates ws.img");
+    assert!(
+        !fx.task_dir().join("ws.img").exists(),
+        "only ReadSnapshot creates ws.img"
+    );
 }
 
 #[tokio::test]
@@ -415,16 +553,29 @@ async fn scratch_img_is_removed_after_a_successful_job_and_vm_json_console_log_r
     let fx = Fx::new();
     let (out, job) = fx.run(EffectKind::ReadSnapshot, b"").await;
     succeeded(&out);
-    assert!(!job.path.join("scratch.img").exists(), "scratch.img was left behind");
+    assert!(
+        !job.path.join("scratch.img").exists(),
+        "scratch.img was left behind"
+    );
     for name in ["vm.json", "console.log", "firecracker.log", "stderr.log"] {
         assert!(job.path.join(name).is_file(), "{name} is missing");
     }
-    let vm: serde_json::Value = serde_json::from_slice(&fs::read(job.path.join("vm.json")).unwrap()).unwrap();
-    assert_eq!(vm["drives"][2]["path_on_host"], serde_json::json!(job.path.join("scratch.img")));
-    assert_eq!(vm["drives"][1]["path_on_host"], serde_json::json!(fx.task_dir().join("ws.img")));
+    let vm: serde_json::Value =
+        serde_json::from_slice(&fs::read(job.path.join("vm.json")).unwrap()).unwrap();
+    assert_eq!(
+        vm["drives"][2]["path_on_host"],
+        serde_json::json!(job.path.join("scratch.img"))
+    );
+    assert_eq!(
+        vm["drives"][1]["path_on_host"],
+        serde_json::json!(fx.task_dir().join("ws.img"))
+    );
     // Relative to Firecracker's working directory, the job directory (sun_path limit).
     assert_eq!(vm["vsock"]["uds_path"], "v.sock");
-    assert!(job.path.join("v.sock").as_os_str().len() > 107, "a job's socket path exceeds sun_path");
+    assert!(
+        job.path.join("v.sock").as_os_str().len() > 107,
+        "a job's socket path exceeds sun_path"
+    );
     assert!(guests_of(&job).is_empty(), "the guest outlived its job");
 }
 
@@ -435,19 +586,40 @@ async fn boot_timeout_is_a_failure_for_every_kind_and_sends_nothing() {
     let env = env_with(&[("AGENTOS_TEST_FAKE_GUEST_NEVER_LISTEN", "1")]);
     for (kind, payload) in [
         (EffectKind::ReadSnapshot, Vec::new()),
-        (EffectKind::ApplyPatch { expected_base: Digest::of(b"base") }, fix_patch().into_bytes()),
+        (
+            EffectKind::ApplyPatch {
+                expected_base: Digest::of(b"base"),
+            },
+            fix_patch().into_bytes(),
+        ),
         (EffectKind::RunVerification, Vec::new()),
     ] {
         let (req, c) = (fx.request(kind, &payload), ctx());
         let job = fx.job(&req, &c);
         let started = Instant::now();
-        let res = fx.worker(&job, env.clone()).with_boot_timeout(Duration::from_secs(1)).run_job(&req, &c).await;
-        let WorkerResult::Outcome(out) = res else { panic!("no outcome for {:?}", req.kind) };
+        let res = fx
+            .worker(&job, env.clone())
+            .with_boot_timeout(Duration::from_secs(1))
+            .run_job(&req, &c)
+            .await;
+        let WorkerResult::Outcome(out) = res else {
+            panic!("no outcome for {:?}", req.kind)
+        };
         let why = reason(&out);
         assert!(why.starts_with("guest did not come up: "), "{why}");
-        assert!(!out.unresolved, "nothing was sent, so nothing is unresolved");
-        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
-        assert!(guests_of(&job).is_empty(), "the never-listening guest was not killed");
+        assert!(
+            !out.unresolved,
+            "nothing was sent, so nothing is unresolved"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            guests_of(&job).is_empty(),
+            "the never-listening guest was not killed"
+        );
         assert!(!job.path.join("scratch.img").exists());
     }
     assert!(!fx.guest_workspace().exists(), "nothing reached a guest");
@@ -458,7 +630,12 @@ async fn eof_after_run_verification_is_a_failure_guest_exited_before_reporting()
     let fx = Fx::new();
     fx.snapshot().await;
     let marker = format!("agentos-fc-eof-{}", fx.task);
-    fx.script_profile(serde_json::json!(["python3", "-c", "import time; time.sleep(5)", marker]));
+    fx.script_profile(serde_json::json!([
+        "python3",
+        "-c",
+        "import time; time.sleep(5)",
+        marker
+    ]));
     let (req, c) = (fx.request(EffectKind::RunVerification, b""), ctx());
     let job = fx.job(&req, &c);
     let job_path = job.path.clone();
@@ -476,7 +653,10 @@ async fn eof_after_run_verification_is_a_failure_guest_exited_before_reporting()
     let check = killer.join().unwrap();
     sigkill(check);
     let why = reason(&out);
-    assert_eq!(why, "guest exited before reporting: firecracker killed by signal 9");
+    assert_eq!(
+        why,
+        "guest exited before reporting: firecracker killed by signal 9"
+    );
     assert!(out.verification.is_none());
 }
 
@@ -484,17 +664,29 @@ async fn eof_after_run_verification_is_a_failure_guest_exited_before_reporting()
 async fn eof_after_apply_patch_yields_no_outcome() {
     let fx = Fx::with_peer();
     fx.fake_ws_img();
-    let (req, c) = (fx.request(EffectKind::ApplyPatch { expected_base: Digest::of(b"base") }, fix_patch().as_bytes()), ctx());
+    let (req, c) = (
+        fx.request(
+            EffectKind::ApplyPatch {
+                expected_base: Digest::of(b"base"),
+            },
+            fix_patch().as_bytes(),
+        ),
+        ctx(),
+    );
     let job = fx.job(&req, &c);
     let guest = peer(&job, |s, request| {
         assert!(matches!(request, Message::ApplyPatch { .. }), "{request:?}");
-        let Frame::Raw(patch) = read_frame(s, RAW_FRAME_LIMIT).unwrap() else { panic!("expected the patch") };
+        let Frame::Raw(patch) = read_frame(s, RAW_FRAME_LIMIT).unwrap() else {
+            panic!("expected the patch")
+        };
         assert_eq!(patch, fix_patch().into_bytes());
         // The connection closes without a reply.
     });
     let res = fx.worker(&job, test_env()).run_job(&req, &c).await;
     guest.join().unwrap();
-    let WorkerResult::NoOutcome(why) = res else { panic!("expected no outcome, got {res:?}") };
+    let WorkerResult::NoOutcome(why) = res else {
+        panic!("expected no outcome, got {res:?}")
+    };
     assert!(why.starts_with("guest exited before reporting: "), "{why}");
 }
 
@@ -504,21 +696,58 @@ async fn kill_vm_after_request_hook_leaves_the_workspace_base_or_patched_and_no_
     let base = fx.snapshot().await;
     let patched = {
         let host = Fx::for_task(fx.task.clone());
-        let exec = FixtureExecutor::new(host.path("snapshot"), host.path("profile"), host.path("work"));
-        succeeded(&exec.run(&host.request(EffectKind::ReadSnapshot, b""), &ctx()).await);
-        let out = exec.run(&host.request(EffectKind::ApplyPatch { expected_base: base }, fix_patch().as_bytes()), &ctx()).await;
+        let exec = FixtureExecutor::new(
+            host.path("snapshot"),
+            host.path("profile"),
+            host.path("work"),
+        );
+        succeeded(
+            &exec
+                .run(&host.request(EffectKind::ReadSnapshot, b""), &ctx())
+                .await,
+        );
+        let out = exec
+            .run(
+                &host.request(
+                    EffectKind::ApplyPatch {
+                        expected_base: base,
+                    },
+                    fix_patch().as_bytes(),
+                ),
+                &ctx(),
+            )
+            .await;
         succeeded(&out);
         out.new_workspace.unwrap()
     };
     let env = env_with(&[("AGENTOS_TEST_KILL_VM_AFTER_REQUEST", "1")]);
-    let (res, job) = fx.run_job(EffectKind::ApplyPatch { expected_base: base }, fix_patch().as_bytes(), env).await;
-    let WorkerResult::NoOutcome(why) = res else { panic!("expected no outcome, got {res:?}") };
-    assert_eq!(why, "guest exited before reporting: firecracker killed by signal 9");
-    assert!(guests_of(&job).is_empty(), "the killed guest is still running");
+    let (res, job) = fx
+        .run_job(
+            EffectKind::ApplyPatch {
+                expected_base: base,
+            },
+            fix_patch().as_bytes(),
+            env,
+        )
+        .await;
+    let WorkerResult::NoOutcome(why) = res else {
+        panic!("expected no outcome, got {res:?}")
+    };
+    assert_eq!(
+        why,
+        "guest exited before reporting: firecracker killed by signal 9"
+    );
+    assert!(
+        guests_of(&job).is_empty(),
+        "the killed guest is still running"
+    );
     // A `git apply` the dead guest started may still finish; it never leaves a torn tree.
     thread::sleep(Duration::from_millis(500));
     let now = workspace_digest(&fx.guest_workspace()).unwrap();
-    assert!(now == base || now == patched, "workspace {now} is neither the base {base} nor patched {patched}");
+    assert!(
+        now == base || now == patched,
+        "workspace {now} is neither the base {base} nor patched {patched}"
+    );
     assert!(job.read_outcome().is_none());
 }
 
@@ -534,8 +763,18 @@ async fn ws_lock_busy_is_a_failure_for_retry_kinds_and_unresolved_for_apply_patc
         assert!(!out.unresolved);
         assert!(!job.path.join("vm.json").exists());
     }
-    let (res, job) = fx.run_job(EffectKind::ApplyPatch { expected_base: Digest::of(b"base") }, fix_patch().as_bytes(), test_env()).await;
-    let WorkerResult::Outcome(out) = res else { panic!("expected the unresolved outcome, got {res:?}") };
+    let (res, job) = fx
+        .run_job(
+            EffectKind::ApplyPatch {
+                expected_base: Digest::of(b"base"),
+            },
+            fix_patch().as_bytes(),
+            test_env(),
+        )
+        .await;
+    let WorkerResult::Outcome(out) = res else {
+        panic!("expected the unresolved outcome, got {res:?}")
+    };
     assert_eq!(reason(&out), "workspace image is attached to another VM");
     assert!(out.unresolved, "another VM may be applying the patch");
     assert!(!job.path.join("vm.json").exists());
@@ -552,7 +791,10 @@ async fn a_refused_reason_is_copied_verbatim_into_the_failure_outcome_and_bounde
     fx.cfg.profile_digest = Some(pinned);
     let found = workspace_digest(&fx.path("profile")).unwrap();
     let (out, _) = fx.run(EffectKind::RunVerification, b"").await;
-    assert_eq!(reason(&out), format!("profile digest mismatch: pinned {pinned}, found {found}"));
+    assert_eq!(
+        reason(&out),
+        format!("profile digest mismatch: pinned {pinned}, found {found}")
+    );
     assert!(out.verification.is_none());
 
     // A reason over the JSON frame limit is a protocol violation, never copied.
@@ -561,12 +803,20 @@ async fn a_refused_reason_is_copied_verbatim_into_the_failure_outcome_and_bounde
     let job = fx.job(&req, &c);
     let guest = peer(&job, |s, _| {
         drain_files(s);
-        send(s, Message::Refused { reason: "x".repeat(2 << 20) });
+        send(
+            s,
+            Message::Refused {
+                reason: "x".repeat(2 << 20),
+            },
+        );
     });
     let out = fx.worker(&job, test_env()).run(&req, &c).await;
     guest.join().unwrap();
     let why = reason(&out);
-    assert!(why.starts_with("guest protocol violation: frame too large: json "), "{why}");
+    assert!(
+        why.starts_with("guest protocol violation: frame too large: json "),
+        "{why}"
+    );
     assert!(why.len() < 200, "the reason is bounded");
 }
 
@@ -591,14 +841,25 @@ async fn a_frame_over_the_limit_is_a_protocol_failure() {
         let out = fx.worker(&job, test_env()).run(&req, &c).await;
         guest.join().unwrap();
         let why = reason(&out);
-        assert!(why.starts_with("guest protocol violation: frame too large: "), "{why}");
+        assert!(
+            why.starts_with("guest protocol violation: frame too large: "),
+            "{why}"
+        );
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     // After an ApplyPatch was sent, a violation is no outcome (reconciled by inspection).
     let fx = Fx::with_peer();
     fx.fake_ws_img();
-    let (req, c) = (fx.request(EffectKind::ApplyPatch { expected_base: Digest::of(b"base") }, fix_patch().as_bytes()), ctx());
+    let (req, c) = (
+        fx.request(
+            EffectKind::ApplyPatch {
+                expected_base: Digest::of(b"base"),
+            },
+            fix_patch().as_bytes(),
+        ),
+        ctx(),
+    );
     let job = fx.job(&req, &c);
     let guest = peer(&job, move |s, _| {
         let _ = read_frame(s, RAW_FRAME_LIMIT);
@@ -606,8 +867,13 @@ async fn a_frame_over_the_limit_is_a_protocol_failure() {
     });
     let res = fx.worker(&job, test_env()).run_job(&req, &c).await;
     guest.join().unwrap();
-    let WorkerResult::NoOutcome(why) = res else { panic!("expected no outcome, got {res:?}") };
-    assert!(why.starts_with("guest protocol violation: frame too large: json"), "{why}");
+    let WorkerResult::NoOutcome(why) = res else {
+        panic!("expected no outcome, got {res:?}")
+    };
+    assert!(
+        why.starts_with("guest protocol violation: frame too large: json"),
+        "{why}"
+    );
 }
 
 #[tokio::test]
@@ -617,30 +883,51 @@ async fn a_reply_of_the_wrong_type_is_a_protocol_failure() {
     let job = fx.job(&req, &c);
     let guest = peer(&job, |s, _| {
         drain_files(s);
-        send(s, Message::DigestIs { workspace_digest: Digest::of(b"x") });
+        send(
+            s,
+            Message::DigestIs {
+                workspace_digest: Digest::of(b"x"),
+            },
+        );
     });
     let out = fx.worker(&job, test_env()).run(&req, &c).await;
     guest.join().unwrap();
-    assert_eq!(reason(&out), "guest protocol violation: expected SnapshotDone, got DigestIs");
+    assert_eq!(
+        reason(&out),
+        "guest protocol violation: expected SnapshotDone, got DigestIs"
+    );
 }
 
 #[tokio::test]
 async fn guest_paths_in_replies_never_touch_host_paths() {
     let fx = Fx::with_peer();
     let reported = Digest::of(b"whatever the guest says");
-    let evil = vec!["../../etc/passwd".to_string(), "../../../agentos-escape-marker".to_string(), "/agentos-escape-marker".to_string()];
+    let evil = vec![
+        "../../etc/passwd".to_string(),
+        "../../../agentos-escape-marker".to_string(),
+        "/agentos-escape-marker".to_string(),
+    ];
     let (req, c) = (fx.request(EffectKind::ReadSnapshot, b""), ctx());
     let job = fx.job(&req, &c);
     let files = evil.clone();
     let guest = peer(&job, move |s, _| {
         drain_files(s);
-        send(s, Message::SnapshotDone { files, workspace_digest: reported });
+        send(
+            s,
+            Message::SnapshotDone {
+                files,
+                workspace_digest: reported,
+            },
+        );
         bye(s);
     });
     let out = fx.worker(&job, test_env()).run(&req, &c).await;
     guest.join().unwrap();
     succeeded(&out);
-    assert_eq!(json(&out), serde_json::json!({ "files": evil, "workspace_digest": reported }));
+    assert_eq!(
+        json(&out),
+        serde_json::json!({ "files": evil, "workspace_digest": reported })
+    );
     assert_eq!(out.new_workspace, Some(reported));
     assert!(!Path::new("/agentos-escape-marker").exists());
     // Everything the job touched (jobs/, work/) lives under the fixture's root.
@@ -648,7 +935,12 @@ async fn guest_paths_in_replies_never_touch_host_paths() {
         .iter()
         .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
         .collect();
-    assert!(!names.iter().any(|n| n.contains("agentos-escape-marker") || n == "passwd"), "{names:?}");
+    assert!(
+        !names
+            .iter()
+            .any(|n| n.contains("agentos-escape-marker") || n == "passwd"),
+        "{names:?}"
+    );
 }
 
 #[tokio::test]
@@ -660,7 +952,17 @@ async fn a_verified_with_exit_1_is_never_passed() {
     let (req, c) = (fx.request(EffectKind::RunVerification, b""), ctx());
     let job = fx.job(&req, &c);
     let guest = peer(&job, move |s, request| {
-        assert!(matches!(request, Message::RunVerification { profile_digest: None, timeout_secs: 60, .. }), "{request:?}");
+        assert!(
+            matches!(
+                request,
+                Message::RunVerification {
+                    profile_digest: None,
+                    timeout_secs: 60,
+                    ..
+                }
+            ),
+            "{request:?}"
+        );
         drain_files(s);
         send(
             s,
@@ -693,11 +995,23 @@ async fn a_verified_with_exit_1_is_never_passed() {
 #[tokio::test]
 async fn receipt_fields_come_from_request_json_only() {
     let fx = Fx::with_peer();
-    let (req, c) = (fx.request(EffectKind::ReadSnapshot, b""), AttemptCtx { lease_generation: 7, ..ctx() });
+    let (req, c) = (
+        fx.request(EffectKind::ReadSnapshot, b""),
+        AttemptCtx {
+            lease_generation: 7,
+            ..ctx()
+        },
+    );
     let job = fx.job(&req, &c);
     let guest = peer(&job, |s, _| {
         drain_files(s);
-        send(s, Message::SnapshotDone { files: vec!["a".into()], workspace_digest: Digest::of(b"a") });
+        send(
+            s,
+            Message::SnapshotDone {
+                files: vec!["a".into()],
+                workspace_digest: Digest::of(b"a"),
+            },
+        );
         bye(s);
     });
     let out = fx.worker(&job, test_env()).run(&req, &c).await;
@@ -715,9 +1029,16 @@ async fn an_unpinned_profile_changed_during_the_run_voids_the_evidence() {
     fx.snapshot().await;
     // The check rewrites the protected source while it runs (the guest cannot see it).
     let source = fx.path("profile/extra.txt");
-    fx.script_profile(serde_json::json!(["python3", "-c", format!("open({:?}, 'w').write('changed')", source.to_str().unwrap())]));
+    fx.script_profile(serde_json::json!([
+        "python3",
+        "-c",
+        format!("open({:?}, 'w').write('changed')", source.to_str().unwrap())
+    ]));
     let (out, _) = fx.run(EffectKind::RunVerification, b"").await;
-    assert_eq!(reason(&out), "protected profile changed during verification");
+    assert_eq!(
+        reason(&out),
+        "protected profile changed during verification"
+    );
     assert!(out.verification.is_none());
 }
 
@@ -728,7 +1049,12 @@ async fn no_handle_and_no_token_appears_in_vm_json_console_or_firecracker_log() 
     let (contract, digest) = contract(10);
     let task = db.create_task(&contract, &digest).unwrap();
     db.approve_task(&task).unwrap();
-    let handles: Vec<String> = db.grants(&task).unwrap().iter().map(|g| g.handle.to_string()).collect();
+    let handles: Vec<String> = db
+        .grants(&task)
+        .unwrap()
+        .iter()
+        .map(|g| g.handle.to_string())
+        .collect();
     assert!(!handles.is_empty());
 
     let fx = Fx::for_task(task);
@@ -738,7 +1064,14 @@ async fn no_handle_and_no_token_appears_in_vm_json_console_or_firecracker_log() 
     succeeded(&snap);
     job.write_outcome(&snap).unwrap();
     jobs.push(job);
-    let (applied, job) = fx.run(EffectKind::ApplyPatch { expected_base: snap.new_workspace.unwrap() }, fix_patch().as_bytes()).await;
+    let (applied, job) = fx
+        .run(
+            EffectKind::ApplyPatch {
+                expected_base: snap.new_workspace.unwrap(),
+            },
+            fix_patch().as_bytes(),
+        )
+        .await;
     succeeded(&applied);
     job.write_outcome(&applied).unwrap();
     jobs.push(job);
@@ -749,23 +1082,47 @@ async fn no_handle_and_no_token_appears_in_vm_json_console_or_firecracker_log() 
 
     for job in &jobs {
         let request = fs::read(job.path.join("request.json")).unwrap();
-        assert!(contains(&request, token.as_bytes()), "the token travels in request.json");
+        assert!(
+            contains(&request, token.as_bytes()),
+            "the token travels in request.json"
+        );
         let mut seen = Vec::new();
         for file in regular_files(&job.path) {
             if file.file_name().is_some_and(|n| n == "request.json") {
                 continue;
             }
             let bytes = fs::read(&file).unwrap();
-            assert!(!contains(&bytes, token.as_bytes()), "the token leaked into {}", file.display());
+            assert!(
+                !contains(&bytes, token.as_bytes()),
+                "the token leaked into {}",
+                file.display()
+            );
             for h in &handles {
-                assert!(!contains(&bytes, h.as_bytes()), "a handle leaked into {}", file.display());
+                assert!(
+                    !contains(&bytes, h.as_bytes()),
+                    "a handle leaked into {}",
+                    file.display()
+                );
             }
             seen.push(file.file_name().unwrap().to_string_lossy().into_owned());
         }
-        for name in ["vm.json", "console.log", "firecracker.log", "stderr.log", "outcome.json"] {
-            assert!(seen.iter().any(|n| n == name), "{name} was not checked: {seen:?}");
+        for name in [
+            "vm.json",
+            "console.log",
+            "firecracker.log",
+            "stderr.log",
+            "outcome.json",
+        ] {
+            assert!(
+                seen.iter().any(|n| n == name),
+                "{name} was not checked: {seen:?}"
+            );
         }
-        assert!(fs::metadata(job.path.join("v.sock")).map(|m| m.file_type().is_socket()).unwrap_or(true));
+        assert!(
+            fs::metadata(job.path.join("v.sock"))
+                .map(|m| m.file_type().is_socket())
+                .unwrap_or(true)
+        );
     }
 }
 
@@ -773,7 +1130,9 @@ async fn no_handle_and_no_token_appears_in_vm_json_console_or_firecracker_log() 
 /// or removed, independent of this process's environment.
 fn worker_process(job: &JobDir, workers: Option<&str>) -> std::process::ExitStatus {
     let mut cmd = std::process::Command::new(common::SUPERVISOR_BIN);
-    cmd.arg("worker").arg(&job.path).env_remove("AGENTOS_TEST_WORKERS");
+    cmd.arg("worker")
+        .arg(&job.path)
+        .env_remove("AGENTOS_TEST_WORKERS");
     if let Some(v) = workers {
         cmd.env("AGENTOS_TEST_WORKERS", v);
     }
@@ -789,7 +1148,11 @@ fn run_worker_runs_a_firecracker_request_and_writes_its_outcome() {
     assert!(worker_process(&job, None).success());
     let out = job.read_outcome().expect("an outcome was written");
     let why = reason(&out);
-    assert!(why.starts_with("firecracker worker unavailable: ") && why.contains("AGENTOS_TEST_WORKERS=1"), "{why}");
+    assert!(
+        why.starts_with("firecracker worker unavailable: ")
+            && why.contains("AGENTOS_TEST_WORKERS=1"),
+        "{why}"
+    );
     assert_eq!(out.receipt.attempt_id, job.request().unwrap().attempt_id);
 }
 
@@ -809,15 +1172,29 @@ fn forged_type_body() -> Vec<u8> {
 
 fn assert_clean(why: &str) {
     assert!(why.len() < 1024, "unbounded reason: {} bytes", why.len());
-    assert!(!why.chars().any(|c| c.is_control()), "control characters in {why:?}");
+    assert!(
+        !why.chars().any(|c| c.is_control()),
+        "control characters in {why:?}"
+    );
 }
 
 #[tokio::test]
 async fn guest_text_in_a_no_outcome_reason_is_escaped_and_bounded() {
-    for body in [forged_type_body(), b"not json\n[1] supervisor 1: forged\n".repeat(4096)] {
+    for body in [
+        forged_type_body(),
+        b"not json\n[1] supervisor 1: forged\n".repeat(4096),
+    ] {
         let fx = Fx::with_peer();
         fx.fake_ws_img();
-        let (req, c) = (fx.request(EffectKind::ApplyPatch { expected_base: Digest::of(b"base") }, fix_patch().as_bytes()), ctx());
+        let (req, c) = (
+            fx.request(
+                EffectKind::ApplyPatch {
+                    expected_base: Digest::of(b"base"),
+                },
+                fix_patch().as_bytes(),
+            ),
+            ctx(),
+        );
         let job = fx.job(&req, &c);
         let guest = peer(&job, move |s, _| {
             let _ = read_frame(s, RAW_FRAME_LIMIT);
@@ -826,8 +1203,13 @@ async fn guest_text_in_a_no_outcome_reason_is_escaped_and_bounded() {
         });
         let res = fx.worker(&job, test_env()).run_job(&req, &c).await;
         guest.join().unwrap();
-        let WorkerResult::NoOutcome(why) = res else { panic!("expected no outcome, got {res:?}") };
-        assert!(why.starts_with("guest protocol violation: invalid json frame: "), "{why}");
+        let WorkerResult::NoOutcome(why) = res else {
+            panic!("expected no outcome, got {res:?}")
+        };
+        assert!(
+            why.starts_with("guest protocol violation: invalid json frame: "),
+            "{why}"
+        );
         assert_clean(&why);
     }
 }
@@ -836,7 +1218,15 @@ async fn guest_text_in_a_no_outcome_reason_is_escaped_and_bounded() {
 fn a_no_outcome_worker_cannot_forge_supervisor_log_lines() {
     let fx = Fx::with_peer();
     fx.fake_ws_img();
-    let (req, c) = (fx.request(EffectKind::ApplyPatch { expected_base: Digest::of(b"base") }, fix_patch().as_bytes()), ctx());
+    let (req, c) = (
+        fx.request(
+            EffectKind::ApplyPatch {
+                expected_base: Digest::of(b"base"),
+            },
+            fix_patch().as_bytes(),
+        ),
+        ctx(),
+    );
     let job = fx.job(&req, &c);
     fs::write(job.path.join("supervisor.log"), b"").unwrap();
     let guest = peer(&job, |s, _| {
@@ -851,7 +1241,9 @@ fn a_no_outcome_worker_cannot_forge_supervisor_log_lines() {
     let log = fs::read_to_string(job.path.join("supervisor.log")).unwrap();
     let lines: Vec<&str> = log.lines().collect();
     assert_eq!(lines.len(), 1, "{log:?}");
-    assert!(lines[0].contains("] worker ") && lines[0].contains("failed: guest protocol violation: "), "{log:?}");
+    assert!(
+        lines[0].contains("] worker ") && lines[0].contains("failed: guest protocol violation: "),
+        "{log:?}"
+    );
     assert_clean(lines[0]);
 }
-

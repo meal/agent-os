@@ -21,11 +21,12 @@ use std::fs;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
-use rustix::process::{getegid, geteuid, getgid, getgroups, getuid, setrlimit, Gid, Resource, Rlimit, Uid};
+use rustix::process::{
+    Gid, Resource, Rlimit, Uid, getegid, geteuid, getgid, getgroups, getuid, setrlimit,
+};
 use rustix::thread::{set_no_new_privs, set_thread_groups, set_thread_res_gid, set_thread_res_uid};
 
-pub const USAGE: &str =
-    "usage: agentos-guest exec-check --uid U --gid G --nproc N --nofile N --oom -1000..1000 -- PROGRAM [ARGS...]";
+pub const USAGE: &str = "usage: agentos-guest exec-check --uid U --gid G --nproc N --nofile N --oom -1000..1000 -- PROGRAM [ARGS...]";
 
 /// The parsed command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,7 +46,11 @@ pub fn parse(args: &[OsString]) -> Result<ExecCheck, String> {
     let (mut uid, mut gid, mut nproc, mut nofile, mut oom) = (None, None, None, None, None);
     // A non-root id (`u32::MAX` is the kernel's "no change").
     let id = |flag: &str, value: &str| -> Result<u32, String> {
-        value.parse::<u32>().ok().filter(|v| *v != 0 && *v != u32::MAX).ok_or_else(|| format!("{flag} {value:?}"))
+        value
+            .parse::<u32>()
+            .ok()
+            .filter(|v| *v != 0 && *v != u32::MAX)
+            .ok_or_else(|| format!("{flag} {value:?}"))
     };
     let mut it = args.iter();
     loop {
@@ -56,14 +61,33 @@ pub fn parse(args: &[OsString]) -> Result<ExecCheck, String> {
             break;
         }
         let flag = flag.to_str().ok_or("non-UTF-8 option")?;
-        let value = it.next().and_then(|v| v.to_str()).ok_or_else(|| format!("{flag} needs a value"))?;
+        let value = it
+            .next()
+            .and_then(|v| v.to_str())
+            .ok_or_else(|| format!("{flag} needs a value"))?;
         let slot_taken = match flag {
             "--uid" => uid.replace(id(flag, value)?).is_some(),
             "--gid" => gid.replace(id(flag, value)?).is_some(),
-            "--nproc" => nproc.replace(value.parse::<u64>().map_err(|_| format!("--nproc {value:?}"))?).is_some(),
-            "--nofile" => nofile.replace(value.parse::<u64>().map_err(|_| format!("--nofile {value:?}"))?).is_some(),
+            "--nproc" => nproc
+                .replace(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| format!("--nproc {value:?}"))?,
+                )
+                .is_some(),
+            "--nofile" => nofile
+                .replace(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| format!("--nofile {value:?}"))?,
+                )
+                .is_some(),
             "--oom" => {
-                let v = value.parse::<i32>().ok().filter(|v| (-1000..=1000).contains(v)).ok_or_else(|| format!("--oom {value:?}"))?;
+                let v = value
+                    .parse::<i32>()
+                    .ok()
+                    .filter(|v| (-1000..=1000).contains(v))
+                    .ok_or_else(|| format!("--oom {value:?}"))?;
                 oom.replace(v).is_some()
             }
             other => return Err(format!("unknown option {other:?}")),
@@ -88,7 +112,9 @@ pub fn parse(args: &[OsString]) -> Result<ExecCheck, String> {
 /// rustix's `set_thread_*` calls are the raw per-thread syscalls; the trampoline has only its
 /// main thread (checked first), so they apply to the whole process.
 fn drop_privileges(uid: u32, gid: u32) -> Result<(), String> {
-    let threads = fs::read_dir("/proc/self/task").map_err(|e| format!("/proc/self/task: {e}"))?.count();
+    let threads = fs::read_dir("/proc/self/task")
+        .map_err(|e| format!("/proc/self/task: {e}"))?
+        .count();
     if threads != 1 {
         return Err(format!("{threads} threads, expected 1"));
     }
@@ -100,7 +126,10 @@ fn drop_privileges(uid: u32, gid: u32) -> Result<(), String> {
     if (getuid(), geteuid(), getgid(), getegid()) != (u, u, g, g) {
         return Err("ids did not change".into());
     }
-    if !getgroups().map_err(|e| format!("getgroups: {e}"))?.is_empty() {
+    if !getgroups()
+        .map_err(|e| format!("getgroups: {e}"))?
+        .is_empty()
+    {
         return Err("supplementary groups remain".into());
     }
     if set_thread_res_uid(Uid::ROOT, Uid::ROOT, Uid::ROOT).is_ok() {
@@ -121,21 +150,39 @@ pub fn main(args: &[OsString]) -> i32 {
         }
     };
     if let Err(e) = fs::write("/proc/self/oom_score_adj", req.oom_score_adj.to_string()) {
-        eprintln!("agentos-guest exec-check: cannot set oom_score_adj to {}: {e}", req.oom_score_adj);
+        eprintln!(
+            "agentos-guest exec-check: cannot set oom_score_adj to {}: {e}",
+            req.oom_score_adj
+        );
         return 126;
     }
-    let limits = [(Resource::Nproc, req.nproc, "RLIMIT_NPROC"), (Resource::Nofile, req.nofile, "RLIMIT_NOFILE")];
+    let limits = [
+        (Resource::Nproc, req.nproc, "RLIMIT_NPROC"),
+        (Resource::Nofile, req.nofile, "RLIMIT_NOFILE"),
+    ];
     for (resource, n, name) in limits {
-        if let Err(e) = setrlimit(resource, Rlimit { current: Some(n), maximum: Some(n) }) {
+        if let Err(e) = setrlimit(
+            resource,
+            Rlimit {
+                current: Some(n),
+                maximum: Some(n),
+            },
+        ) {
             eprintln!("agentos-guest exec-check: cannot set {name} to {n}: {e}");
             return 126;
         }
     }
     if let Err(e) = drop_privileges(req.uid, req.gid) {
-        eprintln!("agentos-guest exec-check: cannot drop privileges to {}:{}: {e}", req.uid, req.gid);
+        eprintln!(
+            "agentos-guest exec-check: cannot drop privileges to {}:{}: {e}",
+            req.uid, req.gid
+        );
         return 126;
     }
     let err = Command::new(&req.program).args(&req.args).exec();
-    eprintln!("agentos-guest exec-check: cannot run {}: {err}", req.program.to_string_lossy().escape_debug());
+    eprintln!(
+        "agentos-guest exec-check: cannot run {}: {err}",
+        req.program.to_string_lossy().escape_debug()
+    );
     127
 }

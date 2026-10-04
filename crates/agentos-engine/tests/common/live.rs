@@ -44,7 +44,9 @@ pub fn require() -> Option<Live> {
             )
         }),
     };
-    let key = ApiKey::new(&raw).unwrap_or_else(|e| panic!("AGENTOS_LIVE_MODEL_TESTS is set but the API key is unusable: {e}"));
+    let key = ApiKey::new(&raw).unwrap_or_else(|e| {
+        panic!("AGENTOS_LIVE_MODEL_TESTS is set but the API key is unusable: {e}")
+    });
     Some(Live {
         key,
         base_url: nonempty("AGENTOS_ANTHROPIC_BASE_URL"),

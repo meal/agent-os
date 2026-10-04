@@ -13,7 +13,7 @@ use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor, Reconcil
 use crate::firecracker::{FirecrackerWorker, WorkerResult};
 use crate::fixture::FixtureExecutor;
 use crate::job::{HostConfig, JobDir, WorkerConfig};
-use crate::process::{run_in_group, GroupError};
+use crate::process::{GroupError, run_in_group};
 
 /// The environment variable that must be `1` for a scripted worker to run anything.
 pub const TEST_WORKERS_ENV: &str = "AGENTOS_TEST_WORKERS";
@@ -37,10 +37,18 @@ fn excerpt(stderr: &[u8]) -> String {
 
 pub trait Worker {
     /// Runs one attempt of an effect; every failure is an `Outcome::Failure`.
-    fn run(&self, req: &EffectRequest, ctx: &AttemptCtx) -> impl Future<Output = ExecOutcome> + Send;
+    fn run(
+        &self,
+        req: &EffectRequest,
+        ctx: &AttemptCtx,
+    ) -> impl Future<Output = ExecOutcome> + Send;
 
     /// Whether a dispatched effect without a receipt took effect (see `Executor::reconcile`).
-    fn reconcile(&self, req: &EffectRequest, ctx: &AttemptCtx) -> impl Future<Output = Reconciliation> + Send;
+    fn reconcile(
+        &self,
+        req: &EffectRequest,
+        ctx: &AttemptCtx,
+    ) -> impl Future<Output = Reconciliation> + Send;
 
     /// The current digest of `task`'s workspace (see `Executor::current_workspace`).
     fn current_workspace(&self, task: &TaskId) -> Option<Result<Digest, String>>;
@@ -67,11 +75,19 @@ impl HostProcessWorker {
 }
 
 impl Worker for HostProcessWorker {
-    fn run(&self, req: &EffectRequest, ctx: &AttemptCtx) -> impl Future<Output = ExecOutcome> + Send {
+    fn run(
+        &self,
+        req: &EffectRequest,
+        ctx: &AttemptCtx,
+    ) -> impl Future<Output = ExecOutcome> + Send {
         self.0.run(req, ctx)
     }
 
-    fn reconcile(&self, req: &EffectRequest, ctx: &AttemptCtx) -> impl Future<Output = Reconciliation> + Send {
+    fn reconcile(
+        &self,
+        req: &EffectRequest,
+        ctx: &AttemptCtx,
+    ) -> impl Future<Output = Reconciliation> + Send {
         self.0.reconcile(req, ctx)
     }
 
@@ -89,7 +105,10 @@ pub struct ScriptedWorker {
 
 impl ScriptedWorker {
     pub fn new(script: impl Into<String>) -> ScriptedWorker {
-        ScriptedWorker { script: script.into(), groups_file: None }
+        ScriptedWorker {
+            script: script.into(),
+            groups_file: None,
+        }
     }
 
     /// Records the script's process group in `groups_file`.
@@ -121,22 +140,39 @@ async fn run_scripted(
     let output = match run_in_group(cmd, Duration::MAX, SCRIPT_OUTPUT_LIMIT, groups_file).await {
         Ok(o) => o,
         Err(GroupError::Timeout) => return ExecOutcome::failure(req, ctx, "timeout"),
-        Err(GroupError::Io(e)) => return ExecOutcome::failure(req, ctx, format!("cannot run script: {e}")),
+        Err(GroupError::Io(e)) => {
+            return ExecOutcome::failure(req, ctx, format!("cannot run script: {e}"));
+        }
     };
     if !output.status.success() {
         let stderr = excerpt(&output.stderr);
-        return ExecOutcome::failure(req, ctx, format!("script failed ({}): {stderr}", output.status));
+        return ExecOutcome::failure(
+            req,
+            ctx,
+            format!("script failed ({}): {stderr}", output.status),
+        );
     }
     // A cut output is not the output the script produced.
     if output.stdout.len() > SCRIPT_OUTPUT_LIMIT {
-        return ExecOutcome::failure(req, ctx, format!("script output exceeds {SCRIPT_OUTPUT_LIMIT} bytes"));
+        return ExecOutcome::failure(
+            req,
+            ctx,
+            format!("script output exceeds {SCRIPT_OUTPUT_LIMIT} bytes"),
+        );
     }
     ExecOutcome::success(req, ctx, output.stdout)
 }
 
 impl Worker for ScriptedWorker {
     async fn run(&self, req: &EffectRequest, ctx: &AttemptCtx) -> ExecOutcome {
-        run_scripted(&self.script, self.groups_file.as_deref(), test_workers_enabled(), req, ctx).await
+        run_scripted(
+            &self.script,
+            self.groups_file.as_deref(),
+            test_workers_enabled(),
+            req,
+            ctx,
+        )
+        .await
     }
 
     async fn reconcile(&self, _req: &EffectRequest, _ctx: &AttemptCtx) -> Reconciliation {
@@ -171,11 +207,21 @@ pub async fn run_worker(job: &JobDir) -> io::Result<()> {
         worker: worker.to_string(),
     };
     let out = match &request.worker {
-        WorkerConfig::Host(config) => HostProcessWorker::new(config, Some(groups)).run(&req, &ctx("host-process")).await,
-        WorkerConfig::Scripted(config) => {
-            ScriptedWorker::new(config.script.clone()).inside_worker(groups).run(&req, &ctx("scripted")).await
+        WorkerConfig::Host(config) => {
+            HostProcessWorker::new(config, Some(groups))
+                .run(&req, &ctx("host-process"))
+                .await
         }
-        WorkerConfig::Firecracker(config) => match FirecrackerWorker::new(config, job).run_job(&req, &ctx("firecracker")).await {
+        WorkerConfig::Scripted(config) => {
+            ScriptedWorker::new(config.script.clone())
+                .inside_worker(groups)
+                .run(&req, &ctx("scripted"))
+                .await
+        }
+        WorkerConfig::Firecracker(config) => match FirecrackerWorker::new(config, job)
+            .run_job(&req, &ctx("firecracker"))
+            .await
+        {
             WorkerResult::Outcome(out) => out,
             // A request was sent and its effect is unknown: no outcome, exit 1 (the caller
             // logs the reason to supervisor.log); the controller reconciles by inspection.
@@ -203,7 +249,14 @@ mod tests {
             contract: Contract::parse(json).unwrap(),
             deadline_ts: 0,
         };
-        (req, AttemptCtx { attempt_id: AttemptId::new(), lease_generation: 2, worker: "scripted".into() })
+        (
+            req,
+            AttemptCtx {
+                attempt_id: AttemptId::new(),
+                lease_generation: 2,
+                worker: "scripted".into(),
+            },
+        )
     }
 
     #[tokio::test]
@@ -211,21 +264,39 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let groups = dir.path().join("groups");
         let (req, ctx) = req();
-        let out = run_scripted("echo $$; cut -d' ' -f5 /proc/$$/stat", Some(&groups), true, &req, &ctx).await;
-        assert_eq!(out.receipt.outcome, Outcome::Success, "{}", String::from_utf8_lossy(&out.output));
+        let out = run_scripted(
+            "echo $$; cut -d' ' -f5 /proc/$$/stat",
+            Some(&groups),
+            true,
+            &req,
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            out.receipt.outcome,
+            Outcome::Success,
+            "{}",
+            String::from_utf8_lossy(&out.output)
+        );
         assert_eq!(out.receipt.result_digest, Some(Digest::of(&out.output)));
         let stdout = String::from_utf8(out.output).unwrap();
         let recorded = std::fs::read_to_string(&groups).unwrap();
         let lines: Vec<&str> = stdout.lines().collect();
         assert_eq!(lines[0], lines[1], "the shell leads its own group");
-        assert_eq!(recorded, format!("{}\n", lines[0]), "and that group is recorded");
+        assert_eq!(
+            recorded,
+            format!("{}\n", lines[0]),
+            "and that group is recorded"
+        );
     }
 
     #[tokio::test]
     async fn a_failing_script_is_a_failure_with_its_stderr() {
         let (req, ctx) = req();
         let out = run_scripted("echo nope >&2; exit 3", None, true, &req, &ctx).await;
-        let Outcome::Failure(reason) = out.receipt.outcome else { panic!("expected failure") };
+        let Outcome::Failure(reason) = out.receipt.outcome else {
+            panic!("expected failure")
+        };
         assert!(reason.contains("nope") && reason.contains('3'), "{reason}");
     }
 
@@ -233,7 +304,9 @@ mod tests {
     async fn an_oversized_output_is_a_failure_not_a_truncation() {
         let (req, ctx) = req();
         let out = run_scripted("head -c 1048577 /dev/zero", None, true, &req, &ctx).await;
-        let Outcome::Failure(reason) = out.receipt.outcome else { panic!("expected failure") };
+        let Outcome::Failure(reason) = out.receipt.outcome else {
+            panic!("expected failure")
+        };
         assert!(reason.contains("exceeds"), "{reason}");
         let out = run_scripted("head -c 1048576 /dev/zero", None, true, &req, &ctx).await;
         assert_eq!(out.receipt.outcome, Outcome::Success);
@@ -243,11 +316,27 @@ mod tests {
     #[tokio::test]
     async fn a_failure_reason_keeps_at_most_4_kib_of_stderr() {
         let (req, ctx) = req();
-        let out = run_scripted("head -c 100000 /dev/zero | tr '\\0' x >&2; exit 1", None, true, &req, &ctx).await;
-        let Outcome::Failure(reason) = out.receipt.outcome else { panic!("expected failure") };
+        let out = run_scripted(
+            "head -c 100000 /dev/zero | tr '\\0' x >&2; exit 1",
+            None,
+            true,
+            &req,
+            &ctx,
+        )
+        .await;
+        let Outcome::Failure(reason) = out.receipt.outcome else {
+            panic!("expected failure")
+        };
         assert!(reason.starts_with("script failed"), "{reason}");
-        assert!(reason.len() <= 4096 + 100, "reason is {} bytes", reason.len());
-        assert!(reason.contains(&"x".repeat(4000)) && reason.ends_with("[truncated]"), "{reason}");
+        assert!(
+            reason.len() <= 4096 + 100,
+            "reason is {} bytes",
+            reason.len()
+        );
+        assert!(
+            reason.contains(&"x".repeat(4000)) && reason.ends_with("[truncated]"),
+            "{reason}"
+        );
     }
 
     #[tokio::test]
@@ -255,21 +344,36 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("marker");
         let (req, ctx) = req();
-        let out = run_scripted(&format!("touch {}", marker.display()), None, false, &req, &ctx).await;
-        assert_eq!(out.receipt.outcome, Outcome::Failure("scripted workers are disabled".into()));
+        let out = run_scripted(
+            &format!("touch {}", marker.display()),
+            None,
+            false,
+            &req,
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            out.receipt.outcome,
+            Outcome::Failure("scripted workers are disabled".into())
+        );
         assert!(!marker.exists());
     }
 
     #[test]
     fn an_unrecordable_group_is_killed_and_reported() {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("marker");
         let (req, ctx) = req();
         let script = format!("sleep 1; touch {}", marker.display());
         let groups = dir.path().join("missing-dir/groups");
         let out = rt.block_on(run_scripted(&script, Some(&groups), true, &req, &ctx));
-        let Outcome::Failure(reason) = out.receipt.outcome else { panic!("expected failure") };
+        let Outcome::Failure(reason) = out.receipt.outcome else {
+            panic!("expected failure")
+        };
         assert!(reason.contains("cannot record process group"), "{reason}");
         std::thread::sleep(Duration::from_millis(1500));
         assert!(!marker.exists(), "the unrecorded script kept running");

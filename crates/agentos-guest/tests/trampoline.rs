@@ -13,18 +13,26 @@ fn is_root() -> bool {
 
 fn skip_unless_root() -> bool {
     if !is_root() {
-        println!("SKIPPED: the trampoline drops privileges and must start as root (the compose test service is root)");
+        println!(
+            "SKIPPED: the trampoline drops privileges and must start as root (the compose test service is root)"
+        );
         return true;
     }
     false
 }
 
 fn limits_args() -> Vec<&'static str> {
-    vec!["--uid", UID, "--gid", UID, "--nproc", "256", "--nofile", "1024", "--oom", "1000", "--"]
+    vec![
+        "--uid", UID, "--gid", UID, "--nproc", "256", "--nofile", "1024", "--oom", "1000", "--",
+    ]
 }
 
 fn exec_check(args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_agentos-guest")).arg("exec-check").args(args).output().unwrap()
+    Command::new(env!("CARGO_BIN_EXE_agentos-guest"))
+        .arg("exec-check")
+        .args(args)
+        .output()
+        .unwrap()
 }
 
 fn exec_check_sh(script: &str) -> std::process::Output {
@@ -35,7 +43,10 @@ fn exec_check_sh(script: &str) -> std::process::Output {
 
 /// The `(soft, hard)` columns of one `/proc/self/limits` row.
 fn limit(limits: &str, name: &str) -> (String, String) {
-    let line = limits.lines().find(|l| l.starts_with(name)).unwrap_or_else(|| panic!("no {name} in {limits}"));
+    let line = limits
+        .lines()
+        .find(|l| l.starts_with(name))
+        .unwrap_or_else(|| panic!("no {name} in {limits}"));
     let fields: Vec<&str> = line[name.len()..].split_whitespace().collect();
     (fields[0].to_string(), fields[1].to_string())
 }
@@ -43,7 +54,11 @@ fn limit(limits: &str, name: &str) -> (String, String) {
 /// Whether this process holds `CAP_SYS_RESOURCE` (bit 24 of `CapEff`).
 fn has_cap_sys_resource() -> bool {
     let status = std::fs::read_to_string("/proc/self/status").unwrap();
-    let hex = status.lines().find_map(|l| l.strip_prefix("CapEff:")).unwrap().trim();
+    let hex = status
+        .lines()
+        .find_map(|l| l.strip_prefix("CapEff:"))
+        .unwrap()
+        .trim();
     u64::from_str_radix(hex, 16).unwrap() >> 24 & 1 == 1
 }
 
@@ -53,11 +68,21 @@ fn trampoline_applies_rlimits_and_oom_score_then_execs() {
         return;
     }
     // dash has no `ulimit -u`; `/proc/self/limits` of the exec'd shell is shell-independent.
-    let out = exec_check_sh("cat /proc/self/limits; echo oom=$(cat /proc/self/oom_score_adj); echo args=\"$0\"");
+    let out = exec_check_sh(
+        "cat /proc/self/limits; echo oom=$(cat /proc/self/oom_score_adj); echo args=\"$0\"",
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{out:?}");
-    assert_eq!(limit(&stdout, "Max processes"), ("256".into(), "256".into()), "{stdout}");
-    assert_eq!(limit(&stdout, "Max open files"), ("1024".into(), "1024".into()), "{stdout}");
+    assert_eq!(
+        limit(&stdout, "Max processes"),
+        ("256".into(), "256".into()),
+        "{stdout}"
+    );
+    assert_eq!(
+        limit(&stdout, "Max open files"),
+        ("1024".into(), "1024".into()),
+        "{stdout}"
+    );
     assert!(stdout.contains("oom=1000\n"), "{stdout}");
     // The program's own arguments pass through untouched.
     assert!(stdout.contains("args=the-arg\n"), "{stdout}");
@@ -69,7 +94,9 @@ fn the_check_cannot_lower_its_oom_score_adj() {
         return;
     }
     let try_write = |v: &str| {
-        let out = exec_check_sh(&format!("echo {v} > /proc/self/oom_score_adj && echo wrote || echo refused; cat /proc/self/oom_score_adj"));
+        let out = exec_check_sh(&format!(
+            "echo {v} > /proc/self/oom_score_adj && echo wrote || echo refused; cat /proc/self/oom_score_adj"
+        ));
         assert!(out.status.success(), "{out:?}");
         String::from_utf8_lossy(&out.stdout).into_owned()
     };
@@ -100,7 +127,10 @@ fn the_check_runs_as_the_given_ids_without_groups_and_cannot_regain_root() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{out:?}");
-    let lines: Vec<String> = stdout.lines().map(|l| l.split_whitespace().collect::<Vec<_>>().join(" ")).collect();
+    let lines: Vec<String> = stdout
+        .lines()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
     assert_eq!(
         lines,
         [
@@ -125,7 +155,11 @@ fn trampoline_execs_in_place_keeping_the_environment_it_was_given() {
     let out = Command::new(env!("CARGO_BIN_EXE_agentos-guest"))
         .arg("exec-check")
         .args(limits_args())
-        .args(["sh", "-c", "echo \"$AGENTOS_TRAMPOLINE_PROBE\"; tr '\\0' ' ' < /proc/self/cmdline"])
+        .args([
+            "sh",
+            "-c",
+            "echo \"$AGENTOS_TRAMPOLINE_PROBE\"; tr '\\0' ' ' < /proc/self/cmdline",
+        ])
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("AGENTOS_TRAMPOLINE_PROBE", "kept")
@@ -157,34 +191,104 @@ fn trampoline_refuses_malformed_arguments_with_exit_2() {
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("ran");
     let touch = format!("touch {}", marker.display());
-    let ok = ["--uid", "1001", "--gid", "1001", "--nproc", "256", "--nofile", "1024", "--oom", "1000"];
-    let with = |opts: &[&str], tail: &[&str]| -> Vec<String> { opts.iter().chain(tail).map(|s| s.to_string()).collect() };
+    let ok = [
+        "--uid", "1001", "--gid", "1001", "--nproc", "256", "--nofile", "1024", "--oom", "1000",
+    ];
+    let with = |opts: &[&str], tail: &[&str]| -> Vec<String> {
+        opts.iter().chain(tail).map(|s| s.to_string()).collect()
+    };
     let run = ["--", "sh", "-c", touch.as_str()];
     let cases: Vec<Vec<String>> = vec![
         vec![],
         with(&ok, &[]),
         with(&ok, &["--"]),
-        with(&["--uid", "1001", "--gid", "1001", "--nproc", "x", "--nofile", "1024", "--oom", "1000"], &run),
-        with(&["--uid", "1001", "--gid", "1001", "--nproc", "256", "--nofile", "1024"], &run),
-        with(&["--uid", "1001", "--gid", "1001", "--nproc", "256", "--nproc", "256", "--nofile", "1024", "--oom", "1000"], &run),
-        with(&["--uid", "1001", "--gid", "1001", "--nproc", "256", "--nofile", "1024", "--oom", "1001"], &run),
-        with(&["--uid", "1001", "--gid", "1001", "--nproc", "256", "--nofile", "1024", "--oom", "-1001"], &run),
+        with(
+            &[
+                "--uid", "1001", "--gid", "1001", "--nproc", "x", "--nofile", "1024", "--oom",
+                "1000",
+            ],
+            &run,
+        ),
+        with(
+            &[
+                "--uid", "1001", "--gid", "1001", "--nproc", "256", "--nofile", "1024",
+            ],
+            &run,
+        ),
+        with(
+            &[
+                "--uid", "1001", "--gid", "1001", "--nproc", "256", "--nproc", "256", "--nofile",
+                "1024", "--oom", "1000",
+            ],
+            &run,
+        ),
+        with(
+            &[
+                "--uid", "1001", "--gid", "1001", "--nproc", "256", "--nofile", "1024", "--oom",
+                "1001",
+            ],
+            &run,
+        ),
+        with(
+            &[
+                "--uid", "1001", "--gid", "1001", "--nproc", "256", "--nofile", "1024", "--oom",
+                "-1001",
+            ],
+            &run,
+        ),
         with(&ok, &["--bogus", "1", "--", "true"]),
         with(&ok, &["true"]),
         // The ids: missing, malformed, or root (no drop at all).
-        with(&["--gid", "1001", "--nproc", "256", "--nofile", "1024", "--oom", "1000"], &run),
-        with(&["--uid", "1001", "--nproc", "256", "--nofile", "1024", "--oom", "1000"], &run),
-        with(&["--uid", "check", "--gid", "1001", "--nproc", "256", "--nofile", "1024", "--oom", "1000"], &run),
-        with(&["--uid", "1001", "--gid", "-1", "--nproc", "256", "--nofile", "1024", "--oom", "1000"], &run),
-        with(&["--uid", "0", "--gid", "1001", "--nproc", "256", "--nofile", "1024", "--oom", "1000"], &run),
-        with(&["--uid", "1001", "--gid", "0", "--nproc", "256", "--nofile", "1024", "--oom", "1000"], &run),
+        with(
+            &[
+                "--gid", "1001", "--nproc", "256", "--nofile", "1024", "--oom", "1000",
+            ],
+            &run,
+        ),
+        with(
+            &[
+                "--uid", "1001", "--nproc", "256", "--nofile", "1024", "--oom", "1000",
+            ],
+            &run,
+        ),
+        with(
+            &[
+                "--uid", "check", "--gid", "1001", "--nproc", "256", "--nofile", "1024", "--oom",
+                "1000",
+            ],
+            &run,
+        ),
+        with(
+            &[
+                "--uid", "1001", "--gid", "-1", "--nproc", "256", "--nofile", "1024", "--oom",
+                "1000",
+            ],
+            &run,
+        ),
+        with(
+            &[
+                "--uid", "0", "--gid", "1001", "--nproc", "256", "--nofile", "1024", "--oom",
+                "1000",
+            ],
+            &run,
+        ),
+        with(
+            &[
+                "--uid", "1001", "--gid", "0", "--nproc", "256", "--nofile", "1024", "--oom",
+                "1000",
+            ],
+            &run,
+        ),
     ];
     for args in &cases {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let out = exec_check(&args);
         assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
         let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains("usage: agentos-guest exec-check"), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("usage: agentos-guest exec-check"),
+            "{args:?}: {stderr}"
+        );
         assert!(out.stdout.is_empty(), "{args:?}");
         assert!(!marker.exists(), "{args:?} ran the program");
     }
@@ -199,7 +303,11 @@ fn a_trampoline_that_cannot_drop_privileges_runs_nothing() {
     // Started unprivileged (another uid), it cannot clear its groups or become 1001.
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("ran");
-    std::fs::set_permissions(dir.path(), std::os::unix::fs::PermissionsExt::from_mode(0o777)).unwrap();
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o777),
+    )
+    .unwrap();
     let touch = format!("touch {}", marker.display());
     let out = Command::new(env!("CARGO_BIN_EXE_agentos-guest"))
         .arg("exec-check")
@@ -210,6 +318,9 @@ fn a_trampoline_that_cannot_drop_privileges_runs_nothing() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(126), "{out:?}");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot drop privileges"), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cannot drop privileges"),
+        "{out:?}"
+    );
     assert!(!marker.exists(), "the program ran without the drop");
 }

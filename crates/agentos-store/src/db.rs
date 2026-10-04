@@ -5,8 +5,8 @@ use agentos_core::budget::BudgetError;
 use agentos_core::contract::{Capability, Contract};
 use agentos_core::effect::{EffectId, EffectState};
 use agentos_core::ids::{Digest, TaskId};
-use agentos_core::state::{reduce, Task, TaskEvent, TaskState, TransitionError};
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use agentos_core::state::{Task, TaskEvent, TaskState, TransitionError, reduce};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 const OWNER: &str = "local-owner";
 
@@ -20,11 +20,35 @@ pub const SCHEMA_VERSION: i64 = 2;
 /// them, so it can never forge a lifecycle event, an effect transition, or a receipt verdict
 /// that readers of the journal (replay, export) rely on.
 const RESERVED_EVENT_TYPES: &[&str] = &[
-    "TaskCreated", "Started", "Waiting", "Woken", "Paused", "Resumed", "VerifyStarted", "VerifyPassed",
-    "VerifyFailed", "WorkspaceUpdated", "ActionUsed", "CancelRequested", "CancelCompleted", "Failed",
-    "EffectIntended", "EffectDispatched", "EffectCompleted", "EffectFailed", "EffectUnknown", "EffectAbandoned", "EffectForfeited",
-    "ArtifactRegistered", "TaskEventRejected", "ReceiptIgnored", "ReceiptRejected",
-    "CapabilitiesIssued", "CapabilityGranted", "CapabilityDenied", "CapabilityRevoked",
+    "TaskCreated",
+    "Started",
+    "Waiting",
+    "Woken",
+    "Paused",
+    "Resumed",
+    "VerifyStarted",
+    "VerifyPassed",
+    "VerifyFailed",
+    "WorkspaceUpdated",
+    "ActionUsed",
+    "CancelRequested",
+    "CancelCompleted",
+    "Failed",
+    "EffectIntended",
+    "EffectDispatched",
+    "EffectCompleted",
+    "EffectFailed",
+    "EffectUnknown",
+    "EffectAbandoned",
+    "EffectForfeited",
+    "ArtifactRegistered",
+    "TaskEventRejected",
+    "ReceiptIgnored",
+    "ReceiptRejected",
+    "CapabilitiesIssued",
+    "CapabilityGranted",
+    "CapabilityDenied",
+    "CapabilityRevoked",
     "ModelRetryScheduled",
 ];
 
@@ -133,38 +157,63 @@ pub enum DbError {
     #[error("corrupt stored value: {0}")]
     Corrupt(String),
     #[error("capability {capability:?} denied: {reason}")]
-    CapabilityDenied { capability: Capability, reason: String },
+    CapabilityDenied {
+        capability: Capability,
+        reason: String,
+    },
     #[error("workspace version conflict: expected {expected}, actual {actual}")]
     VersionConflict { expected: Digest, actual: Digest },
     #[error("budget exceeded: {0}")]
     BudgetExceeded(BudgetError),
     #[error("task may not dispatch effects (state {state:?}, cancel_requested {cancel_requested})")]
-    NotDispatchable { state: TaskState, cancel_requested: bool },
-    #[error("reservation of {got} tool actions does not match the {expected} this effect kind consumes")]
+    NotDispatchable {
+        state: TaskState,
+        cancel_requested: bool,
+    },
+    #[error(
+        "reservation of {got} tool actions does not match the {expected} this effect kind consumes"
+    )]
     InvalidReservation { expected: u32, got: u32 },
-    #[error("effects of this task may not be abandoned (state {state:?}, cancel_requested {cancel_requested}): it could still dispatch them")]
-    NotAbandonable { state: TaskState, cancel_requested: bool },
+    #[error(
+        "effects of this task may not be abandoned (state {state:?}, cancel_requested {cancel_requested}): it could still dispatch them"
+    )]
+    NotAbandonable {
+        state: TaskState,
+        cancel_requested: bool,
+    },
     #[error("{0}")]
     UnprovenVerification(String),
-    #[error("event type {0:?} is reserved for the store and the engine; an audit row may not use it")]
+    #[error(
+        "event type {0:?} is reserved for the store and the engine; an audit row may not use it"
+    )]
     ReservedEventType(String),
     #[error("invalid model retry schedule: {0}")]
     InvalidModelRetry(String),
-    #[error("database schema version {found} is newer than the {supported} this build supports; upgrade agentos")]
+    #[error(
+        "database schema version {found} is newer than the {supported} this build supports; upgrade agentos"
+    )]
     SchemaVersion { found: i64, supported: i64 },
-    #[error("database was created by an older Agent OS; v0.1 databases are not migrated (schema version {found}, this build needs {supported})")]
+    #[error(
+        "database was created by an older Agent OS; v0.1 databases are not migrated (schema version {found}, this build needs {supported})"
+    )]
     OldSchema { found: i64, supported: i64 },
     #[error("effect not found: {0}")]
     EffectNotFound(EffectId),
     #[error("effect {effect} cannot move from {from:?} to {to:?}")]
-    InvalidEffectTransition { effect: EffectId, from: EffectState, to: EffectState },
+    InvalidEffectTransition {
+        effect: EffectId,
+        from: EffectState,
+        to: EffectState,
+    },
     #[error("lease generation {got} is not newer than stored generation {stored}")]
     StaleLease { stored: u64, got: u64 },
     #[error("artifact {0} is not registered; publish and register it before completing the effect")]
     ArtifactNotPublished(Digest),
     #[error("a successful completion of effect {0} must reference a published artifact")]
     ArtifactRequired(EffectId),
-    #[error("artifact {artifact} is not linked to effect {effect}; register it for that effect first")]
+    #[error(
+        "artifact {artifact} is not linked to effect {effect}; register it for that effect first"
+    )]
     ArtifactEffectMismatch { artifact: Digest, effect: EffectId },
     #[error("receipt result digest {receipt} does not match artifact {artifact}")]
     ReceiptArtifactMismatch { artifact: Digest, receipt: Digest },
@@ -216,7 +265,9 @@ pub(crate) fn event_name(ev: &TaskEvent) -> Result<String> {
     // Externally tagged: unit variants serialize as a string, others as {"Name": ...}.
     match serde_json::to_value(ev)? {
         serde_json::Value::String(s) => Ok(s),
-        serde_json::Value::Object(m) if m.len() == 1 => Ok(m.keys().next().cloned().unwrap_or_default()),
+        serde_json::Value::Object(m) if m.len() == 1 => {
+            Ok(m.keys().next().cloned().unwrap_or_default())
+        }
         other => Err(DbError::Corrupt(format!("event serialized as {other}"))),
     }
 }
@@ -267,7 +318,13 @@ pub(crate) fn insert_event(
     )?;
     tx.execute(
         "INSERT INTO events(task_id, seq, type, payload, ts) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![id.as_str(), seq, event_type, serde_json::to_string(payload)?, now_ts()],
+        params![
+            id.as_str(),
+            seq,
+            event_type,
+            serde_json::to_string(payload)?,
+            now_ts()
+        ],
     )?;
     Ok(seq as u64)
 }
@@ -297,21 +354,29 @@ impl Db {
         let mode: String =
             conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))?;
         if !mode.eq_ignore_ascii_case("wal") {
-            return Err(DbError::Corrupt(format!("journal_mode is {mode}, expected wal")));
+            return Err(DbError::Corrupt(format!(
+                "journal_mode is {mode}, expected wal"
+            )));
         }
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let current: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if current == SCHEMA_VERSION {
             // The common case takes no write lock, so opening never waits for a writer.
-            return Ok(Db { conn, clock: Box::new(now_ts) });
+            return Ok(Db {
+                conn,
+                clock: Box::new(now_ts),
+            });
         }
         // One write transaction, so a concurrent first opener never sees the tables of a
         // database whose version is not recorded yet (`user_version` is transactional).
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
         let version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version > SCHEMA_VERSION {
-            return Err(DbError::SchemaVersion { found: version, supported: SCHEMA_VERSION });
+            return Err(DbError::SchemaVersion {
+                found: version,
+                supported: SCHEMA_VERSION,
+            });
         }
         if version < SCHEMA_VERSION {
             let has_tasks: bool = tx.query_row(
@@ -320,13 +385,19 @@ impl Db {
                 |r| r.get(0),
             )?;
             if has_tasks {
-                return Err(DbError::OldSchema { found: version, supported: SCHEMA_VERSION });
+                return Err(DbError::OldSchema {
+                    found: version,
+                    supported: SCHEMA_VERSION,
+                });
             }
             tx.execute_batch(SCHEMA)?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         tx.commit()?;
-        Ok(Db { conn, clock: Box::new(now_ts) })
+        Ok(Db {
+            conn,
+            clock: Box::new(now_ts),
+        })
     }
 
     /// Replaces the clock used for capability expiry and deadlines (`approve_task`,
@@ -344,9 +415,9 @@ impl Db {
 
     /// Current value of a PRAGMA, rendered as text (diagnostics and tests).
     pub fn pragma_string(&self, name: &str) -> Result<String> {
-        let v: rusqlite::types::Value = self
-            .conn
-            .query_row(&format!("PRAGMA {name}"), [], |r| r.get(0))?;
+        let v: rusqlite::types::Value =
+            self.conn
+                .query_row(&format!("PRAGMA {name}"), [], |r| r.get(0))?;
         Ok(match v {
             rusqlite::types::Value::Integer(i) => i.to_string(),
             rusqlite::types::Value::Text(s) => s,
@@ -355,12 +426,18 @@ impl Db {
     }
 
     pub(crate) fn immediate(&self) -> Result<Transaction<'_>> {
-        Ok(Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?)
+        Ok(Transaction::new_unchecked(
+            &self.conn,
+            TransactionBehavior::Immediate,
+        )?)
     }
 
     /// Snapshot read: deferred, so it never takes the write lock and does not block writers under WAL.
     pub(crate) fn read(&self) -> Result<Transaction<'_>> {
-        Ok(Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?)
+        Ok(Transaction::new_unchecked(
+            &self.conn,
+            TransactionBehavior::Deferred,
+        )?)
     }
 
     pub fn create_task(&self, contract: &Contract, contract_digest: &Digest) -> Result<TaskId> {
@@ -387,7 +464,12 @@ impl Db {
                 now
             ],
         )?;
-        insert_event(&tx, &id, "TaskCreated", &serde_json::json!({ "contract_digest": contract_digest.to_string() }))?;
+        insert_event(
+            &tx,
+            &id,
+            "TaskCreated",
+            &serde_json::json!({ "contract_digest": contract_digest.to_string() }),
+        )?;
         tx.commit()?;
         Ok(id)
     }
@@ -412,7 +494,12 @@ impl Db {
 
     /// Append an event row without touching task state (denials, agent turns, recovery
     /// decisions). Reserved event types are refused.
-    pub fn append_audit(&self, id: &TaskId, event_type: &str, payload: &serde_json::Value) -> Result<u64> {
+    pub fn append_audit(
+        &self,
+        id: &TaskId,
+        event_type: &str,
+        payload: &serde_json::Value,
+    ) -> Result<u64> {
         if RESERVED_EVENT_TYPES.contains(&event_type) {
             return Err(DbError::ReservedEventType(event_type.to_string()));
         }
@@ -437,11 +524,15 @@ impl Db {
     pub fn events(&self, id: &TaskId) -> Result<Vec<StoredEvent>> {
         let tx = self.read()?;
         load_task(&tx, id)?;
-        let mut stmt = tx.prepare(
-            "SELECT seq, type, payload, ts FROM events WHERE task_id = ?1 ORDER BY seq",
-        )?;
+        let mut stmt = tx
+            .prepare("SELECT seq, type, payload, ts FROM events WHERE task_id = ?1 ORDER BY seq")?;
         let rows = stmt.query_map([id.as_str()], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
         })?;
         let mut out = Vec::new();
         for row in rows {

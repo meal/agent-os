@@ -50,7 +50,10 @@ pub struct JobRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[allow(clippy::large_enum_variant, reason = "a handful per process, serialized into request.json")]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a handful per process, serialized into request.json"
+)]
 pub enum WorkerConfig {
     Host(HostConfig),
     Scripted(ScriptedConfig),
@@ -80,13 +83,18 @@ impl WorkerConfig {
                     ("work_root", f.work_root.as_path()),
                 ]);
                 if let JailMode::Jailed(j) = &f.jail {
-                    paths.extend([("jailer_bin", j.jailer_bin.as_path()), ("cgroup_root", j.cgroup_root.as_path())]);
+                    paths.extend([
+                        ("jailer_bin", j.jailer_bin.as_path()),
+                        ("cgroup_root", j.cgroup_root.as_path()),
+                    ]);
                 }
                 if let GuestLauncher::Real { firecracker_bin } = &f.launcher {
                     paths.push(("launcher firecracker_bin", firecracker_bin.as_path()));
                 }
                 if !is_attempt_token(&f.attempt_token) {
-                    return Err(invalid("attempt_token must be 32 lowercase hex characters".into()));
+                    return Err(invalid(
+                        "attempt_token must be 32 lowercase hex characters".into(),
+                    ));
                 }
             }
         }
@@ -169,7 +177,9 @@ pub(crate) fn check_plain_name(field: &str, v: &str) -> io::Result<()> {
     if plain {
         Ok(())
     } else {
-        Err(invalid(format!("{field} {v:?} must be a single plain name")))
+        Err(invalid(format!(
+            "{field} {v:?} must be a single plain name"
+        )))
     }
 }
 
@@ -180,7 +190,9 @@ pub fn sync_dir(path: &Path) -> io::Result<()> {
 /// Write `bytes` to `path` so a reader sees the old file or the new one, never a mix,
 /// and so the new one survives a crash once this returns.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let dir = path.parent().ok_or_else(|| invalid(format!("{} has no parent", path.display())))?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| invalid(format!("{} has no parent", path.display())))?;
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -237,9 +249,14 @@ impl JobDir {
 
     pub fn open(path: &Path) -> io::Result<JobDir> {
         if !path.is_dir() {
-            return Err(io::Error::new(io::ErrorKind::NotFound, format!("{} is not a job directory", path.display())));
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} is not a job directory", path.display()),
+            ));
         }
-        Ok(JobDir { path: path.to_path_buf() })
+        Ok(JobDir {
+            path: path.to_path_buf(),
+        })
     }
 
     pub fn request(&self) -> io::Result<JobRequest> {
@@ -335,7 +352,11 @@ impl JobDir {
     /// "nobody"; any other failure to probe answers held, because an unknown answer must
     /// never let recovery redispatch beside a live worker.
     pub fn lock_held(&self) -> bool {
-        probe_lock(&self.path.join("lock"), |p| File::open(p), |f| f.try_lock_shared())
+        probe_lock(
+            &self.path.join("lock"),
+            |p| File::open(p),
+            |f| f.try_lock_shared(),
+        )
     }
 
     /// No further effect can come from this job: it reported a terminal state, left a
@@ -345,7 +366,10 @@ impl JobDir {
     }
 
     fn is_dead_with(&self, lock_held: impl Fn() -> bool) -> bool {
-        if matches!(self.read_status().map(|s| s.state), Some(JobState::Exited | JobState::Killed)) {
+        if matches!(
+            self.read_status().map(|s| s.state),
+            Some(JobState::Exited | JobState::Killed)
+        ) {
             return true;
         }
         self.read_receipt().is_some() || !lock_held()
@@ -360,7 +384,10 @@ impl JobDir {
         for entry in fs::read_dir(jobs_root)? {
             let entry = entry?;
             let name = entry.file_name();
-            if !name.to_str().is_some_and(|n| n.starts_with(&prefix) && !n.contains(".tmp")) {
+            if !name
+                .to_str()
+                .is_some_and(|n| n.starts_with(&prefix) && !n.contains(".tmp"))
+            {
                 continue;
             }
             let job = JobDir { path: entry.path() };
@@ -430,12 +457,15 @@ mod tests {
     fn an_unknown_probe_answer_is_held_never_nobody() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("lock");
-        let denied: fn(&Path) -> io::Result<File> = |_| Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        let denied: fn(&Path) -> io::Result<File> =
+            |_| Err(io::Error::from(io::ErrorKind::PermissionDenied));
         assert!(probe_lock(&p, denied, |_| Ok(())));
-        let missing: fn(&Path) -> io::Result<File> = |_| Err(io::Error::from(io::ErrorKind::NotFound));
+        let missing: fn(&Path) -> io::Result<File> =
+            |_| Err(io::Error::from(io::ErrorKind::NotFound));
         assert!(!probe_lock(&p, missing, |_| Ok(())));
         File::create(&p).unwrap();
-        let enolck: fn(&File) -> Result<(), TryLockError> = |_| Err(TryLockError::Error(io::Error::from_raw_os_error(37)));
+        let enolck: fn(&File) -> Result<(), TryLockError> =
+            |_| Err(TryLockError::Error(io::Error::from_raw_os_error(37)));
         assert!(probe_lock(&p, |p| File::open(p), enolck));
         assert!(!probe_lock(&p, |p| File::open(p), |f| f.try_lock_shared()));
     }
@@ -446,7 +476,13 @@ mod tests {
         let (job, lock) = JobDir::create(root.path(), &req()).unwrap();
         drop(lock);
         assert!(job.is_dead());
-        let unknown = || probe_lock(&job.path.join("lock"), |_| Err(io::Error::from(io::ErrorKind::PermissionDenied)), |_| Ok(()));
+        let unknown = || {
+            probe_lock(
+                &job.path.join("lock"),
+                |_| Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+                |_| Ok(()),
+            )
+        };
         assert!(!job.is_dead_with(unknown));
     }
 
@@ -454,7 +490,9 @@ mod tests {
     fn a_failed_create_leaves_no_directory() {
         let root = tempfile::tempdir().unwrap();
         let r = req();
-        let err = JobDir::create_with(root.path(), &r, |_| Err(io::Error::other("boom"))).err().unwrap();
+        let err = JobDir::create_with(root.path(), &r, |_| Err(io::Error::other("boom")))
+            .err()
+            .unwrap();
         assert_eq!(err.to_string(), "boom");
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
         JobDir::create(root.path(), &r).unwrap();

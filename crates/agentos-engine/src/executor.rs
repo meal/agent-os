@@ -56,7 +56,11 @@ impl ExecOutcome {
         ExecOutcome::with_outcome(req, ctx, Outcome::Success, output)
     }
 
-    pub fn failure(req: &EffectRequest, ctx: &AttemptCtx, reason: impl Into<String>) -> ExecOutcome {
+    pub fn failure(
+        req: &EffectRequest,
+        ctx: &AttemptCtx,
+        reason: impl Into<String>,
+    ) -> ExecOutcome {
         let reason = reason.into();
         let output = serde_json::to_vec(&serde_json::json!({
             "effect_id": req.effect_id,
@@ -69,13 +73,22 @@ impl ExecOutcome {
     }
 
     /// A placeholder for an attempt whose effect cannot be decided (see `unresolved`).
-    pub fn unresolved(req: &EffectRequest, ctx: &AttemptCtx, reason: impl Into<String>) -> ExecOutcome {
+    pub fn unresolved(
+        req: &EffectRequest,
+        ctx: &AttemptCtx,
+        reason: impl Into<String>,
+    ) -> ExecOutcome {
         let mut out = ExecOutcome::failure(req, ctx, reason);
         out.unresolved = true;
         out
     }
 
-    fn with_outcome(req: &EffectRequest, ctx: &AttemptCtx, outcome: Outcome, output: Vec<u8>) -> ExecOutcome {
+    fn with_outcome(
+        req: &EffectRequest,
+        ctx: &AttemptCtx,
+        outcome: Outcome,
+        output: Vec<u8>,
+    ) -> ExecOutcome {
         ExecOutcome {
             receipt: Receipt {
                 effect_id: req.effect_id.clone(),
@@ -117,7 +130,11 @@ pub enum Reconciliation {
 pub trait Executor {
     /// Runs one attempt of an effect. Never panics on effect failure: every failure is an
     /// `Outcome::Failure` receipt with a JSON description in `output`.
-    fn run(&self, req: &EffectRequest, ctx: &AttemptCtx) -> impl Future<Output = ExecOutcome> + Send;
+    fn run(
+        &self,
+        req: &EffectRequest,
+        ctx: &AttemptCtx,
+    ) -> impl Future<Output = ExecOutcome> + Send;
 
     /// The latest outcome the executor durably retained for `effect` (highest lease
     /// generation), independent of the controller's database. Recovery publishes it instead
@@ -128,7 +145,11 @@ pub trait Executor {
 
     /// Inspects the world to decide whether a dispatched effect without a receipt took
     /// effect. `ctx` is the attempt an `Applied` outcome's receipt is issued under.
-    fn reconcile(&self, _req: &EffectRequest, _ctx: &AttemptCtx) -> impl Future<Output = Reconciliation> + Send {
+    fn reconcile(
+        &self,
+        _req: &EffectRequest,
+        _ctx: &AttemptCtx,
+    ) -> impl Future<Output = Reconciliation> + Send {
         async { Reconciliation::Unknown }
     }
 

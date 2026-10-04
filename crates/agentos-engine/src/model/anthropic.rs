@@ -14,11 +14,16 @@ pub const MODEL_RESPONSE_LIMIT: usize = 4 * 1024 * 1024;
 
 async fn read_success_body(mut response: reqwest::Response) -> Result<Vec<u8>, String> {
     let exceeded = || format!("response body exceeds {MODEL_RESPONSE_LIMIT} bytes");
-    if response.content_length().is_some_and(|n| n > MODEL_RESPONSE_LIMIT as u64) {
+    if response
+        .content_length()
+        .is_some_and(|n| n > MODEL_RESPONSE_LIMIT as u64)
+    {
         return Err(exceeded());
     }
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await
+    while let Some(chunk) = response
+        .chunk()
+        .await
         .map_err(|e| format!("response body: {}", e.without_url()))?
     {
         if chunk.len() > MODEL_RESPONSE_LIMIT.saturating_sub(bytes.len()) {
@@ -55,12 +60,17 @@ fn build_client(timeout: Duration) -> reqwest::Client {
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
-        .build().expect("build the HTTP client")
+        .build()
+        .expect("build the HTTP client")
 }
 
 impl AnthropicProvider {
     pub fn new(key: ApiKey) -> AnthropicProvider {
-        AnthropicProvider { client: build_client(MODEL_TIMEOUT), base_url: ANTHROPIC_BASE_URL.into(), key }
+        AnthropicProvider {
+            client: build_client(MODEL_TIMEOUT),
+            base_url: ANTHROPIC_BASE_URL.into(),
+            key,
+        }
     }
 
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
@@ -100,19 +110,30 @@ impl ModelProvider for AnthropicProvider {
             if resp.status().is_success() {
                 match read_success_body(resp).await {
                     Ok(bytes) => {
-                        let usage = serde_json::from_slice(&bytes).map(|v| usage_of(&v)).unwrap_or_default();
+                        let usage = serde_json::from_slice(&bytes)
+                            .map(|v| usage_of(&v))
+                            .unwrap_or_default();
                         ProviderResult::Response(bytes, usage)
                     }
                     Err(reason) => ProviderResult::Transport(reason),
                 }
             } else {
-                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-                let retry_not_before_ts = resp.headers().get("retry-after")
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                let retry_not_before_ts = resp
+                    .headers()
+                    .get("retry-after")
                     .and_then(|h| h.to_str().ok())
                     .and_then(|h| super::policy::parse_retry_after(h, now));
                 let body = read_error_excerpt(resp).await;
                 match retry_not_before_ts {
-                    Some(retry_not_before_ts) => ProviderResult::RejectedWithRetryAfter { status, body, retry_not_before_ts },
+                    Some(retry_not_before_ts) => ProviderResult::RejectedWithRetryAfter {
+                        status,
+                        body,
+                        retry_not_before_ts,
+                    },
                     None => ProviderResult::Rejected { status, body },
                 }
             }

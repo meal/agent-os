@@ -21,11 +21,11 @@ use crate::journal;
 use crate::patch::patch_paths;
 use crate::recover::{self, deadline_stop};
 use crate::shadow::check_path;
-use crate::steps::{intend, run_attempt, Attempt, Cx};
+use crate::steps::{Attempt, Cx, intend, run_attempt};
 use crate::workspace::has_excluded_component;
 
-pub use crate::steps::{follow_up_event, verification_verdict, WORKER};
-use crate::model::policy::{backoff_seconds, check_request_size, ModelFailureClass};
+use crate::model::policy::{ModelFailureClass, backoff_seconds, check_request_size};
+pub use crate::steps::{WORKER, follow_up_event, verification_verdict};
 use agentos_store::effects::ModelRetrySchedule;
 
 #[derive(Debug, thiserror::Error)]
@@ -35,15 +35,25 @@ pub enum EngineError {
     #[error("blob store: {0}")]
     Blob(#[from] std::io::Error),
     #[error("effect {effect} is {state:?}, expected it to be freshly intended or finished")]
-    UnexpectedEffectState { effect: EffectId, state: EffectState },
+    UnexpectedEffectState {
+        effect: EffectId,
+        state: EffectState,
+    },
     #[error("receipt for effect {effect} was not applied: {verdict:?}")]
-    ReceiptNotApplied { effect: EffectId, verdict: ReceiptVerdict },
+    ReceiptNotApplied {
+        effect: EffectId,
+        verdict: ReceiptVerdict,
+    },
     #[error("executor protocol violation: {0}")]
     Protocol(String),
     #[error("injected crash at {0}")]
     Crashed(CrashPoint),
     #[error("agent replay diverged at turn {turn}: journaled {journaled}, agent chose {emitted}")]
-    NondeterministicAgent { turn: u32, journaled: String, emitted: String },
+    NondeterministicAgent {
+        turn: u32,
+        journaled: String,
+        emitted: String,
+    },
 }
 
 pub(crate) type Result<T> = std::result::Result<T, EngineError>;
@@ -57,17 +67,31 @@ enum Next {
 /// Ceiling on agent turns per session. Denied patches and repeated verifications consume
 /// no tool action, so without it a confused agent could loop forever.
 fn turn_limit(contract: &Contract) -> u32 {
-    contract.limits.tool_actions.saturating_mul(4).saturating_add(8)
+    contract
+        .limits
+        .tool_actions
+        .saturating_mul(4)
+        .saturating_add(8)
 }
 
 /// The capability's contract name, e.g. `verification.run`.
 pub(crate) fn capability_name(cap: Capability) -> String {
-    serde_json::to_value(cap).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()
+    serde_json::to_value(cap)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
 }
 
 pub(crate) fn fail(db: &Db, task: &TaskId, reason: &str) -> Result<TaskState> {
     tracing::info!(task_id = %task, reason, "task failed");
-    Ok(db.append(task, &TaskEvent::Failed { reason: reason.into() })?.state)
+    Ok(db
+        .append(
+            task,
+            &TaskEvent::Failed {
+                reason: reason.into(),
+            },
+        )?
+        .state)
 }
 
 /// Terminal, paused or waiting tasks stop the loop; a pending cancel completes here, since
@@ -91,7 +115,11 @@ fn interrupted(db: &Db, task: &TaskId) -> Result<Option<TaskState>> {
 /// the write is then refused (not dispatchable, or the reducer rejects `VerifyStarted`).
 /// Such a refusal stops the run as the interrupt says; any other error propagates. Nothing
 /// is lost: an intent left behind is dispatched on resume or abandoned once cancelled.
-fn or_interrupted<T>(db: &Db, task: &TaskId, r: Result<T>) -> Result<std::result::Result<T, TaskState>> {
+fn or_interrupted<T>(
+    db: &Db,
+    task: &TaskId,
+    r: Result<T>,
+) -> Result<std::result::Result<T, TaskState>> {
     let refused = matches!(
         &r,
         Err(EngineError::Db(
@@ -123,23 +151,39 @@ fn interruptible(db: &Db, task: &TaskId, r: Result<Next>) -> Result<Next> {
 
 /// Runs a freshly intended effect, or takes an already finished one as it is (an idempotent
 /// intent may return it), and gives the agent its observation.
-async fn effect_turn<E: Executor>(cx: &Cx<'_, E>, rec: EffectRecord, payload: Vec<u8>) -> Result<Next> {
+async fn effect_turn<E: Executor>(
+    cx: &Cx<'_, E>,
+    rec: EffectRecord,
+    payload: Vec<u8>,
+) -> Result<Next> {
     let rec = match rec.state {
         EffectState::Intended => match run_attempt(cx, &rec, payload).await? {
             Attempt::Published(ReceiptVerdict::Apply) => cx.db.effect(&rec.effect_id)?,
-            Attempt::Published(verdict) => return Err(EngineError::ReceiptNotApplied { effect: rec.effect_id, verdict }),
+            Attempt::Published(verdict) => {
+                return Err(EngineError::ReceiptNotApplied {
+                    effect: rec.effect_id,
+                    verdict,
+                });
+            }
             Attempt::Ended(state) => return Ok(Next::Stop(state)),
             Attempt::Forfeited => cx.db.effect(&rec.effect_id)?,
         },
         EffectState::Completed | EffectState::Failed => rec,
-        state => return Err(EngineError::UnexpectedEffectState { effect: rec.effect_id, state }),
+        state => {
+            return Err(EngineError::UnexpectedEffectState {
+                effect: rec.effect_id,
+                state,
+            });
+        }
     };
     Ok(Next::Observe(journal::effect_observation(cx.blobs, &rec)?))
 }
 
 /// Ensures the workspace exists; returns the snapshot's file list and whether the snapshot
 /// predates this call, or the state to stop in.
-async fn ensure_snapshot<E: Executor>(cx: &Cx<'_, E>) -> Result<std::result::Result<(Vec<String>, bool), TaskState>> {
+async fn ensure_snapshot<E: Executor>(
+    cx: &Cx<'_, E>,
+) -> Result<std::result::Result<(Vec<String>, bool), TaskState>> {
     let (db, task) = (cx.db, &cx.task);
     let events = db.events(task)?;
     let (rec, resumed) = match journal::intended(&events, "ReadSnapshot", None)? {
@@ -150,26 +194,48 @@ async fn ensure_snapshot<E: Executor>(cx: &Cx<'_, E>) -> Result<std::result::Res
             }
             if let Err(denial) = granted(db, task, Capability::SnapshotRead, &Resource::Task)? {
                 tracing::info!(task_id = %task, denial, "snapshot denied by the broker");
-                let reason = format!("capability {} not granted", capability_name(Capability::SnapshotRead));
+                let reason = format!(
+                    "capability {} not granted",
+                    capability_name(Capability::SnapshotRead)
+                );
                 return Ok(Err(fail(db, task, &reason)?));
             }
             let t = db.task(task)?;
             let request = Digest::of(cx.contract.repository.revision.as_bytes());
-            let rec = intend(db, task, EffectKind::ReadSnapshot, request, &t.workspace_digest, &Resource::Task)?;
+            let rec = intend(
+                db,
+                task,
+                EffectKind::ReadSnapshot,
+                request,
+                &t.workspace_digest,
+                &Resource::Task,
+            )?;
             cx.crash(CrashPoint::AfterIntent, Some(rec.kind.tag()))?;
             match run_attempt(cx, &rec, Vec::new()).await? {
                 Attempt::Published(ReceiptVerdict::Apply) => (db.effect(&rec.effect_id)?, false),
-                Attempt::Published(verdict) => return Err(EngineError::ReceiptNotApplied { effect: rec.effect_id, verdict }),
+                Attempt::Published(verdict) => {
+                    return Err(EngineError::ReceiptNotApplied {
+                        effect: rec.effect_id,
+                        verdict,
+                    });
+                }
                 Attempt::Ended(state) => return Ok(Err(state)),
-                Attempt::Forfeited => return Err(EngineError::Protocol("a snapshot read cannot be forfeited".into())),
+                Attempt::Forfeited => {
+                    return Err(EngineError::Protocol(
+                        "a snapshot read cannot be forfeited".into(),
+                    ));
+                }
             }
         }
     };
     if rec.state != EffectState::Completed {
         return Ok(Err(fail(db, task, "snapshot failed")?));
     }
-    let digest = rec.result_digest.ok_or_else(|| EngineError::Protocol("snapshot without manifest".into()))?;
-    let manifest: serde_json::Value = serde_json::from_slice(&cx.blobs.get(&digest)?).map_err(DbError::from)?;
+    let digest = rec
+        .result_digest
+        .ok_or_else(|| EngineError::Protocol("snapshot without manifest".into()))?;
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&cx.blobs.get(&digest)?).map_err(DbError::from)?;
     let files = serde_json::from_value(manifest["files"].clone()).map_err(DbError::from)?;
     Ok(Ok((files, resumed)))
 }
@@ -193,7 +259,13 @@ fn ensure_patch_artifact<E>(cx: &Cx<'_, E>, rec: &EffectRecord, patch: &str) -> 
         cx.blobs.put(patch.as_bytes())?;
     }
     let provenance = json!({ "source": "agent" }).to_string();
-    cx.db.register_artifact(&rec.request_digest, patch.len() as u64, "patch", Some(&rec.effect_id), &provenance)?;
+    cx.db.register_artifact(
+        &rec.request_digest,
+        patch.len() as u64,
+        "patch",
+        Some(&rec.effect_id),
+        &provenance,
+    )?;
     Ok(())
 }
 
@@ -203,7 +275,8 @@ pub(crate) fn recovered_patch<E>(cx: &Cx<'_, E>, rec: &EffectRecord) -> Result<O
     let text = match journal::journaled_patch(cx.db, &cx.task, &rec.request_digest)? {
         Some(text) => text,
         None if cx.blobs.exists(&rec.request_digest) => {
-            String::from_utf8(cx.blobs.get(&rec.request_digest)?).map_err(|e| EngineError::Protocol(e.to_string()))?
+            String::from_utf8(cx.blobs.get(&rec.request_digest)?)
+                .map_err(|e| EngineError::Protocol(e.to_string()))?
         }
         None => return Ok(None),
     };
@@ -213,7 +286,12 @@ pub(crate) fn recovered_patch<E>(cx: &Cx<'_, E>, rec: &EffectRecord) -> Result<O
 
 /// The broker's pure pre-check (nothing journaled): `Err(reason)` when `op` on `resource`
 /// would be denied. Any other store error propagates.
-fn granted(db: &Db, task: &TaskId, op: Capability, resource: &Resource) -> Result<std::result::Result<(), String>> {
+fn granted(
+    db: &Db,
+    task: &TaskId,
+    op: Capability,
+    resource: &Resource,
+) -> Result<std::result::Result<(), String>> {
     match db.check(task, op, resource) {
         Ok(()) => Ok(Ok(())),
         Err(DbError::CapabilityDenied { reason, .. }) => Ok(Err(reason)),
@@ -223,15 +301,27 @@ fn granted(db: &Db, task: &TaskId, op: Capability, resource: &Resource) -> Resul
 
 /// The broker pre-check: refused patches create no effect and consume no tool action.
 /// Returns the patch's paths (the resource its intent is authorized on), or the denial.
-async fn patch_denial(contract: &Contract, patch: &str, request: Digest) -> std::result::Result<Vec<String>, serde_json::Value> {
+async fn patch_denial(
+    contract: &Contract,
+    patch: &str,
+    request: Digest,
+) -> std::result::Result<Vec<String>, serde_json::Value> {
     let paths = patch_paths(patch).await.map_err(|detail| {
         json!({ "action": "ApplyPatch", "reason": "InvalidPatch", "detail": detail, "request_digest": request })
     })?;
     let refused = |reason: &str, bad: Vec<&String>| {
         (!bad.is_empty()).then(|| json!({ "action": "ApplyPatch", "reason": reason, "paths": bad, "request_digest": request }))
     };
-    let denial = refused("PathNotEditable", paths.iter().filter(|p| !contract.path_allowed(p)).collect())
-        .or_else(|| refused("DigestExcludedPath", paths.iter().filter(|p| has_excluded_component(p)).collect()));
+    let denial = refused(
+        "PathNotEditable",
+        paths.iter().filter(|p| !contract.path_allowed(p)).collect(),
+    )
+    .or_else(|| {
+        refused(
+            "DigestExcludedPath",
+            paths.iter().filter(|p| has_excluded_component(p)).collect(),
+        )
+    });
     match denial {
         Some(audit) => Err(audit),
         None => Ok(paths),
@@ -240,7 +330,12 @@ async fn patch_denial(contract: &Contract, patch: &str, request: Digest) -> std:
 
 /// Applies `patch` for the turn journaled at `since`. Idempotent: an effect or denial the
 /// turn already produced is reused (see [`crate::journal`]).
-async fn apply_patch<E: Executor>(cx: &Cx<'_, E>, since: u64, base: Digest, patch: String) -> Result<Next> {
+async fn apply_patch<E: Executor>(
+    cx: &Cx<'_, E>,
+    since: u64,
+    base: Digest,
+    patch: String,
+) -> Result<Next> {
     let (db, task) = (cx.db, &cx.task);
     let request = Digest::of(patch.as_bytes());
     let after = journal::events_after(db, task, since)?;
@@ -261,17 +356,24 @@ async fn apply_patch<E: Executor>(cx: &Cx<'_, E>, since: u64, base: Digest, patc
         Err(audit) => {
             db.append_audit(task, "Denied", &audit)?;
             tracing::info!(task_id = %task, %audit, "patch denied");
-            return Ok(Next::Observe(Observation::PatchRejected { reason: audit.to_string() }));
+            return Ok(Next::Observe(Observation::PatchRejected {
+                reason: audit.to_string(),
+            }));
         }
     };
 
     // Publish the patch itself first so the intent's request digest names a stored blob.
     cx.blobs.put(patch.as_bytes())?;
-    let kind = EffectKind::ApplyPatch { expected_base: base };
+    let kind = EffectKind::ApplyPatch {
+        expected_base: base,
+    };
     let rec = match intend(db, task, kind, request, &base, &Resource::Paths(paths)) {
         Ok(rec) => rec,
         Err(EngineError::Db(DbError::VersionConflict { expected, actual })) => {
-            return Ok(Next::Observe(Observation::VersionConflict { expected, actual }));
+            return Ok(Next::Observe(Observation::VersionConflict {
+                expected,
+                actual,
+            }));
         }
         Err(EngineError::Db(DbError::BudgetExceeded(_))) => {
             return Ok(Next::Stop(fail(db, task, "budget exhausted")?));
@@ -288,7 +390,9 @@ async fn apply_patch<E: Executor>(cx: &Cx<'_, E>, since: u64, base: Digest, patc
     ensure_patch_artifact(cx, &rec, &patch)?;
     if rec.state == EffectState::Failed {
         // Same patch on the same base already failed; the store returned that record.
-        return Ok(Next::Observe(Observation::PatchRejected { reason: "this patch already failed to apply".into() }));
+        return Ok(Next::Observe(Observation::PatchRejected {
+            reason: "this patch already failed to apply".into(),
+        }));
     }
     effect_turn(cx, rec, patch.into_bytes()).await
 }
@@ -319,13 +423,27 @@ async fn verify<E: Executor>(cx: &Cx<'_, E>, since: Option<u64>) -> Result<Next>
             tracing::info!(task_id = %task, %audit, "verification denied");
         }
         let summary = format!("capability {capability} not granted");
-        return Ok(Next::Observe(Observation::Verification { passed: false, summary }));
+        return Ok(Next::Observe(Observation::Verification {
+            passed: false,
+            summary,
+        }));
     }
     let t = db.task(task)?;
-    let t = if t.state == TaskState::Verifying { t } else { db.append(task, &TaskEvent::VerifyStarted)? };
+    let t = if t.state == TaskState::Verifying {
+        t
+    } else {
+        db.append(task, &TaskEvent::VerifyStarted)?
+    };
     tracing::info!(task_id = %task, step = t.step, "verification started");
     let workspace = t.workspace_digest;
-    let rec = intend(db, task, EffectKind::RunVerification, Digest::of(workspace.as_bytes()), &workspace, &profile)?;
+    let rec = intend(
+        db,
+        task,
+        EffectKind::RunVerification,
+        Digest::of(workspace.as_bytes()),
+        &workspace,
+        &profile,
+    )?;
     if rec.state == EffectState::Intended {
         cx.crash(CrashPoint::AfterIntent, Some(rec.kind.tag()))?;
     }
@@ -344,45 +462,77 @@ fn finish(db: &Db, task: &TaskId) -> Result<TaskState> {
 /// turn that names it is journaled it is registered unlinked (`effect` is `None`), so that
 /// recovery's blob collection keeps it even if the controller dies before the intent; after
 /// the intent the same call links it to the effect.
-fn ensure_request_artifact<E>(cx: &Cx<'_, E>, effect: Option<&EffectId>, request: &Digest, body: &[u8]) -> Result<()> {
+fn ensure_request_artifact<E>(
+    cx: &Cx<'_, E>,
+    effect: Option<&EffectId>,
+    request: &Digest,
+    body: &[u8],
+) -> Result<()> {
     if !cx.blobs.exists(request) {
         cx.blobs.put(body)?;
     }
     let provenance = json!({ "source": "agent" }).to_string();
-    cx.db.register_artifact(request, body.len() as u64, "model-request", effect, &provenance)?;
+    cx.db.register_artifact(
+        request,
+        body.len() as u64,
+        "model-request",
+        effect,
+        &provenance,
+    )?;
     Ok(())
 }
 
 /// The bytes a `CallModel` sends. A body that does not hash to `request` (a journaled action
 /// carries none) is read back from the blob store, where the request was published before the
 /// turn was journaled.
-fn request_body(blobs: &BlobStore, request: &Digest, body: Vec<u8>, rec: Option<&EffectRecord>) -> Result<Vec<u8>> {
+fn request_body(
+    blobs: &BlobStore,
+    request: &Digest,
+    body: Vec<u8>,
+    rec: Option<&EffectRecord>,
+) -> Result<Vec<u8>> {
     if Digest::of(&body) == *request {
         return Ok(body);
     }
     let stored = match rec {
         Some(rec) => journal::model_request_body(blobs, rec)?,
-        None => blobs.exists(request).then(|| blobs.get(request)).transpose()?,
+        None => blobs
+            .exists(request)
+            .then(|| blobs.get(request))
+            .transpose()?,
     };
     match stored {
         Some(bytes) if Digest::of(&bytes) == *request => Ok(bytes),
-        _ => Err(EngineError::Protocol(format!("the model request {request} is gone"))),
+        _ => Err(EngineError::Protocol(format!(
+            "the model request {request} is gone"
+        ))),
     }
 }
 
 /// The model name the request body carries, bounded for the effect kind.
 fn model_of(body: &[u8]) -> String {
     let value: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
-    value["model"].as_str().map_or_else(|| "unknown".to_string(), |m| m.chars().take(128).collect())
+    value["model"]
+        .as_str()
+        .map_or_else(|| "unknown".to_string(), |m| m.chars().take(128).collect())
 }
 
 /// Sends the request for the turn journaled at `since`, once: the effect it already produced
 /// is reused (never intended or sent again), a missing grant ends the task, an exhausted
 /// budget ends it too.
-async fn call_model<E: Executor>(cx: &Cx<'_, E>, since: u64, turn: u32, base: Digest, request: Digest, body: Vec<u8>) -> Result<Next> {
+async fn call_model<E: Executor>(
+    cx: &Cx<'_, E>,
+    since: u64,
+    turn: u32,
+    base: Digest,
+    request: Digest,
+    body: Vec<u8>,
+) -> Result<Next> {
     let (db, task) = (cx.db, &cx.task);
-    if cx.model_policy_version == 1 && let Some(schedule) = pending_model_retry(cx)?
-        && let Some(state) = wait_model_retry(cx, &schedule).await? {
+    if cx.model_policy_version == 1
+        && let Some(schedule) = pending_model_retry(cx)?
+        && let Some(state) = wait_model_retry(cx, &schedule).await?
+    {
         return Ok(Next::Stop(state));
     }
     let after = journal::events_after(db, task, since)?;
@@ -395,7 +545,12 @@ async fn call_model<E: Executor>(cx: &Cx<'_, E>, since: u64, turn: u32, base: Di
     if let Some(state) = deadline_stop(cx).await? {
         return Ok(Next::Stop(state));
     }
-    let not_granted = || format!("capability {} not granted", capability_name(Capability::ModelRequest));
+    let not_granted = || {
+        format!(
+            "capability {} not granted",
+            capability_name(Capability::ModelRequest)
+        )
+    };
     if let Err(denial) = granted(db, task, Capability::ModelRequest, &Resource::Task)? {
         let capability = capability_name(Capability::ModelRequest);
         let audit = json!({ "action": "CallModel", "reason": "CapabilityDenied", "capability": capability, "denial": denial });
@@ -404,14 +559,23 @@ async fn call_model<E: Executor>(cx: &Cx<'_, E>, since: u64, turn: u32, base: Di
         return Ok(Next::Stop(fail(db, task, &not_granted())?));
     }
     let body = request_body(cx.blobs, &request, body, None)?;
-    if cx.model_limits_version == 1 && let Err(reason) = check_request_size(body.len()) {
+    if cx.model_limits_version == 1
+        && let Err(reason) = check_request_size(body.len())
+    {
         return Ok(Next::Stop(fail(db, task, reason)?));
     }
-    let kind = EffectKind::ModelCall { model: model_of(&body), turn };
+    let kind = EffectKind::ModelCall {
+        model: model_of(&body),
+        turn,
+    };
     let rec = match intend(db, task, kind, request, &base, &Resource::Task) {
         Ok(rec) => rec,
-        Err(EngineError::Db(DbError::BudgetExceeded(_))) => return Ok(Next::Stop(fail(db, task, "budget exhausted")?)),
-        Err(EngineError::Db(DbError::CapabilityDenied { .. })) => return Ok(Next::Stop(fail(db, task, &not_granted())?)),
+        Err(EngineError::Db(DbError::BudgetExceeded(_))) => {
+            return Ok(Next::Stop(fail(db, task, "budget exhausted")?));
+        }
+        Err(EngineError::Db(DbError::CapabilityDenied { .. })) => {
+            return Ok(Next::Stop(fail(db, task, &not_granted())?));
+        }
         Err(e) => return Err(e),
     };
     if rec.state == EffectState::Intended {
@@ -424,12 +588,23 @@ async fn call_model<E: Executor>(cx: &Cx<'_, E>, since: u64, turn: u32, base: Di
 /// The intent of a read (a listing or a file), with the error mapping both share: an exhausted
 /// budget ends the task, a missing grant is a rejection the agent sees. `Ok(Err(next))` is that
 /// early exit.
-fn intend_read(db: &Db, task: &TaskId, kind: EffectKind, request: Digest, base: &Digest) -> Result<std::result::Result<EffectRecord, Next>> {
+fn intend_read(
+    db: &Db,
+    task: &TaskId,
+    kind: EffectKind,
+    request: Digest,
+    base: &Digest,
+) -> Result<std::result::Result<EffectRecord, Next>> {
     match intend(db, task, kind, request, base, &Resource::Task) {
         Ok(rec) => Ok(Ok(rec)),
-        Err(EngineError::Db(DbError::BudgetExceeded(_))) => Ok(Err(Next::Stop(fail(db, task, "budget exhausted")?))),
+        Err(EngineError::Db(DbError::BudgetExceeded(_))) => {
+            Ok(Err(Next::Stop(fail(db, task, "budget exhausted")?)))
+        }
         Err(EngineError::Db(DbError::CapabilityDenied { .. })) => {
-            let reason = format!("capability {} not granted", capability_name(Capability::SnapshotRead));
+            let reason = format!(
+                "capability {} not granted",
+                capability_name(Capability::SnapshotRead)
+            );
             Ok(Err(Next::Observe(Observation::FileReadRejected { reason })))
         }
         Err(e) => Err(e),
@@ -437,7 +612,12 @@ fn intend_read(db: &Db, task: &TaskId, kind: EffectKind, request: Digest, base: 
 }
 
 /// Lists the workspace for the turn journaled at `since`, as a read effect.
-async fn list_files<E: Executor>(cx: &Cx<'_, E>, since: u64, turn: u32, base: Digest) -> Result<Next> {
+async fn list_files<E: Executor>(
+    cx: &Cx<'_, E>,
+    since: u64,
+    turn: u32,
+    base: Digest,
+) -> Result<Next> {
     let (db, task) = (cx.db, &cx.task);
     let after = journal::events_after(db, task, since)?;
     if let Some(id) = journal::intended(&after, "ListFiles", None)? {
@@ -449,7 +629,13 @@ async fn list_files<E: Executor>(cx: &Cx<'_, E>, since: u64, turn: u32, base: Di
     if let Some(state) = deadline_stop(cx).await? {
         return Ok(Next::Stop(state));
     }
-    let rec = match intend_read(db, task, EffectKind::ListFiles { turn }, Digest::of(b"list_files"), &base)? {
+    let rec = match intend_read(
+        db,
+        task,
+        EffectKind::ListFiles { turn },
+        Digest::of(b"list_files"),
+        &base,
+    )? {
         Ok(rec) => rec,
         Err(next) => return Ok(next),
     };
@@ -461,7 +647,13 @@ async fn list_files<E: Executor>(cx: &Cx<'_, E>, since: u64, turn: u32, base: Di
 
 /// Reads one file of the workspace for the turn journaled at `since`. A path that can never
 /// name a file of it is refused here, journaled escaped, and never becomes an effect.
-async fn read_file<E: Executor>(cx: &Cx<'_, E>, since: u64, turn: u32, base: Digest, path: String) -> Result<Next> {
+async fn read_file<E: Executor>(
+    cx: &Cx<'_, E>,
+    since: u64,
+    turn: u32,
+    base: Digest,
+    path: String,
+) -> Result<Next> {
     let (db, task) = (cx.db, &cx.task);
     let request = Digest::of(path.as_bytes());
     let after = journal::events_after(db, task, since)?;
@@ -478,9 +670,17 @@ async fn read_file<E: Executor>(cx: &Cx<'_, E>, since: u64, turn: u32, base: Dig
         let audit = json!({ "action": "ReadFile", "reason": "InvalidPath", "path": guest_text(&path), "detail": detail });
         db.append_audit(task, "Denied", &audit)?;
         tracing::info!(task_id = %task, %audit, "file read denied");
-        return Ok(Next::Observe(Observation::FileReadRejected { reason: audit.to_string() }));
+        return Ok(Next::Observe(Observation::FileReadRejected {
+            reason: audit.to_string(),
+        }));
     }
-    let rec = match intend_read(db, task, EffectKind::ReadFile { path, turn }, request, &base)? {
+    let rec = match intend_read(
+        db,
+        task,
+        EffectKind::ReadFile { path, turn },
+        request,
+        &base,
+    )? {
         Ok(rec) => rec,
         Err(next) => return Ok(next),
     };
@@ -490,12 +690,20 @@ async fn read_file<E: Executor>(cx: &Cx<'_, E>, since: u64, turn: u32, base: Dig
     effect_turn(cx, rec, Vec::new()).await
 }
 
-async fn act<E: Executor>(cx: &Cx<'_, E>, since: u64, turn: u32, base: Digest, action: AgentAction) -> Result<Next> {
+async fn act<E: Executor>(
+    cx: &Cx<'_, E>,
+    since: u64,
+    turn: u32,
+    base: Digest,
+    action: AgentAction,
+) -> Result<Next> {
     match action {
         AgentAction::ApplyPatch(patch) => apply_patch(cx, since, base, patch).await,
         AgentAction::Verify => verify(cx, Some(since)).await,
         AgentAction::Finish => Ok(Next::Stop(finish(cx.db, &cx.task)?)),
-        AgentAction::CallModel { request, body } => call_model(cx, since, turn, base, request, body).await,
+        AgentAction::CallModel { request, body } => {
+            call_model(cx, since, turn, base, request, body).await
+        }
         AgentAction::ListFiles => list_files(cx, since, turn, base).await,
         AgentAction::ReadFile(path) => read_file(cx, since, turn, base, path).await,
     }
@@ -523,7 +731,9 @@ fn describe(action: &AgentAction) -> String {
 
 fn observed_workspace(obs: &Observation) -> Option<Digest> {
     match obs {
-        Observation::Start { workspace, .. } | Observation::PatchApplied { workspace } => Some(*workspace),
+        Observation::Start { workspace, .. } | Observation::PatchApplied { workspace } => {
+            Some(*workspace)
+        }
         Observation::VersionConflict { actual, .. } => Some(*actual),
         _ => None,
     }
@@ -531,41 +741,82 @@ fn observed_workspace(obs: &Observation) -> Option<Digest> {
 
 fn pending_model_retry<E>(cx: &Cx<'_, E>) -> Result<Option<ModelRetrySchedule>> {
     let events = cx.db.events(&cx.task)?;
-    let Some(index) = events.iter().rposition(|e| e.event_type == "ModelRetryScheduled") else {
+    let Some(index) = events
+        .iter()
+        .rposition(|e| e.event_type == "ModelRetryScheduled")
+    else {
         return Ok(None);
     };
-    if events[index + 1..].iter().any(|e| e.event_type == "EffectIntended"
-        && e.payload["kind"].get("ModelCall").is_some()) {
+    if events[index + 1..]
+        .iter()
+        .any(|e| e.event_type == "EffectIntended" && e.payload["kind"].get("ModelCall").is_some())
+    {
         return Ok(None);
     }
-    Ok(Some(serde_json::from_value(events[index].payload.clone()).map_err(DbError::from)?))
+    Ok(Some(
+        serde_json::from_value(events[index].payload.clone()).map_err(DbError::from)?,
+    ))
 }
 
-async fn wait_model_retry<E: Executor>(cx: &Cx<'_, E>, schedule: &ModelRetrySchedule) -> Result<Option<TaskState>> {
+async fn wait_model_retry<E: Executor>(
+    cx: &Cx<'_, E>,
+    schedule: &ModelRetrySchedule,
+) -> Result<Option<TaskState>> {
     loop {
-        if let Some(state) = interrupted(cx.db, &cx.task)? { return Ok(Some(state)); }
-        if let Some(state) = deadline_stop(cx).await? { return Ok(Some(state)); }
-        match cx.db.check(&cx.task, Capability::ModelRequest, &Resource::Task) {
+        if let Some(state) = interrupted(cx.db, &cx.task)? {
+            return Ok(Some(state));
+        }
+        if let Some(state) = deadline_stop(cx).await? {
+            return Ok(Some(state));
+        }
+        match cx
+            .db
+            .check(&cx.task, Capability::ModelRequest, &Resource::Task)
+        {
             Ok(()) => {}
-            Err(DbError::CapabilityDenied { .. }) => return Ok(Some(fail(cx.db, &cx.task, "capability model.request not granted during retry wait")?)),
+            Err(DbError::CapabilityDenied { .. }) => {
+                return Ok(Some(fail(
+                    cx.db,
+                    &cx.task,
+                    "capability model.request not granted during retry wait",
+                )?));
+            }
             Err(error) => return Err(error.into()),
         }
         let deadline = cx.db.deadline_ts(&cx.task)?;
         if deadline != 0 && schedule.not_before_ts >= deadline {
-            return Ok(Some(fail(cx.db, &cx.task, "model retry would exceed task deadline")?));
+            return Ok(Some(fail(
+                cx.db,
+                &cx.task,
+                "model retry would exceed task deadline",
+            )?));
         }
-        if cx.db.now() >= schedule.not_before_ts { return Ok(None); }
+        if cx.db.now() >= schedule.not_before_ts {
+            return Ok(None);
+        }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 
-async fn model_failure_policy<E: Executor>(cx: &Cx<'_, E>, obs: &Observation, retry_turn: u32) -> Result<Option<TaskState>> {
-    if cx.model_policy_version == 0 { return Ok(None); }
+async fn model_failure_policy<E: Executor>(
+    cx: &Cx<'_, E>,
+    obs: &Observation,
+    retry_turn: u32,
+) -> Result<Option<TaskState>> {
+    if cx.model_policy_version == 0 {
+        return Ok(None);
+    }
     let provider_not_before = match obs {
         Observation::ModelCallFailed { reason, failure } => {
-            match failure.as_ref().map(|f| f.class).unwrap_or(ModelFailureClass::Permanent) {
+            match failure
+                .as_ref()
+                .map(|f| f.class)
+                .unwrap_or(ModelFailureClass::Permanent)
+            {
                 ModelFailureClass::Permanent => return Ok(Some(fail(cx.db, &cx.task, reason)?)),
-                ModelFailureClass::Transient => failure.as_ref().and_then(|f| f.retry_not_before_ts),
+                ModelFailureClass::Transient => {
+                    failure.as_ref().and_then(|f| f.retry_not_before_ts)
+                }
             }
         }
         Observation::ModelCallLost => None,
@@ -574,19 +825,32 @@ async fn model_failure_policy<E: Executor>(cx: &Cx<'_, E>, obs: &Observation, re
     let events = cx.db.events(&cx.task)?;
     let mut failures = 0u32;
     let mut failed_effect = None;
-    for event in events.iter().rev().filter(|e| e.event_type == "EffectIntended"
-        && e.payload["kind"].get("ModelCall").is_some()) {
-        let effect: EffectId = serde_json::from_value(event.payload["effect_id"].clone()).map_err(DbError::from)?;
+    for event in events.iter().rev().filter(|e| {
+        e.event_type == "EffectIntended" && e.payload["kind"].get("ModelCall").is_some()
+    }) {
+        let effect: EffectId =
+            serde_json::from_value(event.payload["effect_id"].clone()).map_err(DbError::from)?;
         let rec = cx.db.effect(&effect)?;
-        if rec.state == EffectState::Completed { break; }
+        if rec.state == EffectState::Completed {
+            break;
+        }
         if rec.state == EffectState::Failed {
-            if failed_effect.is_none() { failed_effect = Some(effect); }
+            if failed_effect.is_none() {
+                failed_effect = Some(effect);
+            }
             failures = failures.saturating_add(1);
         }
     }
-    let effect = failed_effect.ok_or_else(|| EngineError::Protocol("model failure has no failed effect".into()))?;
-    let schedule = cx.db.schedule_model_retry(&cx.task, &effect, retry_turn,
-        backoff_seconds(failures), provider_not_before, cx.model_policy_version)?;
+    let effect = failed_effect
+        .ok_or_else(|| EngineError::Protocol("model failure has no failed effect".into()))?;
+    let schedule = cx.db.schedule_model_retry(
+        &cx.task,
+        &effect,
+        retry_turn,
+        backoff_seconds(failures),
+        provider_not_before,
+        cx.model_policy_version,
+    )?;
     // The retry schedule is a durable completion boundary distinct from a model send.
     cx.crash(CrashPoint::AfterComplete, Some("model_retry"))?;
     wait_model_retry(cx, &schedule).await
@@ -663,7 +927,11 @@ async fn drive<E: Executor, A: Agent>(cx: &Cx<'_, E>, agent: &mut A) -> Result<T
         let emitted = agent.next(&turn.observation);
         // Compared by description (a model request by its digest): the body is not journaled.
         if describe(&emitted) != describe(&turn.action) {
-            fail(db, task, &format!("agent replay diverged at turn {}", turn.turn))?;
+            fail(
+                db,
+                task,
+                &format!("agent replay diverged at turn {}", turn.turn),
+            )?;
             return Err(EngineError::NondeterministicAgent {
                 turn: turn.turn,
                 journaled: describe(&turn.action),
@@ -679,7 +947,10 @@ async fn drive<E: Executor, A: Agent>(cx: &Cx<'_, E>, agent: &mut A) -> Result<T
             None => interruptible(db, task, act(cx, last.seq, last.turn, base, action).await)?,
         },
         None if t.state == TaskState::Verifying => interruptible(db, task, verify(cx, None).await)?,
-        None => Next::Observe(Observation::Start { files, workspace: base }),
+        None => Next::Observe(Observation::Start {
+            files,
+            workspace: base,
+        }),
     };
     let mut turn = turns.len() as u32;
     loop {
@@ -688,7 +959,9 @@ async fn drive<E: Executor, A: Agent>(cx: &Cx<'_, E>, agent: &mut A) -> Result<T
             Next::Stop(state) => return Ok(state),
         };
         // Legacy journals retain their original observation shape and decisions.
-        if cx.model_policy_version == 0 && let Observation::ModelCallFailed { failure, .. } = &mut obs {
+        if cx.model_policy_version == 0
+            && let Observation::ModelCallFailed { failure, .. } = &mut obs
+        {
             *failure = None;
         }
         if let Some(state) = interrupted(db, task)? {
@@ -716,11 +989,15 @@ async fn drive<E: Executor, A: Agent>(cx: &Cx<'_, E>, agent: &mut A) -> Result<T
         // The request body is a registered artifact before the turn that names it exists, or
         // recovery's blob collection could delete it and an intended call would be lost.
         if let AgentAction::CallModel { request, body } = &action {
-            if cx.model_limits_version == 1 && let Err(reason) = check_request_size(body.len()) {
+            if cx.model_limits_version == 1
+                && let Err(reason) = check_request_size(body.len())
+            {
                 return fail(db, task, reason);
             }
-            if cx.model_policy_version == 1 && let Some(schedule) = pending_model_retry(cx)?
-                && let Some(state) = wait_model_retry(cx, &schedule).await? {
+            if cx.model_policy_version == 1
+                && let Some(schedule) = pending_model_retry(cx)?
+                && let Some(state) = wait_model_retry(cx, &schedule).await?
+            {
                 return Ok(state);
             }
             ensure_request_artifact(cx, None, request, body)?;
@@ -736,7 +1013,10 @@ mod tests {
     use super::*;
 
     fn rec(request: Digest) -> EffectRecord {
-        let kind = EffectKind::ModelCall { model: "m".into(), turn: 1 };
+        let kind = EffectKind::ModelCall {
+            model: "m".into(),
+            turn: 1,
+        };
         EffectRecord {
             effect_id: EffectId::derive(&TaskId::new(), 1, &kind, &request),
             task_id: TaskId::new(),
@@ -757,20 +1037,41 @@ mod tests {
         let request = Digest::of(&body);
 
         // A body that hashes to the request is used as it is.
-        assert_eq!(request_body(&blobs, &request, body.clone(), None).unwrap(), body);
+        assert_eq!(
+            request_body(&blobs, &request, body.clone(), None).unwrap(),
+            body
+        );
         // An empty one (what the journal holds) needs the blob; without it the call is lost.
-        assert!(matches!(request_body(&blobs, &request, Vec::new(), None), Err(EngineError::Protocol(_))));
-        assert!(matches!(request_body(&blobs, &request, Vec::new(), Some(&rec(request))), Err(EngineError::Protocol(_))));
+        assert!(matches!(
+            request_body(&blobs, &request, Vec::new(), None),
+            Err(EngineError::Protocol(_))
+        ));
+        assert!(matches!(
+            request_body(&blobs, &request, Vec::new(), Some(&rec(request))),
+            Err(EngineError::Protocol(_))
+        ));
         blobs.put(&body).unwrap();
-        assert_eq!(request_body(&blobs, &request, Vec::new(), None).unwrap(), body);
-        assert_eq!(request_body(&blobs, &request, Vec::new(), Some(&rec(request))).unwrap(), body);
+        assert_eq!(
+            request_body(&blobs, &request, Vec::new(), None).unwrap(),
+            body
+        );
+        assert_eq!(
+            request_body(&blobs, &request, Vec::new(), Some(&rec(request))).unwrap(),
+            body
+        );
         // A body for another request is not trusted either.
-        assert_eq!(request_body(&blobs, &request, b"other".to_vec(), None).unwrap(), body);
+        assert_eq!(
+            request_body(&blobs, &request, b"other".to_vec(), None).unwrap(),
+            body
+        );
     }
 
     #[test]
     fn the_model_name_comes_from_the_body_and_is_bounded() {
-        assert_eq!(model_of(br#"{"model":"claude-opus-5-5"}"#), "claude-opus-5-5");
+        assert_eq!(
+            model_of(br#"{"model":"claude-opus-5-5"}"#),
+            "claude-opus-5-5"
+        );
         assert_eq!(model_of(b"not json"), "unknown");
         assert_eq!(model_of(br#"{"model":7}"#), "unknown");
         let long = format!(r#"{{"model":"{}"}}"#, "x".repeat(500));

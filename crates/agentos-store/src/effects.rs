@@ -31,19 +31,21 @@
 use std::collections::HashSet;
 
 use agentos_core::broker::Resource;
-use agentos_core::budget::{check_model_budget, tool_actions_for, BudgetError, Reservation, UsageTotals};
+use agentos_core::budget::{
+    BudgetError, Reservation, UsageTotals, check_model_budget, tool_actions_for,
+};
 use agentos_core::effect::{
-    accept_receipt, AttemptId, EffectId, EffectKind, EffectRecord, EffectState, Outcome, Receipt,
-    ReceiptVerdict,
+    AttemptId, EffectId, EffectKind, EffectRecord, EffectState, Outcome, Receipt, ReceiptVerdict,
+    accept_receipt,
 };
 use agentos_core::ids::{Digest, TaskId};
-use agentos_core::state::{reduce, Task, TaskEvent, TransitionError};
-use rusqlite::{params, OptionalExtension, Transaction};
+use agentos_core::state::{Task, TaskEvent, TransitionError, reduce};
+use rusqlite::{OptionalExtension, Transaction, params};
 use serde_json::json;
 
 use crate::caps::{authorize_in, reauthorize_in};
 use crate::db::{
-    digest_from_str, event_name, insert_event, load_task, now_ts, store_task, Db, DbError, Result,
+    Db, DbError, Result, digest_from_str, event_name, insert_event, load_task, now_ts, store_task,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -92,7 +94,16 @@ fn effect_state_from(s: &str) -> Result<EffectState> {
     })
 }
 
-type EffectRow = (String, String, u32, String, String, String, i64, Option<String>);
+type EffectRow = (
+    String,
+    String,
+    u32,
+    String,
+    String,
+    String,
+    i64,
+    Option<String>,
+);
 
 /// SQLite integers are i64; counters and generations are u64 in the API.
 fn from_sql_int(v: i64) -> Result<u64> {
@@ -117,7 +128,8 @@ fn effect_row(r: &rusqlite::Row) -> rusqlite::Result<EffectRow> {
 }
 
 fn effect_from_row(row: EffectRow) -> Result<EffectRecord> {
-    let (effect_id, task_id, step, kind, state, request_digest, lease_generation, result_digest) = row;
+    let (effect_id, task_id, step, kind, state, request_digest, lease_generation, result_digest) =
+        row;
     Ok(EffectRecord {
         effect_id: serde_json::from_value(serde_json::Value::String(effect_id))?,
         task_id: serde_json::from_value(serde_json::Value::String(task_id))?,
@@ -154,7 +166,11 @@ fn usage_totals(tx: &Transaction, task: &TaskId) -> Result<UsageSummary> {
          FROM usage WHERE task_id = ?1 GROUP BY status",
     )?;
     let rows = stmt.query_map([task.as_str()], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
     })?;
     let mut s = UsageSummary::default();
     for row in rows {
@@ -177,7 +193,10 @@ fn ensure_abandonable(task: &Task) -> Result<()> {
     if task.state.is_terminal() || task.cancel_requested {
         Ok(())
     } else {
-        Err(DbError::NotAbandonable { state: task.state, cancel_requested: task.cancel_requested })
+        Err(DbError::NotAbandonable {
+            state: task.state,
+            cancel_requested: task.cancel_requested,
+        })
     }
 }
 
@@ -185,7 +204,11 @@ fn abandon(tx: &Transaction, rec: &EffectRecord, reason: &str) -> Result<()> {
     let now = now_ts();
     tx.execute(
         "UPDATE effects SET state = ?2, updated_ts = ?3 WHERE effect_id = ?1",
-        params![rec.effect_id.as_str(), effect_state_str(EffectState::Abandoned), now],
+        params![
+            rec.effect_id.as_str(),
+            effect_state_str(EffectState::Abandoned),
+            now
+        ],
     )?;
     tx.execute(
         "UPDATE attempts SET finished_ts = ?2 WHERE effect_id = ?1 AND finished_ts IS NULL",
@@ -209,7 +232,9 @@ fn expect_one(n: usize, what: &str, effect: &EffectId) -> Result<()> {
     if n == 1 {
         Ok(())
     } else {
-        Err(DbError::Corrupt(format!("{what} for effect {effect} touched {n} rows")))
+        Err(DbError::Corrupt(format!(
+            "{what} for effect {effect} touched {n} rows"
+        )))
     }
 }
 
@@ -225,31 +250,56 @@ impl Db {
     /// Persist a retry wait once, owned by a finished model effect. Repeated calls return
     /// the original timestamp; callers must release the transaction before waiting.
     pub fn schedule_model_retry(
-        &self, task: &TaskId, failed_effect_id: &EffectId, retry_turn: u32,
-        delay_seconds: i64, provider_not_before: Option<i64>, policy_version: u32,
+        &self,
+        task: &TaskId,
+        failed_effect_id: &EffectId,
+        retry_turn: u32,
+        delay_seconds: i64,
+        provider_not_before: Option<i64>,
+        policy_version: u32,
     ) -> Result<ModelRetrySchedule> {
         if policy_version != 1 || retry_turn == 0 || !(2..=60).contains(&delay_seconds) {
-            return Err(DbError::InvalidModelRetry("unsupported policy, turn or delay".into()));
+            return Err(DbError::InvalidModelRetry(
+                "unsupported policy, turn or delay".into(),
+            ));
         }
         let tx = self.immediate()?;
         load_task(&tx, task)?;
         let rec = load_effect(&tx, failed_effect_id)?;
-        if rec.task_id != *task || rec.state != EffectState::Failed || !matches!(rec.kind, EffectKind::ModelCall { .. }) {
-            return Err(DbError::InvalidModelRetry("requires this task's failed model effect".into()));
+        if rec.task_id != *task
+            || rec.state != EffectState::Failed
+            || !matches!(rec.kind, EffectKind::ModelCall { .. })
+        {
+            return Err(DbError::InvalidModelRetry(
+                "requires this task's failed model effect".into(),
+            ));
         }
-        let existing: Option<String> = tx.query_row(
-            "SELECT payload FROM events WHERE task_id = ?1 AND type = 'ModelRetryScheduled'
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT payload FROM events WHERE task_id = ?1 AND type = 'ModelRetryScheduled'
              AND json_extract(payload, '$.failed_effect_id') = ?2 ORDER BY seq LIMIT 1",
-            params![task.as_str(), failed_effect_id.as_str()], |row| row.get(0),
-        ).optional()?;
+                params![task.as_str(), failed_effect_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
         if let Some(payload) = existing {
             return Ok(serde_json::from_str(&payload)?);
         }
         let schedule = ModelRetrySchedule {
-            failed_effect_id: failed_effect_id.clone(), retry_turn, policy_version,
-            not_before_ts: self.now().saturating_add(delay_seconds).max(provider_not_before.unwrap_or(i64::MIN)),
+            failed_effect_id: failed_effect_id.clone(),
+            retry_turn,
+            policy_version,
+            not_before_ts: self
+                .now()
+                .saturating_add(delay_seconds)
+                .max(provider_not_before.unwrap_or(i64::MIN)),
         };
-        insert_event(&tx, task, "ModelRetryScheduled", &serde_json::to_value(&schedule)?)?;
+        insert_event(
+            &tx,
+            task,
+            "ModelRetryScheduled",
+            &serde_json::to_value(&schedule)?,
+        )?;
         tx.commit()?;
         Ok(schedule)
     }
@@ -289,7 +339,10 @@ impl Db {
             });
         }
         if reserve.tool_actions != consumes {
-            return Err(DbError::InvalidReservation { expected: consumes, got: reserve.tool_actions });
+            return Err(DbError::InvalidReservation {
+                expected: consumes,
+                got: reserve.tool_actions,
+            });
         }
         let capability = kind.capability();
         match authorize_in(&tx, task_id, capability, resource, self.now()) {
@@ -314,7 +367,10 @@ impl Db {
         }
         if let EffectKind::ApplyPatch { expected_base } = &kind {
             let actual = task.workspace_digest;
-            if let Some(expected) = [*expected_workspace, *expected_base].into_iter().find(|d| *d != actual) {
+            if let Some(expected) = [*expected_workspace, *expected_base]
+                .into_iter()
+                .find(|d| *d != actual)
+            {
                 drop(tx);
                 self.append_audit(
                     task_id,
@@ -330,13 +386,17 @@ impl Db {
                 return Err(DbError::VersionConflict { expected, actual });
             }
         }
-        check_model_budget(&usage_totals(&tx, task_id)?.model_totals(), &reserve, &contract.limits)
-            .map_err(DbError::BudgetExceeded)?;
+        check_model_budget(
+            &usage_totals(&tx, task_id)?.model_totals(),
+            &reserve,
+            &contract.limits,
+        )
+        .map_err(DbError::BudgetExceeded)?;
         let after_action = if consumes > 0 {
             match reduce(&task, &TaskEvent::ActionUsed, &contract.limits) {
                 Ok(next) => Some(next),
                 Err(TransitionError::ActionLimit(limit)) => {
-                    return Err(DbError::BudgetExceeded(BudgetError::ToolActions { limit }))
+                    return Err(DbError::BudgetExceeded(BudgetError::ToolActions { limit }));
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -386,7 +446,12 @@ impl Db {
         )?;
         if let Some(next) = &after_action {
             store_task(&tx, next)?;
-            insert_event(&tx, task_id, "ActionUsed", &serde_json::to_value(TaskEvent::ActionUsed)?)?;
+            insert_event(
+                &tx,
+                task_id,
+                "ActionUsed",
+                &serde_json::to_value(TaskEvent::ActionUsed)?,
+            )?;
         }
         let record = load_effect(&tx, &effect_id)?;
         tx.commit()?;
@@ -409,17 +474,22 @@ impl Db {
         let rec = load_effect(&tx, effect)?;
         let stale = match rec.state {
             EffectState::Intended => lease_generation < rec.lease_generation,
-            EffectState::Dispatched | EffectState::Unknown => lease_generation <= rec.lease_generation,
+            EffectState::Dispatched | EffectState::Unknown => {
+                lease_generation <= rec.lease_generation
+            }
             from => {
                 return Err(DbError::InvalidEffectTransition {
                     effect: effect.clone(),
                     from,
                     to: EffectState::Dispatched,
-                })
+                });
             }
         };
         if stale {
-            return Err(DbError::StaleLease { stored: rec.lease_generation, got: lease_generation });
+            return Err(DbError::StaleLease {
+                stored: rec.lease_generation,
+                got: lease_generation,
+            });
         }
         let (task, _) = load_task(&tx, &rec.task_id)?;
         if !task.may_dispatch() {
@@ -511,7 +581,7 @@ impl Db {
         }
         match result_artifact {
             None if receipt.outcome == Outcome::Success => {
-                return Err(DbError::ArtifactRequired(effect.clone()))
+                return Err(DbError::ArtifactRequired(effect.clone()));
             }
             None => {}
             Some(artifact) => {
@@ -525,10 +595,16 @@ impl Db {
                     return Err(DbError::ArtifactNotPublished(*artifact));
                 }
                 if !linked {
-                    return Err(DbError::ArtifactEffectMismatch { artifact: *artifact, effect: effect.clone() });
+                    return Err(DbError::ArtifactEffectMismatch {
+                        artifact: *artifact,
+                        effect: effect.clone(),
+                    });
                 }
                 if let Some(d) = receipt.result_digest.filter(|d| d != artifact) {
-                    return Err(DbError::ReceiptArtifactMismatch { artifact: *artifact, receipt: d });
+                    return Err(DbError::ReceiptArtifactMismatch {
+                        artifact: *artifact,
+                        receipt: d,
+                    });
                 }
             }
         }
@@ -540,16 +616,24 @@ impl Db {
             // digest to be that workspace too.
             let bound = Digest::of(task.workspace_digest.as_bytes());
             let why = if rec.kind != EffectKind::RunVerification {
-                Some(format!("effect {effect} is {}, not a verification", rec.kind.tag()))
+                Some(format!(
+                    "effect {effect} is {}, not a verification",
+                    rec.kind.tag()
+                ))
             } else if receipt.outcome != Outcome::Success {
                 Some(format!("verification {effect} did not succeed"))
             } else if rec.request_digest != bound {
-                Some(format!("verification {effect} was not intended for the current workspace {}", task.workspace_digest))
+                Some(format!(
+                    "verification {effect} was not intended for the current workspace {}",
+                    task.workspace_digest
+                ))
             } else {
                 None
             };
             if let Some(why) = why {
-                return Err(DbError::UnprovenVerification(format!("VerifyPassed refused: {why}")));
+                return Err(DbError::UnprovenVerification(format!(
+                    "VerifyPassed refused: {why}"
+                )));
             }
         }
         let (state, event_type) = match receipt.outcome {
@@ -596,9 +680,16 @@ impl Db {
             match reduce(&task, &ev, &contract.limits) {
                 Ok(next) => {
                     store_task(&tx, &next)?;
-                    insert_event(&tx, &rec.task_id, &event_name(&ev)?, &serde_json::to_value(&ev)?)?;
+                    insert_event(
+                        &tx,
+                        &rec.task_id,
+                        &event_name(&ev)?,
+                        &serde_json::to_value(&ev)?,
+                    )?;
                 }
-                Err(e @ (TransitionError::Terminal(_) | TransitionError::CancelRequested { .. })) => {
+                Err(
+                    e @ (TransitionError::Terminal(_) | TransitionError::CancelRequested { .. }),
+                ) => {
                     insert_event(
                         &tx,
                         &rec.task_id,
@@ -630,7 +721,13 @@ impl Db {
         tx.execute(
             "INSERT OR IGNORE INTO artifacts(digest, size, type, provenance, created_ts)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![digest.to_string(), to_sql_int(size)?, artifact_type, provenance, now_ts()],
+            params![
+                digest.to_string(),
+                to_sql_int(size)?,
+                artifact_type,
+                provenance,
+                now_ts()
+            ],
         )?;
         let Some(rec) = owner else {
             tx.commit()?;
@@ -671,7 +768,11 @@ impl Db {
         }
         tx.execute(
             "UPDATE effects SET state = ?2, updated_ts = ?3 WHERE effect_id = ?1",
-            params![effect.as_str(), effect_state_str(EffectState::Unknown), now_ts()],
+            params![
+                effect.as_str(),
+                effect_state_str(EffectState::Unknown),
+                now_ts()
+            ],
         )?;
         let n = tx.execute(
             "UPDATE usage SET status = 'Uncertain' WHERE effect_id = ?1 AND status IN ('Reserved', 'Uncertain')",
@@ -695,7 +796,11 @@ impl Db {
         let tx = self.immediate()?;
         let rec = load_effect(&tx, effect)?;
         if !matches!(rec.state, EffectState::Dispatched | EffectState::Unknown) {
-            return Err(DbError::InvalidEffectTransition { effect: effect.clone(), from: rec.state, to: EffectState::Failed });
+            return Err(DbError::InvalidEffectTransition {
+                effect: effect.clone(),
+                from: rec.state,
+                to: EffectState::Failed,
+            });
         }
         let now = now_ts();
         tx.execute(
@@ -755,7 +860,10 @@ impl Db {
     pub fn abandon_effect(&self, effect: &EffectId, reason: &str) -> Result<()> {
         let tx = self.immediate()?;
         let rec = load_effect(&tx, effect)?;
-        if !matches!(rec.state, EffectState::Intended | EffectState::Dispatched | EffectState::Unknown) {
+        if !matches!(
+            rec.state,
+            EffectState::Intended | EffectState::Dispatched | EffectState::Unknown
+        ) {
             return Err(DbError::InvalidEffectTransition {
                 effect: effect.clone(),
                 from: rec.state,
@@ -781,7 +889,8 @@ impl Db {
                 "SELECT {EFFECT_COLUMNS} FROM effects WHERE task_id = ?1 AND state = 'INTENDED' ORDER BY rowid"
             ))?;
             let rows = stmt.query_map([task_id.as_str()], effect_row)?;
-            rows.map(|r| effect_from_row(r?)).collect::<Result<Vec<_>>>()?
+            rows.map(|r| effect_from_row(r?))
+                .collect::<Result<Vec<_>>>()?
         };
         for rec in &intended {
             abandon(&tx, rec, "task can no longer dispatch it")?;

@@ -2,7 +2,7 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::contract::{path_matches, Capability, Contract};
+use crate::contract::{Capability, Contract, path_matches};
 use crate::ids::TaskId;
 
 #[derive(Debug, thiserror::Error)]
@@ -28,7 +28,9 @@ impl Handle {
         if ok {
             Ok(Handle(s.to_string()))
         } else {
-            Err(BrokerError::InvalidHandle("must be exactly 32 lowercase hex characters".into()))
+            Err(BrokerError::InvalidHandle(
+                "must be exactly 32 lowercase hex characters".into(),
+            ))
         }
     }
 
@@ -135,19 +137,27 @@ pub fn authorize(
         return Err(Denial::Expired);
     }
     let in_scope = match (&grant.scope, resource) {
-        (Scope::Paths(pats), Resource::Paths(paths)) => !paths.is_empty() && paths.iter().all(|p| path_matches(pats, p)),
+        (Scope::Paths(pats), Resource::Paths(paths)) => {
+            !paths.is_empty() && paths.iter().all(|p| path_matches(pats, p))
+        }
         (Scope::Profile(a), Resource::Profile(b)) => a == b,
         (Scope::Task, Resource::Task) => true,
         _ => false,
     };
-    if in_scope { Ok(()) } else { Err(Denial::OutOfScope) }
+    if in_scope {
+        Ok(())
+    } else {
+        Err(Denial::OutOfScope)
+    }
 }
 
 /// The scope a contract implies for an operation.
 pub fn scope_for(op: Capability, contract: &Contract) -> Scope {
     match op {
         Capability::WorkspaceApplyPatch => Scope::Paths(contract.editable_paths.clone()),
-        Capability::SnapshotRead | Capability::ArtifactExport | Capability::ModelRequest => Scope::Task,
+        Capability::SnapshotRead | Capability::ArtifactExport | Capability::ModelRequest => {
+            Scope::Task
+        }
         Capability::VerificationRun => Scope::Profile(contract.verification_profile.clone()),
     }
 }
@@ -217,7 +227,10 @@ mod tests {
         assert!(Handle::parse(&format!("{ok}0")).is_err());
         assert!(Handle::parse(&ok.to_uppercase()).is_err());
         assert!(Handle::parse(&format!("{}g", &ok[..31])).is_err());
-        assert!(matches!(Handle::parse("x"), Err(BrokerError::InvalidHandle(_))));
+        assert!(matches!(
+            Handle::parse("x"),
+            Err(BrokerError::InvalidHandle(_))
+        ));
     }
 
     #[test]
@@ -226,14 +239,29 @@ mod tests {
         let op = Capability::WorkspaceApplyPatch;
         let g = grant(&t, src_scope(), Some(100), false);
         let r = paths(&["src/a.py"]);
-        assert_eq!(authorize(&g, &TaskId::new(), op, &r, 0), Err(Denial::WrongTask));
-        assert_eq!(authorize(&g, &t, Capability::SnapshotRead, &r, 0), Err(Denial::WrongOperation));
+        assert_eq!(
+            authorize(&g, &TaskId::new(), op, &r, 0),
+            Err(Denial::WrongTask)
+        );
+        assert_eq!(
+            authorize(&g, &t, Capability::SnapshotRead, &r, 0),
+            Err(Denial::WrongOperation)
+        );
         let revoked = grant(&t, src_scope(), Some(100), true);
         assert_eq!(authorize(&revoked, &t, op, &r, 1000), Err(Denial::Revoked));
         assert_eq!(authorize(&g, &t, op, &r, 100), Err(Denial::Expired));
-        assert_eq!(authorize(&g, &t, op, &paths(&["tests/x.py"]), 99), Err(Denial::OutOfScope));
-        assert_eq!(authorize(&g, &t, op, &paths(&["src/../tests/x"]), 99), Err(Denial::OutOfScope));
-        assert_eq!(authorize(&g, &t, op, &paths(&["src/a.py", "tests/x.py"]), 99), Err(Denial::OutOfScope));
+        assert_eq!(
+            authorize(&g, &t, op, &paths(&["tests/x.py"]), 99),
+            Err(Denial::OutOfScope)
+        );
+        assert_eq!(
+            authorize(&g, &t, op, &paths(&["src/../tests/x"]), 99),
+            Err(Denial::OutOfScope)
+        );
+        assert_eq!(
+            authorize(&g, &t, op, &paths(&["src/a.py", "tests/x.py"]), 99),
+            Err(Denial::OutOfScope)
+        );
         assert_eq!(authorize(&g, &t, op, &r, 99), Ok(()));
     }
 
@@ -243,7 +271,10 @@ mod tests {
         let op = Capability::WorkspaceApplyPatch;
         let bad = paths(&["tests/x.py"]);
         let g = grant(&t, src_scope(), Some(100), false);
-        assert_eq!(authorize(&g, &TaskId::new(), Capability::SnapshotRead, &bad, 0), Err(Denial::WrongTask));
+        assert_eq!(
+            authorize(&g, &TaskId::new(), Capability::SnapshotRead, &bad, 0),
+            Err(Denial::WrongTask)
+        );
         let revoked = grant(&t, src_scope(), Some(100), true);
         assert_eq!(authorize(&revoked, &t, op, &bad, 0), Err(Denial::Revoked));
         assert_eq!(authorize(&g, &t, op, &bad, 100), Err(Denial::Expired));
@@ -254,17 +285,35 @@ mod tests {
         let t = TaskId::new();
         let op = Capability::WorkspaceApplyPatch;
         let g = grant(&t, src_scope(), None, false);
-        assert_eq!(authorize(&g, &t, op, &Resource::Paths(vec![]), 0), Err(Denial::OutOfScope));
+        assert_eq!(
+            authorize(&g, &t, op, &Resource::Paths(vec![]), 0),
+            Err(Denial::OutOfScope)
+        );
         let none = grant(&t, Scope::Paths(vec![]), None, false);
-        assert_eq!(authorize(&none, &t, op, &paths(&["src/a.py"]), 0), Err(Denial::OutOfScope));
-        assert_eq!(authorize(&none, &t, op, &Resource::Paths(vec![]), 0), Err(Denial::OutOfScope));
+        assert_eq!(
+            authorize(&none, &t, op, &paths(&["src/a.py"]), 0),
+            Err(Denial::OutOfScope)
+        );
+        assert_eq!(
+            authorize(&none, &t, op, &Resource::Paths(vec![]), 0),
+            Err(Denial::OutOfScope)
+        );
     }
 
     #[test]
     fn no_expiry_never_expires() {
         let t = TaskId::new();
         let g = grant(&t, src_scope(), None, false);
-        assert_eq!(authorize(&g, &t, Capability::WorkspaceApplyPatch, &paths(&["src/a"]), i64::MAX), Ok(()));
+        assert_eq!(
+            authorize(
+                &g,
+                &t,
+                Capability::WorkspaceApplyPatch,
+                &paths(&["src/a"]),
+                i64::MAX
+            ),
+            Ok(())
+        );
     }
 
     #[test]
@@ -272,13 +321,28 @@ mod tests {
         let t = TaskId::new();
         let op = Capability::WorkspaceApplyPatch;
         let p = grant(&t, Scope::Profile("p1".into()), None, false);
-        assert_eq!(authorize(&p, &t, op, &Resource::Profile("p1".into()), 0), Ok(()));
-        assert_eq!(authorize(&p, &t, op, &Resource::Profile("p2".into()), 0), Err(Denial::OutOfScope));
-        assert_eq!(authorize(&p, &t, op, &Resource::Task, 0), Err(Denial::OutOfScope));
+        assert_eq!(
+            authorize(&p, &t, op, &Resource::Profile("p1".into()), 0),
+            Ok(())
+        );
+        assert_eq!(
+            authorize(&p, &t, op, &Resource::Profile("p2".into()), 0),
+            Err(Denial::OutOfScope)
+        );
+        assert_eq!(
+            authorize(&p, &t, op, &Resource::Task, 0),
+            Err(Denial::OutOfScope)
+        );
         let k = grant(&t, Scope::Task, None, false);
         assert_eq!(authorize(&k, &t, op, &Resource::Task, 0), Ok(()));
-        assert_eq!(authorize(&k, &t, op, &paths(&["src/a"]), 0), Err(Denial::OutOfScope));
-        assert_eq!(authorize(&k, &t, op, &Resource::Profile("p1".into()), 0), Err(Denial::OutOfScope));
+        assert_eq!(
+            authorize(&k, &t, op, &paths(&["src/a"]), 0),
+            Err(Denial::OutOfScope)
+        );
+        assert_eq!(
+            authorize(&k, &t, op, &Resource::Profile("p1".into()), 0),
+            Err(Denial::OutOfScope)
+        );
     }
 
     #[test]
@@ -302,7 +366,10 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         assert_eq!(json, r#"{"kind":"paths","value":["src/**"]}"#);
         assert_eq!(serde_json::from_str::<Scope>(&json).unwrap(), s);
-        assert_eq!(serde_json::to_string(&Scope::Task).unwrap(), r#"{"kind":"task"}"#);
+        assert_eq!(
+            serde_json::to_string(&Scope::Task).unwrap(),
+            r#"{"kind":"task"}"#
+        );
     }
 
     #[test]
@@ -315,10 +382,16 @@ mod tests {
                 "deadline_seconds":1,"worker_vcpus":1,"worker_memory_mib":1}}"#,
         )
         .unwrap();
-        assert_eq!(scope_for(Capability::WorkspaceApplyPatch, &c), Scope::Paths(vec!["src/**".into()]));
+        assert_eq!(
+            scope_for(Capability::WorkspaceApplyPatch, &c),
+            Scope::Paths(vec!["src/**".into()])
+        );
         assert_eq!(scope_for(Capability::SnapshotRead, &c), Scope::Task);
         assert_eq!(scope_for(Capability::ArtifactExport, &c), Scope::Task);
         assert_eq!(scope_for(Capability::ModelRequest, &c), Scope::Task);
-        assert_eq!(scope_for(Capability::VerificationRun, &c), Scope::Profile("parser-checks-v1".into()));
+        assert_eq!(
+            scope_for(Capability::VerificationRun, &c),
+            Scope::Profile("parser-checks-v1".into())
+        );
     }
 }

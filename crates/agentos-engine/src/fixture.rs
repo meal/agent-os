@@ -12,8 +12,11 @@ use serde::Deserialize;
 use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor, Reconciliation};
 use crate::outcomes::{self, Check};
 use crate::patch::{git, paths_of_file};
-use crate::process::{run_in_group, GroupError};
-use crate::workspace::{copy_tree, symlink_on_path, excluded_entries, has_excluded_component, purge_excluded, workspace_digest};
+use crate::process::{GroupError, run_in_group};
+use crate::workspace::{
+    copy_tree, excluded_entries, has_excluded_component, purge_excluded, symlink_on_path,
+    workspace_digest,
+};
 
 use agentos_core::guest::OUTPUT_LIMIT;
 
@@ -38,8 +41,12 @@ pub struct FixtureExecutor {
 }
 
 /// Runs blocking filesystem work off the async runtime.
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> io::Result<T> + Send + 'static) -> io::Result<T> {
-    tokio::task::spawn_blocking(f).await.map_err(io::Error::other)?
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(io::Error::other)?
 }
 
 /// At most `OUTPUT_LIMIT` bytes, and whether more were captured.
@@ -106,7 +113,12 @@ impl FixtureExecutor {
         }
     }
 
-    async fn apply_patch(&self, req: &EffectRequest, ctx: &AttemptCtx, expected_base: Digest) -> ExecOutcome {
+    async fn apply_patch(
+        &self,
+        req: &EffectRequest,
+        ctx: &AttemptCtx,
+        expected_base: Digest,
+    ) -> ExecOutcome {
         match self.try_apply_patch(req, expected_base).await {
             Ok((paths, digest)) => outcomes::patch_applied(req, ctx, paths, digest),
             Err(reason) => ExecOutcome::failure(req, ctx, reason),
@@ -116,7 +128,11 @@ impl FixtureExecutor {
     /// Whether the patch in `req` was applied to the workspace: `Ok(None)` if the workspace
     /// is still exactly the expected base, `Ok(Some(..))` if it is exactly the base plus
     /// this patch (reverting the patch on a scratch copy gives the base back), else `Err`.
-    async fn patch_state(&self, req: &EffectRequest, expected_base: Digest) -> Result<Option<(Vec<String>, Digest)>, String> {
+    async fn patch_state(
+        &self,
+        req: &EffectRequest,
+        expected_base: Digest,
+    ) -> Result<Option<(Vec<String>, Digest)>, String> {
         let ws = self.workspace(&req.task_id);
         if !ws.is_dir() {
             return Err("workspace missing".into());
@@ -125,10 +141,11 @@ impl FixtureExecutor {
         if actual == expected_base {
             return Ok(None);
         }
-        let scratch =
-            tempfile::tempdir_in(self.task_dir(&req.task_id)).map_err(|e| format!("scratch dir: {e}"))?;
+        let scratch = tempfile::tempdir_in(self.task_dir(&req.task_id))
+            .map_err(|e| format!("scratch dir: {e}"))?;
         let patch_file = scratch.path().join("change.patch");
-        std::fs::write(&patch_file, &req.payload).map_err(|e| format!("cannot write patch: {e}"))?;
+        std::fs::write(&patch_file, &req.payload)
+            .map_err(|e| format!("cannot write patch: {e}"))?;
         let paths = paths_of_file(&patch_file, scratch.path()).await?;
         let copy = scratch.path().join("ws");
         copy_tree(&ws, &copy).map_err(|e| format!("cannot copy workspace: {e}"))?;
@@ -138,9 +155,12 @@ impl FixtureExecutor {
             .output()
             .await
             .map_err(|e| format!("cannot run git: {e}"))?;
-        let reverted = reverted.status.success() && workspace_digest(&copy).is_ok_and(|d| d == expected_base);
+        let reverted =
+            reverted.status.success() && workspace_digest(&copy).is_ok_and(|d| d == expected_base);
         if !reverted {
-            return Err(format!("workspace {actual} is neither the base {expected_base} nor the base with this patch"));
+            return Err(format!(
+                "workspace {actual} is neither the base {expected_base} nor the base with this patch"
+            ));
         }
         Ok(Some((paths, actual)))
     }
@@ -156,10 +176,11 @@ impl FixtureExecutor {
             return Err("workspace missing: no snapshot was read".into());
         }
         // The patch file lives next to, never inside, the workspace.
-        let scratch =
-            tempfile::tempdir_in(self.task_dir(&req.task_id)).map_err(|e| format!("scratch dir: {e}"))?;
+        let scratch = tempfile::tempdir_in(self.task_dir(&req.task_id))
+            .map_err(|e| format!("scratch dir: {e}"))?;
         let patch_file = scratch.path().join("change.patch");
-        std::fs::write(&patch_file, &req.payload).map_err(|e| format!("cannot write patch: {e}"))?;
+        std::fs::write(&patch_file, &req.payload)
+            .map_err(|e| format!("cannot write patch: {e}"))?;
 
         let paths = paths_of_file(&patch_file, scratch.path()).await?;
         if let Some(p) = paths.iter().find(|p| !req.contract.path_allowed(p)) {
@@ -177,7 +198,9 @@ impl FixtureExecutor {
         }
         let actual = workspace_digest(&ws).map_err(|e| format!("cannot digest workspace: {e}"))?;
         if actual != expected_base {
-            return Err(format!("version conflict: expected {expected_base}, actual {actual}"));
+            return Err(format!(
+                "version conflict: expected {expected_base}, actual {actual}"
+            ));
         }
         // A planted `.git` would make `git apply` honour its repo-local configuration.
         purge_excluded(&ws).map_err(|e| format!("cannot clean workspace: {e}"))?;
@@ -190,7 +213,10 @@ impl FixtureExecutor {
                 .await
                 .map_err(|e| format!("cannot run git: {e}"))?;
             if !out.status.success() {
-                return Err(format!("patch does not apply: {}", String::from_utf8_lossy(&out.stderr).trim()));
+                return Err(format!(
+                    "patch does not apply: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
             }
         }
         let digest = workspace_digest(&ws).map_err(|e| format!("cannot digest workspace: {e}"))?;
@@ -209,10 +235,7 @@ impl FixtureExecutor {
     /// staged copy, so a pin covers exactly what runs. Unpinned, any change to the source
     /// while the run is staged or under way voids the evidence; pinned, the source is not
     /// consulted after staging, and any change to the staged copy voids it.
-    async fn try_run_verification(
-        &self,
-        req: &EffectRequest,
-    ) -> Result<Check, String> {
+    async fn try_run_verification(&self, req: &EffectRequest) -> Result<Check, String> {
         let ws = self.workspace(&req.task_id);
         if !ws.is_dir() {
             return Err("workspace missing: no snapshot was read".into());
@@ -227,22 +250,30 @@ impl FixtureExecutor {
 
         let source_digest = match self.pinned_profile {
             Some(_) => None,
-            None => Some(workspace_digest(&self.profile_dir).map_err(|e| format!("cannot digest profile: {e}"))?),
+            None => Some(
+                workspace_digest(&self.profile_dir)
+                    .map_err(|e| format!("cannot digest profile: {e}"))?,
+            ),
         };
         // Entries the digest ignores must not decide the check: a bytecode cache planted by
         // an earlier run could stand in for the source the evidence names.
         purge_excluded(&ws).map_err(|e| format!("cannot clean workspace: {e}"))?;
-        let run_dir = tempfile::tempdir_in(self.task_dir(&req.task_id)).map_err(|e| format!("scratch dir: {e}"))?;
+        let run_dir = tempfile::tempdir_in(self.task_dir(&req.task_id))
+            .map_err(|e| format!("scratch dir: {e}"))?;
         let run_profile = run_dir.path().join("profile");
-        copy_tree(&self.profile_dir, &run_profile).map_err(|e| format!("cannot stage profile: {e}"))?;
+        copy_tree(&self.profile_dir, &run_profile)
+            .map_err(|e| format!("cannot stage profile: {e}"))?;
         #[cfg(test)]
         if let Some(hook) = self.after_stage {
             hook(&self.profile_dir);
         }
-        let profile_digest = workspace_digest(&run_profile).map_err(|e| format!("cannot digest profile: {e}"))?;
+        let profile_digest =
+            workspace_digest(&run_profile).map_err(|e| format!("cannot digest profile: {e}"))?;
         match (self.pinned_profile, source_digest) {
             (Some(pinned), _) if profile_digest != pinned => {
-                return Err(format!("profile digest mismatch: pinned {pinned}, found {profile_digest}"));
+                return Err(format!(
+                    "profile digest mismatch: pinned {pinned}, found {profile_digest}"
+                ));
             }
             (None, Some(source)) if profile_digest != source => {
                 return Err("protected profile changed during verification".into());
@@ -250,12 +281,15 @@ impl FixtureExecutor {
             _ => {}
         }
         // Parsed from the bytes just digested, never from the shared source.
-        let raw = std::fs::read(run_profile.join("profile.json")).map_err(|e| format!("cannot read profile: {e}"))?;
-        let profile: Profile = serde_json::from_slice(&raw).map_err(|e| format!("invalid profile.json: {e}"))?;
+        let raw = std::fs::read(run_profile.join("profile.json"))
+            .map_err(|e| format!("cannot read profile: {e}"))?;
+        let profile: Profile =
+            serde_json::from_slice(&raw).map_err(|e| format!("invalid profile.json: {e}"))?;
         let Some((program, args)) = profile.command.split_first() else {
             return Err("profile command is empty".into());
         };
-        let workspace = workspace_digest(&ws).map_err(|e| format!("cannot digest workspace: {e}"))?;
+        let workspace =
+            workspace_digest(&ws).map_err(|e| format!("cannot digest workspace: {e}"))?;
 
         let mut cmd = tokio::process::Command::new(program);
         cmd.args(args)
@@ -268,7 +302,14 @@ impl FixtureExecutor {
         if let Some(path) = std::env::var_os("PATH") {
             cmd.env("PATH", path);
         }
-        let output = match run_in_group(cmd, self.verify_timeout, OUTPUT_LIMIT, self.groups_file.as_deref()).await {
+        let output = match run_in_group(
+            cmd,
+            self.verify_timeout,
+            OUTPUT_LIMIT,
+            self.groups_file.as_deref(),
+        )
+        .await
+        {
             Err(GroupError::Timeout) => return Err("timeout".into()),
             Err(GroupError::Io(e)) => return Err(format!("cannot run profile command: {e}")),
             Ok(o) => o,
@@ -283,9 +324,13 @@ impl FixtureExecutor {
             return Err("workspace changed during verification".into());
         }
         // Whatever the check left behind outside the digest voids its evidence.
-        let polluted = excluded_entries(&ws).map_err(|e| format!("cannot inspect workspace: {e}"))?;
+        let polluted =
+            excluded_entries(&ws).map_err(|e| format!("cannot inspect workspace: {e}"))?;
         if !polluted.is_empty() {
-            return Err(format!("workspace polluted by excluded entries: {}", polluted.join(", ")));
+            return Err(format!(
+                "workspace polluted by excluded entries: {}",
+                polluted.join(", ")
+            ));
         }
 
         let (stdout, stdout_truncated) = truncated(output.stdout);
@@ -308,10 +353,16 @@ impl Executor for FixtureExecutor {
     async fn run(&self, req: &EffectRequest, ctx: &AttemptCtx) -> ExecOutcome {
         match req.kind {
             EffectKind::ReadSnapshot => self.read_snapshot(req, ctx).await,
-            EffectKind::ApplyPatch { expected_base } => self.apply_patch(req, ctx, expected_base).await,
+            EffectKind::ApplyPatch { expected_base } => {
+                self.apply_patch(req, ctx, expected_base).await
+            }
             EffectKind::RunVerification => self.run_verification(req, ctx).await,
-            EffectKind::ExportBundle => ExecOutcome::failure(req, ctx, "not implemented in this milestone"),
-            EffectKind::ModelCall { .. } | EffectKind::ListFiles { .. } | EffectKind::ReadFile { .. } => {
+            EffectKind::ExportBundle => {
+                ExecOutcome::failure(req, ctx, "not implemented in this milestone")
+            }
+            EffectKind::ModelCall { .. }
+            | EffectKind::ListFiles { .. }
+            | EffectKind::ReadFile { .. } => {
                 ExecOutcome::failure(req, ctx, format!("not a worker effect: {}", req.kind.tag()))
             }
         }
@@ -324,7 +375,9 @@ impl Executor for FixtureExecutor {
         };
         match self.patch_state(req, expected_base).await {
             Ok(None) => Reconciliation::NotApplied,
-            Ok(Some((paths, digest))) => Reconciliation::Applied(outcomes::patch_applied(req, ctx, paths, digest)),
+            Ok(Some((paths, digest))) => {
+                Reconciliation::Applied(outcomes::patch_applied(req, ctx, paths, digest))
+            }
             Err(reason) => {
                 tracing::warn!(effect_id = %req.effect_id, reason, "patch cannot be reconciled");
                 Reconciliation::Unknown
@@ -349,7 +402,8 @@ mod tests {
     use agentos_core::effect::{AttemptId, EffectId, Outcome};
     use serde_json::json;
 
-    const STAGED: &str = r#"{"id": "staged", "command": ["python3", "-c", "print('STAGED')"], "protected": true}"#;
+    const STAGED: &str =
+        r#"{"id": "staged", "command": ["python3", "-c", "print('STAGED')"], "protected": true}"#;
 
     fn tamper(profile_dir: &Path) {
         let tampered = r#"{"id": "tampered", "command": ["python3", "-c", "print('TAMPERED')"], "protected": true}"#;
@@ -368,11 +422,19 @@ mod tests {
         std::fs::create_dir(dir.path().join("profile")).unwrap();
         std::fs::write(dir.path().join("profile/profile.json"), STAGED).unwrap();
         let digest = workspace_digest(&dir.path().join("profile")).unwrap();
-        let mut exec = FixtureExecutor::new(dir.path().join("snapshot"), dir.path().join("profile"), dir.path().join("work"))
-            .with_pinned_profile(pinned.then_some(digest));
+        let mut exec = FixtureExecutor::new(
+            dir.path().join("snapshot"),
+            dir.path().join("profile"),
+            dir.path().join("work"),
+        )
+        .with_pinned_profile(pinned.then_some(digest));
         exec.after_stage = Some(tamper);
         let task = TaskId::new();
-        let ctx = AttemptCtx { attempt_id: AttemptId::new(), lease_generation: 1, worker: "t".into() };
+        let ctx = AttemptCtx {
+            attempt_id: AttemptId::new(),
+            lease_generation: 1,
+            worker: "t".into(),
+        };
         let req = |kind: EffectKind| EffectRequest {
             effect_id: EffectId::derive(&task, 0, &kind, &Digest::of(b"")),
             task_id: task.clone(),
@@ -383,17 +445,28 @@ mod tests {
         };
         let snap = exec.run(&req(EffectKind::ReadSnapshot), &ctx).await;
         assert_eq!(snap.receipt.outcome, Outcome::Success);
-        (exec.run(&req(EffectKind::RunVerification), &ctx).await, digest)
+        (
+            exec.run(&req(EffectKind::RunVerification), &ctx).await,
+            digest,
+        )
     }
 
     #[tokio::test]
     async fn a_pinned_verification_runs_the_staged_command_not_the_source() {
         let (out, pinned) = verify_with_tampering(true).await;
-        assert_eq!(out.receipt.outcome, Outcome::Success, "{}", String::from_utf8_lossy(&out.output));
+        assert_eq!(
+            out.receipt.outcome,
+            Outcome::Success,
+            "{}",
+            String::from_utf8_lossy(&out.output)
+        );
         let evidence: serde_json::Value = serde_json::from_slice(&out.output).unwrap();
         assert_eq!(evidence["stdout"].as_str().unwrap().trim(), "STAGED");
         assert_eq!(evidence["profile_id"], "staged");
-        assert_eq!(evidence["command"], json!(["python3", "-c", "print('STAGED')"]));
+        assert_eq!(
+            evidence["command"],
+            json!(["python3", "-c", "print('STAGED')"])
+        );
         assert_eq!(evidence["profile_digest"], json!(pinned));
         assert!(out.verification.unwrap().passed);
     }
@@ -402,7 +475,10 @@ mod tests {
     async fn an_unpinned_verification_still_voids_evidence_when_the_source_changes() {
         let (out, _) = verify_with_tampering(false).await;
         let Outcome::Failure(reason) = &out.receipt.outcome else {
-            panic!("expected failure, got {}", String::from_utf8_lossy(&out.output))
+            panic!(
+                "expected failure, got {}",
+                String::from_utf8_lossy(&out.output)
+            )
         };
         assert_eq!(reason, "protected profile changed during verification");
         assert!(out.verification.is_none());

@@ -23,26 +23,29 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentos_core::effect::{EffectId, EffectKind, RetryPolicy};
-use agentos_core::guest::{mint_attempt_token, PatchStateKind};
+use agentos_core::guest::{PatchStateKind, mint_attempt_token};
 use agentos_core::ids::{Digest, TaskId};
-use agentos_core::lease::{lease_expiry_ms, EffectTimeouts};
-use rustix::process::{getpgrp, getpid, getsid, kill_process_group, pidfd_open, pidfd_send_signal, Pid, PidfdFlags, Signal};
+use agentos_core::lease::{EffectTimeouts, lease_expiry_ms};
+use rustix::process::{
+    Pid, PidfdFlags, Signal, getpgrp, getpid, getsid, kill_process_group, pidfd_open,
+    pidfd_send_signal,
+};
 
 use crate::crash::{CrashHook, CrashPoint};
-use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor, Reconciliation};
 pub use crate::executor::JobWait;
-use crate::firecracker::{collect_root, Answer, Inspector, Query};
+use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor, Reconciliation};
+use crate::firecracker::{Answer, Inspector, Query, collect_root};
 use crate::fixture::FixtureExecutor;
 use crate::guestlink::guest_text;
 use crate::jail;
 use crate::job::{JobDir, JobRequest, JobState, WorkerConfig};
 use crate::outcomes;
-use crate::supervisor::{group_in_session, proc_stats, SupervisorCmd};
+use crate::supervisor::{SupervisorCmd, group_in_session, proc_stats};
 
 /// How often a job directory is looked at while waiting.
 const POLL: Duration = Duration::from_millis(25);
@@ -99,7 +102,11 @@ pub enum PatchVerdict {
 /// The host's check on a guest's patch-state answer: `NotApplied` only with the base digest,
 /// `Applied` only with a digest that is not the base; anything else (a missing digest, a
 /// state that contradicts its digest, `unknown`) is `Unknown`, never `NotApplied`.
-pub fn patch_verdict(state: PatchStateKind, digest: Option<Digest>, expected_base: Digest) -> PatchVerdict {
+pub fn patch_verdict(
+    state: PatchStateKind,
+    digest: Option<Digest>,
+    expected_base: Digest,
+) -> PatchVerdict {
     match (state, digest) {
         (PatchStateKind::NotApplied, Some(d)) if d == expected_base => PatchVerdict::NotApplied,
         (PatchStateKind::Applied, Some(d)) if d != expected_base => PatchVerdict::Applied(d),
@@ -129,10 +136,19 @@ impl Reconciler {
         let EffectKind::ApplyPatch { expected_base } = req.kind else {
             return Reconciliation::Unknown;
         };
-        let (inspector, task, patch) = (inspector.clone(), req.task_id.clone(), req.payload.clone());
-        let answer = tokio::task::spawn_blocking(move || inspector.query(&task, Query::PatchState { expected_base, patch }))
-            .await
-            .unwrap_or_else(|e| Err(format!("workspace inspection failed: {e}")));
+        let (inspector, task, patch) =
+            (inspector.clone(), req.task_id.clone(), req.payload.clone());
+        let answer = tokio::task::spawn_blocking(move || {
+            inspector.query(
+                &task,
+                Query::PatchState {
+                    expected_base,
+                    patch,
+                },
+            )
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("workspace inspection failed: {e}")));
         let state = match answer {
             Ok(Answer::PatchState(state)) => state,
             Ok(Answer::Digest(_)) => {
@@ -146,7 +162,9 @@ impl Reconciler {
         };
         match patch_verdict(state.state, state.workspace_digest, expected_base) {
             PatchVerdict::NotApplied => Reconciliation::NotApplied,
-            PatchVerdict::Applied(d) => Reconciliation::Applied(outcomes::patch_applied(req, ctx, state.paths, d)),
+            PatchVerdict::Applied(d) => {
+                Reconciliation::Applied(outcomes::patch_applied(req, ctx, state.paths, d))
+            }
             PatchVerdict::Unknown => {
                 let reason = guest_text(state.reason.as_deref().unwrap_or(""));
                 let (kind, digest) = (state.state, state.workspace_digest);
@@ -161,11 +179,15 @@ impl Reconciler {
     pub fn current_workspace(&self, task: &TaskId) -> Option<Result<Digest, String>> {
         match self {
             Reconciler::Host(fixture) => fixture.current_workspace(task),
-            Reconciler::Firecracker(inspector) => Some(match inspector.query(task, Query::Digest) {
-                Ok(Answer::Digest(d)) => Ok(d),
-                Ok(Answer::PatchState(_)) => Err("workspace inspection failed: a patch state answered a digest query".into()),
-                Err(e) => Err(e),
-            }),
+            Reconciler::Firecracker(inspector) => {
+                Some(match inspector.query(task, Query::Digest) {
+                    Ok(Answer::Digest(d)) => Ok(d),
+                    Ok(Answer::PatchState(_)) => Err(
+                        "workspace inspection failed: a patch state answered a digest query".into(),
+                    ),
+                    Err(e) => Err(e),
+                })
+            }
         }
     }
 }
@@ -186,7 +208,10 @@ pub struct SupervisedExecutor {
 }
 
 fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn millis(d: Duration) -> i64 {
@@ -211,7 +236,10 @@ async fn wait_dead(jobs: &[JobDir], until_ms: i64) -> bool {
 fn receipt_for(job: &JobDir, req: &EffectRequest, ctx: &AttemptCtx) -> Option<ExecOutcome> {
     let out = job.read_receipt()?;
     let r = &out.receipt;
-    if r.effect_id == req.effect_id && r.attempt_id == ctx.attempt_id && r.lease_generation == ctx.lease_generation {
+    if r.effect_id == req.effect_id
+        && r.attempt_id == ctx.attempt_id
+        && r.lease_generation == ctx.lease_generation
+    {
         Some(out)
     } else {
         tracing::warn!(job = %job.path.display(), receipt = ?r, "job receipt is for another attempt");
@@ -234,7 +262,10 @@ fn signalable(id: i32) -> Option<Pid> {
 /// `run <job_dir>`. `status.json` is worker-writable, so the pid it names proves nothing.
 fn is_job_supervisor(pid: Pid, job: &JobDir) -> bool {
     let proc = PathBuf::from(format!("/proc/{}", pid.as_raw_nonzero()));
-    let same_lock = match (fs::metadata(proc.join("fd/0")), fs::metadata(job.path.join("lock"))) {
+    let same_lock = match (
+        fs::metadata(proc.join("fd/0")),
+        fs::metadata(job.path.join("lock")),
+    ) {
         (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
         _ => false,
     };
@@ -244,9 +275,17 @@ fn is_job_supervisor(pid: Pid, job: &JobDir) -> bool {
 /// Whether `pid`'s command line ends with `<verb> <job_dir>` for `job`'s directory.
 fn runs_job(pid: Pid, job: &JobDir, verb: &[u8]) -> bool {
     let proc = PathBuf::from(format!("/proc/{}", pid.as_raw_nonzero()));
-    let Ok(cmdline) = fs::read(proc.join("cmdline")) else { return false };
-    let args: Vec<&[u8]> = cmdline.strip_suffix(b"\0").unwrap_or(&cmdline).split(|b| *b == 0).collect();
-    let [.., found, dir] = args.as_slice() else { return false };
+    let Ok(cmdline) = fs::read(proc.join("cmdline")) else {
+        return false;
+    };
+    let args: Vec<&[u8]> = cmdline
+        .strip_suffix(b"\0")
+        .unwrap_or(&cmdline)
+        .split(|b| *b == 0)
+        .collect();
+    let [.., found, dir] = args.as_slice() else {
+        return false;
+    };
     if *found != verb {
         return false;
     }
@@ -270,7 +309,11 @@ fn kill_job(job: &JobDir) {
         tracing::warn!(job = %job.path.display(), "no status: no recorded process to kill");
         return;
     };
-    let Some(supervisor) = status.supervisor_pid.and_then(|p| i32::try_from(p).ok()).and_then(signalable) else {
+    let Some(supervisor) = status
+        .supervisor_pid
+        .and_then(|p| i32::try_from(p).ok())
+        .and_then(signalable)
+    else {
         tracing::warn!(job = %job.path.display(), pid = ?status.supervisor_pid, "no usable supervisor pid");
         return;
     };
@@ -287,12 +330,16 @@ fn kill_job(job: &JobDir) {
     }
     let groups = status.worker_pgid.into_iter().chain(job.groups());
     for pgid in groups {
-        let Some(group) = signalable(pgid) else { continue };
+        let Some(group) = signalable(pgid) else {
+            continue;
+        };
         match group_in_session(group, supervisor) {
             Some(true) => {
                 let _ = kill_process_group(group, Signal::KILL);
             }
-            Some(false) => tracing::warn!(job = %job.path.display(), pgid, "not killing a group outside the job's session"),
+            Some(false) => {
+                tracing::warn!(job = %job.path.display(), pgid, "not killing a group outside the job's session")
+            }
             None => {} // nothing of the group is left
         }
     }
@@ -302,7 +349,9 @@ fn kill_job(job: &JobDir) {
     // had no time to record dies too. Its members keep the session id from being reused.
     match proc_stats() {
         Ok(stats) => kill_session(supervisor, &stats),
-        Err(e) => tracing::warn!(job = %job.path.display(), error = %e, "cannot scan /proc for the job's session"),
+        Err(e) => {
+            tracing::warn!(job = %job.path.display(), error = %e, "cannot scan /proc for the job's session")
+        }
     }
 }
 
@@ -320,8 +369,12 @@ fn kill_session(sid: Pid, stats: &[(i32, [String; 4])]) {
         if *session != session_field || state == "Z" || *pid == raw {
             continue;
         }
-        let Some(pid) = signalable(*pid) else { continue };
-        let Ok(fd) = pidfd_open(pid, PidfdFlags::empty()) else { continue };
+        let Some(pid) = signalable(*pid) else {
+            continue;
+        };
+        let Ok(fd) = pidfd_open(pid, PidfdFlags::empty()) else {
+            continue;
+        };
         if getsid(Some(pid)).ok() == Some(sid) {
             let _ = pidfd_send_signal(&fd, Signal::KILL);
         }
@@ -340,7 +393,12 @@ fn settled(job: &JobDir) -> bool {
         return false;
     }
     let status = job.read_status();
-    if job.read_receipt().is_some() || matches!(status.as_ref().map(|s| s.state), Some(JobState::Exited | JobState::Killed)) {
+    if job.read_receipt().is_some()
+        || matches!(
+            status.as_ref().map(|s| s.state),
+            Some(JobState::Exited | JobState::Killed)
+        )
+    {
         // The supervisor wrote these only after every process of the job was reaped.
         return true;
     }
@@ -351,18 +409,29 @@ fn settled(job: &JobDir) -> bool {
             return false;
         }
     };
-    let live = |pid: i32| stats.iter().any(|(p, [state, ..])| *p == pid && state != "Z");
+    let live = |pid: i32| {
+        stats
+            .iter()
+            .any(|(p, [state, ..])| *p == pid && state != "Z")
+    };
     let members = |sid: i32| {
         let sid = sid.to_string();
-        stats.iter().filter(move |(_, [state, _, _, session])| *session == sid && state != "Z").map(|(p, _)| *p)
+        stats
+            .iter()
+            .filter(move |(_, [state, _, _, session])| *session == sid && state != "Z")
+            .map(|(p, _)| *p)
     };
     let own_session = getsid(None).ok().map(|s| s.as_raw_nonzero().get());
     let workers: BTreeSet<i32> = stats
         .iter()
-        .filter(|(pid, [state, ..])| state != "Z" && Pid::from_raw(*pid).is_some_and(|p| runs_job(p, job, b"worker")))
+        .filter(|(pid, [state, ..])| {
+            state != "Z" && Pid::from_raw(*pid).is_some_and(|p| runs_job(p, job, b"worker"))
+        })
         .filter_map(|(_, [.., session])| session.parse().ok())
         .collect();
-    let recorded = status.and_then(|s| s.supervisor_pid).and_then(|p| i32::try_from(p).ok());
+    let recorded = status
+        .and_then(|s| s.supervisor_pid)
+        .and_then(|p| i32::try_from(p).ok());
     let mut clean = true;
     for sid in workers.iter().copied().chain(recorded) {
         if sid <= 1 || Some(sid) == own_session || members(sid).next().is_none() {
@@ -383,7 +452,9 @@ fn settled(job: &JobDir) -> bool {
                 tracing::warn!(job = %job.path.display(), sid, "killing what the job's dead supervisor left running");
                 kill_session(session, &stats);
             }
-            _ => tracing::warn!(job = %job.path.display(), sid, "processes left in the recorded session cannot be tied to the job; not killing"),
+            _ => {
+                tracing::warn!(job = %job.path.display(), sid, "processes left in the recorded session cannot be tied to the job; not killing")
+            }
         }
     }
     clean
@@ -394,7 +465,11 @@ fn settled(job: &JobDir) -> bool {
 /// never "no job".
 fn jobs_of(jobs_root: &Path, effect: &EffectId) -> io::Result<Vec<JobDir>> {
     match JobDir::list(jobs_root, effect) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound && fs::symlink_metadata(jobs_root).is_err_and(|m| m.kind() == io::ErrorKind::NotFound) => {
+        Err(e)
+            if e.kind() == io::ErrorKind::NotFound
+                && fs::symlink_metadata(jobs_root)
+                    .is_err_and(|m| m.kind() == io::ErrorKind::NotFound) =>
+        {
             Ok(Vec::new())
         }
         listed => listed,
@@ -418,7 +493,9 @@ pub fn cancel_jobs_in(jobs_root: &Path, effects: &[EffectId]) -> usize {
         for job in jobs.iter().filter(|j| !j.is_dead()) {
             match job.drop_cancel() {
                 Ok(()) => dropped += 1,
-                Err(e) => tracing::warn!(job = %job.path.display(), error = %e, "cannot drop the cancel marker"),
+                Err(e) => {
+                    tracing::warn!(job = %job.path.display(), error = %e, "cannot drop the cancel marker")
+                }
             }
         }
     }
@@ -435,15 +512,22 @@ impl SupervisedExecutor {
         fs::create_dir_all(&jobs_root)?;
         let reconciler = match &worker {
             WorkerConfig::Host(h) => Some(Reconciler::Host(
-                FixtureExecutor::new(h.snapshot_dir.clone(), h.profile_dir.clone(), h.work_root.clone())
-                    .with_verify_timeout(Duration::from_secs(h.verify_timeout_secs))
-                    .with_pinned_profile(h.profile_digest),
+                FixtureExecutor::new(
+                    h.snapshot_dir.clone(),
+                    h.profile_dir.clone(),
+                    h.work_root.clone(),
+                )
+                .with_verify_timeout(Duration::from_secs(h.verify_timeout_secs))
+                .with_pinned_profile(h.profile_digest),
             )),
             WorkerConfig::Scripted(_) => None,
             WorkerConfig::Firecracker(cfg) => {
                 // `<home>/jobs` ⇒ `<home>/inspect`.
                 let inspect_root = jobs_root.parent().unwrap_or(&jobs_root).join("inspect");
-                Some(Reconciler::Firecracker(Inspector::new(cfg.clone(), inspect_root)))
+                Some(Reconciler::Firecracker(Inspector::new(
+                    cfg.clone(),
+                    inspect_root,
+                )))
             }
         };
         Ok(SupervisedExecutor {
@@ -480,7 +564,11 @@ impl SupervisedExecutor {
 
     /// Sets `key` in the supervisor's (and so the worker's) environment, and in the
     /// environment the inspector treats as its own.
-    pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> SupervisedExecutor {
+    pub fn with_env(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> SupervisedExecutor {
         let (key, value) = (key.into(), value.into());
         if let Some(Reconciler::Firecracker(inspector)) = &mut self.reconciler {
             inspector.push_env(key.clone(), value.clone());
@@ -527,9 +615,11 @@ impl SupervisedExecutor {
             // `cmd`, and with it the controller's copy of the lock, is dropped here.
         };
         let mut child = spawned?;
-        let reaper = std::thread::Builder::new().name("supervisor-reaper".into()).spawn(move || {
-            let _ = child.wait();
-        });
+        let reaper = std::thread::Builder::new()
+            .name("supervisor-reaper".into())
+            .spawn(move || {
+                let _ = child.wait();
+            });
         if let Err(e) = reaper {
             tracing::warn!(job = %job.path.display(), error = %e, "cannot reap the supervisor; it stays a zombie");
         }
@@ -547,11 +637,18 @@ impl SupervisedExecutor {
     /// (`MAX_EFFECT_TIMEOUT_MS`) plus `GRACE_MS`, so a forged or corrupt lease cannot stall
     /// the wait.
     fn lease_bound(&self, now: i64, lease_expiry_ms: i64) -> i64 {
-        lease_expiry_ms.min(now.saturating_add(self.max_lease_clamp_ms)).saturating_add(GRACE_MS)
+        lease_expiry_ms
+            .min(now.saturating_add(self.max_lease_clamp_ms))
+            .saturating_add(GRACE_MS)
     }
 
     /// The job's `request.json`. A Firecracker job gets a fresh attempt token of its own.
-    fn job_request(&self, req: &EffectRequest, ctx: &AttemptCtx, lease_expiry_ms: i64) -> JobRequest {
+    fn job_request(
+        &self,
+        req: &EffectRequest,
+        ctx: &AttemptCtx,
+        lease_expiry_ms: i64,
+    ) -> JobRequest {
         let mut worker = self.worker.clone();
         if let WorkerConfig::Firecracker(cfg) = &mut worker {
             cfg.attempt_token = mint_attempt_token();
@@ -574,7 +671,9 @@ impl SupervisedExecutor {
     /// it: a supervisor SIGKILL, a lease kill). Only ever called once 3a has proven the job
     /// settled; a failure is a warning.
     fn collect_jails(&self, jobs: &[JobDir]) {
-        let WorkerConfig::Firecracker(cfg) = &self.worker else { return };
+        let WorkerConfig::Firecracker(cfg) = &self.worker else {
+            return;
+        };
         for job in jobs {
             if let Err(e) = jail::collect(&job.path, collect_root(cfg)) {
                 tracing::warn!(job = %job.path.display(), error = %e, "the job's jail was not collected");
@@ -593,13 +692,15 @@ impl SupervisedExecutor {
     /// `ctx`, never launched), so a later recovery publishes it instead of reconciling again.
     /// A failure is logged: without the copy, recovery reconciles again.
     fn retain(&self, req: &EffectRequest, ctx: &AttemptCtx, out: &ExecOutcome) {
-        let kept = JobDir::create(&self.jobs_root, &self.job_request(req, ctx, now_ms())).and_then(|(job, lock)| {
-            // The receipt goes in while the lock is held, so the job is never seen dead
-            // without it.
-            let written = job.write_receipt(out);
-            drop(lock);
-            written
-        });
+        let kept = JobDir::create(&self.jobs_root, &self.job_request(req, ctx, now_ms())).and_then(
+            |(job, lock)| {
+                // The receipt goes in while the lock is held, so the job is never seen dead
+                // without it.
+                let written = job.write_receipt(out);
+                drop(lock);
+                written
+            },
+        );
         if let Err(e) = kept {
             tracing::warn!(effect_id = %req.effect_id, error = %e, "could not retain the reconciled outcome");
         }
@@ -608,19 +709,25 @@ impl SupervisedExecutor {
     /// The outcome of a job that is dead without a receipt (the kill-receipt rule).
     async fn without_receipt(&self, req: &EffectRequest, ctx: &AttemptCtx) -> ExecOutcome {
         match req.kind.retry_policy() {
-            RetryPolicy::Retry => ExecOutcome::failure(req, ctx, "supervisor died without a receipt"),
+            RetryPolicy::Retry => {
+                ExecOutcome::failure(req, ctx, "supervisor died without a receipt")
+            }
             RetryPolicy::ReconcileThenRetry => match self.reconcile_in_place(req, ctx).await {
                 Reconciliation::Applied(out) => out,
-                Reconciliation::NotApplied => ExecOutcome::failure(req, ctx, "patch provably not applied"),
+                Reconciliation::NotApplied => {
+                    ExecOutcome::failure(req, ctx, "patch provably not applied")
+                }
                 Reconciliation::Unknown => ExecOutcome::unresolved(
                     req,
                     ctx,
                     "the job died without a receipt and reconciliation cannot tell whether it took effect",
                 ),
             },
-            RetryPolicy::NoRetry => {
-                ExecOutcome::unresolved(req, ctx, "the job died without a receipt and its kind is never retried")
-            }
+            RetryPolicy::NoRetry => ExecOutcome::unresolved(
+                req,
+                ctx,
+                "the job died without a receipt and its kind is never retried",
+            ),
             RetryPolicy::ForfeitThenRetry => ExecOutcome::unresolved(
                 req,
                 ctx,
@@ -692,7 +799,9 @@ impl SupervisedExecutor {
             .filter(|j| !settled(j))
             .map(|j| match j.is_dead() {
                 true => now.saturating_add(KILL_SETTLE_MS),
-                false => j.request().map_or(unknown_lease, |r| self.lease_bound(now, r.lease_expiry_ms)),
+                false => j
+                    .request()
+                    .map_or(unknown_lease, |r| self.lease_bound(now, r.lease_expiry_ms)),
             })
             .max()
             .unwrap_or(now);
@@ -710,13 +819,24 @@ impl SupervisedExecutor {
 impl Executor for SupervisedExecutor {
     async fn run(&self, req: &EffectRequest, ctx: &AttemptCtx) -> ExecOutcome {
         let now = now_ms();
-        let lease = lease_expiry_ms(now, millis(self.timeout(&req.kind)), req.deadline_ts.saturating_mul(1000));
+        let lease = lease_expiry_ms(
+            now,
+            millis(self.timeout(&req.kind)),
+            req.deadline_ts.saturating_mul(1000),
+        );
         if lease <= now {
             return ExecOutcome::failure(req, ctx, "deadline exceeded");
         }
-        let (job, lock) = match JobDir::create(&self.jobs_root, &self.job_request(req, ctx, lease)) {
+        let (job, lock) = match JobDir::create(&self.jobs_root, &self.job_request(req, ctx, lease))
+        {
             Ok(created) => created,
-            Err(e) => return ExecOutcome::failure(req, ctx, format!("supervisor launch failed: cannot create the job: {e}")),
+            Err(e) => {
+                return ExecOutcome::failure(
+                    req,
+                    ctx,
+                    format!("supervisor launch failed: cannot create the job: {e}"),
+                );
+            }
         };
         if let Err(e) = self.launch(&job, lock) {
             // Nothing runs and the lock is free again: leave no dead job without a receipt.
@@ -727,13 +847,22 @@ impl Executor for SupervisedExecutor {
         }
         // Counted only now: a refused or failed launch executed nothing.
         self.counts.record(&req.kind);
-        if self.crash.as_ref().is_some_and(|h| h.check(CrashPoint::DuringExecute, Some(req.kind.tag()))) {
+        if self
+            .crash
+            .as_ref()
+            .is_some_and(|h| h.check(CrashPoint::DuringExecute, Some(req.kind.tag())))
+        {
             // The controller "dies" with the job running; the runner discards this outcome.
             return ExecOutcome::failure(req, ctx, "injected crash after the launch");
         }
         let jobs = std::slice::from_ref(&job);
-        if !wait_dead(jobs, self.lease_bound(now_ms(), lease)).await && !self.fence_jobs(jobs).await {
-            return ExecOutcome::unresolved(req, ctx, "the job outlived its lease and could not be stopped");
+        if !wait_dead(jobs, self.lease_bound(now_ms(), lease)).await && !self.fence_jobs(jobs).await
+        {
+            return ExecOutcome::unresolved(
+                req,
+                ctx,
+                "the job outlived its lease and could not be stopped",
+            );
         }
         // Settled: its jail, if its worker could not collect it, goes now, before any
         // inspection boots on the same image.
@@ -772,14 +901,17 @@ impl Executor for SupervisedExecutor {
     }
 
     fn current_workspace(&self, task: &TaskId) -> Option<Result<Digest, String>> {
-        self.reconciler.as_ref().and_then(|r| r.current_workspace(task))
+        self.reconciler
+            .as_ref()
+            .and_then(|r| r.current_workspace(task))
     }
 
     /// [`SupervisedExecutor::wait_for_job`]; a job whose request cannot be read is waited
     /// for as long as the longest effect timeout plus `GRACE_MS`.
     async fn await_job(&self, effect: &EffectId) -> JobWait {
         let longest = self.timeouts.verification.max(self.timeouts.other);
-        self.wait_for_job(effect, longest + Duration::from_millis(GRACE_MS as u64)).await
+        self.wait_for_job(effect, longest + Duration::from_millis(GRACE_MS as u64))
+            .await
     }
 
     async fn fence_job(&self, effect: &EffectId) -> bool {
@@ -813,7 +945,11 @@ mod tests {
             (Unknown, Some(other), PatchVerdict::Unknown),
         ];
         for (state, digest, want) in rows {
-            assert_eq!(patch_verdict(state, digest, base), want, "{state:?} {digest:?}");
+            assert_eq!(
+                patch_verdict(state, digest, base),
+                want,
+                "{state:?} {digest:?}"
+            );
         }
     }
 }

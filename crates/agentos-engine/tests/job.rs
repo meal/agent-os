@@ -2,8 +2,8 @@ mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use agentos_core::effect::{AttemptId, EffectId, EffectKind, Outcome, Receipt};
 use agentos_core::ids::{Digest, TaskId};
@@ -20,7 +20,9 @@ fn effect_id(n: u32) -> EffectId {
 }
 
 fn scripted() -> WorkerConfig {
-    WorkerConfig::Scripted(ScriptedConfig { script: "noop".into() })
+    WorkerConfig::Scripted(ScriptedConfig {
+        script: "noop".into(),
+    })
 }
 
 fn request_for(effect: &EffectId, generation: u64, worker: WorkerConfig) -> JobRequest {
@@ -44,7 +46,13 @@ fn request() -> JobRequest {
 }
 
 fn status(state: JobState) -> JobStatus {
-    JobStatus { state, reason: None, supervisor_pid: Some(42), worker_pgid: Some(43), updated_ms: 7 }
+    JobStatus {
+        state,
+        reason: None,
+        supervisor_pid: Some(42),
+        worker_pgid: Some(43),
+        updated_ms: 7,
+    }
 }
 
 fn outcome_for(req: &JobRequest, output: &[u8]) -> ExecOutcome {
@@ -75,7 +83,11 @@ fn request_roundtrip() {
     assert_eq!(job.request().unwrap(), req);
     let reopened = JobDir::open(&job.path).unwrap();
     assert_eq!(reopened.request().unwrap(), req);
-    assert_eq!(job.path, root.path().join(format!("{}-{}", req.effect_id, req.attempt_id)));
+    assert_eq!(
+        job.path,
+        root.path()
+            .join(format!("{}-{}", req.effect_id, req.attempt_id))
+    );
 }
 
 #[test]
@@ -109,14 +121,21 @@ fn status_write_is_atomic() {
         std::thread::spawn(move || {
             let mut reads = 0u64;
             while !stop.load(Ordering::SeqCst) {
-                assert!(job.read_status().is_some(), "reader saw a partial status file");
+                assert!(
+                    job.read_status().is_some(),
+                    "reader saw a partial status file"
+                );
                 reads += 1;
             }
             reads
         })
     };
     for i in 0..2_000 {
-        let mut s = status(if i % 2 == 0 { JobState::Running } else { JobState::Starting });
+        let mut s = status(if i % 2 == 0 {
+            JobState::Running
+        } else {
+            JobState::Starting
+        });
         s.updated_ms = i;
         job.write_status(&s).unwrap();
     }
@@ -204,7 +223,11 @@ fn create_refuses_existing_directory_and_relative_paths_and_traversal_ids() {
         }
         let bad = request_for(&effect_id(2), 1, WorkerConfig::Host(h));
         let err = JobDir::create(root.path(), &bad).err().unwrap();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "field {field}");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "field {field}"
+        );
     }
     let mut abs = rel;
     abs.snapshot_dir = PathBuf::from("/abs/snap");
@@ -215,11 +238,19 @@ fn create_refuses_existing_directory_and_relative_paths_and_traversal_ids() {
         let mut req = request();
         req.effect_id = serde_json::from_str(&format!("{evil:?}")).unwrap();
         let err = JobDir::create(root.path(), &req).err().unwrap();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "effect id {evil:?}");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "effect id {evil:?}"
+        );
         let mut req = request();
         req.attempt_id = serde_json::from_str(&format!("{evil:?}")).unwrap();
         let err = JobDir::create(root.path(), &req).err().unwrap();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "attempt id {evil:?}");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "attempt id {evil:?}"
+        );
     }
     assert!(!root.path().parent().unwrap().join("escape").exists());
 }
@@ -233,7 +264,9 @@ fn create_returns_a_held_lock_and_dropping_it_frees_it() {
     assert!(!job.lock_held());
     assert!(!job.lock_held(), "a probe must not leave the lock held");
     let other = fs::File::open(job.path.join("lock")).unwrap();
-    other.try_lock().expect("exclusive lock is free after probes");
+    other
+        .try_lock()
+        .expect("exclusive lock is free after probes");
 }
 
 #[test]
@@ -266,9 +299,17 @@ fn list_does_not_confuse_effect_a_with_effect_a_dash_b() {
     let ab: EffectId = serde_json::from_str("\"a-b\"").unwrap();
     let (ja, _l1) = JobDir::create(root.path(), &request_for(&a, 1, scripted())).unwrap();
     let (jab, _l2) = JobDir::create(root.path(), &request_for(&ab, 1, scripted())).unwrap();
-    let la: Vec<_> = JobDir::list(root.path(), &a).unwrap().into_iter().map(|j| j.path).collect();
+    let la: Vec<_> = JobDir::list(root.path(), &a)
+        .unwrap()
+        .into_iter()
+        .map(|j| j.path)
+        .collect();
     assert_eq!(la, vec![ja.path]);
-    let lab: Vec<_> = JobDir::list(root.path(), &ab).unwrap().into_iter().map(|j| j.path).collect();
+    let lab: Vec<_> = JobDir::list(root.path(), &ab)
+        .unwrap()
+        .into_iter()
+        .map(|j| j.path)
+        .collect();
     assert_eq!(lab, vec![jab.path]);
 }
 
@@ -334,7 +375,11 @@ fn list_orders_attempts_by_lease_generation_and_ignores_tmp() {
     fs::create_dir(&broken).unwrap();
     fs::write(broken.join("request.json"), b"{").unwrap();
 
-    let listed: Vec<PathBuf> = JobDir::list(root.path(), &effect).unwrap().into_iter().map(|j| j.path).collect();
+    let listed: Vec<PathBuf> = JobDir::list(root.path(), &effect)
+        .unwrap()
+        .into_iter()
+        .map(|j| j.path)
+        .collect();
     made.sort();
     let mut expected = vec![broken];
     expected.extend(made.into_iter().map(|(_, p)| p));
@@ -364,7 +409,10 @@ fn groups_file_append_and_read() {
     job.record_group(100).unwrap();
     job.record_group(200).unwrap();
     assert_eq!(job.groups(), vec![100, 200]);
-    let mut f = fs::OpenOptions::new().append(true).open(job.path.join("groups")).unwrap();
+    let mut f = fs::OpenOptions::new()
+        .append(true)
+        .open(job.path.join("groups"))
+        .unwrap();
     std::io::Write::write_all(&mut f, b"garbage\n300\n").unwrap();
     assert_eq!(job.groups(), vec![100, 200, 300]);
 }
@@ -373,15 +421,25 @@ fn groups_file_append_and_read() {
 fn cancel_jobs_in_drops_markers_for_live_jobs_only_and_tolerates_a_missing_root() {
     let root = root();
     let (live, other, dead) = (effect_id(1), effect_id(2), effect_id(3));
-    let (live_job, _live_lock) = JobDir::create(root.path(), &request_for(&live, 1, scripted())).unwrap();
-    let (other_job, _other_lock) = JobDir::create(root.path(), &request_for(&other, 1, scripted())).unwrap();
-    let (dead_job, dead_lock) = JobDir::create(root.path(), &request_for(&dead, 1, scripted())).unwrap();
+    let (live_job, _live_lock) =
+        JobDir::create(root.path(), &request_for(&live, 1, scripted())).unwrap();
+    let (other_job, _other_lock) =
+        JobDir::create(root.path(), &request_for(&other, 1, scripted())).unwrap();
+    let (dead_job, dead_lock) =
+        JobDir::create(root.path(), &request_for(&dead, 1, scripted())).unwrap();
     drop(dead_lock);
 
-    assert_eq!(cancel_jobs_in(root.path(), &[live.clone(), dead.clone()]), 1, "only the live job is asked to stop");
+    assert_eq!(
+        cancel_jobs_in(root.path(), &[live.clone(), dead.clone()]),
+        1,
+        "only the live job is asked to stop"
+    );
     assert!(live_job.cancel_requested());
     assert!(!dead_job.cancel_requested(), "a dead job gets no marker");
-    assert!(!other_job.cancel_requested(), "an effect not asked for is left alone");
+    assert!(
+        !other_job.cancel_requested(),
+        "an effect not asked for is left alone"
+    );
     assert_eq!(cancel_jobs_in(root.path(), &[]), 0);
     // No jobs root at all: nothing ran, nothing to stop.
     assert_eq!(cancel_jobs_in(&root.path().join("missing"), &[live]), 0);

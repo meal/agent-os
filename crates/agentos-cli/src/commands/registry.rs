@@ -25,13 +25,17 @@ pub struct Registered {
 /// `kind` names the thing in the message (`profile`, `guest image`).
 pub fn check_id(kind: &str, id: &str) -> Result<(), CliError> {
     let mut parts = Path::new(id).components();
-    let plain = matches!((parts.next(), parts.next()), (Some(Component::Normal(_)), None))
-        && !id.starts_with('-')
+    let plain = matches!(
+        (parts.next(), parts.next()),
+        (Some(Component::Normal(_)), None)
+    ) && !id.starts_with('-')
         && !id.contains(['/', '\\', '\0', '@']);
     if plain {
         Ok(())
     } else {
-        Err(CliError::usage(format!("{kind} id {id:?} must be one plain name without '@'")))
+        Err(CliError::usage(format!(
+            "{kind} id {id:?} must be one plain name without '@'"
+        )))
     }
 }
 
@@ -56,7 +60,9 @@ fn make_read_only(dir: &Path) -> Result<(), CliError> {
 pub fn register_tree(registry: &Path, id: &str, source: &Path) -> Result<Registered, CliError> {
     check_id("registry entry", id)?;
     fs::create_dir_all(registry)?;
-    let staging = tempfile::Builder::new().prefix(".register-").tempdir_in(registry)?;
+    let staging = tempfile::Builder::new()
+        .prefix(".register-")
+        .tempdir_in(registry)?;
     let staged = staging.path().join("entry");
     copy_tree(source, &staged)?;
     let digest = workspace_digest(&staged)?;
@@ -65,27 +71,50 @@ pub fn register_tree(registry: &Path, id: &str, source: &Path) -> Result<Registe
     if !entry.exists() {
         make_read_only(&staged)?;
         fs::rename(&staged, &entry)?;
-        let registered_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+        let registered_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
         let meta = json!({ "id": id, "digest": digest, "registered_ms": registered_ms });
-        atomic_write(&registry.join(format!("{name}.meta.json")), meta.to_string().as_bytes())?;
+        atomic_write(
+            &registry.join(format!("{name}.meta.json")),
+            meta.to_string().as_bytes(),
+        )?;
     }
-    Ok(Registered { id: id.to_string(), digest })
+    Ok(Registered {
+        id: id.to_string(),
+        digest,
+    })
 }
 
 /// Every complete entry of `registry` (`<id>@<64 hex>` directories for which `has_marker`
 /// holds), unordered. Missing registry: none.
 pub fn list_entries(registry: &Path, has_marker: impl Fn(&Path) -> bool) -> Vec<RegistryEntry> {
-    let Ok(entries) = fs::read_dir(registry) else { return Vec::new() };
+    let Ok(entries) = fs::read_dir(registry) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Some((id, digest)) = name.split_once('@') else { continue };
-        if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) || !has_marker(&entry.path()) {
+        let Some((id, digest)) = name.split_once('@') else {
+            continue;
+        };
+        if digest.len() != 64
+            || !digest.bytes().all(|b| b.is_ascii_hexdigit())
+            || !has_marker(&entry.path())
+        {
             continue;
         }
-        let meta = fs::read(registry.join(format!("{name}.meta.json"))).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+        let meta = fs::read(registry.join(format!("{name}.meta.json")))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
         let registered_ms = meta.and_then(|m| m["registered_ms"].as_i64()).unwrap_or(0);
-        out.push(RegistryEntry { id: id.to_string(), digest: digest.to_string(), dir: entry.path(), registered_ms });
+        out.push(RegistryEntry {
+            id: id.to_string(),
+            digest: digest.to_string(),
+            dir: entry.path(),
+            registered_ms,
+        });
     }
     out
 }

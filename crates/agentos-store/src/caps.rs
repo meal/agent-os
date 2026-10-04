@@ -5,13 +5,13 @@
 //! A full handle lives only in `capabilities.id`. Journal payloads, errors and logs carry
 //! its 8-character prefix at most.
 
-use agentos_core::broker::{authorize, scope_for, CapabilityGrant, Handle, Resource, Scope};
+use agentos_core::broker::{CapabilityGrant, Handle, Resource, Scope, authorize, scope_for};
 use agentos_core::contract::Capability;
 use agentos_core::ids::TaskId;
-use rusqlite::{params, OptionalExtension, Transaction};
-use serde_json::{json, Value};
+use rusqlite::{OptionalExtension, Transaction, params};
+use serde_json::{Value, json};
 
-use crate::db::{insert_event, load_task, now_ts, Db, DbError, Result};
+use crate::db::{Db, DbError, Result, insert_event, load_task, now_ts};
 
 const NOT_APPROVED: &str = "not_approved";
 const UNKNOWN_HANDLE: &str = "unknown_handle";
@@ -19,7 +19,9 @@ const UNKNOWN_HANDLE: &str = "unknown_handle";
 fn op_str(op: Capability) -> Result<String> {
     match serde_json::to_value(op)? {
         Value::String(s) => Ok(s),
-        other => Err(DbError::Corrupt(format!("capability serialized as {other}"))),
+        other => Err(DbError::Corrupt(format!(
+            "capability serialized as {other}"
+        ))),
     }
 }
 
@@ -43,9 +45,13 @@ fn scope_resource(scope: &Scope) -> Resource {
 }
 
 pub(crate) fn deadline_of(tx: &Transaction, task: &TaskId) -> Result<i64> {
-    tx.query_row("SELECT deadline_ts FROM tasks WHERE id = ?1", [task.as_str()], |r| r.get(0))
-        .optional()?
-        .ok_or_else(|| DbError::NotFound(task.clone()))
+    tx.query_row(
+        "SELECT deadline_ts FROM tasks WHERE id = ?1",
+        [task.as_str()],
+        |r| r.get(0),
+    )
+    .optional()?
+    .ok_or_else(|| DbError::NotFound(task.clone()))
 }
 
 fn load_grants(tx: &Transaction, task: &TaskId) -> Result<Vec<CapabilityGrant>> {
@@ -66,7 +72,8 @@ fn load_grants(tx: &Transaction, task: &TaskId) -> Result<Vec<CapabilityGrant>> 
         let (id, operation, scope, expires_ts, revoked) = row?;
         out.push(CapabilityGrant {
             // The error names no part of the stored value.
-            handle: Handle::parse(&id).map_err(|_| DbError::Corrupt("malformed capability handle".into()))?,
+            handle: Handle::parse(&id)
+                .map_err(|_| DbError::Corrupt("malformed capability handle".into()))?,
             task: task.clone(),
             operation: serde_json::from_value(Value::String(operation))?,
             scope: serde_json::from_str(&scope)?,
@@ -84,16 +91,34 @@ struct Refusal {
 }
 
 /// The broker decision for `op` on `resource`, without side effects.
-fn decide(tx: &Transaction, task: &TaskId, op: Capability, resource: &Resource, now: i64) -> Result<std::result::Result<Handle, Refusal>> {
+fn decide(
+    tx: &Transaction,
+    task: &TaskId,
+    op: Capability,
+    resource: &Resource,
+    now: i64,
+) -> Result<std::result::Result<Handle, Refusal>> {
     if deadline_of(tx, task)? == 0 {
-        return Ok(Err(Refusal { reason: NOT_APPROVED, prefix: None }));
+        return Ok(Err(Refusal {
+            reason: NOT_APPROVED,
+            prefix: None,
+        }));
     }
-    let Some(grant) = load_grants(tx, task)?.into_iter().find(|g| g.operation == op) else {
-        return Ok(Err(Refusal { reason: UNKNOWN_HANDLE, prefix: None }));
+    let Some(grant) = load_grants(tx, task)?
+        .into_iter()
+        .find(|g| g.operation == op)
+    else {
+        return Ok(Err(Refusal {
+            reason: UNKNOWN_HANDLE,
+            prefix: None,
+        }));
     };
     Ok(match authorize(&grant, task, op, resource, now) {
         Ok(()) => Ok(grant.handle),
-        Err(d) => Err(Refusal { reason: d.reason(), prefix: Some(grant.handle.prefix().to_string()) }),
+        Err(d) => Err(Refusal {
+            reason: d.reason(),
+            prefix: Some(grant.handle.prefix().to_string()),
+        }),
     })
 }
 
@@ -102,7 +127,13 @@ fn decide(tx: &Transaction, task: &TaskId, op: Capability, resource: &Resource, 
 /// journals `CapabilityDenied` in `tx` and returns `DbError::CapabilityDenied`: the caller
 /// must then COMMIT `tx` (having written nothing else in it yet) so the denial is durable
 /// although the operation is refused.
-pub(crate) fn authorize_in(tx: &Transaction, task: &TaskId, op: Capability, resource: &Resource, now: i64) -> Result<Handle> {
+pub(crate) fn authorize_in(
+    tx: &Transaction,
+    task: &TaskId,
+    op: Capability,
+    resource: &Resource,
+    now: i64,
+) -> Result<Handle> {
     let mut payload = json!({ "operation": op_str(op)?, "resource": describe(resource) });
     match decide(tx, task, op, resource, now)? {
         Ok(handle) => {
@@ -116,14 +147,22 @@ pub(crate) fn authorize_in(tx: &Transaction, task: &TaskId, op: Capability, reso
                 payload["handle_prefix"] = json!(prefix);
             }
             insert_event(tx, task, "CapabilityDenied", &payload)?;
-            Err(DbError::CapabilityDenied { capability: op, reason: reason.to_string() })
+            Err(DbError::CapabilityDenied {
+                capability: op,
+                reason: reason.to_string(),
+            })
         }
     }
 }
 
 /// [`authorize_in`] for a dispatch: re-checks the handle for `op` (revoked, expired) over
 /// its whole scope. Same commit rule on denial.
-pub(crate) fn reauthorize_in(tx: &Transaction, task: &TaskId, op: Capability, now: i64) -> Result<Handle> {
+pub(crate) fn reauthorize_in(
+    tx: &Transaction,
+    task: &TaskId,
+    op: Capability,
+    now: i64,
+) -> Result<Handle> {
     let resource = load_grants(tx, task)?
         .into_iter()
         .find(|g| g.operation == op)
@@ -132,7 +171,10 @@ pub(crate) fn reauthorize_in(tx: &Transaction, task: &TaskId, op: Capability, no
 }
 
 fn handle_list(grants: &[CapabilityGrant]) -> Result<Value> {
-    let operations = grants.iter().map(|g| op_str(g.operation)).collect::<Result<Vec<_>>>()?;
+    let operations = grants
+        .iter()
+        .map(|g| op_str(g.operation))
+        .collect::<Result<Vec<_>>>()?;
     let handles = grants
         .iter()
         .zip(&operations)
@@ -150,10 +192,18 @@ impl Db {
         let tx = self.immediate()?;
         let (_, contract) = load_task(&tx, task)?;
         if deadline_of(&tx, task)? != 0 {
-            return Ok(load_grants(&tx, task)?.into_iter().map(|g| g.operation).collect());
+            return Ok(load_grants(&tx, task)?
+                .into_iter()
+                .map(|g| g.operation)
+                .collect());
         }
-        let deadline = self.now().saturating_add(i64::from(contract.limits.deadline_seconds));
-        tx.execute("UPDATE tasks SET deadline_ts = ?2 WHERE id = ?1", params![task.as_str(), deadline])?;
+        let deadline = self
+            .now()
+            .saturating_add(i64::from(contract.limits.deadline_seconds));
+        tx.execute(
+            "UPDATE tasks SET deadline_ts = ?2 WHERE id = ?1",
+            params![task.as_str(), deadline],
+        )?;
         let created = now_ts();
         let mut ops: Vec<Capability> = Vec::new();
         for op in &contract.capabilities {
@@ -175,7 +225,12 @@ impl Db {
                 ],
             )?;
         }
-        insert_event(&tx, task, "CapabilitiesIssued", &handle_list(&load_grants(&tx, task)?)?)?;
+        insert_event(
+            &tx,
+            task,
+            "CapabilitiesIssued",
+            &handle_list(&load_grants(&tx, task)?)?,
+        )?;
         tx.commit()?;
         Ok(ops)
     }
@@ -188,7 +243,10 @@ impl Db {
         load_task(&tx, task)?;
         match decide(&tx, task, op, resource, self.now())? {
             Ok(_) => Ok(()),
-            Err(r) => Err(DbError::CapabilityDenied { capability: op, reason: r.reason.to_string() }),
+            Err(r) => Err(DbError::CapabilityDenied {
+                capability: op,
+                reason: r.reason.to_string(),
+            }),
         }
     }
 

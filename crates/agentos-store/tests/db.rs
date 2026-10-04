@@ -44,11 +44,28 @@ fn verify_passed(db: &Db, id: &TaskId, workspace: Digest) {
     // Intents need the owner's approval (idempotent).
     db.approve_task(id).unwrap();
     let profile = Resource::Profile("parser-checks-v1".into());
-    let rec = db.record_intent(id, kind, Digest::of(workspace.as_bytes()), &workspace, reserve, &profile).unwrap();
+    let rec = db
+        .record_intent(
+            id,
+            kind,
+            Digest::of(workspace.as_bytes()),
+            &workspace,
+            reserve,
+            &profile,
+        )
+        .unwrap();
     let attempt = AttemptId::new();
-    db.mark_dispatched(&rec.effect_id, &attempt, "w", 1).unwrap();
+    db.mark_dispatched(&rec.effect_id, &attempt, "w", 1)
+        .unwrap();
     let evidence = Digest::of(b"evidence");
-    db.register_artifact(&evidence, 8, "verification-evidence", Some(&rec.effect_id), "w").unwrap();
+    db.register_artifact(
+        &evidence,
+        8,
+        "verification-evidence",
+        Some(&rec.effect_id),
+        "w",
+    )
+    .unwrap();
     let receipt = Receipt {
         effect_id: rec.effect_id.clone(),
         attempt_id: attempt,
@@ -57,7 +74,11 @@ fn verify_passed(db: &Db, id: &TaskId, workspace: Digest) {
         result_digest: Some(evidence),
     };
     let follow_up = Some(TaskEvent::VerifyPassed { digest: workspace });
-    assert_eq!(db.complete_effect(&rec.effect_id, &receipt, Some(&evidence), follow_up).unwrap(), ReceiptVerdict::Apply);
+    assert_eq!(
+        db.complete_effect(&rec.effect_id, &receipt, Some(&evidence), follow_up)
+            .unwrap(),
+        ReceiptVerdict::Apply
+    );
 }
 
 fn running(db: &Db) -> TaskId {
@@ -117,7 +138,13 @@ fn sequences_are_gapless_and_payload_preserves_event() {
     for _ in 0..5 {
         db.append(&id, &TaskEvent::ActionUsed).unwrap();
     }
-    db.append(&id, &TaskEvent::Failed { reason: "boom".into() }).unwrap();
+    db.append(
+        &id,
+        &TaskEvent::Failed {
+            reason: "boom".into(),
+        },
+    )
+    .unwrap();
     let evs = db.events(&id).unwrap();
     let seqs: Vec<u64> = evs.iter().map(|e| e.seq).collect();
     assert_eq!(seqs, (1..=8).collect::<Vec<_>>());
@@ -127,7 +154,9 @@ fn sequences_are_gapless_and_payload_preserves_event() {
     assert_eq!(last.event_type, "Failed");
     assert_eq!(
         serde_json::from_value::<TaskEvent>(last.payload.clone()).unwrap(),
-        TaskEvent::Failed { reason: "boom".into() }
+        TaskEvent::Failed {
+            reason: "boom".into()
+        }
     );
     assert_eq!(db.task(&id).unwrap().state, TaskState::Failed);
     assert_eq!(db.task(&id).unwrap().actions_used, 5);
@@ -150,7 +179,8 @@ fn eight_threads_with_own_handles_get_unique_gapless_sequences() {
                     if (i + j) % 2 == 0 {
                         db.append(&id, &TaskEvent::ActionUsed).unwrap();
                     } else {
-                        db.append_audit(&id, "Audit", &serde_json::json!({"t": i})).unwrap();
+                        db.append_audit(&id, "Audit", &serde_json::json!({"t": i}))
+                            .unwrap();
                     }
                 }
             })
@@ -163,7 +193,10 @@ fn eight_threads_with_own_handles_get_unique_gapless_sequences() {
     let evs = db.events(&id).unwrap();
     assert_eq!(evs.len(), 2 + 8 * per_thread);
     let seqs: Vec<u64> = evs.iter().map(|e| e.seq).collect();
-    assert_eq!(seqs.iter().copied().collect::<HashSet<_>>().len(), seqs.len());
+    assert_eq!(
+        seqs.iter().copied().collect::<HashSet<_>>().len(),
+        seqs.len()
+    );
     assert_eq!(seqs, (1..=evs.len() as u64).collect::<Vec<_>>());
     let actions = evs.iter().filter(|e| e.event_type == "ActionUsed").count();
     assert_eq!(db.task(&id).unwrap().actions_used as usize, actions);
@@ -177,7 +210,13 @@ fn reopening_the_file_yields_identical_task_and_events() {
         let db = Db::open(&path).unwrap();
         let id = running(&db);
         db.append(&id, &TaskEvent::ActionUsed).unwrap();
-        db.append(&id, &TaskEvent::WorkspaceUpdated { digest: Digest::of(b"w2") }).unwrap();
+        db.append(
+            &id,
+            &TaskEvent::WorkspaceUpdated {
+                digest: Digest::of(b"w2"),
+            },
+        )
+        .unwrap();
         db.append(&id, &TaskEvent::VerifyStarted).unwrap();
         // Success only arrives as the follow-up of a verification of exactly this workspace.
         verify_passed(&db, &id, Digest::of(b"w2"));
@@ -208,7 +247,10 @@ fn missing_task_is_not_found_not_a_panic() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(&dir);
     let ghost = TaskId::new();
-    assert!(matches!(db.append(&ghost, &TaskEvent::Started), Err(DbError::NotFound(_))));
+    assert!(matches!(
+        db.append(&ghost, &TaskEvent::Started),
+        Err(DbError::NotFound(_))
+    ));
     assert!(matches!(db.task(&ghost), Err(DbError::NotFound(_))));
     assert!(matches!(db.events(&ghost), Err(DbError::NotFound(_))));
     assert!(matches!(
@@ -237,11 +279,15 @@ fn audit_events_keep_seq_gapless_and_leave_task_untouched() {
     let db = open(&dir);
     let id = running(&db);
     let before = db.task(&id).unwrap();
-    let s1 = db.append_audit(&id, "PolicyNote", &serde_json::json!({"why": "x"})).unwrap();
+    let s1 = db
+        .append_audit(&id, "PolicyNote", &serde_json::json!({"why": "x"}))
+        .unwrap();
     assert_eq!(s1, 3);
     assert_eq!(db.task(&id).unwrap(), before);
     db.append(&id, &TaskEvent::ActionUsed).unwrap();
-    let s2 = db.append_audit(&id, "OperatorNote", &serde_json::json!({})).unwrap();
+    let s2 = db
+        .append_audit(&id, "OperatorNote", &serde_json::json!({}))
+        .unwrap();
     assert_eq!(s2, 5);
     let seqs: Vec<u64> = db.events(&id).unwrap().iter().map(|e| e.seq).collect();
     assert_eq!(seqs, vec![1, 2, 3, 4, 5]);
@@ -263,8 +309,11 @@ fn uncommitted_transaction_leaves_no_partial_row() {
     {
         let mut conn = Connection::open(&path).unwrap();
         let tx = conn.transaction().unwrap();
-        tx.execute("UPDATE tasks SET actions_used = 99, step = 99 WHERE id = ?1", [id.as_str()])
-            .unwrap();
+        tx.execute(
+            "UPDATE tasks SET actions_used = 99, step = 99 WHERE id = ?1",
+            [id.as_str()],
+        )
+        .unwrap();
         tx.execute(
             "INSERT INTO events(task_id, seq, type, payload, ts) VALUES (?1, 3, 'ActionUsed', '{}', 0)",
             [id.as_str()],
@@ -285,16 +334,25 @@ fn all_spec_tables_exist() {
     drop(Db::open(&path).unwrap());
     let conn = Connection::open(&path).unwrap();
     for t in [
-        "tasks", "events", "effects", "attempts", "artifacts", "usage", "capabilities",
+        "tasks",
+        "events",
+        "effects",
+        "attempts",
+        "artifacts",
+        "usage",
+        "capabilities",
         "observations",
     ] {
         let n: i64 = conn
-            .query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1", [t], |r| r.get(0))
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [t],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(n, 1, "missing table {t}");
     }
 }
-
 
 #[test]
 fn reads_do_not_block_on_an_open_write_transaction() {
@@ -307,13 +365,21 @@ fn reads_do_not_block_on_an_open_write_transaction() {
 
     let raw = Connection::open(&path).unwrap();
     raw.execute_batch("BEGIN IMMEDIATE").unwrap();
-    raw.execute("UPDATE tasks SET actions_used = 42 WHERE id = ?1", [id.as_str()]).unwrap();
+    raw.execute(
+        "UPDATE tasks SET actions_used = 42 WHERE id = ?1",
+        [id.as_str()],
+    )
+    .unwrap();
 
     let reader = Db::open(&path).unwrap();
     let start = std::time::Instant::now();
     assert_eq!(reader.task(&id).unwrap(), before_task);
     assert_eq!(reader.events(&id).unwrap(), before_events);
-    assert!(start.elapsed() < std::time::Duration::from_millis(500), "{:?}", start.elapsed());
+    assert!(
+        start.elapsed() < std::time::Duration::from_millis(500),
+        "{:?}",
+        start.elapsed()
+    );
     raw.execute_batch("ROLLBACK").unwrap();
 }
 
@@ -336,7 +402,10 @@ fn failed_event_insert_rolls_back_the_state_update() {
     let events_before = db.events(&id).unwrap();
     inject_failure(&path, "ActionUsed");
 
-    assert!(matches!(db.append(&id, &TaskEvent::ActionUsed), Err(DbError::Sqlite(_))));
+    assert!(matches!(
+        db.append(&id, &TaskEvent::ActionUsed),
+        Err(DbError::Sqlite(_))
+    ));
     assert_eq!(db.task(&id).unwrap(), task_before);
     assert_eq!(db.events(&id).unwrap(), events_before);
     // Handle remains usable afterwards.
@@ -352,7 +421,9 @@ fn failed_create_task_leaves_no_task_row() {
     let (c, d) = contract();
     assert!(db.create_task(&c, &d).is_err());
     let raw = Connection::open(&path).unwrap();
-    let n: i64 = raw.query_row("SELECT count(*) FROM tasks", [], |r| r.get(0)).unwrap();
+    let n: i64 = raw
+        .query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(n, 0);
 }
 
@@ -365,7 +436,10 @@ fn contract_returns_the_stored_contract() {
     assert_eq!(db.contract(&id).unwrap(), c);
     let reopened = open(&dir);
     assert_eq!(reopened.contract(&id).unwrap(), c);
-    assert!(matches!(db.contract(&TaskId::new()), Err(DbError::NotFound(_))));
+    assert!(matches!(
+        db.contract(&TaskId::new()),
+        Err(DbError::NotFound(_))
+    ));
 }
 
 #[test]
@@ -376,7 +450,9 @@ fn verify_passed_cannot_be_appended_directly() {
     db.append(&id, &TaskEvent::VerifyStarted).unwrap();
     let before = (db.task(&id).unwrap(), db.events(&id).unwrap());
     let ws = before.0.workspace_digest;
-    let err = db.append(&id, &TaskEvent::VerifyPassed { digest: ws }).unwrap_err();
+    let err = db
+        .append(&id, &TaskEvent::VerifyPassed { digest: ws })
+        .unwrap_err();
     assert!(matches!(err, DbError::UnprovenVerification(_)), "{err:?}");
     assert!(err.to_string().contains("RunVerification"), "{err}");
     assert_eq!((db.task(&id).unwrap(), db.events(&id).unwrap()), before);
@@ -389,13 +465,38 @@ fn audit_rows_cannot_forge_engine_or_store_events() {
     let id = running(&db);
     let n = db.events(&id).unwrap().len();
     for name in [
-        "TaskCreated", "Started", "Waiting", "Woken", "Paused", "Resumed", "VerifyStarted", "VerifyPassed",
-        "VerifyFailed", "WorkspaceUpdated", "ActionUsed", "CancelRequested", "CancelCompleted", "Failed",
-        "EffectIntended", "EffectDispatched", "EffectCompleted", "EffectFailed", "EffectUnknown", "EffectAbandoned",
-        "ArtifactRegistered", "TaskEventRejected", "ReceiptIgnored", "ReceiptRejected",
+        "TaskCreated",
+        "Started",
+        "Waiting",
+        "Woken",
+        "Paused",
+        "Resumed",
+        "VerifyStarted",
+        "VerifyPassed",
+        "VerifyFailed",
+        "WorkspaceUpdated",
+        "ActionUsed",
+        "CancelRequested",
+        "CancelCompleted",
+        "Failed",
+        "EffectIntended",
+        "EffectDispatched",
+        "EffectCompleted",
+        "EffectFailed",
+        "EffectUnknown",
+        "EffectAbandoned",
+        "ArtifactRegistered",
+        "TaskEventRejected",
+        "ReceiptIgnored",
+        "ReceiptRejected",
     ] {
-        let err = db.append_audit(&id, name, &serde_json::json!({})).unwrap_err();
-        assert!(matches!(err, DbError::ReservedEventType(ref t) if t == name), "{name}: {err:?}");
+        let err = db
+            .append_audit(&id, name, &serde_json::json!({}))
+            .unwrap_err();
+        assert!(
+            matches!(err, DbError::ReservedEventType(ref t) if t == name),
+            "{name}: {err:?}"
+        );
     }
     assert_eq!(db.events(&id).unwrap().len(), n);
 }
@@ -405,13 +506,22 @@ fn a_new_database_records_its_schema_version_and_a_newer_one_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("agentos.db");
     let db = Db::open(&path).unwrap();
-    assert_eq!(db.pragma_string("user_version").unwrap(), agentos_store::db::SCHEMA_VERSION.to_string());
+    assert_eq!(
+        db.pragma_string("user_version").unwrap(),
+        agentos_store::db::SCHEMA_VERSION.to_string()
+    );
     drop(db);
     // Reopening a current database is fine.
     drop(Db::open(&path).unwrap());
     let future = agentos_store::db::SCHEMA_VERSION + 1;
-    Connection::open(&path).unwrap().pragma_update(None, "user_version", future).unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .pragma_update(None, "user_version", future)
+        .unwrap();
     let err = Db::open(&path).err().expect("a newer schema is refused");
-    assert!(matches!(err, DbError::SchemaVersion { found, supported } if found == future && supported == agentos_store::db::SCHEMA_VERSION), "{err:?}");
+    assert!(
+        matches!(err, DbError::SchemaVersion { found, supported } if found == future && supported == agentos_store::db::SCHEMA_VERSION),
+        "{err:?}"
+    );
     assert!(err.to_string().contains("newer"), "{err}");
 }

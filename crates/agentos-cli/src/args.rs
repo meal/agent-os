@@ -61,7 +61,12 @@ pub struct Args {
     #[arg(long, global = true, env = "AGENTOS_API_KEY_FILE", value_name = "FILE")]
     pub api_key_file: Option<PathBuf>,
     /// The Anthropic API base URL [default: https://api.anthropic.com] (tests point it at a local fake).
-    #[arg(long, global = true, env = "AGENTOS_ANTHROPIC_BASE_URL", value_name = "URL")]
+    #[arg(
+        long,
+        global = true,
+        env = "AGENTOS_ANTHROPIC_BASE_URL",
+        value_name = "URL"
+    )]
     pub anthropic_base_url: Option<String>,
     #[command(subcommand)]
     pub command: Command,

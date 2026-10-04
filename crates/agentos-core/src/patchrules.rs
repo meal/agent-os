@@ -26,7 +26,8 @@ pub fn check_summary(summary_stdout: &[u8]) -> Result<(), String> {
 pub fn parse_numstat(numstat_stdout: &[u8]) -> Result<Vec<String>, String> {
     let mut paths = Vec::new();
     for record in numstat_stdout.split(|b| *b == 0).filter(|r| !r.is_empty()) {
-        let record = std::str::from_utf8(record).map_err(|_| "patch path is not UTF-8".to_string())?;
+        let record =
+            std::str::from_utf8(record).map_err(|_| "patch path is not UTF-8".to_string())?;
         let mut fields = record.splitn(3, '\t');
         let (added, deleted, path) = match (fields.next(), fields.next(), fields.next()) {
             (Some(a), Some(d), Some(p)) => (a, d, p),
@@ -52,25 +53,37 @@ mod tests {
 
     #[test]
     fn check_summary_accepts_only_plain_create_and_delete() {
-        assert_eq!(check_summary(b" create mode 100644 a\n delete mode 100755 b\n"), Ok(()));
+        assert_eq!(
+            check_summary(b" create mode 100644 a\n delete mode 100755 b\n"),
+            Ok(())
+        );
         for bad in [
             " rename src/a => src/b (100%)",
             " mode change 100644 => 100755 x",
             " create mode 120000 l",
         ] {
             let err = check_summary(format!("{bad}\n").as_bytes()).unwrap_err();
-            assert_eq!(err, format!("unsupported patch operation: {}", bad.trim_start()));
+            assert_eq!(
+                err,
+                format!("unsupported patch operation: {}", bad.trim_start())
+            );
         }
     }
 
     #[test]
     fn parse_numstat_reports_paths_in_patch_order_and_refuses_binary() {
-        assert_eq!(parse_numstat(b"1\t0\tsrc/a.py\x002\t1\tsrc/b.py\x00").unwrap(), ["src/a.py", "src/b.py"]);
+        assert_eq!(
+            parse_numstat(b"1\t0\tsrc/a.py\x002\t1\tsrc/b.py\x00").unwrap(),
+            ["src/a.py", "src/b.py"]
+        );
         assert_eq!(
             parse_numstat(b"-\t-\timg.png\x00").unwrap_err(),
             "binary patches are not supported: img.png"
         );
         assert_eq!(parse_numstat(b"").unwrap_err(), "patch touches no files");
-        assert_eq!(parse_numstat(b"1\t0\t\xff\x00").unwrap_err(), "patch path is not UTF-8");
+        assert_eq!(
+            parse_numstat(b"1\t0\t\xff\x00").unwrap_err(),
+            "patch path is not UTF-8"
+        );
     }
 }

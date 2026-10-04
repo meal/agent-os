@@ -26,14 +26,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use agentos_core::effect::RetryPolicy;
 use rustix::io::Errno;
 use rustix::process::{
-    getpgrp, getpid, getsid, kill_process, kill_process_group, set_child_subreaper, setsid, wait, waitid, Pid,
-    Signal, WaitId, WaitIdOptions, WaitOptions,
+    Pid, Signal, WaitId, WaitIdOptions, WaitOptions, getpgrp, getpid, getsid, kill_process,
+    kill_process_group, set_child_subreaper, setsid, wait, waitid,
 };
 
 use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome};
 use crate::guestlink::escape_controls;
 use crate::job::{JobDir, JobRequest, JobState, JobStatus, KillReason};
-use crate::worker::{run_worker, TEST_WORKERS_ENV};
+use crate::worker::{TEST_WORKERS_ENV, run_worker};
 
 /// Overrides the 50 ms poll interval; honoured only with `AGENTOS_TEST_WORKERS=1`.
 pub const POLL_ENV: &str = "AGENTOS_SUPERVISOR_POLL_MS";
@@ -67,13 +67,21 @@ pub struct SupervisorCmd {
 }
 
 fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Best effort and never panics (unlike `eprintln!`): a full or failing `supervisor.log`
 /// must not take the supervisor down while its worker lives.
 fn log(msg: impl std::fmt::Display) {
-    let _ = writeln!(io::stderr(), "[{}] supervisor {}: {msg}", now_ms(), std::process::id());
+    let _ = writeln!(
+        io::stderr(),
+        "[{}] supervisor {}: {msg}",
+        now_ms(),
+        std::process::id()
+    );
 }
 
 fn env_on(var: &str) -> bool {
@@ -140,7 +148,9 @@ fn failure(req: &JobRequest, reason: &str) -> ExecOutcome {
 fn fallback_receipt(req: &JobRequest, reason: &str) -> Option<ExecOutcome> {
     match req.kind.retry_policy() {
         RetryPolicy::Retry => Some(failure(req, reason)),
-        RetryPolicy::ReconcileThenRetry | RetryPolicy::ForfeitThenRetry | RetryPolicy::NoRetry => None,
+        RetryPolicy::ReconcileThenRetry | RetryPolicy::ForfeitThenRetry | RetryPolicy::NoRetry => {
+            None
+        }
     }
 }
 
@@ -149,7 +159,10 @@ fn fallback_receipt(req: &JobRequest, reason: &str) -> Option<ExecOutcome> {
 fn valid_outcome(job: &JobDir, req: &JobRequest) -> Option<ExecOutcome> {
     let out = job.read_outcome()?;
     let r = &out.receipt;
-    if r.effect_id == req.effect_id && r.attempt_id == req.attempt_id && r.lease_generation == req.lease_generation {
+    if r.effect_id == req.effect_id
+        && r.attempt_id == req.attempt_id
+        && r.lease_generation == req.lease_generation
+    {
         Some(out)
     } else {
         log(format_args!(
@@ -164,10 +177,20 @@ fn valid_outcome(job: &JobDir, req: &JobRequest) -> Option<ExecOutcome> {
 pub(crate) fn proc_stats() -> io::Result<Vec<(i32, [String; 4])>> {
     let mut found = Vec::new();
     for entry in fs::read_dir("/proc")?.flatten() {
-        let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<i32>().ok()) else { continue };
-        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else { continue };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
         // Fields after the command name, which may itself contain spaces and parentheses.
-        let Some(rest) = stat.rfind(')').and_then(|i| stat.get(i + 1..)) else { continue };
+        let Some(rest) = stat.rfind(')').and_then(|i| stat.get(i + 1..)) else {
+            continue;
+        };
         let mut fields = rest.split_whitespace().map(str::to_string);
         if let (Some(state), Some(ppid), Some(pgrp), Some(session)) =
             (fields.next(), fields.next(), fields.next(), fields.next())
@@ -186,9 +209,17 @@ pub(crate) fn group_in_session(pgid: Pid, sid: Pid) -> Option<bool> {
     if let Ok(leader_sid) = getsid(Some(pgid)) {
         return Some(leader_sid == sid);
     }
-    let (pgid, sid) = (pgid.as_raw_nonzero().get().to_string(), sid.as_raw_nonzero().get().to_string());
-    let Ok(stats) = proc_stats() else { return Some(false) };
-    stats.iter().find(|(_, [_, _, pgrp, _])| *pgrp == pgid).map(|(_, [.., session])| *session == sid)
+    let (pgid, sid) = (
+        pgid.as_raw_nonzero().get().to_string(),
+        sid.as_raw_nonzero().get().to_string(),
+    );
+    let Ok(stats) = proc_stats() else {
+        return Some(false);
+    };
+    stats
+        .iter()
+        .find(|(_, [_, _, pgrp, _])| *pgrp == pgid)
+        .map(|(_, [.., session])| *session == sid)
 }
 
 /// SIGKILLs recorded group `pgid`: never init's (1, which would mean "everyone"), never
@@ -202,7 +233,9 @@ fn kill_recorded_group(pgid: i32, sid: Pid) {
             Some(true) => {
                 let _ = kill_process_group(p, Signal::KILL);
             }
-            Some(false) => log(format_args!("not killing recorded group {pgid}: not in our session")),
+            Some(false) => log(format_args!(
+                "not killing recorded group {pgid}: not in our session"
+            )),
             None => {}
         }
     }
@@ -211,7 +244,9 @@ fn kill_recorded_group(pgid: i32, sid: Pid) {
 /// SIGKILLs every live child of this process. A child's pid cannot be reused before we
 /// reap it, so nothing else can be hit.
 fn kill_children() -> io::Result<()> {
-    if test_hook(PROC_SCAN_FAILS_ENV) && FAILED_SCANS.fetch_add(1, Ordering::Relaxed) < TEST_FAILED_SCANS {
+    if test_hook(PROC_SCAN_FAILS_ENV)
+        && FAILED_SCANS.fetch_add(1, Ordering::Relaxed) < TEST_FAILED_SCANS
+    {
         return Err(io::Error::other("test hook: /proc scan fails"));
     }
     let me = std::process::id().to_string();
@@ -256,7 +291,10 @@ fn reap_all() -> io::Result<()> {
 /// Whether the worker has exited, WITHOUT reaping it: while it is an unreaped zombie its
 /// pid, and so its process group id, cannot be reused, which keeps the group kill exact.
 fn exited(worker: Pid) -> io::Result<bool> {
-    match waitid(WaitId::Pid(worker), WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT) {
+    match waitid(
+        WaitId::Pid(worker),
+        WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+    ) {
         Ok(found) => Ok(found.is_some()),
         Err(Errno::INTR) => Ok(false),
         Err(e) => Err(e.into()),
@@ -273,7 +311,12 @@ struct Supervisor<'a> {
 }
 
 impl Supervisor<'_> {
-    fn status(&self, state: JobState, reason: Option<KillReason>, worker_pgid: Option<i32>) -> io::Result<()> {
+    fn status(
+        &self,
+        state: JobState,
+        reason: Option<KillReason>,
+        worker_pgid: Option<i32>,
+    ) -> io::Result<()> {
         self.job.write_status(&JobStatus {
             state,
             reason,
@@ -306,7 +349,8 @@ impl Supervisor<'_> {
     /// receipt (if any); then the terminal status.
     fn finish_killed(&self, reason: KillReason, worker_pgid: Option<i32>) -> io::Result<JobState> {
         log(format_args!("killing the job: {}", kill_text(reason)));
-        let receipt = valid_outcome(self.job, &self.req).or_else(|| fallback_receipt(&self.req, kill_text(reason)));
+        let receipt = valid_outcome(self.job, &self.req)
+            .or_else(|| fallback_receipt(&self.req, kill_text(reason)));
         if let Some(receipt) = receipt {
             self.job.write_receipt(&receipt)?;
         }
@@ -352,9 +396,15 @@ impl Supervisor<'_> {
 /// polls every 50 ms. Must run in a process whose stdin is the job's locked `lock` file.
 /// `Err` means the supervisor itself failed; any worker it started is killed first.
 pub fn run_supervisor(job: &JobDir, worker_cmd: &SupervisorCmd) -> io::Result<JobState> {
-    let req = job
-        .request()
-        .map_err(|e| io::Error::new(e.kind(), format!("cannot read {}: {e}", job.path.join("request.json").display())))?;
+    let req = job.request().map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "cannot read {}: {e}",
+                job.path.join("request.json").display()
+            ),
+        )
+    })?;
     // EPERM: `main_run` already made us a session leader, or the launcher made us a group
     // leader. The second case is refused below.
     match setsid() {
@@ -370,10 +420,18 @@ pub fn run_supervisor(job: &JobDir, worker_cmd: &SupervisorCmd) -> io::Result<Jo
     }
     set_child_subreaper(Some(getpid()))?;
     if !job.lock_held() {
-        return Err(io::Error::other("the job lock is not held: launch the supervisor with the locked lock file as stdin"));
+        return Err(io::Error::other(
+            "the job lock is not held: launch the supervisor with the locked lock file as stdin",
+        ));
     }
     let sid = getsid(None)?;
-    let sup = Supervisor { job, req, pid: std::process::id(), sid, worker_reaped: Cell::new(false) };
+    let sup = Supervisor {
+        job,
+        req,
+        pid: std::process::id(),
+        sid,
+        worker_reaped: Cell::new(false),
+    };
     sup.status(JobState::Starting, None, None)?;
     if let Some(reason) = kill_reason(job, &sup.req, now_ms()) {
         // Nothing was spawned, so there is nothing to kill.
@@ -388,20 +446,24 @@ pub fn run_supervisor(job: &JobDir, worker_cmd: &SupervisorCmd) -> io::Result<Jo
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-    let worker = Pid::from_raw(child.id() as i32).ok_or_else(|| io::Error::other("worker has no pid"))?;
+    let worker =
+        Pid::from_raw(child.id() as i32).ok_or_else(|| io::Error::other("worker has no pid"))?;
     // From here on a worker may be alive, and the lock is released when we exit: neither
     // an error nor a panic may end the supervisor before everything of the job is dead.
     let poll = poll_interval();
-    let failed = match panic::catch_unwind(AssertUnwindSafe(|| sup.supervise(&mut child, worker, poll))) {
-        Ok(Ok(state)) => return Ok(state),
-        Ok(Err(e)) => e,
-        Err(_) => io::Error::other("the supervisor panicked"),
-    };
+    let failed =
+        match panic::catch_unwind(AssertUnwindSafe(|| sup.supervise(&mut child, worker, poll))) {
+            Ok(Ok(state)) => return Ok(state),
+            Ok(Err(e)) => e,
+            Err(_) => io::Error::other("the supervisor panicked"),
+        };
     log(format_args!("failed ({failed}); stopping the job"));
     match panic::catch_unwind(AssertUnwindSafe(|| sup.stop(&mut child, worker))) {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            log(format_args!("cannot stop the job cleanly ({e}); waiting for the remaining children"));
+            log(format_args!(
+                "cannot stop the job cleanly ({e}); waiting for the remaining children"
+            ));
             last_resort(&sup, worker);
         }
         Err(_) => last_resort(&sup, worker),
@@ -463,7 +525,9 @@ pub fn main_run(job_dir: &Path, worker_cmd: &SupervisorCmd) -> i32 {
 /// Its stdio is null, so errors are appended to `supervisor.log`.
 pub fn main_worker(job_dir: &Path) -> i32 {
     let ran = JobDir::open(job_dir).and_then(|job| {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
         rt.block_on(run_worker(&job))
     });
     match ran {
@@ -471,7 +535,13 @@ pub fn main_worker(job_dir: &Path) -> i32 {
         Err(e) => {
             if let Ok(mut f) = OpenOptions::new().append(true).open(job_dir.join(LOG_FILE)) {
                 // One line, whatever the error carries (guest text included).
-                let _ = writeln!(f, "[{}] worker {}: failed: {}", now_ms(), std::process::id(), escape_controls(&e.to_string()));
+                let _ = writeln!(
+                    f,
+                    "[{}] worker {}: failed: {}",
+                    now_ms(),
+                    std::process::id(),
+                    escape_controls(&e.to_string())
+                );
             }
             1
         }
@@ -485,18 +555,26 @@ pub fn main_with_args(args: impl IntoIterator<Item = OsString>, worker_cmd: &Sup
         [verb, dir] if verb == "run" => main_run(Path::new(dir), worker_cmd),
         [verb, dir] if verb == "worker" => main_worker(Path::new(dir)),
         [verb, _, _] if verb == "fake-guest" && !env_on(TEST_WORKERS_ENV) => {
-            let _ = writeln!(io::stderr(), "agentos-supervisor: fake-guest is a test hook; it needs AGENTOS_TEST_WORKERS=1");
+            let _ = writeln!(
+                io::stderr(),
+                "agentos-supervisor: fake-guest is a test hook; it needs AGENTOS_TEST_WORKERS=1"
+            );
             1
         }
-        [verb, uds, root] if verb == "fake-guest" => match agentos_guest::fake::serve(Path::new(uds), Path::new(root)) {
-            Ok(()) => 0,
-            Err(e) => {
-                let _ = writeln!(io::stderr(), "agentos-supervisor: fake guest: {e}");
-                1
+        [verb, uds, root] if verb == "fake-guest" => {
+            match agentos_guest::fake::serve(Path::new(uds), Path::new(root)) {
+                Ok(()) => 0,
+                Err(e) => {
+                    let _ = writeln!(io::stderr(), "agentos-supervisor: fake guest: {e}");
+                    1
+                }
             }
-        },
+        }
         _ => {
-            let _ = writeln!(io::stderr(), "usage: agentos-supervisor run|worker <job_dir> | fake-guest <uds> <root>");
+            let _ = writeln!(
+                io::stderr(),
+                "usage: agentos-supervisor run|worker <job_dir> | fake-guest <uds> <root>"
+            );
             1
         }
     }

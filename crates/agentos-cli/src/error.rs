@@ -14,11 +14,17 @@ pub struct CliError {
 
 impl CliError {
     pub fn usage(message: impl Into<String>) -> CliError {
-        CliError { code: 2, message: message.into() }
+        CliError {
+            code: 2,
+            message: message.into(),
+        }
     }
 
     pub fn other(message: impl Into<String>) -> CliError {
-        CliError { code: 1, message: message.into() }
+        CliError {
+            code: 1,
+            message: message.into(),
+        }
     }
 }
 

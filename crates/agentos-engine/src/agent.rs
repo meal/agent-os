@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use agentos_core::contract::Contract;
 use agentos_core::ids::Digest;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// What the agent asks the runner to do next.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,14 +31,31 @@ pub enum AgentAction {
 /// What the runner tells the agent after each step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Observation {
-    Start { files: Vec<String>, workspace: Digest },
-    PatchApplied { workspace: Digest },
-    PatchRejected { reason: String },
-    VersionConflict { expected: Digest, actual: Digest },
-    Verification { passed: bool, summary: String },
+    Start {
+        files: Vec<String>,
+        workspace: Digest,
+    },
+    PatchApplied {
+        workspace: Digest,
+    },
+    PatchRejected {
+        reason: String,
+    },
+    VersionConflict {
+        expected: Digest,
+        actual: Digest,
+    },
+    Verification {
+        passed: bool,
+        summary: String,
+    },
     BudgetExhausted,
     /// The model answered: its content blocks, why it stopped and the tokens it produced.
-    ModelResponse { content: serde_json::Value, stop_reason: String, output_tokens: u64 },
+    ModelResponse {
+        content: serde_json::Value,
+        stop_reason: String,
+        output_tokens: u64,
+    },
     /// The model request failed with an answer (an HTTP error, a refusal).
     ModelCallFailed {
         reason: String,
@@ -49,9 +66,17 @@ pub enum Observation {
     /// used.
     ModelCallLost,
     /// The workspace's files.
-    Files { files: Vec<String> },
-    FileRead { path: String, content: String, truncated: bool },
-    FileReadRejected { reason: String },
+    Files {
+        files: Vec<String>,
+    },
+    FileRead {
+        path: String,
+        content: String,
+        truncated: bool,
+    },
+    FileReadRejected {
+        reason: String,
+    },
 }
 
 pub trait Agent {
@@ -67,12 +92,19 @@ pub struct FakeAgent {
 
 impl FakeAgent {
     pub fn scripted(actions: Vec<AgentAction>) -> FakeAgent {
-        FakeAgent { script: actions.into(), seen: Vec::new() }
+        FakeAgent {
+            script: actions.into(),
+            seen: Vec::new(),
+        }
     }
 
     /// The scripted fixture solution: apply `patch`, verify, finish.
     pub fn from_fixture_patch(patch: String) -> FakeAgent {
-        FakeAgent::scripted(vec![AgentAction::ApplyPatch(patch), AgentAction::Verify, AgentAction::Finish])
+        FakeAgent::scripted(vec![
+            AgentAction::ApplyPatch(patch),
+            AgentAction::Verify,
+            AgentAction::Finish,
+        ])
     }
 
     /// Every observation the agent was given, in order.
@@ -109,7 +141,12 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
 /// The tool definitions sent with every request.
 pub fn tools() -> Value {
     json!([
-        tool("list_files", "List the files of the repository.", json!({}), &[]),
+        tool(
+            "list_files",
+            "List the files of the repository.",
+            json!({}),
+            &[]
+        ),
         tool(
             "read_file",
             "Read one file of the repository by its path relative to the repository root.",
@@ -122,7 +159,12 @@ pub fn tools() -> Value {
             json!({"patch": {"type": "string", "description": "the unified diff"}}),
             &["patch"],
         ),
-        tool("run_verification", "Run the protected verification against the current workspace.", json!({}), &[]),
+        tool(
+            "run_verification",
+            "Run the protected verification against the current workspace.",
+            json!({}),
+            &[]
+        ),
         tool(
             "finish",
             "Finish the task once the verification passes.",
@@ -144,7 +186,12 @@ pub struct ModelAgent {
 
 impl ModelAgent {
     pub fn new(contract: Contract, model: impl Into<String>) -> ModelAgent {
-        ModelAgent { contract, model: model.into(), history: Vec::new(), pending_tool_use_id: None }
+        ModelAgent {
+            contract,
+            model: model.into(),
+            history: Vec::new(),
+            pending_tool_use_id: None,
+        }
     }
 
     pub fn history(&self) -> &[Value] {
@@ -167,16 +214,22 @@ impl ModelAgent {
 
     fn call(&mut self) -> AgentAction {
         let body = self.request_body();
-        AgentAction::CallModel { request: Digest::of(&body), body }
+        AgentAction::CallModel {
+            request: Digest::of(&body),
+            body,
+        }
     }
 
     fn push_result(&mut self, text: String, is_error: bool) {
-        let Some(id) = self.pending_tool_use_id.clone() else { return };
+        let Some(id) = self.pending_tool_use_id.clone() else {
+            return;
+        };
         let mut block = json!({"type": "tool_result", "tool_use_id": id, "content": text});
         if is_error {
             block["is_error"] = Value::Bool(true);
         }
-        self.history.push(json!({"role": "user", "content": [block]}));
+        self.history
+            .push(json!({"role": "user", "content": [block]}));
     }
 
     /// Answer the pending tool use with a result and ask the model again; without a
@@ -190,7 +243,8 @@ impl ModelAgent {
     }
 
     fn on_response(&mut self, content: &Value) -> AgentAction {
-        self.history.push(json!({"role": "assistant", "content": content}));
+        self.history
+            .push(json!({"role": "assistant", "content": content}));
         self.pending_tool_use_id = None;
         let mut tool_uses = content
             .as_array()
@@ -203,12 +257,21 @@ impl ModelAgent {
         if tool_uses.next().is_some() {
             return AgentAction::Finish;
         }
-        let Some(block) = block else { return AgentAction::Finish };
-        let Some(id) = block.get("id").and_then(Value::as_str) else { return AgentAction::Finish };
+        let Some(block) = block else {
+            return AgentAction::Finish;
+        };
+        let Some(id) = block.get("id").and_then(Value::as_str) else {
+            return AgentAction::Finish;
+        };
         self.pending_tool_use_id = Some(id.to_string());
         let name = block.get("name").and_then(Value::as_str).unwrap_or("");
         let input = block.get("input");
-        let string_field = |field: &str| input.and_then(|i| i.get(field)).and_then(Value::as_str).map(str::to_string);
+        let string_field = |field: &str| {
+            input
+                .and_then(|i| i.get(field))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
         match name {
             "list_files" => AgentAction::ListFiles,
             "run_verification" => AgentAction::Verify,
@@ -250,18 +313,28 @@ impl Agent for ModelAgent {
             }
             Observation::ModelResponse { content, .. } => self.on_response(content),
             Observation::Files { files } => self.answer(files.join("\n"), false),
-            Observation::FileRead { content, truncated, .. } => {
-                let text = if *truncated { format!("{content}{TRUNCATED_MARKER}") } else { content.clone() };
+            Observation::FileRead {
+                content, truncated, ..
+            } => {
+                let text = if *truncated {
+                    format!("{content}{TRUNCATED_MARKER}")
+                } else {
+                    content.clone()
+                };
                 self.answer(text, false)
             }
             Observation::FileReadRejected { reason } => self.answer(reason.clone(), true),
-            Observation::PatchApplied { workspace } => {
-                self.answer(format!("patch applied; the workspace is now {workspace}"), false)
+            Observation::PatchApplied { workspace } => self.answer(
+                format!("patch applied; the workspace is now {workspace}"),
+                false,
+            ),
+            Observation::PatchRejected { reason } => {
+                self.answer(format!("patch rejected: {reason}"), true)
             }
-            Observation::PatchRejected { reason } => self.answer(format!("patch rejected: {reason}"), true),
-            Observation::VersionConflict { expected, actual } => {
-                self.answer(format!("version conflict: expected {expected}, actual {actual}"), true)
-            }
+            Observation::VersionConflict { expected, actual } => self.answer(
+                format!("version conflict: expected {expected}, actual {actual}"),
+                true,
+            ),
             Observation::Verification { passed, summary } => {
                 let verdict = if *passed { "passed" } else { "failed" };
                 self.answer(format!("verification {verdict}: {summary}"), !*passed)

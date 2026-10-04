@@ -15,7 +15,10 @@ pub fn status(home: &Home, task: &TaskId) -> Result<(), CliError> {
     let t = store.db.task(task)?;
     let effects = store.db.outstanding_effects(task)?;
     let jobs_root = std::path::absolute(&home.root)?.join("jobs");
-    let jobs: Vec<_> = effects.iter().filter_map(|e| latest_job(&jobs_root, &e.effect_id)).collect();
+    let jobs: Vec<_> = effects
+        .iter()
+        .filter_map(|e| latest_job(&jobs_root, &e.effect_id))
+        .collect();
     let outstanding: Vec<_> = effects
         .into_iter()
         .map(|e| json!({ "effect_id": e.effect_id, "kind": e.kind.tag(), "state": e.state, "lease_generation": e.lease_generation }))
@@ -28,7 +31,8 @@ pub fn status(home: &Home, task: &TaskId) -> Result<(), CliError> {
         .map(|g| json!({ "operation": g.operation, "handle_prefix": g.handle.prefix(), "revoked": g.revoked, "expires_ts": g.expires_ts }))
         .collect();
     let worker = home.recorded_worker(&store, task)?;
-    let (model_policy_version, model_limits_version) = agentos_engine::model::policy::versions(&store.db, task)?;
+    let (model_policy_version, model_limits_version) =
+        agentos_engine::model::policy::versions(&store.db, task)?;
     let mut shown = json!({
         "task_id": t.id,
         "state": t.state.label(),
@@ -68,9 +72,15 @@ pub fn events(home: &Home, task: &TaskId) -> Result<(), CliError> {
 /// The job of the highest lease generation of `effect`: where it stands, whether its
 /// supervisor still holds the lock (`alive`), and whether a receipt is on disk.
 fn latest_job(jobs_root: &std::path::Path, effect: &EffectId) -> Option<Value> {
-    let job = JobDir::list(jobs_root, effect).ok()?.into_iter().next_back()?;
+    let job = JobDir::list(jobs_root, effect)
+        .ok()?
+        .into_iter()
+        .next_back()?;
     let request = job.request().ok()?;
-    let state = job.read_status().map(|s| serde_json::to_value(s.state).unwrap_or(Value::Null)).unwrap_or(Value::Null);
+    let state = job
+        .read_status()
+        .map(|s| serde_json::to_value(s.state).unwrap_or(Value::Null))
+        .unwrap_or(Value::Null);
     Some(json!({
         "effect_id": effect,
         "attempt_id": request.attempt_id,

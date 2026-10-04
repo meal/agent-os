@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use agentos_core::guest::INIT_PATH;
-use rustix::fs::{chownat, syncfs, AtFlags, Gid, Uid, CWD};
-use rustix::mount::{mount, mount_remount, unmount, MountFlags, UnmountFlags};
+use rustix::fs::{AtFlags, CWD, Gid, Uid, chownat, syncfs};
+use rustix::mount::{MountFlags, UnmountFlags, mount, mount_remount, unmount};
 
 pub trait Backend: Send {
     /// The workspace root (`/workspace` in a VM).
@@ -40,7 +40,14 @@ pub trait Backend: Send {
     /// above `cwd`.
     fn git(&self, cwd: &Path) -> Command;
     /// The check command `program args… workspace`, run from `cwd` (the staged profile).
-    fn check_command(&self, program: &str, args: &[String], workspace: &Path, cwd: &Path, pycache: &Path) -> Command;
+    fn check_command(
+        &self,
+        program: &str,
+        args: &[String],
+        workspace: &Path,
+        cwd: &Path,
+        pycache: &Path,
+    ) -> Command;
     /// Whether `program` can be started as the check from `cwd`, checked before the run
     /// where the start itself cannot report it: the VM starts the trampoline, whose `exec`
     /// failure would look like the check's own exit 127, so a missing or non-executable
@@ -107,7 +114,11 @@ impl FakeBackend {
             Err(e) => return Err(e),
         }
         fs::create_dir_all(&scratch)?;
-        Ok(FakeBackend { root, workspace, scratch })
+        Ok(FakeBackend {
+            root,
+            workspace,
+            scratch,
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -146,7 +157,14 @@ impl Backend for FakeBackend {
     }
 
     /// The 3a environment: nothing inherited but `PATH`.
-    fn check_command(&self, program: &str, args: &[String], workspace: &Path, cwd: &Path, pycache: &Path) -> Command {
+    fn check_command(
+        &self,
+        program: &str,
+        args: &[String],
+        workspace: &Path,
+        cwd: &Path,
+        pycache: &Path,
+    ) -> Command {
         let mut cmd = Command::new(program);
         cmd.args(args)
             .arg(workspace)
@@ -219,7 +237,13 @@ pub fn is_mount_point(path: &Path) -> bool {
 /// inherited.
 pub fn mkfs_ext4(device: &str) -> Result<(), String> {
     let out = Command::new(MKFS_EXT4)
-        .args(["-q", "-F", "-E", "lazy_itable_init=0,lazy_journal_init=0", device])
+        .args([
+            "-q",
+            "-F",
+            "-E",
+            "lazy_itable_init=0,lazy_journal_init=0",
+            device,
+        ])
         .env_clear()
         .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
         .output()
@@ -270,7 +294,10 @@ pub fn find_program(program: &str, cwd: &Path) -> io::Result<PathBuf> {
     let candidates: Vec<PathBuf> = if program.contains('/') {
         vec![cwd.join(program)]
     } else {
-        CHECK_PATH.split(':').map(|dir| Path::new(dir).join(program)).collect()
+        CHECK_PATH
+            .split(':')
+            .map(|dir| Path::new(dir).join(program))
+            .collect()
     };
     let mut found_unexecutable = false;
     for c in candidates {
@@ -283,7 +310,14 @@ pub fn find_program(program: &str, cwd: &Path) -> io::Result<PathBuf> {
             found_unexecutable = true;
         }
     }
-    Err(io::Error::from_raw_os_error(if found_unexecutable { rustix::io::Errno::ACCESS } else { rustix::io::Errno::NOENT }.raw_os_error()))
+    Err(io::Error::from_raw_os_error(
+        if found_unexecutable {
+            rustix::io::Errno::ACCESS
+        } else {
+            rustix::io::Errno::NOENT
+        }
+        .raw_os_error(),
+    ))
 }
 
 /// The real guest: `/workspace` on `/dev/vdb`, `/scratch` on `/dev/vdc`, `git` as `builder`,
@@ -297,7 +331,10 @@ pub struct VmBackend {
 
 impl Default for VmBackend {
     fn default() -> VmBackend {
-        VmBackend { workspace: PathBuf::from(WORKSPACE_DIR), scratch: PathBuf::from(SCRATCH_DIR) }
+        VmBackend {
+            workspace: PathBuf::from(WORKSPACE_DIR),
+            scratch: PathBuf::from(SCRATCH_DIR),
+        }
     }
 }
 
@@ -320,7 +357,8 @@ impl Backend for VmBackend {
     /// `rw,nosuid,nodev`, owned by `builder`, 0755.
     fn prepare_workspace(&mut self) -> Result<(), String> {
         if is_mount_point(&self.workspace) {
-            unmount(&self.workspace, UnmountFlags::empty()).map_err(|e| format!("unmount {}: {e}", self.workspace.display()))?;
+            unmount(&self.workspace, UnmountFlags::empty())
+                .map_err(|e| format!("unmount {}: {e}", self.workspace.display()))?;
         }
         wipe(WORKSPACE_DEVICE).map_err(|e| format!("cannot wipe {WORKSPACE_DEVICE}: {e}"))?;
         mkfs_ext4(WORKSPACE_DEVICE)?;
@@ -333,12 +371,15 @@ impl Backend for VmBackend {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(format!("rmdir {}/lost+found: {e}", ws.display())),
         }
-        chown_tree(ws, BUILDER_UID, BUILDER_UID).map_err(|e| format!("chown {}: {e}", ws.display()))?;
-        fs::set_permissions(ws, fs::Permissions::from_mode(0o755)).map_err(|e| format!("chmod {}: {e}", ws.display()))
+        chown_tree(ws, BUILDER_UID, BUILDER_UID)
+            .map_err(|e| format!("chown {}: {e}", ws.display()))?;
+        fs::set_permissions(ws, fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod {}: {e}", ws.display()))
     }
 
     fn sync_workspace(&self) -> Result<(), String> {
-        let dir = File::open(&self.workspace).map_err(|e| format!("open {}: {e}", self.workspace.display()))?;
+        let dir = File::open(&self.workspace)
+            .map_err(|e| format!("open {}: {e}", self.workspace.display()))?;
         syncfs(&dir).map_err(|e| format!("syncfs {}: {e}", self.workspace.display()))
     }
 
@@ -353,7 +394,8 @@ impl Backend for VmBackend {
     }
 
     fn own_tree(&self, dir: &Path) -> Result<(), String> {
-        chown_tree(dir, BUILDER_UID, BUILDER_UID).map_err(|e| format!("cannot hand {} to builder: {e}", dir.display()))
+        chown_tree(dir, BUILDER_UID, BUILDER_UID)
+            .map_err(|e| format!("cannot hand {} to builder: {e}", dir.display()))
     }
 
     fn git(&self, cwd: &Path) -> Command {
@@ -365,20 +407,44 @@ impl Backend for VmBackend {
     /// The trampoline is started as root: it sets the OOM priority while privileged (so it
     /// becomes the check's floor), the rlimits, drops to `check` and `exec`s the check (spec
     /// issue 6: no `pre_exec`).
-    fn check_command(&self, program: &str, args: &[String], workspace: &Path, cwd: &Path, pycache: &Path) -> Command {
-        let (nproc, nofile, oom) = (CHECK_NPROC.to_string(), CHECK_NOFILE.to_string(), CHECK_OOM_SCORE_ADJ.to_string());
+    fn check_command(
+        &self,
+        program: &str,
+        args: &[String],
+        workspace: &Path,
+        cwd: &Path,
+        pycache: &Path,
+    ) -> Command {
+        let (nproc, nofile, oom) = (
+            CHECK_NPROC.to_string(),
+            CHECK_NOFILE.to_string(),
+            CHECK_OOM_SCORE_ADJ.to_string(),
+        );
         let id = CHECK_UID.to_string();
         let mut cmd = Command::new(INIT_PATH);
-        cmd.args(["exec-check", "--uid", &id, "--gid", &id, "--nproc", &nproc, "--nofile", &nofile, "--oom", &oom, "--"])
-            .arg(program)
-            .args(args)
-            .arg(workspace)
-            .current_dir(cwd)
-            .process_group(0)
-            .env_clear()
-            .env("PATH", CHECK_PATH)
-            .env("PYTHONDONTWRITEBYTECODE", "1")
-            .env("PYTHONPYCACHEPREFIX", pycache);
+        cmd.args([
+            "exec-check",
+            "--uid",
+            &id,
+            "--gid",
+            &id,
+            "--nproc",
+            &nproc,
+            "--nofile",
+            &nofile,
+            "--oom",
+            &oom,
+            "--",
+        ])
+        .arg(program)
+        .args(args)
+        .arg(workspace)
+        .current_dir(cwd)
+        .process_group(0)
+        .env_clear()
+        .env("PATH", CHECK_PATH)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("PYTHONPYCACHEPREFIX", pycache);
         cmd
     }
 
@@ -416,15 +482,33 @@ mod tests {
         assert_eq!(
             args,
             [
-                "exec-check", "--uid", "1001", "--gid", "1001", "--nproc", "256", "--nofile", "1024", "--oom", "1000", "--",
-                "python3", "check.py", "/workspace"
+                "exec-check",
+                "--uid",
+                "1001",
+                "--gid",
+                "1001",
+                "--nproc",
+                "256",
+                "--nofile",
+                "1024",
+                "--oom",
+                "1000",
+                "--",
+                "python3",
+                "check.py",
+                "/workspace"
             ]
             .map(OsStr::new)
         );
         assert_eq!(cmd.get_current_dir(), Some(Path::new("/scratch/profile")));
         let mut envs: Vec<(String, String)> = cmd
             .get_envs()
-            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.unwrap().to_string_lossy().into_owned()))
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.unwrap().to_string_lossy().into_owned(),
+                )
+            })
             .collect();
         envs.sort();
         assert_eq!(
@@ -432,12 +516,25 @@ mod tests {
             [
                 ("PATH".to_string(), "/usr/bin:/bin".to_string()),
                 ("PYTHONDONTWRITEBYTECODE".to_string(), "1".to_string()),
-                ("PYTHONPYCACHEPREFIX".to_string(), "/scratch/check/pycache".to_string()),
+                (
+                    "PYTHONPYCACHEPREFIX".to_string(),
+                    "/scratch/check/pycache".to_string()
+                ),
             ]
         );
         // The trampoline's own usage agrees with the arguments the agent builds.
-        let parsed = crate::trampoline::parse(&args.iter().skip(1).map(|a| a.to_os_string()).collect::<Vec<_>>()).unwrap();
-        assert_eq!((parsed.nproc, parsed.nofile, parsed.oom_score_adj), (CHECK_NPROC, CHECK_NOFILE, CHECK_OOM_SCORE_ADJ));
+        let parsed = crate::trampoline::parse(
+            &args
+                .iter()
+                .skip(1)
+                .map(|a| a.to_os_string())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(
+            (parsed.nproc, parsed.nofile, parsed.oom_score_adj),
+            (CHECK_NPROC, CHECK_NOFILE, CHECK_OOM_SCORE_ADJ)
+        );
         assert_eq!((parsed.uid, parsed.gid), (CHECK_UID, CHECK_UID));
         assert_eq!(parsed.program, "python3");
     }
@@ -446,23 +543,46 @@ mod tests {
     fn vm_git_is_the_scrubbed_git() {
         let cmd = VmBackend::default().git(Path::new("/workspace"));
         assert_eq!(cmd.get_program(), OsStr::new("git"));
-        let envs: Vec<String> = cmd.get_envs().map(|(k, _)| k.to_string_lossy().into_owned()).collect();
-        assert!(envs.contains(&"GIT_CEILING_DIRECTORIES".to_string()), "{envs:?}");
-        assert!(envs.contains(&"GIT_CONFIG_NOSYSTEM".to_string()), "{envs:?}");
+        let envs: Vec<String> = cmd
+            .get_envs()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            envs.contains(&"GIT_CEILING_DIRECTORIES".to_string()),
+            "{envs:?}"
+        );
+        assert!(
+            envs.contains(&"GIT_CONFIG_NOSYSTEM".to_string()),
+            "{envs:?}"
+        );
     }
 
     #[test]
     fn find_program_mirrors_execvp_failures() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(find_program("sh", dir.path()).unwrap().parent().map(|p| p.to_path_buf()), Some(PathBuf::from("/usr/bin")));
+        assert_eq!(
+            find_program("sh", dir.path())
+                .unwrap()
+                .parent()
+                .map(|p| p.to_path_buf()),
+            Some(PathBuf::from("/usr/bin"))
+        );
         let err = find_program("no-such-program-xyz", dir.path()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
         fs::write(dir.path().join("run.sh"), "#!/bin/sh\n").unwrap();
         let err = find_program("./run.sh", dir.path()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         fs::set_permissions(dir.path().join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(find_program("./run.sh", dir.path()).unwrap(), dir.path().join("./run.sh"));
-        assert_eq!(find_program("/nonexistent/prog", dir.path()).unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            find_program("./run.sh", dir.path()).unwrap(),
+            dir.path().join("./run.sh")
+        );
+        assert_eq!(
+            find_program("/nonexistent/prog", dir.path())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
     }
 
     #[test]
@@ -486,10 +606,25 @@ mod tests {
         fs::write(tree.join("a/b/f"), "x").unwrap();
         symlink(&outside, tree.join("a/link")).unwrap();
         chown_tree(&tree, BUILDER_UID, BUILDER_UID).unwrap();
-        for p in [tree.clone(), tree.join("a"), tree.join("a/b"), tree.join("a/b/f"), tree.join("a/link")] {
+        for p in [
+            tree.clone(),
+            tree.join("a"),
+            tree.join("a/b"),
+            tree.join("a/b/f"),
+            tree.join("a/link"),
+        ] {
             let m = fs::symlink_metadata(&p).unwrap();
-            assert_eq!((m.uid(), m.gid()), (BUILDER_UID, BUILDER_UID), "{}", p.display());
+            assert_eq!(
+                (m.uid(), m.gid()),
+                (BUILDER_UID, BUILDER_UID),
+                "{}",
+                p.display()
+            );
         }
-        assert_eq!(fs::metadata(&outside).unwrap().uid(), 0, "the symlink's target was chowned");
+        assert_eq!(
+            fs::metadata(&outside).unwrap().uid(),
+            0,
+            "the symlink's target was chowned"
+        );
     }
 }

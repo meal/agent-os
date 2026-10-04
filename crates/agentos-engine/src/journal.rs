@@ -35,7 +35,7 @@ use agentos_core::effect::{EffectId, EffectKind, EffectRecord, EffectState};
 use agentos_core::ids::{Digest, TaskId};
 use agentos_store::blob::BlobStore;
 use agentos_store::db::{Db, DbError, StoredEvent};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::agent::{AgentAction, Observation};
 use crate::runner::{EngineError, Result};
@@ -48,7 +48,13 @@ pub(crate) struct Turn {
 }
 
 /// Appends the turn the runner is about to act on; returns its journal sequence number.
-pub(crate) fn append_turn(db: &Db, task: &TaskId, turn: u32, obs: &Observation, action: &AgentAction) -> Result<u64> {
+pub(crate) fn append_turn(
+    db: &Db,
+    task: &TaskId,
+    turn: u32,
+    obs: &Observation,
+    action: &AgentAction,
+) -> Result<u64> {
     let payload = json!({ "turn": turn, "observation": obs, "action": action });
     Ok(db.append_audit(task, "AgentTurn", &payload)?)
 }
@@ -86,11 +92,19 @@ pub(crate) fn events_after(db: &Db, task: &TaskId, since: u64) -> Result<Vec<Sto
 
 /// The variant name of a serialized `EffectKind` (`"ReadSnapshot"`, `"ApplyPatch"`, ...).
 fn kind_name(kind: &Value) -> Option<&str> {
-    kind.as_str().or_else(|| kind.as_object().and_then(|m| m.keys().next()).map(String::as_str))
+    kind.as_str().or_else(|| {
+        kind.as_object()
+            .and_then(|m| m.keys().next())
+            .map(String::as_str)
+    })
 }
 
 /// The first effect of kind `kind_variant` intended in `events`, optionally for `request`.
-pub(crate) fn intended(events: &[StoredEvent], kind_variant: &str, request: Option<&Digest>) -> Result<Option<EffectId>> {
+pub(crate) fn intended(
+    events: &[StoredEvent],
+    kind_variant: &str,
+    request: Option<&Digest>,
+) -> Result<Option<EffectId>> {
     for e in events.iter().filter(|e| e.event_type == "EffectIntended") {
         if kind_name(&e.payload["kind"]) != Some(kind_variant) {
             continue;
@@ -107,35 +121,56 @@ pub(crate) fn intended(events: &[StoredEvent], kind_variant: &str, request: Opti
 
 /// The first `Denied` audit in `events`.
 pub(crate) fn denial(events: &[StoredEvent]) -> Option<&Value> {
-    events.iter().find(|e| e.event_type == "Denied").map(|e| &e.payload)
+    events
+        .iter()
+        .find(|e| e.event_type == "Denied")
+        .map(|e| &e.payload)
 }
 
 /// The observation a patch denial gave the agent, rebuilt from its audit payload.
 pub(crate) fn denial_observation(payload: &Value) -> Result<Observation> {
     if matches!(payload["action"].as_str(), Some("ReadFile" | "ListFiles")) {
-        return Ok(Observation::FileReadRejected { reason: payload.to_string() });
+        return Ok(Observation::FileReadRejected {
+            reason: payload.to_string(),
+        });
     }
     Ok(match payload["reason"].as_str() {
-        Some("VersionConflict") => {
-            Observation::VersionConflict { expected: decode(&payload["expected"])?, actual: decode(&payload["actual"])? }
-        }
+        Some("VersionConflict") => Observation::VersionConflict {
+            expected: decode(&payload["expected"])?,
+            actual: decode(&payload["actual"])?,
+        },
         Some("CapabilityDenied") if kind_name(&payload["kind"]) == Some("ModelCall") => {
-            Observation::ModelCallFailed { reason: "capability model.request not granted".into(), failure: None }
+            Observation::ModelCallFailed {
+                reason: "capability model.request not granted".into(),
+                failure: None,
+            }
         }
-        Some("CapabilityDenied") if matches!(kind_name(&payload["kind"]), Some("ListFiles" | "ReadFile")) => {
-            Observation::FileReadRejected { reason: "capability snapshot.read not granted".into() }
+        Some("CapabilityDenied")
+            if matches!(kind_name(&payload["kind"]), Some("ListFiles" | "ReadFile")) =>
+        {
+            Observation::FileReadRejected {
+                reason: "capability snapshot.read not granted".into(),
+            }
         }
         Some("CapabilityDenied") => {
             let cap: Capability = decode(&payload["capability"])?;
-            Observation::PatchRejected { reason: format!("capability {cap:?} not granted") }
+            Observation::PatchRejected {
+                reason: format!("capability {cap:?} not granted"),
+            }
         }
-        _ => Observation::PatchRejected { reason: payload.to_string() },
+        _ => Observation::PatchRejected {
+            reason: payload.to_string(),
+        },
     })
 }
 
 /// The text of a journaled `ApplyPatch` action whose digest is `request`, from any session.
 pub(crate) fn journaled_patch(db: &Db, task: &TaskId, request: &Digest) -> Result<Option<String>> {
-    for e in db.events(task)?.iter().filter(|e| e.event_type == "AgentTurn") {
+    for e in db
+        .events(task)?
+        .iter()
+        .filter(|e| e.event_type == "AgentTurn")
+    {
         if let AgentAction::ApplyPatch(patch) = decode(&e.payload["action"])? {
             if Digest::of(patch.as_bytes()) == *request {
                 return Ok(Some(patch));
@@ -151,7 +186,11 @@ pub(crate) fn journaled_patch(db: &Db, task: &TaskId, request: &Digest) -> Resul
 /// replay must not guess.
 pub(crate) fn completed_patches(db: &Db, task: &TaskId) -> Result<Vec<Vec<u8>>> {
     let mut out = Vec::new();
-    for e in db.events(task)?.iter().filter(|e| e.event_type == "EffectIntended") {
+    for e in db
+        .events(task)?
+        .iter()
+        .filter(|e| e.event_type == "EffectIntended")
+    {
         if kind_name(&e.payload["kind"]) != Some("ApplyPatch") {
             continue;
         }
@@ -162,7 +201,11 @@ pub(crate) fn completed_patches(db: &Db, task: &TaskId) -> Result<Vec<Vec<u8>>> 
         }
         match journaled_patch(db, task, &rec.request_digest)? {
             Some(text) => out.push(text.into_bytes()),
-            None => return Err(EngineError::Protocol(format!("the patch of effect {id} is not journaled"))),
+            None => {
+                return Err(EngineError::Protocol(format!(
+                    "the patch of effect {id} is not journaled"
+                )));
+            }
         }
     }
     Ok(out)
@@ -170,10 +213,12 @@ pub(crate) fn completed_patches(db: &Db, task: &TaskId) -> Result<Vec<Vec<u8>>> 
 
 /// Whether a receipt of attempt `attempt` was already journaled as ignored or rejected.
 pub(crate) fn receipt_audited(db: &Db, task: &TaskId, attempt: &Value) -> Result<bool> {
-    Ok(db
-        .events(task)?
-        .iter()
-        .any(|e| matches!(e.event_type.as_str(), "ReceiptIgnored" | "ReceiptRejected" | "RetainedReceiptRejected") && e.payload["receipt"]["attempt_id"] == *attempt))
+    Ok(db.events(task)?.iter().any(|e| {
+        matches!(
+            e.event_type.as_str(),
+            "ReceiptIgnored" | "ReceiptRejected" | "RetainedReceiptRejected"
+        ) && e.payload["receipt"]["attempt_id"] == *attempt
+    }))
 }
 
 /// The serialized request of a `ModelCall` effect: the blob at its request digest, if it
@@ -197,34 +242,56 @@ fn protocol(rec: &EffectRecord, what: &str) -> EngineError {
 /// workspace cannot change while the task is VERIFYING.
 pub(crate) fn effect_observation(blobs: &BlobStore, rec: &EffectRecord) -> Result<Observation> {
     // A forfeited model call has no result by design: checked before the blob read.
-    if let (EffectKind::ModelCall { .. }, EffectState::Failed, None) = (&rec.kind, rec.state, rec.result_digest) {
+    if let (EffectKind::ModelCall { .. }, EffectState::Failed, None) =
+        (&rec.kind, rec.state, rec.result_digest)
+    {
         return Ok(Observation::ModelCallLost);
     }
-    let digest = rec.result_digest.ok_or_else(|| protocol(rec, "was never published"))?;
+    let digest = rec
+        .result_digest
+        .ok_or_else(|| protocol(rec, "was never published"))?;
     let result: Value = serde_json::from_slice(&blobs.get(&digest)?).map_err(DbError::from)?;
-    let reason = || result["reason"].as_str().map(str::to_string).ok_or_else(|| protocol(rec, "has no failure reason"));
+    let reason = || {
+        result["reason"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| protocol(rec, "has no failure reason"))
+    };
     Ok(match (&rec.kind, rec.state) {
         (EffectKind::ApplyPatch { .. }, EffectState::Completed) => {
-            let workspace = result.get("workspace_digest").ok_or_else(|| protocol(rec, "has no workspace digest"))?;
-            Observation::PatchApplied { workspace: decode(workspace)? }
+            let workspace = result
+                .get("workspace_digest")
+                .ok_or_else(|| protocol(rec, "has no workspace digest"))?;
+            Observation::PatchApplied {
+                workspace: decode(workspace)?,
+            }
         }
-        (EffectKind::ApplyPatch { .. }, EffectState::Failed) => Observation::PatchRejected { reason: reason()? },
+        (EffectKind::ApplyPatch { .. }, EffectState::Failed) => {
+            Observation::PatchRejected { reason: reason()? }
+        }
         (EffectKind::RunVerification, EffectState::Completed) => {
             let checked: Digest = decode(&result["workspace_digest"])?;
             if Digest::of(checked.as_bytes()) != rec.request_digest {
                 let summary = format!("evidence is for workspace {checked}, not the one verified");
-                Observation::Verification { passed: false, summary }
+                Observation::Verification {
+                    passed: false,
+                    summary,
+                }
             } else {
                 let summary = match result["summary"].as_str() {
                     Some(s) => s.to_string(),
                     None => format!("exit code {}", result["exit_code"]),
                 };
-                Observation::Verification { passed: result["passed"] == true, summary }
+                Observation::Verification {
+                    passed: result["passed"] == true,
+                    summary,
+                }
             }
         }
-        (EffectKind::RunVerification, EffectState::Failed) => {
-            Observation::Verification { passed: false, summary: format!("verification did not complete: {}", reason()?) }
-        }
+        (EffectKind::RunVerification, EffectState::Failed) => Observation::Verification {
+            passed: false,
+            summary: format!("verification did not complete: {}", reason()?),
+        },
         (EffectKind::ModelCall { .. }, EffectState::Completed) => {
             let content = result["content"].clone();
             if !content.is_array() {
@@ -232,7 +299,10 @@ pub(crate) fn effect_observation(blobs: &BlobStore, rec: &EffectRecord) -> Resul
             }
             Observation::ModelResponse {
                 content,
-                stop_reason: result["stop_reason"].as_str().unwrap_or("unknown").to_string(),
+                stop_reason: result["stop_reason"]
+                    .as_str()
+                    .unwrap_or("unknown")
+                    .to_string(),
                 output_tokens: result["usage"]["output_tokens"].as_u64().unwrap_or(0),
             }
         }
@@ -240,9 +310,9 @@ pub(crate) fn effect_observation(blobs: &BlobStore, rec: &EffectRecord) -> Resul
             reason: reason()?,
             failure: result.get("failure").map(decode).transpose()?,
         },
-        (EffectKind::ListFiles { .. }, EffectState::Completed) => {
-            Observation::Files { files: decode(&result["files"])? }
-        }
+        (EffectKind::ListFiles { .. }, EffectState::Completed) => Observation::Files {
+            files: decode(&result["files"])?,
+        },
         (EffectKind::ReadFile { .. }, EffectState::Completed) => Observation::FileRead {
             path: decode(&result["path"])?,
             content: decode(&result["content"])?,
@@ -251,7 +321,12 @@ pub(crate) fn effect_observation(blobs: &BlobStore, rec: &EffectRecord) -> Resul
         (EffectKind::ListFiles { .. } | EffectKind::ReadFile { .. }, EffectState::Failed) => {
             Observation::FileReadRejected { reason: reason()? }
         }
-        (kind, state) => return Err(protocol(rec, &format!("({kind:?}, {state:?}) gives the agent no observation"))),
+        (kind, state) => {
+            return Err(protocol(
+                rec,
+                &format!("({kind:?}, {state:?}) gives the agent no observation"),
+            ));
+        }
     })
 }
 
@@ -285,13 +360,21 @@ mod tests {
         (dir, blobs)
     }
 
-    fn with_result(blobs: &BlobStore, kind: EffectKind, state: EffectState, result: Value) -> EffectRecord {
+    fn with_result(
+        blobs: &BlobStore,
+        kind: EffectKind,
+        state: EffectState,
+        result: Value,
+    ) -> EffectRecord {
         let digest = blobs.put(result.to_string().as_bytes()).unwrap();
         rec(kind, state, Some(digest))
     }
 
     fn model() -> EffectKind {
-        EffectKind::ModelCall { model: "m".into(), turn: 1 }
+        EffectKind::ModelCall {
+            model: "m".into(),
+            turn: 1,
+        }
     }
 
     #[test]
@@ -302,27 +385,59 @@ mod tests {
         let done = with_result(&blobs, model(), EffectState::Completed, response);
         assert_eq!(
             effect_observation(&blobs, &done).unwrap(),
-            Observation::ModelResponse { content, stop_reason: "end_turn".into(), output_tokens: 7 }
+            Observation::ModelResponse {
+                content,
+                stop_reason: "end_turn".into(),
+                output_tokens: 7
+            }
         );
 
         // Lost: no result at all, decided before the store is consulted.
         let (_other, empty) = store();
         let lost = rec(model(), EffectState::Failed, None);
-        assert_eq!(effect_observation(&empty, &lost).unwrap(), Observation::ModelCallLost);
-
-        let failed = with_result(&blobs, model(), EffectState::Failed, json!({ "reason": "http 400: bad" }));
         assert_eq!(
-            effect_observation(&blobs, &failed).unwrap(),
-            Observation::ModelCallFailed { reason: "http 400: bad".into(), failure: None }
+            effect_observation(&empty, &lost).unwrap(),
+            Observation::ModelCallLost
         );
 
-        let bare = with_result(&blobs, model(), EffectState::Completed, json!({ "stop_reason": "end_turn" }));
-        assert!(matches!(effect_observation(&blobs, &bare), Err(EngineError::Protocol(_))));
+        let failed = with_result(
+            &blobs,
+            model(),
+            EffectState::Failed,
+            json!({ "reason": "http 400: bad" }),
+        );
+        assert_eq!(
+            effect_observation(&blobs, &failed).unwrap(),
+            Observation::ModelCallFailed {
+                reason: "http 400: bad".into(),
+                failure: None
+            }
+        );
 
-        let unnamed = with_result(&blobs, model(), EffectState::Completed, json!({ "content": [] }));
+        let bare = with_result(
+            &blobs,
+            model(),
+            EffectState::Completed,
+            json!({ "stop_reason": "end_turn" }),
+        );
+        assert!(matches!(
+            effect_observation(&blobs, &bare),
+            Err(EngineError::Protocol(_))
+        ));
+
+        let unnamed = with_result(
+            &blobs,
+            model(),
+            EffectState::Completed,
+            json!({ "content": [] }),
+        );
         assert_eq!(
             effect_observation(&blobs, &unnamed).unwrap(),
-            Observation::ModelResponse { content: json!([]), stop_reason: "unknown".into(), output_tokens: 0 }
+            Observation::ModelResponse {
+                content: json!([]),
+                stop_reason: "unknown".into(),
+                output_tokens: 0
+            }
         );
     }
 
@@ -331,11 +446,21 @@ mod tests {
         let (_dir, blobs) = store();
         let ws = d("ws");
         let list = EffectKind::ListFiles { turn: 1 };
-        let read = EffectKind::ReadFile { path: "a".into(), turn: 1 };
-        let files = with_result(&blobs, list.clone(), EffectState::Completed, json!({ "files": ["a", "b"], "workspace_digest": ws }));
+        let read = EffectKind::ReadFile {
+            path: "a".into(),
+            turn: 1,
+        };
+        let files = with_result(
+            &blobs,
+            list.clone(),
+            EffectState::Completed,
+            json!({ "files": ["a", "b"], "workspace_digest": ws }),
+        );
         assert_eq!(
             effect_observation(&blobs, &files).unwrap(),
-            Observation::Files { files: vec!["a".into(), "b".into()] }
+            Observation::Files {
+                files: vec!["a".into(), "b".into()]
+            }
         );
         let file = with_result(
             &blobs,
@@ -345,13 +470,24 @@ mod tests {
         );
         assert_eq!(
             effect_observation(&blobs, &file).unwrap(),
-            Observation::FileRead { path: "a".into(), content: "x".into(), truncated: true }
+            Observation::FileRead {
+                path: "a".into(),
+                content: "x".into(),
+                truncated: true
+            }
         );
         for kind in [list, read] {
-            let failed = with_result(&blobs, kind, EffectState::Failed, json!({ "reason": "no such file" }));
+            let failed = with_result(
+                &blobs,
+                kind,
+                EffectState::Failed,
+                json!({ "reason": "no such file" }),
+            );
             assert_eq!(
                 effect_observation(&blobs, &failed).unwrap(),
-                Observation::FileReadRejected { reason: "no such file".into() }
+                Observation::FileReadRejected {
+                    reason: "no such file".into()
+                }
             );
         }
     }
@@ -361,19 +497,28 @@ mod tests {
         let read = json!({ "action": "ReadFile", "reason": "InvalidPath", "path": "../x" });
         assert_eq!(
             denial_observation(&read).unwrap(),
-            Observation::FileReadRejected { reason: read.to_string() }
+            Observation::FileReadRejected {
+                reason: read.to_string()
+            }
         );
-        let model_denied =
-            json!({ "reason": "CapabilityDenied", "capability": "model.request", "kind": { "ModelCall": { "model": "m", "turn": 1 } } });
+        let model_denied = json!({ "reason": "CapabilityDenied", "capability": "model.request", "kind": { "ModelCall": { "model": "m", "turn": 1 } } });
         assert_eq!(
             denial_observation(&model_denied).unwrap(),
-            Observation::ModelCallFailed { reason: "capability model.request not granted".into(), failure: None }
+            Observation::ModelCallFailed {
+                reason: "capability model.request not granted".into(),
+                failure: None
+            }
         );
-        for kind in [json!({ "ListFiles": { "turn": 1 } }), json!({ "ReadFile": { "path": "a", "turn": 1 } })] {
+        for kind in [
+            json!({ "ListFiles": { "turn": 1 } }),
+            json!({ "ReadFile": { "path": "a", "turn": 1 } }),
+        ] {
             let denied = json!({ "reason": "CapabilityDenied", "capability": "snapshot.read", "kind": kind });
             assert_eq!(
                 denial_observation(&denied).unwrap(),
-                Observation::FileReadRejected { reason: "capability snapshot.read not granted".into() }
+                Observation::FileReadRejected {
+                    reason: "capability snapshot.read not granted".into()
+                }
             );
         }
         // A non-capability denial journaled by a listing is a read rejection too, never a
@@ -381,17 +526,30 @@ mod tests {
         let listed = json!({ "action": "ListFiles", "reason": "SomethingElse" });
         assert_eq!(
             denial_observation(&listed).unwrap(),
-            Observation::FileReadRejected { reason: listed.to_string() }
+            Observation::FileReadRejected {
+                reason: listed.to_string()
+            }
         );
         // Patch denials are unchanged.
         let patch = json!({ "action": "ApplyPatch", "reason": "PathNotEditable", "paths": ["x"] });
-        assert_eq!(denial_observation(&patch).unwrap(), Observation::PatchRejected { reason: patch.to_string() });
+        assert_eq!(
+            denial_observation(&patch).unwrap(),
+            Observation::PatchRejected {
+                reason: patch.to_string()
+            }
+        );
         let conflict = json!({ "reason": "VersionConflict", "expected": d("a"), "actual": d("b") });
         assert_eq!(
             denial_observation(&conflict).unwrap(),
-            Observation::VersionConflict { expected: d("a"), actual: d("b") }
+            Observation::VersionConflict {
+                expected: d("a"),
+                actual: d("b")
+            }
         );
         let cap = json!({ "reason": "CapabilityDenied", "capability": "workspace.apply_patch", "kind": { "ApplyPatch": { "expected_base": d("a") } } });
-        assert!(matches!(denial_observation(&cap).unwrap(), Observation::PatchRejected { .. }));
+        assert!(matches!(
+            denial_observation(&cap).unwrap(),
+            Observation::PatchRejected { .. }
+        ));
     }
 }

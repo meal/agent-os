@@ -17,20 +17,21 @@ use std::time::{Duration, Instant};
 
 use agentos_core::effect::{AttemptId, EffectKind};
 use agentos_core::guest::{
-    mint_attempt_token, unb64, Message, Mode, FILE_LIMIT, GUEST_CID, GUEST_MIN_MEMORY_MIB, GUEST_PROTOCOL, MAX_VCPUS, OUTPUT_LIMIT, PATCH_LIMIT,
-    PROFILE_LIMIT, SCRATCH_IMAGE_BYTES, SNAPSHOT_BYTES_LIMIT, SNAPSHOT_FILES_LIMIT, WS_IMAGE_BYTES,
+    FILE_LIMIT, GUEST_CID, GUEST_MIN_MEMORY_MIB, GUEST_PROTOCOL, MAX_VCPUS, Message, Mode,
+    OUTPUT_LIMIT, PATCH_LIMIT, PROFILE_LIMIT, SCRATCH_IMAGE_BYTES, SNAPSHOT_BYTES_LIMIT,
+    SNAPSHOT_FILES_LIMIT, WS_IMAGE_BYTES, mint_attempt_token, unb64,
 };
 use agentos_core::ids::{Digest, TaskId};
 use agentos_core::workspace::{list_files, workspace_digest};
-use rustix::process::{kill_process, kill_process_group, Pid, Signal};
+use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 use serde::{Deserialize, Serialize};
 
 use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Reconciliation};
-use crate::guestlink::{fake_command, guest_text, type_name, GuestLauncher, GuestLink, LinkError};
+use crate::guestlink::{GuestLauncher, GuestLink, LinkError, fake_command, guest_text, type_name};
 use crate::jail::{self, CgroupOverrides, JailMode, StageSources};
 use crate::job::JobDir;
 use crate::outcomes::{self, Check};
-use crate::worker::{Worker, TEST_WORKERS_ENV};
+use crate::worker::{TEST_WORKERS_ENV, Worker};
 
 pub use agentos_guest::handlers::PatchStateIs;
 
@@ -94,7 +95,9 @@ impl FirecrackerConfig {
             return Err(format!("worker_vcpus must be between 1 and {MAX_VCPUS}"));
         }
         if self.memory_mib < GUEST_MIN_MEMORY_MIB {
-            return Err(format!("worker_memory_mib must be at least {GUEST_MIN_MEMORY_MIB}"));
+            return Err(format!(
+                "worker_memory_mib must be at least {GUEST_MIN_MEMORY_MIB}"
+            ));
         }
         Ok(())
     }
@@ -153,7 +156,10 @@ impl VmPaths {
             rootfs: text(&image_dir.join(ROOTFS_FILE)),
             ws_img: text(&self.ws_img),
             scratch_img: text(&self.scratch_img),
-            uds: self.uds.file_name().map_or_else(|| text(&self.uds), |n| text(Path::new(n))),
+            uds: self
+                .uds
+                .file_name()
+                .map_or_else(|| text(&self.uds), |n| text(Path::new(n))),
             log: text(&self.firecracker_log),
         }
     }
@@ -211,17 +217,49 @@ struct Logger<'a> {
 
 fn vm_config<'a>(cfg: &FirecrackerConfig, view: &'a VmView) -> VmConfig<'a> {
     VmConfig {
-        boot_source: BootSource { kernel_image_path: &view.kernel, boot_args: BOOT_ARGS },
+        boot_source: BootSource {
+            kernel_image_path: &view.kernel,
+            boot_args: BOOT_ARGS,
+        },
         drives: [
-            Drive { drive_id: "rootfs", is_root_device: true, is_read_only: true, path_on_host: &view.rootfs, cache_type: "Unsafe" },
+            Drive {
+                drive_id: "rootfs",
+                is_root_device: true,
+                is_read_only: true,
+                path_on_host: &view.rootfs,
+                cache_type: "Unsafe",
+            },
             // Writeback: a guest fsync reaches ws.img before the guest reports success.
-            Drive { drive_id: "workspace", is_root_device: false, is_read_only: false, path_on_host: &view.ws_img, cache_type: "Writeback" },
-            Drive { drive_id: "scratch", is_root_device: false, is_read_only: false, path_on_host: &view.scratch_img, cache_type: "Unsafe" },
+            Drive {
+                drive_id: "workspace",
+                is_root_device: false,
+                is_read_only: false,
+                path_on_host: &view.ws_img,
+                cache_type: "Writeback",
+            },
+            Drive {
+                drive_id: "scratch",
+                is_root_device: false,
+                is_read_only: false,
+                path_on_host: &view.scratch_img,
+                cache_type: "Unsafe",
+            },
         ],
-        machine_config: MachineConfig { vcpu_count: cfg.vcpus, mem_size_mib: cfg.memory_mib, smt: false, huge_pages: "None" },
-        vsock: Vsock { guest_cid: GUEST_CID, uds_path: &view.uds },
+        machine_config: MachineConfig {
+            vcpu_count: cfg.vcpus,
+            mem_size_mib: cfg.memory_mib,
+            smt: false,
+            huge_pages: "None",
+        },
+        vsock: Vsock {
+            guest_cid: GUEST_CID,
+            uds_path: &view.uds,
+        },
         network_interfaces: [],
-        logger: Logger { log_path: &view.log, level: "Warning" },
+        logger: Logger {
+            log_path: &view.log,
+            level: "Warning",
+        },
     }
 }
 
@@ -275,25 +313,50 @@ pub struct ImageManifest {
 pub fn read_image(image_dir: &Path) -> Result<ImageManifest, String> {
     let path = image_dir.join("image.json");
     let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let image: ImageManifest = serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    let image: ImageManifest =
+        serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     if let Some(interpreter) = &image.interpreter {
-        let hex = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-        if interpreter.version.is_empty() || interpreter.version.len() > 32
-            || !interpreter.version.bytes().all(|b| b.is_ascii_digit() || b == b'.')
-            || !hex(&interpreter.source_sha256, 64) || !hex(&interpreter.pyenv_commit, 40) {
+        let hex = |s: &str, n: usize| {
+            s.len() == n
+                && s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        if interpreter.version.is_empty()
+            || interpreter.version.len() > 32
+            || !interpreter
+                .version
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b == b'.')
+            || !hex(&interpreter.source_sha256, 64)
+            || !hex(&interpreter.pyenv_commit, 40)
+        {
             return Err("invalid interpreter provenance".into());
         }
     }
     if image.protocol != GUEST_PROTOCOL {
-        return Err(format!("{}: guest image speaks protocol {}, expected {GUEST_PROTOCOL}", path.display(), image.protocol));
+        return Err(format!(
+            "{}: guest image speaks protocol {}, expected {GUEST_PROTOCOL}",
+            path.display(),
+            image.protocol
+        ));
     }
-    for (field, name, want) in [("kernel", &image.kernel, KERNEL_FILE), ("rootfs", &image.rootfs, ROOTFS_FILE)] {
+    for (field, name, want) in [
+        ("kernel", &image.kernel, KERNEL_FILE),
+        ("rootfs", &image.rootfs, ROOTFS_FILE),
+    ] {
         if name != want {
-            return Err(format!("{}: {field} is {name:?}, expected {want:?}", path.display()));
+            return Err(format!(
+                "{}: {field} is {name:?}, expected {want:?}",
+                path.display()
+            ));
         }
         let file = image_dir.join(want);
         if !file.is_file() {
-            return Err(format!("{}: {field} {} is missing", path.display(), file.display()));
+            return Err(format!(
+                "{}: {field} {} is missing",
+                path.display(),
+                file.display()
+            ));
         }
     }
     Ok(image)
@@ -319,7 +382,10 @@ pub fn firecracker_version(firecracker_bin: &Path) -> Result<String, String> {
 fn version_line(cmd: Command, timeout: Duration) -> Result<String, String> {
     let (status, first) = first_stdout_line(cmd, timeout)?;
     if !status.success() || !first.starts_with(FIRECRACKER_VERSION_PREFIX) {
-        return Err(format!("expected {FIRECRACKER_VERSION_PREFIX}…, got {} ({status})", guest_text(&format!("{first:?}"))));
+        return Err(format!(
+            "expected {FIRECRACKER_VERSION_PREFIX}…, got {} ({status})",
+            guest_text(&format!("{first:?}"))
+        ));
     }
     Ok(first)
 }
@@ -327,7 +393,10 @@ fn version_line(cmd: Command, timeout: Duration) -> Result<String, String> {
 /// Runs `cmd` (stdin null, environment cleared, stdout captured up to 4 KiB) for at most
 /// `timeout`, killing it after that, and returns its exit status and trimmed first stdout
 /// line (unchecked, raw: the caller escapes it before it enters any text).
-pub(crate) fn first_stdout_line(mut cmd: Command, timeout: Duration) -> Result<(ExitStatus, String), String> {
+pub(crate) fn first_stdout_line(
+    mut cmd: Command,
+    timeout: Duration,
+) -> Result<(ExitStatus, String), String> {
     use std::io::Read;
     use std::sync::mpsc;
     let mut child = cmd
@@ -376,16 +445,25 @@ pub fn preflight(cfg: &FirecrackerConfig) -> Result<(), String> {
     cfg.validate()?;
     match &cfg.launcher {
         GuestLauncher::Real { .. } => {
-            File::options().read(true).write(true).open("/dev/kvm").map_err(|e| format!("/dev/kvm: {e}"))?;
+            File::options()
+                .read(true)
+                .write(true)
+                .open("/dev/kvm")
+                .map_err(|e| format!("/dev/kvm: {e}"))?;
             executable(&cfg.firecracker_bin)?;
-            firecracker_version(&cfg.firecracker_bin).map_err(|e| format!("firecracker --version: {e}"))?;
+            firecracker_version(&cfg.firecracker_bin)
+                .map_err(|e| format!("firecracker --version: {e}"))?;
         }
         GuestLauncher::Fake { program, .. } => executable(program)?,
     }
     read_image(&cfg.image_dir)?;
-    let found = workspace_digest(&cfg.image_dir).map_err(|e| format!("cannot digest {}: {e}", cfg.image_dir.display()))?;
+    let found = workspace_digest(&cfg.image_dir)
+        .map_err(|e| format!("cannot digest {}: {e}", cfg.image_dir.display()))?;
     if found != cfg.image_digest {
-        return Err(format!("guest image digest mismatch: pinned {}, found {found}", cfg.image_digest));
+        return Err(format!(
+            "guest image digest mismatch: pinned {}, found {found}",
+            cfg.image_digest
+        ));
     }
     Ok(())
 }
@@ -413,9 +491,19 @@ pub struct FirecrackerWorker {
 
 /// The request to send, prepared (and limit-checked) before anything is launched.
 enum Plan {
-    Snapshot { files: u64, bytes: u64 },
-    Patch { expected_base: Digest, editable_paths: Vec<String> },
-    Verify { files: u64, bytes: u64, source: Option<Digest> },
+    Snapshot {
+        files: u64,
+        bytes: u64,
+    },
+    Patch {
+        expected_base: Digest,
+        editable_paths: Vec<String>,
+    },
+    Verify {
+        files: u64,
+        bytes: u64,
+        source: Option<Digest>,
+    },
 }
 
 /// The reply that decides the outcome, held until the VM is down.
@@ -478,7 +566,10 @@ impl Vm {
                         let _ = kill_process_group(pid, Signal::KILL);
                     }
                 }
-                let status = self.child.wait().unwrap_or_else(|_| ExitStatus::from_raw(9));
+                let status = self
+                    .child
+                    .wait()
+                    .unwrap_or_else(|_| ExitStatus::from_raw(9));
                 self.status = Some(status);
                 status
             }
@@ -531,13 +622,17 @@ fn tree_within(root: &Path, bytes_limit: u64) -> Result<(u64, u64), String> {
     let entries = list_files(root).map_err(|e| e.to_string())?;
     let files = entries.len() as u64;
     if files > SNAPSHOT_FILES_LIMIT {
-        return Err(format!("{files} files, over the {SNAPSHOT_FILES_LIMIT} limit"));
+        return Err(format!(
+            "{files} files, over the {SNAPSHOT_FILES_LIMIT} limit"
+        ));
     }
     let mut bytes = 0u64;
     for (rel, path) in &entries {
         let len = path.metadata().map_err(|e| format!("{rel}: {e}"))?.len();
         if len > FILE_LIMIT {
-            return Err(format!("file {rel} is {len} bytes, over the {FILE_LIMIT} limit"));
+            return Err(format!(
+                "file {rel} is {len} bytes, over the {FILE_LIMIT} limit"
+            ));
         }
         bytes += len;
     }
@@ -577,12 +672,18 @@ fn sparse(path: &Path, len: u64) -> io::Result<()> {
 
 /// `name` from `extra` (a test seam's environment, last entry wins) or else the process's.
 fn env_value(extra: &[(String, String)], name: &str) -> Option<String> {
-    extra.iter().rev().find(|(k, _)| k == name).map(|(_, v)| v.clone()).or_else(|| std::env::var(name).ok())
+    extra
+        .iter()
+        .rev()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.clone())
+        .or_else(|| std::env::var(name).ok())
 }
 
 /// A test hook: `name=1` together with `AGENTOS_TEST_WORKERS=1`.
 fn test_hook(extra: &[(String, String)], name: &str) -> bool {
-    env_value(extra, TEST_WORKERS_ENV).as_deref() == Some("1") && env_value(extra, name).as_deref() == Some("1")
+    env_value(extra, TEST_WORKERS_ENV).as_deref() == Some("1")
+        && env_value(extra, name).as_deref() == Some("1")
 }
 
 /// The environment of a spawned VM process: the test switches of this process
@@ -598,8 +699,12 @@ fn guest_env(extra: &[(String, String)]) -> Vec<(String, String)> {
 
 /// The fake launcher runs only in tests.
 fn fake_gate(cfg: &FirecrackerConfig, extra: &[(String, String)]) -> Result<(), String> {
-    if matches!(cfg.launcher, GuestLauncher::Fake { .. }) && env_value(extra, TEST_WORKERS_ENV).as_deref() != Some("1") {
-        return Err(format!("firecracker worker unavailable: the fake guest launcher needs {TEST_WORKERS_ENV}=1"));
+    if matches!(cfg.launcher, GuestLauncher::Fake { .. })
+        && env_value(extra, TEST_WORKERS_ENV).as_deref() != Some("1")
+    {
+        return Err(format!(
+            "firecracker worker unavailable: the fake guest launcher needs {TEST_WORKERS_ENV}=1"
+        ));
     }
     Ok(())
 }
@@ -646,12 +751,16 @@ fn launch(
 ) -> Result<(Child, PathBuf), String> {
     let start = |e: io::Error| format!("cannot start firecracker: {e}");
     let stdio = || -> io::Result<(File, File)> {
-        Ok((File::options().append(true).open(&paths.console_log)?, File::options().append(true).open(&paths.stderr_log)?))
+        Ok((
+            File::options().append(true).open(&paths.console_log)?,
+            File::options().append(true).open(&paths.stderr_log)?,
+        ))
     };
     let env = guest_env(extra_env);
     let (mut cmd, uds) = match (&cfg.jail, &cfg.launcher) {
         (JailMode::Jailed(jc), _) => {
-            let plan = jail::plan(jc, &cfg.firecracker_bin, &paths.dir, id).map_err(|e| format!("cannot prepare the jail: {e}"))?;
+            let plan = jail::plan(jc, &cfg.firecracker_bin, &paths.dir, id)
+                .map_err(|e| format!("cannot prepare the jail: {e}"))?;
             let vm_json = render_vm_json(cfg, &jail::chroot_view(&plan));
             let sources = StageSources {
                 kernel: &cfg.image_dir.join(KERNEL_FILE),
@@ -663,13 +772,27 @@ fn launch(
             jail::stage(jc, &plan, &paths.dir, sources)?;
             let mut cmd = Command::new(&jc.jailer_bin);
             // The test seams' lowered bounds count only in a test run.
-            let overrides = if env_value(extra_env, TEST_WORKERS_ENV).as_deref() == Some("1") { overrides } else { CgroupOverrides::default() };
-            cmd.args(jail::jailer_args_with(jc, &plan, &cfg.firecracker_bin, cfg.vcpus, cfg.memory_mib, overrides));
+            let overrides = if env_value(extra_env, TEST_WORKERS_ENV).as_deref() == Some("1") {
+                overrides
+            } else {
+                CgroupOverrides::default()
+            };
+            cmd.args(jail::jailer_args_with(
+                jc,
+                &plan,
+                &cfg.firecracker_bin,
+                cfg.vcpus,
+                cfg.memory_mib,
+                overrides,
+            ));
             (cmd, jail::host_uds(&plan))
         }
         (JailMode::Unjailed, GuestLauncher::Real { .. }) => {
             let mut cmd = Command::new(&cfg.firecracker_bin);
-            cmd.args(["--no-api", "--config-file"]).arg(&paths.vm_json).arg("--id").arg(id);
+            cmd.args(["--no-api", "--config-file"])
+                .arg(&paths.vm_json)
+                .arg("--id")
+                .arg(id);
             (cmd, paths.uds.clone())
         }
         (JailMode::Unjailed, fake @ GuestLauncher::Fake { .. }) => {
@@ -681,7 +804,12 @@ fn launch(
         }
     };
     let (console, stderr) = stdio().map_err(start)?;
-    cmd.env_clear().envs(env).current_dir(&paths.dir).stdin(Stdio::null()).stdout(console).stderr(stderr);
+    cmd.env_clear()
+        .envs(env)
+        .current_dir(&paths.dir)
+        .stdin(Stdio::null())
+        .stdout(console)
+        .stderr(stderr);
     if group == Group::Own {
         cmd.process_group(0);
     }
@@ -692,7 +820,11 @@ fn launch(
 impl FirecrackerWorker {
     pub fn new(cfg: &FirecrackerConfig, job: &JobDir) -> FirecrackerWorker {
         // `<home>/jobs/<job>` ⇒ `<home>/inspect`, as `SupervisedExecutor` derives it.
-        let inspect_root = job.path.parent().and_then(Path::parent).map(|home| home.join("inspect"));
+        let inspect_root = job
+            .path
+            .parent()
+            .and_then(Path::parent)
+            .map(|home| home.join("inspect"));
         FirecrackerWorker {
             cfg: cfg.clone(),
             job_dir: job.path.clone(),
@@ -751,27 +883,44 @@ impl FirecrackerWorker {
     fn plan(&self, req: &EffectRequest) -> Result<Plan, String> {
         match &req.kind {
             EffectKind::ReadSnapshot => {
-                let (files, bytes) = tree_within(&self.cfg.snapshot_dir, SNAPSHOT_BYTES_LIMIT).map_err(|e| format!("snapshot failed: {e}"))?;
+                let (files, bytes) = tree_within(&self.cfg.snapshot_dir, SNAPSHOT_BYTES_LIMIT)
+                    .map_err(|e| format!("snapshot failed: {e}"))?;
                 Ok(Plan::Snapshot { files, bytes })
             }
             EffectKind::ApplyPatch { expected_base } => {
                 if req.payload.len() > PATCH_LIMIT {
-                    return Err(format!("invalid patch: {} bytes, over the {PATCH_LIMIT} limit", req.payload.len()));
+                    return Err(format!(
+                        "invalid patch: {} bytes, over the {PATCH_LIMIT} limit",
+                        req.payload.len()
+                    ));
                 }
-                Ok(Plan::Patch { expected_base: *expected_base, editable_paths: req.contract.editable_paths.clone() })
+                Ok(Plan::Patch {
+                    expected_base: *expected_base,
+                    editable_paths: req.contract.editable_paths.clone(),
+                })
             }
             EffectKind::RunVerification => {
-                let (files, bytes) = tree_within(&self.cfg.profile_dir, PROFILE_LIMIT).map_err(|e| format!("cannot stage profile: {e}"))?;
+                let (files, bytes) = tree_within(&self.cfg.profile_dir, PROFILE_LIMIT)
+                    .map_err(|e| format!("cannot stage profile: {e}"))?;
                 // Unpinned, the source must not change while the run is under way (the
                 // guest only sees the staged copy, so the host checks the source).
                 let source = match self.cfg.profile_digest {
                     Some(_) => None,
-                    None => Some(workspace_digest(&self.cfg.profile_dir).map_err(|e| format!("cannot digest profile: {e}"))?),
+                    None => Some(
+                        workspace_digest(&self.cfg.profile_dir)
+                            .map_err(|e| format!("cannot digest profile: {e}"))?,
+                    ),
                 };
-                Ok(Plan::Verify { files, bytes, source })
+                Ok(Plan::Verify {
+                    files,
+                    bytes,
+                    source,
+                })
             }
             EffectKind::ExportBundle => Err("not implemented in this milestone".into()),
-            EffectKind::ModelCall { .. } | EffectKind::ListFiles { .. } | EffectKind::ReadFile { .. } => {
+            EffectKind::ModelCall { .. }
+            | EffectKind::ListFiles { .. }
+            | EffectKind::ReadFile { .. } => {
                 Err(format!("not a worker effect: {}", req.kind.tag()))
             }
         }
@@ -810,22 +959,39 @@ impl FirecrackerWorker {
         // Prepare: ws.lock, ws.img, the request, scratch.img, the logs, vm.json.
         let task_dir = self.cfg.work_root.join(req.task_id.as_str());
         let paths = VmPaths::new(&self.job_dir, &self.cfg.work_root, &req.task_id);
-        let lock = match fs::create_dir_all(&task_dir).and_then(|()| File::options().create(true).truncate(false).write(true).open(task_dir.join("ws.lock"))) {
+        let lock = match fs::create_dir_all(&task_dir).and_then(|()| {
+            File::options()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(task_dir.join("ws.lock"))
+        }) {
             Ok(f) => f,
             Err(e) => return fail(format!("cannot prepare the VM: {e}")),
         };
         match lock_ws(&lock) {
             Ok(()) => {}
             // Another VM has the image: for a patch it may be applying it right now.
-            Err(TryLockError::WouldBlock) if is_patch => return WorkerResult::Outcome(ExecOutcome::unresolved(req, ctx, WS_BUSY)),
+            Err(TryLockError::WouldBlock) if is_patch => {
+                return WorkerResult::Outcome(ExecOutcome::unresolved(req, ctx, WS_BUSY));
+            }
             Err(TryLockError::WouldBlock) => return fail(WS_BUSY.into()),
-            Err(TryLockError::Error(e)) => return fail(format!("cannot prepare the VM: cannot lock {}: {e}", task_dir.join("ws.lock").display())),
+            Err(TryLockError::Error(e)) => {
+                return fail(format!(
+                    "cannot prepare the VM: cannot lock {}: {e}",
+                    task_dir.join("ws.lock").display()
+                ));
+            }
         }
         // A dead inspector's VM may still have the image (it held the lock and died).
         if let Some(root) = &self.inspect_root
             && let Err(busy) = collect_dead_inspections(&self.cfg, &root.join(req.task_id.as_str()))
         {
-            return if is_patch { WorkerResult::Outcome(ExecOutcome::unresolved(req, ctx, busy)) } else { fail(busy) };
+            return if is_patch {
+                WorkerResult::Outcome(ExecOutcome::unresolved(req, ctx, busy))
+            } else {
+                fail(busy)
+            };
         }
         let snapshot = matches!(req.kind, EffectKind::ReadSnapshot);
         if !snapshot && !paths.ws_img.is_file() {
@@ -835,13 +1001,19 @@ impl FirecrackerWorker {
             Ok(p) => p,
             Err(reason) => return fail(reason),
         };
-        if [&self.cfg.image_dir, &paths.dir, &paths.ws_img].iter().any(|p| p.to_str().is_none()) {
+        if [&self.cfg.image_dir, &paths.dir, &paths.ws_img]
+            .iter()
+            .any(|p| p.to_str().is_none())
+        {
             return fail("cannot prepare the VM: a VM path is not valid UTF-8".into());
         }
         // ws.img is created by ReadSnapshot only, from zero on every attempt, so a retry
         // starts clean.
         if snapshot && let Err(e) = sparse(&paths.ws_img, WS_IMAGE_BYTES) {
-            return fail(format!("cannot prepare the VM: {}: {e}", paths.ws_img.display()));
+            return fail(format!(
+                "cannot prepare the VM: {}: {e}",
+                paths.ws_img.display()
+            ));
         }
         let _scratch = ScratchGuard(paths.scratch_img.clone());
         if let Err(e) = prepare_vm_files(&self.cfg, &paths) {
@@ -850,8 +1022,24 @@ impl FirecrackerWorker {
 
         // Spawn and boot.
         let attempt = ctx.attempt_id.to_string();
-        let (mut vm, uds) = match launch(&self.cfg, &paths, &task_dir, &attempt, &self.env, Group::Caller, self.cgroup_overrides) {
-            Ok((child, uds)) => (Vm { child, status: None, own_group: false, swept: false }, uds),
+        let (mut vm, uds) = match launch(
+            &self.cfg,
+            &paths,
+            &task_dir,
+            &attempt,
+            &self.env,
+            Group::Caller,
+            self.cgroup_overrides,
+        ) {
+            Ok((child, uds)) => (
+                Vm {
+                    child,
+                    status: None,
+                    own_group: false,
+                    swept: false,
+                },
+                uds,
+            ),
             Err(reason) => return fail(reason),
         };
         let boot_deadline = Instant::now() + self.boot_timeout;
@@ -872,10 +1060,14 @@ impl FirecrackerWorker {
             lease_generation: ctx.lease_generation,
             mode: Mode::Job,
         };
-        let ready = link.hello(hello, boot_deadline).and_then(|ready| match ready {
-            Message::Ready { mode: Mode::Job, .. } => link.set_write_timeout(Some(WRITE_TIMEOUT)),
-            _ => Err(LinkError::Protocol("guest is not in job mode".into())),
-        });
+        let ready = link
+            .hello(hello, boot_deadline)
+            .and_then(|ready| match ready {
+                Message::Ready {
+                    mode: Mode::Job, ..
+                } => link.set_write_timeout(Some(WRITE_TIMEOUT)),
+                _ => Err(LinkError::Protocol("guest is not in job mode".into())),
+            });
         if let Err(e) = ready {
             drop(link);
             vm.kill();
@@ -891,10 +1083,16 @@ impl FirecrackerWorker {
                 drop(link);
                 let status = vm.wait_or_kill(SHUTDOWN_WAIT);
                 let reason = match served {
-                    Served::Lost => format!("guest exited before reporting: {}", exit_code_text(&status)),
+                    Served::Lost => {
+                        format!("guest exited before reporting: {}", exit_code_text(&status))
+                    }
                     Served::Violation(why) => why,
                 };
-                return if is_patch { WorkerResult::NoOutcome(reason) } else { fail(reason) };
+                return if is_patch {
+                    WorkerResult::NoOutcome(reason)
+                } else {
+                    fail(reason)
+                };
             }
         };
 
@@ -925,9 +1123,16 @@ impl FirecrackerWorker {
         if let Some(pinned) = self.cfg.profile_digest
             && check.profile_digest != pinned
         {
-            return Err(format!("profile digest mismatch: pinned {pinned}, found {}", check.profile_digest));
+            return Err(format!(
+                "profile digest mismatch: pinned {pinned}, found {}",
+                check.profile_digest
+            ));
         }
-        if let Plan::Verify { source: Some(source), .. } = plan {
+        if let Plan::Verify {
+            source: Some(source),
+            ..
+        } = plan
+        {
             let unchanged = workspace_digest(&self.cfg.profile_dir).is_ok_and(|d| d == *source);
             if check.profile_digest != *source || !unchanged {
                 return Err("protected profile changed during verification".into());
@@ -936,20 +1141,36 @@ impl FirecrackerWorker {
         Ok(())
     }
 
-    fn serve(&self, link: &mut GuestLink, plan: &Plan, req: &EffectRequest, vm: &mut Vm) -> Result<Reply, Served> {
+    fn serve(
+        &self,
+        link: &mut GuestLink,
+        plan: &Plan,
+        req: &EffectRequest,
+        vm: &mut Vm,
+    ) -> Result<Reply, Served> {
         let link_err = |e: LinkError| match e {
             LinkError::Protocol(_) => Served::Violation(e.to_string()),
             _ => Served::Lost,
         };
         let reply_until = match plan {
             Plan::Snapshot { files, bytes } => {
-                link.send(&Message::ReadSnapshot { file_count: *files, total_bytes: *bytes }).map_err(link_err)?;
+                link.send(&Message::ReadSnapshot {
+                    file_count: *files,
+                    total_bytes: *bytes,
+                })
+                .map_err(link_err)?;
                 link.send_tree(&self.cfg.snapshot_dir).map_err(link_err)?;
                 Instant::now() + REPLY_TIMEOUT
             }
-            Plan::Patch { expected_base, editable_paths } => {
-                link.send(&Message::ApplyPatch { expected_base: *expected_base, editable_paths: editable_paths.clone() })
-                    .map_err(link_err)?;
+            Plan::Patch {
+                expected_base,
+                editable_paths,
+            } => {
+                link.send(&Message::ApplyPatch {
+                    expected_base: *expected_base,
+                    editable_paths: editable_paths.clone(),
+                })
+                .map_err(link_err)?;
                 link.send_patch(&req.payload).map_err(link_err)?;
                 if self.test_hook(KILL_VM_AFTER_REQUEST_ENV) {
                     vm.kill();
@@ -966,7 +1187,9 @@ impl FirecrackerWorker {
                 })
                 .map_err(link_err)?;
                 link.send_tree(&self.cfg.profile_dir).map_err(link_err)?;
-                Instant::now() + Duration::from_secs(self.cfg.verify_timeout_secs) + VERIFY_REPLY_MARGIN
+                Instant::now()
+                    + Duration::from_secs(self.cfg.verify_timeout_secs)
+                    + VERIFY_REPLY_MARGIN
             }
         };
         let violation = |why: String| Served::Violation(LinkError::Protocol(why).to_string());
@@ -977,8 +1200,20 @@ impl FirecrackerWorker {
         };
         match (plan, link.recv(reply_until).map_err(link_err)?) {
             (_, Message::Refused { reason }) => Ok(Reply::Refused(reason)),
-            (Plan::Snapshot { .. }, Message::SnapshotDone { files, workspace_digest }) => Ok(Reply::Snapshot(files, workspace_digest)),
-            (Plan::Patch { .. }, Message::PatchApplied { paths, workspace_digest }) => Ok(Reply::Patch(paths, workspace_digest)),
+            (
+                Plan::Snapshot { .. },
+                Message::SnapshotDone {
+                    files,
+                    workspace_digest,
+                },
+            ) => Ok(Reply::Snapshot(files, workspace_digest)),
+            (
+                Plan::Patch { .. },
+                Message::PatchApplied {
+                    paths,
+                    workspace_digest,
+                },
+            ) => Ok(Reply::Patch(paths, workspace_digest)),
             (
                 Plan::Verify { .. },
                 Message::Verified {
@@ -993,8 +1228,10 @@ impl FirecrackerWorker {
                     stderr_truncated,
                 },
             ) => {
-                let stdout = unb64(&stdout_b64).map_err(|e| violation(guest_text(&format!("stdout_b64: {e}"))))?;
-                let stderr = unb64(&stderr_b64).map_err(|e| violation(guest_text(&format!("stderr_b64: {e}"))))?;
+                let stdout = unb64(&stdout_b64)
+                    .map_err(|e| violation(guest_text(&format!("stdout_b64: {e}"))))?;
+                let stderr = unb64(&stderr_b64)
+                    .map_err(|e| violation(guest_text(&format!("stderr_b64: {e}"))))?;
                 let (stdout, stdout_truncated) = capped(stdout, stdout_truncated);
                 let (stderr, stderr_truncated) = capped(stderr, stderr_truncated);
                 Ok(Reply::Verified(Check {
@@ -1009,7 +1246,10 @@ impl FirecrackerWorker {
                     stderr_truncated,
                 }))
             }
-            (_, other) => Err(violation(format!("expected {expected}, got {}", type_name(&other)))),
+            (_, other) => Err(violation(format!(
+                "expected {expected}, got {}",
+                type_name(&other)
+            ))),
         }
     }
 }
@@ -1020,7 +1260,10 @@ pub enum Query {
     /// The workspace digest (`current_workspace`).
     Digest,
     /// Whether `patch` was applied on top of `expected_base` (`reconcile`).
-    PatchState { expected_base: Digest, patch: Vec<u8> },
+    PatchState {
+        expected_base: Digest,
+        patch: Vec<u8>,
+    },
 }
 
 /// The guest's answer to a `Query`. Guest-controlled: `PatchStateIs.reason` must be
@@ -1049,7 +1292,10 @@ pub struct Inspector {
 /// Never prints the config's attempt token.
 impl std::fmt::Debug for Inspector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let cfg = FirecrackerConfig { attempt_token: "<redacted>".into(), ..self.cfg.clone() };
+        let cfg = FirecrackerConfig {
+            attempt_token: "<redacted>".into(),
+            ..self.cfg.clone()
+        };
         f.debug_struct("Inspector")
             .field("cfg", &cfg)
             .field("inspect_root", &self.inspect_root)
@@ -1081,7 +1327,10 @@ fn duration_text(d: Duration) -> String {
 /// has processes is proof that the dead inspector's VM lives on with `ws.img` attached (the
 /// lock died with its holder): that is `Err(WS_BUSY)`, and no second VM may boot on the
 /// image. Any other failure is a warning and keeps the directory for the next try.
-pub(crate) fn collect_dead_inspections(cfg: &FirecrackerConfig, task_root: &Path) -> Result<(), String> {
+pub(crate) fn collect_dead_inspections(
+    cfg: &FirecrackerConfig,
+    task_root: &Path,
+) -> Result<(), String> {
     let entries = match fs::read_dir(task_root) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -1107,7 +1356,9 @@ pub(crate) fn collect_dead_inspections(cfg: &FirecrackerConfig, task_root: &Path
                 tracing::warn!(dir = %dir.display(), error = %e, "a dead inspection's VM is still alive on the workspace image");
                 live = true;
             }
-            Err(e) => tracing::warn!(dir = %dir.display(), error = %e, "a dead inspection's jail was not collected; kept"),
+            Err(e) => {
+                tracing::warn!(dir = %dir.display(), error = %e, "a dead inspection's jail was not collected; kept")
+            }
         }
     }
     if live { Err(WS_BUSY.into()) } else { Ok(()) }
@@ -1187,7 +1438,8 @@ impl Inspector {
         }
         let deadline = Instant::now() + self.inspect_timeout;
         fake_gate(&self.cfg, &self.env).map_err(inspect_failed)?;
-        preflight(&self.cfg).map_err(|e| inspect_failed(format!("firecracker worker unavailable: {e}")))?;
+        preflight(&self.cfg)
+            .map_err(|e| inspect_failed(format!("firecracker worker unavailable: {e}")))?;
         let task_root = self.inspect_root.join(task.as_str());
 
         let lock_path = task_dir.join("ws.lock");
@@ -1200,7 +1452,12 @@ impl Inspector {
         match lock_ws(&lock) {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => return Err(WS_BUSY.into()),
-            Err(TryLockError::Error(e)) => return Err(inspect_failed(format!("cannot lock {}: {e}", lock_path.display()))),
+            Err(TryLockError::Error(e)) => {
+                return Err(inspect_failed(format!(
+                    "cannot lock {}: {e}",
+                    lock_path.display()
+                )));
+            }
         }
         // Under the lock: no VM of this process owns any of the task's inspect directories.
         collect_dead_inspections(&self.cfg, &task_root)?;
@@ -1209,13 +1466,18 @@ impl Inspector {
         let id = format!("inspect-{uuid}");
         let dir = task_root.join(&uuid);
         let paths = VmPaths::new(&dir, &self.cfg.work_root, task);
-        let result = self.boot(&paths, &task_dir, &id, task, &query, deadline).map_err(|why| {
-            if Instant::now() >= deadline {
-                inspect_failed(format!("timeout after {}", duration_text(self.inspect_timeout)))
-            } else {
-                inspect_failed(why)
-            }
-        });
+        let result = self
+            .boot(&paths, &task_dir, &id, task, &query, deadline)
+            .map_err(|why| {
+                if Instant::now() >= deadline {
+                    inspect_failed(format!(
+                        "timeout after {}",
+                        duration_text(self.inspect_timeout)
+                    ))
+                } else {
+                    inspect_failed(why)
+                }
+            });
 
         // The VM is reaped by now.
         let collected = match jail::collect(&dir, collect_root(&self.cfg)) {
@@ -1233,7 +1495,9 @@ impl Inspector {
                 }
             }
             Ok(_) => {}
-            Err(e) => tracing::warn!(task = %task, dir = %dir.display(), error = %e, "inspection failed; its directory is kept"),
+            Err(e) => {
+                tracing::warn!(task = %task, dir = %dir.display(), error = %e, "inspection failed; its directory is kept")
+            }
         }
         drop(lock);
         result
@@ -1242,17 +1506,43 @@ impl Inspector {
     /// Prepare, spawn, connect, `Hello{mode: inspect}`, the query, `Shutdown`. The VM is
     /// reaped (`Vm` kills its group and waits when dropped) before this returns. Errors are
     /// the reasons after `workspace inspection failed: `.
-    fn boot(&self, paths: &VmPaths, task_dir: &Path, id: &str, task: &TaskId, query: &Query, deadline: Instant) -> Result<Answer, String> {
-        fs::create_dir_all(&paths.dir).map_err(|e| format!("cannot prepare the VM: {}: {e}", paths.dir.display()))?;
-        if [&self.cfg.image_dir, &paths.dir, &paths.ws_img].iter().any(|p| p.to_str().is_none()) {
+    fn boot(
+        &self,
+        paths: &VmPaths,
+        task_dir: &Path,
+        id: &str,
+        task: &TaskId,
+        query: &Query,
+        deadline: Instant,
+    ) -> Result<Answer, String> {
+        fs::create_dir_all(&paths.dir)
+            .map_err(|e| format!("cannot prepare the VM: {}: {e}", paths.dir.display()))?;
+        if [&self.cfg.image_dir, &paths.dir, &paths.ws_img]
+            .iter()
+            .any(|p| p.to_str().is_none())
+        {
             return Err("cannot prepare the VM: a VM path is not valid UTF-8".into());
         }
         prepare_vm_files(&self.cfg, paths).map_err(|e| format!("cannot prepare the VM: {e}"))?;
-        let (child, uds) = launch(&self.cfg, paths, task_dir, id, &self.env, Group::Own, self.cgroup_overrides)?;
-        let mut vm = Vm { child, status: None, own_group: true, swept: false };
+        let (child, uds) = launch(
+            &self.cfg,
+            paths,
+            task_dir,
+            id,
+            &self.env,
+            Group::Own,
+            self.cgroup_overrides,
+        )?;
+        let mut vm = Vm {
+            child,
+            status: None,
+            own_group: true,
+            swept: false,
+        };
 
         let boot_deadline = deadline.min(Instant::now() + self.boot_timeout);
-        let mut link = GuestLink::connect_until(&uds, boot_deadline, || vm.exited()).map_err(|e| not_up(&e))?;
+        let mut link = GuestLink::connect_until(&uds, boot_deadline, || vm.exited())
+            .map_err(|e| not_up(&e))?;
         let hello = Message::Hello {
             protocol: GUEST_PROTOCOL,
             // Fresh per inspection: identity of this boot, never a job's token.
@@ -1264,12 +1554,22 @@ impl Inspector {
             mode: Mode::Inspect,
         };
         match link.hello(hello, boot_deadline) {
-            Ok(Message::Ready { mode: Mode::Inspect, .. }) => {}
-            Ok(_) => return Err(not_up(&LinkError::Protocol("guest is not in inspect mode".into()))),
+            Ok(Message::Ready {
+                mode: Mode::Inspect,
+                ..
+            }) => {}
+            Ok(_) => {
+                return Err(not_up(&LinkError::Protocol(
+                    "guest is not in inspect mode".into(),
+                )));
+            }
             Err(e) => return Err(not_up(&e)),
         }
-        let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
-        link.set_write_timeout(Some(left)).map_err(|e| e.to_string())?;
+        let left = deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1));
+        link.set_write_timeout(Some(left))
+            .map_err(|e| e.to_string())?;
 
         let violation = |why: String| LinkError::Protocol(why).to_string();
         let answer = match query {
@@ -1278,18 +1578,42 @@ impl Inspector {
                 match link.recv(deadline).map_err(|e| e.to_string())? {
                     Message::DigestIs { workspace_digest } => Answer::Digest(workspace_digest),
                     Message::Refused { reason } => return Err(guest_text(&reason)),
-                    other => return Err(violation(format!("expected DigestIs, got {}", type_name(&other)))),
+                    other => {
+                        return Err(violation(format!(
+                            "expected DigestIs, got {}",
+                            type_name(&other)
+                        )));
+                    }
                 }
             }
-            Query::PatchState { expected_base, patch } => {
-                link.send(&Message::PatchState { expected_base: *expected_base }).map_err(|e| e.to_string())?;
+            Query::PatchState {
+                expected_base,
+                patch,
+            } => {
+                link.send(&Message::PatchState {
+                    expected_base: *expected_base,
+                })
+                .map_err(|e| e.to_string())?;
                 link.send_patch(patch).map_err(|e| e.to_string())?;
                 match link.recv(deadline).map_err(|e| e.to_string())? {
-                    Message::PatchStateIs { state, paths, workspace_digest, reason } => {
-                        Answer::PatchState(PatchStateIs { state, paths, workspace_digest, reason })
-                    }
+                    Message::PatchStateIs {
+                        state,
+                        paths,
+                        workspace_digest,
+                        reason,
+                    } => Answer::PatchState(PatchStateIs {
+                        state,
+                        paths,
+                        workspace_digest,
+                        reason,
+                    }),
                     Message::Refused { reason } => return Err(guest_text(&reason)),
-                    other => return Err(violation(format!("expected PatchStateIs, got {}", type_name(&other)))),
+                    other => {
+                        return Err(violation(format!(
+                            "expected PatchStateIs, got {}",
+                            type_name(&other)
+                        )));
+                    }
                 }
             }
         };
@@ -1352,7 +1676,9 @@ mod tests {
             vcpus: 2,
             memory_mib: 512,
             attempt_token: "0123456789abcdef0123456789abcdef".into(),
-            launcher: GuestLauncher::Real { firecracker_bin: "/home/x/bin/firecracker".into() },
+            launcher: GuestLauncher::Real {
+                firecracker_bin: "/home/x/bin/firecracker".into(),
+            },
             jail: JailMode::Unjailed,
         }
     }
@@ -1361,26 +1687,51 @@ mod tests {
     fn vm_json_matches_the_golden_file() {
         let cfg = config();
         let task: TaskId = serde_json::from_str("\"task-1\"").unwrap();
-        let paths = VmPaths::new(Path::new("/home/x/jobs/effect-1-attempt-1"), &cfg.work_root, &task);
+        let paths = VmPaths::new(
+            Path::new("/home/x/jobs/effect-1-attempt-1"),
+            &cfg.work_root,
+            &task,
+        );
         let rendered = render_vm_json(&cfg, &paths.host_view(&cfg.image_dir));
-        let golden: serde_json::Value = serde_json::from_str(include_str!("../tests/golden/vm.json")).unwrap();
+        let golden: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/golden/vm.json")).unwrap();
         assert_eq!(rendered, golden);
         assert_eq!(rendered["network-interfaces"], serde_json::json!([]));
         assert_eq!(rendered["machine-config"]["smt"], false);
-        let ids: Vec<&str> = rendered["drives"].as_array().unwrap().iter().map(|d| d["drive_id"].as_str().unwrap()).collect();
+        let ids: Vec<&str> = rendered["drives"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["drive_id"].as_str().unwrap())
+            .collect();
         assert_eq!(ids, ["rootfs", "workspace", "scratch"]);
         assert_eq!(rendered["vsock"]["guest_cid"], 3);
 
         // The written file keeps the documented field order.
         let dir = tempfile::tempdir().unwrap();
-        write_vm_json(&dir.path().join("vm.json"), &cfg, &paths.host_view(&cfg.image_dir)).unwrap();
+        write_vm_json(
+            &dir.path().join("vm.json"),
+            &cfg,
+            &paths.host_view(&cfg.image_dir),
+        )
+        .unwrap();
         let written = fs::read_to_string(dir.path().join("vm.json")).unwrap();
-        let order: Vec<usize> = ["boot-source", "drives", "machine-config", "vsock", "network-interfaces", "logger"]
-            .iter()
-            .map(|k| written.find(&format!("\"{k}\"")).unwrap())
-            .collect();
+        let order: Vec<usize> = [
+            "boot-source",
+            "drives",
+            "machine-config",
+            "vsock",
+            "network-interfaces",
+            "logger",
+        ]
+        .iter()
+        .map(|k| written.find(&format!("\"{k}\"")).unwrap())
+        .collect();
         assert!(order.windows(2).all(|w| w[0] < w[1]), "{written}");
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&written).unwrap(), golden);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&written).unwrap(),
+            golden
+        );
     }
 
     #[test]
@@ -1393,11 +1744,17 @@ mod tests {
             gid: crate::jail::JAIL_GID,
             cgroup_root: "/sys/fs/cgroup".into(),
         });
-        jailed.launcher = GuestLauncher::Fake { program: "/bin/agentos".into(), prefix_args: vec!["supervise".into()] };
+        jailed.launcher = GuestLauncher::Fake {
+            program: "/bin/agentos".into(),
+            prefix_args: vec!["supervise".into()],
+        };
         jailed.profile_digest = Some(Digest::of(b"p"));
         for cfg in [unjailed, jailed] {
             let json = serde_json::to_string(&cfg).unwrap();
-            assert_eq!(serde_json::from_str::<FirecrackerConfig>(&json).unwrap(), cfg);
+            assert_eq!(
+                serde_json::from_str::<FirecrackerConfig>(&json).unwrap(),
+                cfg
+            );
             let worker = WorkerConfig::Firecracker(cfg.clone());
             let json = serde_json::to_string(&worker).unwrap();
             assert_eq!(serde_json::from_str::<WorkerConfig>(&json).unwrap(), worker);
@@ -1407,17 +1764,39 @@ mod tests {
     #[test]
     fn exit_codes_are_named() {
         for code in [0, 1, 2, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157] {
-            assert_eq!(exit_code_text(&ExitStatus::from_raw(code << 8)), format!("firecracker exit code {code}"));
+            assert_eq!(
+                exit_code_text(&ExitStatus::from_raw(code << 8)),
+                format!("firecracker exit code {code}")
+            );
         }
-        assert_eq!(exit_code_text(&ExitStatus::from_raw(9)), "firecracker killed by signal 9");
+        assert_eq!(
+            exit_code_text(&ExitStatus::from_raw(9)),
+            "firecracker killed by signal 9"
+        );
     }
 
     #[test]
     fn config_validation_rejects_vcpus_0_and_33_and_memory_127() {
-        let with = |vcpus, memory_mib| FirecrackerConfig { vcpus, memory_mib, ..config() }.validate();
-        assert_eq!(with(0, 256).unwrap_err(), "worker_vcpus must be between 1 and 32");
-        assert_eq!(with(33, 256).unwrap_err(), "worker_vcpus must be between 1 and 32");
-        assert_eq!(with(1, 127).unwrap_err(), "worker_memory_mib must be at least 128");
+        let with = |vcpus, memory_mib| {
+            FirecrackerConfig {
+                vcpus,
+                memory_mib,
+                ..config()
+            }
+            .validate()
+        };
+        assert_eq!(
+            with(0, 256).unwrap_err(),
+            "worker_vcpus must be between 1 and 32"
+        );
+        assert_eq!(
+            with(33, 256).unwrap_err(),
+            "worker_vcpus must be between 1 and 32"
+        );
+        assert_eq!(
+            with(1, 127).unwrap_err(),
+            "worker_memory_mib must be at least 128"
+        );
         for (v, m) in [(1, 128), (32, 128), (1, 65536)] {
             with(v, m).unwrap();
         }
@@ -1457,24 +1836,52 @@ mod tests {
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{name}");
             assert!(err.to_string().starts_with(name), "{err}");
         }
-        for token in ["", "0123456789abcdef0123456789abcde", "0123456789ABCDEF0123456789ABCDEF"] {
-            let cfg = FirecrackerConfig { attempt_token: token.into(), ..config() };
+        for token in [
+            "",
+            "0123456789abcdef0123456789abcde",
+            "0123456789ABCDEF0123456789ABCDEF",
+        ] {
+            let cfg = FirecrackerConfig {
+                attempt_token: token.into(),
+                ..config()
+            };
             let err = JobDir::create(root.path(), &request(cfg)).err().unwrap();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{token:?}");
             assert!(err.to_string().contains("attempt_token"), "{err}");
         }
         let mut jailed = config();
-        jailed.jail = JailMode::Jailed(JailConfig { jailer_bin: "jailer".into(), uid: 1, gid: 1, cgroup_root: "/sys/fs/cgroup".into() });
+        jailed.jail = JailMode::Jailed(JailConfig {
+            jailer_bin: "jailer".into(),
+            uid: 1,
+            gid: 1,
+            cgroup_root: "/sys/fs/cgroup".into(),
+        });
         assert!(JobDir::create(root.path(), &request(jailed)).is_err());
-        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0, "nothing was created");
+        assert_eq!(
+            fs::read_dir(root.path()).unwrap().count(),
+            0,
+            "nothing was created"
+        );
         JobDir::create(root.path(), &request(config())).unwrap();
         // A Real launcher must name the same (absolute) binary as the config.
         let mut two = config();
-        two.launcher = GuestLauncher::Real { firecracker_bin: "/elsewhere/firecracker".into() };
+        two.launcher = GuestLauncher::Real {
+            firecracker_bin: "/elsewhere/firecracker".into(),
+        };
         let err = JobDir::create(root.path(), &request(two)).err().unwrap();
-        assert!(err.to_string().contains("differs from firecracker_bin"), "{err}");
+        assert!(
+            err.to_string().contains("differs from firecracker_bin"),
+            "{err}"
+        );
         // run_worker re-checks the same rule.
-        assert!(WorkerConfig::Firecracker(FirecrackerConfig { work_root: "w".into(), ..config() }).check_paths().is_err());
+        assert!(
+            WorkerConfig::Firecracker(FirecrackerConfig {
+                work_root: "w".into(),
+                ..config()
+            })
+            .check_paths()
+            .is_err()
+        );
     }
 
     #[test]
@@ -1487,28 +1894,61 @@ mod tests {
         let started = Instant::now();
         let err = version_line(sh("sleep 30"), Duration::from_millis(300)).unwrap_err();
         assert_eq!(err, "no answer within 300 ms");
-        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
-        assert_eq!(version_line(sh("echo 'Firecracker v1.17.0'; echo x"), Duration::from_secs(5)).unwrap(), "Firecracker v1.17.0");
-        let err = version_line(sh("printf 'Firecracker v1.16.2\\n'"), Duration::from_secs(5)).unwrap_err();
-        assert!(err.starts_with("expected Firecracker v1.17.…, got \"Firecracker v1.16.2\""), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            version_line(
+                sh("echo 'Firecracker v1.17.0'; echo x"),
+                Duration::from_secs(5)
+            )
+            .unwrap(),
+            "Firecracker v1.17.0"
+        );
+        let err = version_line(
+            sh("printf 'Firecracker v1.16.2\\n'"),
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with("expected Firecracker v1.17.…, got \"Firecracker v1.16.2\""),
+            "{err}"
+        );
         assert!(firecracker_version(Path::new("/nonexistent/firecracker")).is_err());
     }
 
     #[test]
     fn guest_text_is_one_bounded_line() {
-        use crate::guestlink::{escape_controls, guest_text, GUEST_TEXT_LIMIT};
-        assert_eq!(escape_controls("a\nb\u{1b}c\u{2028}"), "a\\nb\\u{1b}c\\u{2028}");
+        use crate::guestlink::{GUEST_TEXT_LIMIT, escape_controls, guest_text};
+        assert_eq!(
+            escape_controls("a\nb\u{1b}c\u{2028}"),
+            "a\\nb\\u{1b}c\\u{2028}"
+        );
         assert_eq!(guest_text("plain"), "plain");
         let long = guest_text(&"é\n".repeat(10_000));
-        assert!(long.len() <= GUEST_TEXT_LIMIT + " [truncated]".len() && long.ends_with(" [truncated]"), "{long}");
+        assert!(
+            long.len() <= GUEST_TEXT_LIMIT + " [truncated]".len() && long.ends_with(" [truncated]"),
+            "{long}"
+        );
         assert!(!long.chars().any(|c| c.is_control()));
     }
 
     #[test]
     fn a_refusal_at_hello_is_escaped_and_bounded() {
-        let why = not_up(&LinkError::Refused(format!("bad\n\u{1b}[31m{}", "x".repeat(5000))));
-        assert!(why.starts_with("guest did not come up: bad\\n\\u{1b}[31m"), "{why}");
-        assert!(!why.chars().any(|c| c.is_control()) && why.len() < 700, "{why}");
+        let why = not_up(&LinkError::Refused(format!(
+            "bad\n\u{1b}[31m{}",
+            "x".repeat(5000)
+        )));
+        assert!(
+            why.starts_with("guest did not come up: bad\\n\\u{1b}[31m"),
+            "{why}"
+        );
+        assert!(
+            !why.chars().any(|c| c.is_control()) && why.len() < 700,
+            "{why}"
+        );
     }
 
     #[test]
@@ -1522,11 +1962,23 @@ mod tests {
         assert_eq!(read_image(dir.path()).unwrap().id, "python-stdlib-v1");
 
         write(&good.replace(r#""built_from":"test""#, r#""built_from":"test","extra":1"#));
-        assert!(read_image(dir.path()).unwrap_err().contains("unknown field `extra`"));
+        assert!(
+            read_image(dir.path())
+                .unwrap_err()
+                .contains("unknown field `extra`")
+        );
         write(&good.replace(r#""protocol":1"#, r#""protocol":2"#));
-        assert!(read_image(dir.path()).unwrap_err().contains("protocol 2, expected 1"));
+        assert!(
+            read_image(dir.path())
+                .unwrap_err()
+                .contains("protocol 2, expected 1")
+        );
         write(&good.replace(r#""kernel":"vmlinux""#, r#""kernel":"../../etc/vmlinux""#));
-        assert!(read_image(dir.path()).unwrap_err().contains("expected \"vmlinux\""));
+        assert!(
+            read_image(dir.path())
+                .unwrap_err()
+                .contains("expected \"vmlinux\"")
+        );
         write(good);
         fs::remove_file(dir.path().join(ROOTFS_FILE)).unwrap();
         assert!(read_image(dir.path()).unwrap_err().contains("is missing"));
@@ -1548,10 +2000,19 @@ mod tests {
                 "pyenv_commit": "3787bacc9188d76ba7ca24c23e26afb1a841a543"
             }
         });
-        let write = |v: &serde_json::Value| fs::write(dir.path().join("image.json"), serde_json::to_vec(v).unwrap()).unwrap();
+        let write = |v: &serde_json::Value| {
+            fs::write(
+                dir.path().join("image.json"),
+                serde_json::to_vec(v).unwrap(),
+            )
+            .unwrap()
+        };
         write(&value);
         let manifest = read_image(dir.path()).unwrap();
-        assert_eq!(serde_json::to_value(manifest).unwrap()["interpreter"], value["interpreter"]);
+        assert_eq!(
+            serde_json::to_value(manifest).unwrap()["interpreter"],
+            value["interpreter"]
+        );
         value["interpreter"]["source_sha256"] = serde_json::json!("invalid");
         write(&value);
         assert!(read_image(dir.path()).is_err());

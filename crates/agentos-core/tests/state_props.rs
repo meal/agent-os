@@ -1,6 +1,6 @@
 use agentos_core::contract::Limits;
 use agentos_core::ids::{Digest, TaskId};
-use agentos_core::state::{reduce, Task, TaskEvent, TaskState};
+use agentos_core::state::{Task, TaskEvent, TaskState, reduce};
 use proptest::prelude::*;
 
 fn digest() -> impl Strategy<Value = Digest> {

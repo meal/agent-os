@@ -24,14 +24,25 @@ struct Fx {
 impl Fx {
     fn new() -> Fx {
         let dir = tempfile::tempdir().unwrap();
-        copy_dir(&fixtures().join("parser-repo"), &dir.path().join("snapshot"));
-        copy_dir(&fixtures().join("profiles/parser-checks-v1"), &dir.path().join("profile"));
+        copy_dir(
+            &fixtures().join("parser-repo"),
+            &dir.path().join("snapshot"),
+        );
+        copy_dir(
+            &fixtures().join("profiles/parser-checks-v1"),
+            &dir.path().join("profile"),
+        );
         let exec = FixtureExecutor::new(
             dir.path().join("snapshot"),
             dir.path().join("profile"),
             dir.path().join("work"),
         );
-        Fx { dir, exec, task: TaskId::new(), contract: contract(10).0 }
+        Fx {
+            dir,
+            exec,
+            task: TaskId::new(),
+            contract: contract(10).0,
+        }
     }
 
     fn ws(&self) -> std::path::PathBuf {
@@ -50,7 +61,11 @@ impl Fx {
     }
 
     async fn run(&self, kind: EffectKind, payload: &[u8]) -> ExecOutcome {
-        let ctx = AttemptCtx { attempt_id: AttemptId::new(), lease_generation: 1, worker: "test".into() };
+        let ctx = AttemptCtx {
+            attempt_id: AttemptId::new(),
+            lease_generation: 1,
+            worker: "test".into(),
+        };
         let req = self.request(kind, payload);
         let out = self.exec.run(&req, &ctx).await;
         assert_eq!(out.receipt.effect_id, req.effect_id);
@@ -62,19 +77,33 @@ impl Fx {
 
     async fn snapshot(&self) -> Digest {
         let out = self.run(EffectKind::ReadSnapshot, b"").await;
-        assert_eq!(out.receipt.outcome, Outcome::Success, "{}", String::from_utf8_lossy(&out.output));
+        assert_eq!(
+            out.receipt.outcome,
+            Outcome::Success,
+            "{}",
+            String::from_utf8_lossy(&out.output)
+        );
         out.new_workspace.unwrap()
     }
 
     async fn apply(&self, base: Digest, patch: &str) -> ExecOutcome {
-        self.run(EffectKind::ApplyPatch { expected_base: base }, patch.as_bytes()).await
+        self.run(
+            EffectKind::ApplyPatch {
+                expected_base: base,
+            },
+            patch.as_bytes(),
+        )
+        .await
     }
 }
 
 fn reason(out: &ExecOutcome) -> String {
     match &out.receipt.outcome {
         Outcome::Failure(r) => r.clone(),
-        Outcome::Success => panic!("expected failure, got success: {}", String::from_utf8_lossy(&out.output)),
+        Outcome::Success => panic!(
+            "expected failure, got success: {}",
+            String::from_utf8_lossy(&out.output)
+        ),
     }
 }
 
@@ -88,13 +117,21 @@ async fn read_snapshot_copies_the_repo_and_reports_a_manifest() {
     fs::create_dir_all(fx.dir.path().join("snapshot/.git")).unwrap();
     fs::write(fx.dir.path().join("snapshot/.git/HEAD"), "x").unwrap();
     let digest = fx.snapshot().await;
-    assert_eq!(digest, workspace_digest(&fx.dir.path().join("snapshot")).unwrap());
+    assert_eq!(
+        digest,
+        workspace_digest(&fx.dir.path().join("snapshot")).unwrap()
+    );
     assert_eq!(digest, workspace_digest(&fx.ws()).unwrap());
     assert!(!fx.ws().join(".git").exists());
     let out = fx.run(EffectKind::ReadSnapshot, b"").await;
     let manifest = json(&out);
     assert_eq!(manifest["workspace_digest"], digest.to_string());
-    assert!(manifest["files"].as_array().unwrap().contains(&"src/parser.py".into()));
+    assert!(
+        manifest["files"]
+            .as_array()
+            .unwrap()
+            .contains(&"src/parser.py".into())
+    );
 
     // Re-running the snapshot resets the workspace (retry is idempotent).
     fs::write(fx.ws().join("src/extra.py"), "x").unwrap();
@@ -107,7 +144,12 @@ async fn apply_patch_changes_the_workspace_and_reports_paths() {
     let fx = Fx::new();
     let base = fx.snapshot().await;
     let out = fx.apply(base, &fix_patch()).await;
-    assert_eq!(out.receipt.outcome, Outcome::Success, "{}", String::from_utf8_lossy(&out.output));
+    assert_eq!(
+        out.receipt.outcome,
+        Outcome::Success,
+        "{}",
+        String::from_utf8_lossy(&out.output)
+    );
     let new = workspace_digest(&fx.ws()).unwrap();
     assert_eq!(out.new_workspace, Some(new));
     assert_ne!(new, base);
@@ -123,7 +165,11 @@ async fn apply_patch_with_a_stale_base_is_a_version_conflict_and_touches_nothing
     let fx = Fx::new();
     let base = fx.snapshot().await;
     let out = fx.apply(Digest::of(b"stale"), &fix_patch()).await;
-    assert!(reason(&out).contains("version conflict"), "{}", reason(&out));
+    assert!(
+        reason(&out).contains("version conflict"),
+        "{}",
+        reason(&out)
+    );
     assert_eq!(out.new_workspace, None);
     assert_eq!(workspace_digest(&fx.ws()).unwrap(), base);
 }
@@ -137,16 +183,34 @@ async fn patch_through_a_symlinked_directory_is_rejected_without_writing_outside
     fs::create_dir_all(&outside).unwrap();
     std::os::unix::fs::symlink(&outside, fx.ws().join("src/escape")).unwrap();
 
-    let out = fx.apply(base, &create_patch("src/escape/pwned.py", "owned")).await;
+    let out = fx
+        .apply(base, &create_patch("src/escape/pwned.py", "owned"))
+        .await;
     let r = reason(&out);
-    assert!(r.contains("symlink") && r.contains("src/escape/pwned.py"), "{r}");
-    assert_eq!(fs::read_dir(&outside).unwrap().count(), 0, "nothing written outside the workspace");
+    assert!(
+        r.contains("symlink") && r.contains("src/escape/pwned.py"),
+        "{r}"
+    );
+    assert_eq!(
+        fs::read_dir(&outside).unwrap().count(),
+        0,
+        "nothing written outside the workspace"
+    );
 
     // An existing file reached through the link is equally refused.
     fs::write(outside.join("target.py"), "old\n").unwrap();
-    let out = fx.apply(base, &edit_patch("src/escape/target.py", "old", "new")).await;
-    assert!(reason(&out).contains("crosses symlink src/escape"), "{}", reason(&out));
-    assert_eq!(fs::read_to_string(outside.join("target.py")).unwrap(), "old\n");
+    let out = fx
+        .apply(base, &edit_patch("src/escape/target.py", "old", "new"))
+        .await;
+    assert!(
+        reason(&out).contains("crosses symlink src/escape"),
+        "{}",
+        reason(&out)
+    );
+    assert_eq!(
+        fs::read_to_string(outside.join("target.py")).unwrap(),
+        "old\n"
+    );
 }
 
 #[tokio::test]
@@ -156,8 +220,14 @@ async fn patch_onto_a_symlinked_file_is_rejected() {
     let outside = fx.dir.path().join("victim.py");
     fs::write(&outside, "old\n").unwrap();
     std::os::unix::fs::symlink(&outside, fx.ws().join("src/victim.py")).unwrap();
-    let out = fx.apply(base, &edit_patch("src/victim.py", "old", "new")).await;
-    assert!(reason(&out).contains("crosses symlink src/victim.py"), "{}", reason(&out));
+    let out = fx
+        .apply(base, &edit_patch("src/victim.py", "old", "new"))
+        .await;
+    assert!(
+        reason(&out).contains("crosses symlink src/victim.py"),
+        "{}",
+        reason(&out)
+    );
     assert_eq!(fs::read_to_string(&outside).unwrap(), "old\n");
 }
 
@@ -183,7 +253,12 @@ async fn parent_traversal_is_rejected_even_when_the_target_exists() {
 async fn executor_enforces_editable_paths_itself() {
     let fx = Fx::new();
     let base = fx.snapshot().await;
-    let out = fx.apply(base, &edit_patch("tests/test_parser.py", "import unittest", "import os")).await;
+    let out = fx
+        .apply(
+            base,
+            &edit_patch("tests/test_parser.py", "import unittest", "import os"),
+        )
+        .await;
     assert!(reason(&out).contains("not editable"), "{}", reason(&out));
     assert_eq!(workspace_digest(&fx.ws()).unwrap(), base);
 }
@@ -207,7 +282,12 @@ async fn unsupported_patch_shapes_are_rejected() {
     let mode = "diff --git a/src/parser.py b/src/parser.py\nold mode 100644\nnew mode 100755\n";
     let copy = "diff --git a/tests/test_parser.py b/src/t.py\nsimilarity index 100%\ncopy from tests/test_parser.py\ncopy to src/t.py\n";
     let binary = "diff --git a/src/b.bin b/src/b.bin\nnew file mode 100644\nindex 0000000..1111111\nGIT binary patch\nliteral 1\nIcmZpX000310RR91\n\nliteral 0\nHcmV?d00001\n\n";
-    for (name, p) in [("symlink", symlink), ("mode", mode), ("copy", copy), ("binary", binary)] {
+    for (name, p) in [
+        ("symlink", symlink),
+        ("mode", mode),
+        ("copy", copy),
+        ("binary", binary),
+    ] {
         assert!(patch_paths(p).await.is_err(), "{name} accepted");
     }
     assert!(patch_paths("").await.is_err());
@@ -221,7 +301,11 @@ async fn patch_paths_lists_created_deleted_and_quoted_paths() {
     let both = format!("{}{delete}{quoted}", create_patch("src/new.py", "n"));
     assert_eq!(
         patch_paths(&both).await.unwrap(),
-        vec!["src/new.py".to_string(), "src/old.py".into(), "src/we ird.py".into()]
+        vec![
+            "src/new.py".to_string(),
+            "src/old.py".into(),
+            "src/we ird.py".into()
+        ]
     );
 }
 
@@ -249,7 +333,11 @@ async fn verification_reports_pass_and_fail_as_successful_effects() {
     assert!(report.passed);
     assert_eq!(report.workspace, fixed);
     assert_eq!(json(&passing)["exit_code"], 0);
-    assert_eq!(workspace_digest(&fx.ws()).unwrap(), fixed, "verification leaves the workspace as is");
+    assert_eq!(
+        workspace_digest(&fx.ws()).unwrap(),
+        fixed,
+        "verification leaves the workspace as is"
+    );
     assert!(!fx.ws().join("src/__pycache__").exists());
 }
 
@@ -288,14 +376,23 @@ async fn verification_sees_only_path_from_the_environment() {
     assert!(std::env::var_os("CARGO_MANIFEST_DIR").is_some() || std::env::var_os("HOME").is_some());
     let out = fx.run(EffectKind::RunVerification, b"").await;
     let stdout = json(&out)["stdout"].as_str().unwrap().to_string();
-    let env: std::collections::BTreeMap<String, String> = serde_json::from_str(stdout.trim()).unwrap();
+    let env: std::collections::BTreeMap<String, String> =
+        serde_json::from_str(stdout.trim()).unwrap();
     // Python itself may add LC_CTYPE (locale coercion); nothing else leaks in.
-    let allowed = ["LC_CTYPE", "PATH", "PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX"];
+    let allowed = [
+        "LC_CTYPE",
+        "PATH",
+        "PYTHONDONTWRITEBYTECODE",
+        "PYTHONPYCACHEPREFIX",
+    ];
     assert!(env.keys().all(|k| allowed.contains(&k.as_str())), "{env:?}");
     assert!(env.contains_key("PATH") && env.contains_key("PYTHONDONTWRITEBYTECODE"));
     // Bytecode caches go to the run's scratch dir, never into the workspace.
     let prefix = Path::new(&env["PYTHONPYCACHEPREFIX"]);
-    assert!(prefix.is_absolute() && !prefix.starts_with(fx.ws()), "{prefix:?}");
+    assert!(
+        prefix.is_absolute() && !prefix.starts_with(fx.ws()),
+        "{prefix:?}"
+    );
 }
 
 #[tokio::test]
@@ -318,10 +415,17 @@ async fn apply_without_a_snapshot_fails() {
 async fn executor_rejects_paths_the_workspace_digest_ignores() {
     let fx = Fx::new();
     let base = fx.snapshot().await;
-    for path in ["src/__pycache__/helper.py", "src/helper.pyc", "src/.git/config"] {
+    for path in [
+        "src/__pycache__/helper.py",
+        "src/helper.pyc",
+        "src/.git/config",
+    ] {
         let out = fx.apply(base, &create_patch(path, "import os")).await;
         let r = reason(&out);
-        assert!(r.contains("excluded from the workspace digest") && r.contains(path), "{r}");
+        assert!(
+            r.contains("excluded from the workspace digest") && r.contains(path),
+            "{r}"
+        );
         assert!(!fx.ws().join(path).exists(), "{path}");
     }
     assert_eq!(workspace_digest(&fx.ws()).unwrap(), base);
@@ -331,7 +435,11 @@ async fn executor_rejects_paths_the_workspace_digest_ignores() {
 /// `Fx` works on a copy.
 fn script_profile(fx: &Fx, script: &str) {
     let profile = serde_json::json!({ "id": "pg-test", "command": ["python3", "-c", script], "protected": true });
-    fs::write(fx.dir.path().join("profile/profile.json"), profile.to_string()).unwrap();
+    fs::write(
+        fx.dir.path().join("profile/profile.json"),
+        profile.to_string(),
+    )
+    .unwrap();
 }
 
 /// A grandchild that outlives the check by `delay` and then writes `marker`.
@@ -355,13 +463,29 @@ async fn verification_kills_the_whole_process_group_after_the_check_exits() {
 
     let started = std::time::Instant::now();
     let out = fx.run(EffectKind::RunVerification, b"").await;
-    assert_eq!(out.receipt.outcome, Outcome::Success, "{}", String::from_utf8_lossy(&out.output));
+    assert_eq!(
+        out.receipt.outcome,
+        Outcome::Success,
+        "{}",
+        String::from_utf8_lossy(&out.output)
+    );
     assert!(out.verification.as_ref().unwrap().passed);
-    assert!(json(&out)["stdout"].as_str().unwrap().contains("checks done"));
-    assert!(started.elapsed() < Duration::from_millis(900), "did not wait for the grandchild");
+    assert!(
+        json(&out)["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("checks done")
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(900),
+        "did not wait for the grandchild"
+    );
 
     tokio::time::sleep(Duration::from_millis(1800)).await;
-    assert!(!marker.exists(), "a background grandchild survived the verification run");
+    assert!(
+        !marker.exists(),
+        "a background grandchild survived the verification run"
+    );
 }
 
 #[tokio::test]
@@ -382,7 +506,10 @@ async fn verification_timeout_kills_the_whole_process_group() {
     assert_eq!(reason(&out), "timeout");
 
     tokio::time::sleep(Duration::from_millis(1800)).await;
-    assert!(!marker.exists(), "a background grandchild survived the timeout");
+    assert!(
+        !marker.exists(),
+        "a background grandchild survived the timeout"
+    );
 }
 
 /// Writes an unchecked-hash bytecode cache of the workspace's current `src/parser.py` where
@@ -393,7 +520,11 @@ fn plant_bytecode(ws: &Path) {
                   tag = sys.implementation.cache_tag\n\
                   out = os.path.join(sys.argv[1], 'src', '__pycache__', f'parser.{tag}.pyc')\n\
                   py_compile.compile(src, cfile=out, doraise=True, invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)\n";
-    let status = std::process::Command::new("python3").args(["-c", script]).arg(ws).status().unwrap();
+    let status = std::process::Command::new("python3")
+        .args(["-c", script])
+        .arg(ws)
+        .status()
+        .unwrap();
     assert!(status.success());
     assert!(ws.join("src/__pycache__").is_dir());
 }
@@ -405,14 +536,29 @@ async fn planted_bytecode_cannot_decide_a_later_verification() {
     fx.apply(base, &fix_patch()).await;
     // Bytecode of the FIXED parser, then the source goes back to the buggy one.
     plant_bytecode(&fx.ws());
-    fs::copy(fx.dir.path().join("snapshot/src/parser.py"), fx.ws().join("src/parser.py")).unwrap();
-    assert_eq!(workspace_digest(&fx.ws()).unwrap(), base, "the digest cannot see the planted bytecode");
+    fs::copy(
+        fx.dir.path().join("snapshot/src/parser.py"),
+        fx.ws().join("src/parser.py"),
+    )
+    .unwrap();
+    assert_eq!(
+        workspace_digest(&fx.ws()).unwrap(),
+        base,
+        "the digest cannot see the planted bytecode"
+    );
 
     let out = fx.run(EffectKind::RunVerification, b"").await;
 
     let passed = out.verification.as_ref().is_some_and(|r| r.passed);
-    assert!(!passed, "the buggy source must not pass: {}", String::from_utf8_lossy(&out.output));
-    assert!(!fx.ws().join("src/__pycache__").exists(), "excluded entries are purged before the run");
+    assert!(
+        !passed,
+        "the buggy source must not pass: {}",
+        String::from_utf8_lossy(&out.output)
+    );
+    assert!(
+        !fx.ws().join("src/__pycache__").exists(),
+        "excluded entries are purged before the run"
+    );
 }
 
 #[tokio::test]
@@ -429,7 +575,11 @@ async fn a_check_that_leaves_excluded_entries_behind_voids_its_evidence() {
     let out = fx.run(EffectKind::RunVerification, b"").await;
 
     assert!(out.verification.is_none());
-    assert!(reason(&out).contains("workspace polluted by excluded entries"), "{}", reason(&out));
+    assert!(
+        reason(&out).contains("workspace polluted by excluded entries"),
+        "{}",
+        reason(&out)
+    );
     assert!(reason(&out).contains("src/__pycache__"), "{}", reason(&out));
 }
 
@@ -438,7 +588,12 @@ async fn a_planted_git_directory_does_not_influence_git_apply() {
     let fx = Fx::new();
     let base = fx.snapshot().await;
     let git = |args: &[&str]| {
-        let ok = std::process::Command::new("git").args(args).current_dir(fx.ws()).env("GIT_CONFIG_GLOBAL", "/dev/null").status().unwrap();
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(fx.ws())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .unwrap();
         assert!(ok.success(), "{args:?}");
     };
     // A repository whose config would reject the patch's trailing whitespace.
@@ -449,6 +604,14 @@ async fn a_planted_git_directory_does_not_influence_git_apply() {
 
     let out = fx.apply(base, &trailing).await;
 
-    assert_eq!(out.receipt.outcome, Outcome::Success, "{}", String::from_utf8_lossy(&out.output));
-    assert!(!fx.ws().join(".git").exists(), "the planted repository is gone");
+    assert_eq!(
+        out.receipt.outcome,
+        Outcome::Success,
+        "{}",
+        String::from_utf8_lossy(&out.output)
+    );
+    assert!(
+        !fx.ws().join(".git").exists(),
+        "the planted repository is gone"
+    );
 }

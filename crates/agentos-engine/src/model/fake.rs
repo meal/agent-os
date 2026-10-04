@@ -26,7 +26,12 @@ pub struct Transcript {
 
 pub fn load_transcript(path: &Path) -> io::Result<Transcript> {
     let bytes = std::fs::read(path)?;
-    serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display())))
+    serde_json::from_slice(&bytes).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{}: {e}", path.display()),
+        )
+    })
 }
 
 enum Mode {
@@ -48,11 +53,17 @@ impl FakeProvider {
     }
 
     pub fn from_transcript(t: Transcript) -> FakeProvider {
-        FakeProvider { mode: Arc::new(Mode::Transcript(t)), calls: Arc::new(AtomicUsize::new(0)) }
+        FakeProvider {
+            mode: Arc::new(Mode::Transcript(t)),
+            calls: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     pub fn scripted(results: Vec<ProviderResult>) -> FakeProvider {
-        FakeProvider { mode: Arc::new(Mode::Scripted(Mutex::new(results.into()))), calls: Arc::new(AtomicUsize::new(0)) }
+        FakeProvider {
+            mode: Arc::new(Mode::Scripted(Mutex::new(results.into()))),
+            calls: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     /// Another handle on the same script and call counter, for a test that hands the provider
@@ -122,7 +133,11 @@ pub struct Recording<P: ModelProvider> {
 
 impl<P: ModelProvider> Recording<P> {
     pub fn new(inner: P, path: PathBuf) -> Recording<P> {
-        Recording { inner, path, entries: Mutex::new(Vec::new()) }
+        Recording {
+            inner,
+            path,
+            entries: Mutex::new(Vec::new()),
+        }
     }
 }
 
@@ -135,8 +150,13 @@ impl<P: ModelProvider> ModelProvider for Recording<P> {
             {
                 let transcript = {
                     let mut entries = self.entries.lock().expect("recording lock");
-                    entries.push(TranscriptEntry { expect_request_digest: Some(Digest::of(body)), response });
-                    Transcript { responses: entries.clone() }
+                    entries.push(TranscriptEntry {
+                        expect_request_digest: Some(Digest::of(body)),
+                        response,
+                    });
+                    Transcript {
+                        responses: entries.clone(),
+                    }
                 };
                 let json = serde_json::to_vec_pretty(&transcript).expect("a transcript serializes");
                 if let Err(e) = atomic_write(&self.path, &json) {
@@ -166,23 +186,38 @@ mod tests {
 
     fn id_of(r: &ProviderResult) -> String {
         match r {
-            ProviderResult::Response(b, _) => serde_json::from_slice::<serde_json::Value>(b).unwrap()["id"].as_str().unwrap().to_string(),
+            ProviderResult::Response(b, _) => serde_json::from_slice::<serde_json::Value>(b)
+                .unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
             other => panic!("not a response: {other:?}"),
         }
     }
 
     #[tokio::test]
     async fn transcript_answers_by_conversation_depth() {
-        let p = FakeProvider::from_transcript(Transcript { responses: vec![entry(0), entry(1), entry(2)] });
+        let p = FakeProvider::from_transcript(Transcript {
+            responses: vec![entry(0), entry(1), entry(2)],
+        });
         assert_eq!(id_of(&p.complete(&body(1)).await), "msg_0");
         assert_eq!(id_of(&p.complete(&body(3)).await), "msg_1");
         assert_eq!(id_of(&p.complete(&body(5)).await), "msg_2");
-        assert_eq!(id_of(&p.complete(&body(1)).await), "msg_0", "a retry gets the same answer");
+        assert_eq!(
+            id_of(&p.complete(&body(1)).await),
+            "msg_0",
+            "a retry gets the same answer"
+        );
         match p.complete(&body(7)).await {
-            ProviderResult::Rejected { status: 400, body } => assert!(body.contains("exhausted"), "{body}"),
+            ProviderResult::Rejected { status: 400, body } => {
+                assert!(body.contains("exhausted"), "{body}")
+            }
             other => panic!("{other:?}"),
         }
-        assert!(matches!(p.complete(&body(2)).await, ProviderResult::Rejected { .. }));
+        assert!(matches!(
+            p.complete(&body(2)).await,
+            ProviderResult::Rejected { .. }
+        ));
         assert_eq!(p.calls(), 6);
     }
 
@@ -193,9 +228,14 @@ mod tests {
         e.expect_request_digest = Some(Digest::of(&pinned));
         let p = FakeProvider::from_transcript(Transcript { responses: vec![e] });
         assert_eq!(id_of(&p.complete(&pinned).await), "msg_0");
-        let other = serde_json::to_vec(&serde_json::json!({"messages": [{"role": "user", "content": "different"}]})).unwrap();
+        let other = serde_json::to_vec(
+            &serde_json::json!({"messages": [{"role": "user", "content": "different"}]}),
+        )
+        .unwrap();
         match p.complete(&other).await {
-            ProviderResult::Rejected { status: 400, body } => assert!(body.contains("entry 0 expects request"), "{body}"),
+            ProviderResult::Rejected { status: 400, body } => {
+                assert!(body.contains("entry 0 expects request"), "{body}")
+            }
             other => panic!("{other:?}"),
         }
     }
@@ -206,11 +246,20 @@ mod tests {
             ProviderResult::Transport("boom".into()),
             ProviderResult::Response(b"{}".to_vec(), Default::default()),
         ]);
-        assert_eq!(p.complete(b"a").await, ProviderResult::Transport("boom".into()));
-        assert!(matches!(p.complete(b"b").await, ProviderResult::Response(..)));
+        assert_eq!(
+            p.complete(b"a").await,
+            ProviderResult::Transport("boom".into())
+        );
+        assert!(matches!(
+            p.complete(b"b").await,
+            ProviderResult::Response(..)
+        ));
         assert_eq!(
             p.complete(b"c").await,
-            ProviderResult::Rejected { status: 400, body: "scripted provider exhausted".into() }
+            ProviderResult::Rejected {
+                status: 400,
+                body: "scripted provider exhausted".into()
+            }
         );
         assert_eq!(p.calls(), 3);
     }
@@ -219,7 +268,12 @@ mod tests {
     async fn recording_writes_the_transcript_format_without_the_request_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rec.json");
-        let rec = Recording::new(FakeProvider::from_transcript(Transcript { responses: vec![entry(0), entry(1)] }), path.clone());
+        let rec = Recording::new(
+            FakeProvider::from_transcript(Transcript {
+                responses: vec![entry(0), entry(1)],
+            }),
+            path.clone(),
+        );
         let b1 = br#"{"messages":[{"role":"user","content":"PRIVATE-REQUEST-TEXT"}]}"#.to_vec();
         let b2 = br#"{"messages":[{"role":"user","content":"PRIVATE-REQUEST-TEXT"},{"role":"assistant","content":"a"},{"role":"user","content":"PRIVATE-2"}]}"#.to_vec();
         rec.complete(&b1).await;

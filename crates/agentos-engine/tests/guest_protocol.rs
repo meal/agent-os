@@ -26,9 +26,18 @@ fn frames_cross_a_real_pipe_in_both_directions() {
         read_frame(&mut a, RAW_FRAME_LIMIT).unwrap()
     });
 
-    assert_eq!(read_frame(&mut b, RAW_FRAME_LIMIT).unwrap(), Frame::Json(hello));
-    assert_eq!(read_frame(&mut b, RAW_FRAME_LIMIT).unwrap(), Frame::Raw(raw));
-    assert_eq!(read_frame(&mut b, RAW_FRAME_LIMIT).unwrap(), Frame::Json(Message::Shutdown));
+    assert_eq!(
+        read_frame(&mut b, RAW_FRAME_LIMIT).unwrap(),
+        Frame::Json(hello)
+    );
+    assert_eq!(
+        read_frame(&mut b, RAW_FRAME_LIMIT).unwrap(),
+        Frame::Raw(raw)
+    );
+    assert_eq!(
+        read_frame(&mut b, RAW_FRAME_LIMIT).unwrap(),
+        Frame::Json(Message::Shutdown)
+    );
     write_frame(&mut b, &Frame::Json(Message::Bye)).unwrap();
     assert_eq!(writer.join().unwrap(), Frame::Json(Message::Bye));
 }

@@ -12,15 +12,16 @@ use std::time::Duration;
 
 use agentos_core::contract::path_matches;
 use agentos_core::guest::{
-    b64, raw_frames_for, read_frame, Frame, Message, PatchStateKind, FILE_LIMIT, JSON_FRAME_LIMIT, OUTPUT_LIMIT, PROFILE_LIMIT,
-    RAW_FRAME_LIMIT, SNAPSHOT_BYTES_LIMIT, SNAPSHOT_FILES_LIMIT,
+    FILE_LIMIT, Frame, JSON_FRAME_LIMIT, Message, OUTPUT_LIMIT, PROFILE_LIMIT, PatchStateKind,
+    RAW_FRAME_LIMIT, SNAPSHOT_BYTES_LIMIT, SNAPSHOT_FILES_LIMIT, b64, raw_frames_for, read_frame,
 };
 use agentos_core::ids::Digest;
 use agentos_core::patchrules::{check_summary, parse_numstat};
 use agentos_core::workspace::{
-    copy_tree, excluded_entries, has_excluded_component, list_files, purge_excluded, symlink_on_path, workspace_digest,
+    copy_tree, excluded_entries, has_excluded_component, list_files, purge_excluded,
+    symlink_on_path, workspace_digest,
 };
-use rustix::process::{kill_process_group, waitpgid, Pid, Signal, WaitOptions};
+use rustix::process::{Pid, Signal, WaitOptions, kill_process_group, waitpgid};
 use serde::Deserialize;
 
 use crate::backend::Backend;
@@ -80,7 +81,12 @@ pub struct PatchStateIs {
 
 impl PatchStateIs {
     fn unknown(workspace_digest: Option<Digest>, reason: String) -> PatchStateIs {
-        PatchStateIs { state: PatchStateKind::Unknown, paths: Vec::new(), workspace_digest, reason: Some(reason) }
+        PatchStateIs {
+            state: PatchStateKind::Unknown,
+            paths: Vec::new(),
+            workspace_digest,
+            reason: Some(reason),
+        }
     }
 
     pub fn into_message(self) -> Message {
@@ -118,7 +124,10 @@ impl FileSink for DirSink {
     }
 
     fn chunk(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.current.as_mut().ok_or_else(|| io::Error::other("no open file"))?.write_all(bytes)
+        self.current
+            .as_mut()
+            .ok_or_else(|| io::Error::other("no open file"))?
+            .write_all(bytes)
     }
 
     fn end(&mut self) -> io::Result<()> {
@@ -139,7 +148,11 @@ impl FileSink for MemSink {
     }
 
     fn chunk(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.files.last_mut().ok_or_else(|| io::Error::other("no open file"))?.1.extend_from_slice(bytes);
+        self.files
+            .last_mut()
+            .ok_or_else(|| io::Error::other("no open file"))?
+            .1
+            .extend_from_slice(bytes);
         Ok(())
     }
 
@@ -152,8 +165,12 @@ impl FileSink for MemSink {
 fn safe_relative(rel: &str) -> bool {
     !rel.is_empty()
         && !rel.starts_with('/')
-        && Path::new(rel).components().all(|c| matches!(c, Component::Normal(_)))
-        && !rel.split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..")
+        && Path::new(rel)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
+        && !rel
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
 }
 
 /// Receives `File{path, len}` + `raw_frames_for(len)` raw frames per file, then `EndFiles`,
@@ -168,10 +185,14 @@ fn receive_files(
     sink: &mut dyn FileSink,
 ) -> Result<Option<io::Error>, String> {
     if file_count > SNAPSHOT_FILES_LIMIT {
-        return Err(format!("{file_count} files announced, limit {SNAPSHOT_FILES_LIMIT}"));
+        return Err(format!(
+            "{file_count} files announced, limit {SNAPSHOT_FILES_LIMIT}"
+        ));
     }
     if total_bytes > bytes_limit {
-        return Err(format!("{total_bytes} bytes announced, limit {bytes_limit}"));
+        return Err(format!(
+            "{total_bytes} bytes announced, limit {bytes_limit}"
+        ));
     }
     let (mut files, mut bytes) = (0u64, 0u64);
     let mut failed: Option<io::Error> = None;
@@ -197,7 +218,10 @@ fn receive_files(
         if len > FILE_LIMIT {
             return Err(format!("file of {len} bytes, limit {FILE_LIMIT}"));
         }
-        bytes = bytes.checked_add(len).filter(|b| *b <= total_bytes).ok_or("more bytes than announced")?;
+        bytes = bytes
+            .checked_add(len)
+            .filter(|b| *b <= total_bytes)
+            .ok_or("more bytes than announced")?;
         if !safe_relative(&path) {
             return Err(format!("unsafe path {path:?}"));
         }
@@ -207,11 +231,15 @@ fn receive_files(
         let mut left = len;
         for _ in 0..raw_frames_for(len) {
             let want = left.min(RAW_FRAME_LIMIT as u64);
-            let Frame::Raw(chunk) = read_frame(link, RAW_FRAME_LIMIT).map_err(|e| e.to_string())? else {
+            let Frame::Raw(chunk) = read_frame(link, RAW_FRAME_LIMIT).map_err(|e| e.to_string())?
+            else {
                 return Err("JSON frame inside a file's bytes".into());
             };
             if chunk.len() as u64 != want {
-                return Err(format!("raw frame of {} bytes, expected {want}", chunk.len()));
+                return Err(format!(
+                    "raw frame of {} bytes, expected {want}",
+                    chunk.len()
+                ));
             }
             left -= want;
             if failed.is_none() {
@@ -240,12 +268,20 @@ pub fn read_snapshot(
     let failed = |e: String| StreamError::Refused(format!("snapshot failed: {e}"));
     let prepared = backend.prepare_workspace();
     let ws = backend.workspace_dir().to_path_buf();
-    let mut dir_sink = DirSink { root: ws.clone(), current: None };
+    let mut dir_sink = DirSink {
+        root: ws.clone(),
+        current: None,
+    };
     // Even when the workspace could not be prepared, the stream is drained, so the reply
     // stays in step with the request.
     let mut discard = DiscardSink;
-    let sink: &mut dyn FileSink = if prepared.is_ok() { &mut dir_sink } else { &mut discard };
-    let written = receive_files(link, file_count, total_bytes, SNAPSHOT_BYTES_LIMIT, sink).map_err(StreamError::Protocol)?;
+    let sink: &mut dyn FileSink = if prepared.is_ok() {
+        &mut dir_sink
+    } else {
+        &mut discard
+    };
+    let written = receive_files(link, file_count, total_bytes, SNAPSHOT_BYTES_LIMIT, sink)
+        .map_err(StreamError::Protocol)?;
     prepared.map_err(failed)?;
     if let Some(e) = written {
         return Err(failed(e.to_string()));
@@ -253,7 +289,11 @@ pub fn read_snapshot(
     // Written as root; `git` runs as `builder` from now on.
     backend.own_tree(&ws).map_err(failed)?;
     backend.sync_workspace().map_err(failed)?;
-    let files = list_files(&ws).map_err(|e| failed(e.to_string()))?.into_iter().map(|(rel, _)| rel).collect();
+    let files = list_files(&ws)
+        .map_err(|e| failed(e.to_string()))?
+        .into_iter()
+        .map(|(rel, _)| rel)
+        .collect();
     let digest = workspace_digest(&ws).map_err(|e| failed(e.to_string()))?;
     Ok((files, digest))
 }
@@ -275,7 +315,11 @@ impl FileSink for DiscardSink {
 
 /// The profile files of a `RunVerification`, held in memory (≤ `PROFILE_LIMIT`). The sink
 /// cannot fail, so the only error is a protocol violation (its text).
-pub fn receive_profile(link: &mut impl Read, file_count: u64, total_bytes: u64) -> Result<StagedProfile, String> {
+pub fn receive_profile(
+    link: &mut impl Read,
+    file_count: u64,
+    total_bytes: u64,
+) -> Result<StagedProfile, String> {
     let mut sink = MemSink::default();
     receive_files(link, file_count, total_bytes, PROFILE_LIMIT, &mut sink)?;
     Ok(StagedProfile { files: sink.files })
@@ -323,7 +367,11 @@ fn stderr_of(out: &std::process::Output) -> String {
 
 /// Repo-relative paths `patch_file` touches, in patch order, or why it is unacceptable
 /// (3a `paths_of_file`). `cwd` lies outside any repository.
-fn paths_of_file(backend: &dyn Backend, patch_file: &Path, cwd: &Path) -> Result<Vec<String>, String> {
+fn paths_of_file(
+    backend: &dyn Backend,
+    patch_file: &Path,
+    cwd: &Path,
+) -> Result<Vec<String>, String> {
     let numstat = backend
         .git(cwd)
         .args(["apply", "--numstat", "-z"])
@@ -333,8 +381,12 @@ fn paths_of_file(backend: &dyn Backend, patch_file: &Path, cwd: &Path) -> Result
     if !numstat.status.success() {
         return Err(format!("invalid patch: {}", stderr_of(&numstat)));
     }
-    let summary =
-        backend.git(cwd).args(["apply", "--summary"]).arg(patch_file).output().map_err(|e| format!("cannot run git: {e}"))?;
+    let summary = backend
+        .git(cwd)
+        .args(["apply", "--summary"])
+        .arg(patch_file)
+        .output()
+        .map_err(|e| format!("cannot run git: {e}"))?;
     if !summary.status.success() {
         return Err(format!("invalid patch: {}", stderr_of(&summary)));
     }
@@ -343,7 +395,11 @@ fn paths_of_file(backend: &dyn Backend, patch_file: &Path, cwd: &Path) -> Result
 }
 
 /// Writes the patch to a fresh `<scratch>/<name>/change.patch` and parses it there.
-fn stage_patch(backend: &dyn Backend, name: &str, patch: &[u8]) -> Result<(PathBuf, PathBuf, Vec<String>), String> {
+fn stage_patch(
+    backend: &dyn Backend,
+    name: &str,
+    patch: &[u8],
+) -> Result<(PathBuf, PathBuf, Vec<String>), String> {
     let dir = fresh_scratch(backend, name)?;
     let file = dir.join("change.patch");
     fs::write(&file, patch).map_err(|e| format!("cannot write patch: {e}"))?;
@@ -379,17 +435,26 @@ pub fn apply_patch(
     }
     let actual = workspace_digest(&ws).map_err(|e| format!("cannot digest workspace: {e}"))?;
     if actual != expected_base {
-        return Err(format!("version conflict: expected {expected_base}, actual {actual}"));
+        return Err(format!(
+            "version conflict: expected {expected_base}, actual {actual}"
+        ));
     }
     // A planted `.git` would make `git apply` honour its repo-local configuration.
     purge_excluded(&ws).map_err(|e| format!("cannot clean workspace: {e}"))?;
     for args in [&["apply", "--check"][..], &["apply"][..]] {
-        let out = backend.git(&ws).args(args).arg(&patch_file).output().map_err(|e| format!("cannot run git: {e}"))?;
+        let out = backend
+            .git(&ws)
+            .args(args)
+            .arg(&patch_file)
+            .output()
+            .map_err(|e| format!("cannot run git: {e}"))?;
         if !out.status.success() {
             return Err(format!("patch does not apply: {}", stderr_of(&out)));
         }
     }
-    backend.sync_workspace().map_err(|e| format!("cannot sync workspace: {e}"))?;
+    backend
+        .sync_workspace()
+        .map_err(|e| format!("cannot sync workspace: {e}"))?;
     let digest = workspace_digest(&ws).map_err(|e| format!("cannot digest workspace: {e}"))?;
     Ok((paths, digest))
 }
@@ -402,14 +467,17 @@ struct Profile {
 
 /// The serialized `command` and `profile_id` must leave room in the `Verified` frame for
 /// both output streams at their limit (base64) and the fixed fields.
-pub const VERIFIED_TEXT_BUDGET: usize = JSON_FRAME_LIMIT - 2 * (4 * (OUTPUT_LIMIT + 1).div_ceil(3)) - 4096;
+pub const VERIFIED_TEXT_BUDGET: usize =
+    JSON_FRAME_LIMIT - 2 * (4 * (OUTPUT_LIMIT + 1).div_ceil(3)) - 4096;
 
 /// Refuses a profile whose `id` and `command`, as JSON, would not fit `Verified`.
 fn check_reply_size(profile: &Profile) -> Result<(), String> {
     let size = serde_json::to_vec(&profile.command).map_or(usize::MAX, |v| v.len())
         + serde_json::to_vec(&profile.id).map_or(usize::MAX, |v| v.len());
     if size > VERIFIED_TEXT_BUDGET {
-        return Err(format!("profile command too large: {size} bytes of JSON, limit {VERIFIED_TEXT_BUDGET}"));
+        return Err(format!(
+            "profile command too large: {size} bytes of JSON, limit {VERIFIED_TEXT_BUDGET}"
+        ));
     }
     Ok(())
 }
@@ -435,7 +503,10 @@ pub fn run_verification(
     }
     let ws = backend.workspace_dir().to_path_buf();
     let staged = fresh_scratch(backend, "profile")?;
-    let mut sink = DirSink { root: staged.clone(), current: None };
+    let mut sink = DirSink {
+        root: staged.clone(),
+        current: None,
+    };
     for (rel, bytes) in &profile_files.files {
         if !safe_relative(rel) {
             return Err(format!("cannot stage profile: unsafe path {rel:?}"));
@@ -446,15 +517,20 @@ pub fn run_verification(
             .map_err(|e| format!("cannot stage profile: {e}"))?;
     }
     drop(profile_files);
-    let profile_digest = workspace_digest(&staged).map_err(|e| format!("cannot digest profile: {e}"))?;
+    let profile_digest =
+        workspace_digest(&staged).map_err(|e| format!("cannot digest profile: {e}"))?;
     if let Some(pinned) = pinned
         && pinned != profile_digest
     {
-        return Err(format!("profile digest mismatch: pinned {pinned}, found {profile_digest}"));
+        return Err(format!(
+            "profile digest mismatch: pinned {pinned}, found {profile_digest}"
+        ));
     }
     // Parsed from the bytes just digested.
-    let raw = fs::read(staged.join("profile.json")).map_err(|e| format!("cannot read profile: {e}"))?;
-    let profile: Profile = serde_json::from_slice(&raw).map_err(|e| format!("invalid profile.json: {e}"))?;
+    let raw =
+        fs::read(staged.join("profile.json")).map_err(|e| format!("cannot read profile: {e}"))?;
+    let profile: Profile =
+        serde_json::from_slice(&raw).map_err(|e| format!("invalid profile.json: {e}"))?;
     let Some((program, args)) = profile.command.split_first() else {
         return Err("profile command is empty".into());
     };
@@ -468,7 +544,9 @@ pub fn run_verification(
     let check_dir = backend.scratch_dir().join("check");
     empty_dir(&check_dir).map_err(|e| format!("scratch dir: {e}"))?;
     let pycache = check_dir.join("pycache");
-    backend.check_program(program, &staged).map_err(|e| format!("cannot run profile command: {e}"))?;
+    backend
+        .check_program(program, &staged)
+        .map_err(|e| format!("cannot run profile command: {e}"))?;
     let cmd = backend.check_command(program, args, &ws, &staged, &pycache);
     let output = match run_in_group(cmd, Duration::from_secs(timeout_secs), OUTPUT_LIMIT) {
         Err(GroupError::Timeout) => return Err("timeout".into()),
@@ -485,7 +563,10 @@ pub fn run_verification(
     }
     let polluted = excluded_entries(&ws).map_err(|e| format!("cannot inspect workspace: {e}"))?;
     if !polluted.is_empty() {
-        return Err(format!("workspace polluted by excluded entries: {}", polluted.join(", ")));
+        return Err(format!(
+            "workspace polluted by excluded entries: {}",
+            polluted.join(", ")
+        ));
     }
 
     let (stdout, stdout_truncated) = cut(output.stdout);
@@ -523,7 +604,12 @@ pub fn patch_state(backend: &dyn Backend, expected_base: Digest, patch: &[u8]) -
         Err(e) => return PatchStateIs::unknown(None, format!("cannot digest workspace: {e}")),
     };
     if actual == expected_base {
-        return PatchStateIs { state: PatchStateKind::NotApplied, paths: Vec::new(), workspace_digest: Some(actual), reason: None };
+        return PatchStateIs {
+            state: PatchStateKind::NotApplied,
+            paths: Vec::new(),
+            workspace_digest: Some(actual),
+            reason: None,
+        };
     }
     let (dir, patch_file, paths) = match stage_patch(backend, "reverse", patch) {
         Ok(staged) => staged,
@@ -536,17 +622,31 @@ pub fn patch_state(backend: &dyn Backend, expected_base: Digest, patch: &[u8]) -
     if let Err(e) = backend.own_tree(&copy) {
         return PatchStateIs::unknown(Some(actual), e);
     }
-    let reverted = match backend.git(&copy).args(["apply", "--reverse"]).arg(&patch_file).output() {
-        Ok(out) => out.status.success() && workspace_digest(&copy).is_ok_and(|d| d == expected_base),
+    let reverted = match backend
+        .git(&copy)
+        .args(["apply", "--reverse"])
+        .arg(&patch_file)
+        .output()
+    {
+        Ok(out) => {
+            out.status.success() && workspace_digest(&copy).is_ok_and(|d| d == expected_base)
+        }
         Err(e) => return PatchStateIs::unknown(Some(actual), format!("cannot run git: {e}")),
     };
     if !reverted {
         return PatchStateIs::unknown(
             Some(actual),
-            format!("workspace {actual} is neither the base {expected_base} nor the base with this patch"),
+            format!(
+                "workspace {actual} is neither the base {expected_base} nor the base with this patch"
+            ),
         );
     }
-    PatchStateIs { state: PatchStateKind::Applied, paths, workspace_digest: Some(actual), reason: None }
+    PatchStateIs {
+        state: PatchStateKind::Applied,
+        paths,
+        workspace_digest: Some(actual),
+        reason: None,
+    }
 }
 
 struct GroupOutput {
@@ -592,7 +692,9 @@ fn reap_group(pgid: Option<Pid>) {
         match waitpgid(pgid, WaitOptions::NOHANG) {
             Ok(Some(_)) => {}
             // Members of ours still dying.
-            Ok(None) if std::time::Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(5))
+            }
             // ECHILD: none left; or the window is over.
             Ok(None) | Err(_) => return,
         }
@@ -602,9 +704,16 @@ fn reap_group(pgid: Option<Pid>) {
 /// Runs `cmd` as the leader of a new process group (3a `run_in_group`, without tokio): a
 /// waiter thread reaps the leader; when it exits or the timeout fires, the whole group is
 /// killed, so no grandchild outlives the run or holds the pipes open.
-fn run_in_group(mut cmd: std::process::Command, timeout: Duration, limit: usize) -> Result<GroupOutput, GroupError> {
+fn run_in_group(
+    mut cmd: std::process::Command,
+    timeout: Duration,
+    limit: usize,
+) -> Result<GroupOutput, GroupError> {
     use std::os::unix::process::CommandExt;
-    cmd.process_group(0).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child: Child = cmd.spawn().map_err(GroupError::Io)?;
     let pgid = i32::try_from(child.id()).ok().and_then(Pid::from_raw);
     let stdout = capture(child.stdout.take().expect("stdout is piped"), limit);
@@ -616,9 +725,14 @@ fn run_in_group(mut cmd: std::process::Command, timeout: Duration, limit: usize)
         let _ = tx.send(());
         status
     });
-    let timed_out = matches!(rx.recv_timeout(timeout), Err(mpsc::RecvTimeoutError::Timeout));
+    let timed_out = matches!(
+        rx.recv_timeout(timeout),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    );
     kill_group(pgid);
-    let status = waiter.join().map_err(|_| GroupError::Io(io::Error::other("waiter thread panicked")))?;
+    let status = waiter
+        .join()
+        .map_err(|_| GroupError::Io(io::Error::other("waiter thread panicked")))?;
     // Only now that std has reaped the leader (waiting on the group earlier could steal its
     // status).
     reap_group(pgid);
@@ -626,6 +740,13 @@ fn run_in_group(mut cmd: std::process::Command, timeout: Duration, limit: usize)
         return Err(GroupError::Timeout);
     }
     let status = status.map_err(GroupError::Io)?;
-    let join = |h: thread::JoinHandle<Vec<u8>>| h.join().map_err(|_| GroupError::Io(io::Error::other("capture thread panicked")));
-    Ok(GroupOutput { status, stdout: join(stdout)?, stderr: join(stderr)? })
+    let join = |h: thread::JoinHandle<Vec<u8>>| {
+        h.join()
+            .map_err(|_| GroupError::Io(io::Error::other("capture thread panicked")))
+    };
+    Ok(GroupOutput {
+        status,
+        stdout: join(stdout)?,
+        stderr: join(stderr)?,
+    })
 }

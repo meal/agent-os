@@ -42,7 +42,10 @@
 
 use std::time::Instant;
 
-use agentos_core::effect::{accept_receipt, AttemptId, EffectId, EffectKind, EffectRecord, EffectState, ReceiptVerdict, RetryPolicy};
+use agentos_core::effect::{
+    AttemptId, EffectId, EffectKind, EffectRecord, EffectState, ReceiptVerdict, RetryPolicy,
+    accept_receipt,
+};
 use agentos_core::ids::TaskId;
 use agentos_core::state::{TaskEvent, TaskState};
 use agentos_store::blob::BlobStore;
@@ -53,8 +56,10 @@ use serde_json::json;
 use crate::crash::RunOptions;
 use crate::executor::{AttemptCtx, ExecOutcome, Executor, JobWait, Reconciliation};
 use crate::journal;
-use crate::runner::{fail, recovered_patch, EngineError, Result};
-use crate::steps::{check_outcome, finish_attempt, mark_unreconcilable, request, run_attempt, Attempt, Cx, WORKER};
+use crate::runner::{EngineError, Result, fail, recovered_patch};
+use crate::steps::{
+    Attempt, Cx, WORKER, check_outcome, finish_attempt, mark_unreconcilable, request, run_attempt,
+};
 
 /// What recovery did with one outstanding effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,7 +114,12 @@ pub struct RecoveryReport {
 }
 
 /// Recovers `task` after a controller restart. See the module docs.
-pub async fn recover<E: Executor>(db: &Db, blobs: &BlobStore, executor: &E, task: &TaskId) -> Result<RecoveryReport> {
+pub async fn recover<E: Executor>(
+    db: &Db,
+    blobs: &BlobStore,
+    executor: &E,
+    task: &TaskId,
+) -> Result<RecoveryReport> {
     recover_with(db, blobs, executor, task, &RunOptions::default()).await
 }
 
@@ -154,7 +164,8 @@ pub(crate) async fn deadline_stop<E: Executor>(cx: &Cx<'_, E>) -> Result<Option<
 pub(crate) async fn close<E: Executor>(cx: &Cx<'_, E>, reason: &str) -> Result<TaskState> {
     let closing = cx.closing_with(reason);
     // Boxed: closing recovery reaches `run_attempt` (which can close) again.
-    let pass: std::pin::Pin<Box<dyn std::future::Future<Output = Result<RecoveryReport>> + '_>> = Box::pin(reconcile(&closing));
+    let pass: std::pin::Pin<Box<dyn std::future::Future<Output = Result<RecoveryReport>> + '_>> =
+        Box::pin(reconcile(&closing));
     Ok(pass.await?.state.unwrap_or(TaskState::Failed))
 }
 
@@ -170,11 +181,24 @@ pub(crate) async fn reconcile<E: Executor>(cx: &Cx<'_, E>) -> Result<RecoveryRep
     let (db, task) = (cx.db, &cx.task);
     // Not in closing mode's mid-run passes: a blob the runner put but has not registered yet
     // would be lost. The next recovery collects what this skips.
-    let gc_removed = if cx.closing.is_some() { 0 } else { cx.blobs.gc(&db.referenced_blobs()?)? };
-    let mut report = RecoveryReport { gc_removed, ..RecoveryReport::default() };
+    let gc_removed = if cx.closing.is_some() {
+        0
+    } else {
+        cx.blobs.gc(&db.referenced_blobs()?)?
+    };
+    let mut report = RecoveryReport {
+        gc_removed,
+        ..RecoveryReport::default()
+    };
     for rec in db.outstanding_effects(task)? {
         // A dispatch refused on the way can close the task and decide the later effects.
-        let Some(rec) = db.outstanding_effects(task)?.into_iter().find(|e| e.effect_id == rec.effect_id) else { continue };
+        let Some(rec) = db
+            .outstanding_effects(task)?
+            .into_iter()
+            .find(|e| e.effect_id == rec.effect_id)
+        else {
+            continue;
+        };
         recover_effect(cx, rec, &mut report).await?;
     }
 
@@ -190,7 +214,10 @@ pub(crate) async fn reconcile<E: Executor>(cx: &Cx<'_, E>) -> Result<RecoveryRep
         }
     }
     let t = db.task(task)?;
-    let in_flight = db.outstanding_effects(task)?.iter().any(|e| e.state == EffectState::Dispatched);
+    let in_flight = db
+        .outstanding_effects(task)?
+        .iter()
+        .any(|e| e.state == EffectState::Dispatched);
     if t.cancel_requested && !t.state.is_terminal() && !in_flight {
         tracing::info!(task_id = %task, "cancel completed after recovery");
         db.append(task, &TaskEvent::CancelCompleted)?;
@@ -206,7 +233,13 @@ pub(crate) async fn reconcile<E: Executor>(cx: &Cx<'_, E>) -> Result<RecoveryRep
 
 const RETAINED: &str = "the executor retained a receipt for this effect";
 
-fn decide<E>(cx: &Cx<'_, E>, report: &mut RecoveryReport, rec: &EffectRecord, decision: Decision, reason: &str) -> Result<()> {
+fn decide<E>(
+    cx: &Cx<'_, E>,
+    report: &mut RecoveryReport,
+    rec: &EffectRecord,
+    decision: Decision,
+    reason: &str,
+) -> Result<()> {
     let d = RecoveryDecision {
         effect_id: rec.effect_id.clone(),
         kind: rec.kind.tag().to_string(),
@@ -215,7 +248,11 @@ fn decide<E>(cx: &Cx<'_, E>, report: &mut RecoveryReport, rec: &EffectRecord, de
         decision,
         reason: reason.to_string(),
     };
-    cx.db.append_audit(&cx.task, "RecoveryDecision", &serde_json::to_value(&d).map_err(agentos_store::db::DbError::from)?)?;
+    cx.db.append_audit(
+        &cx.task,
+        "RecoveryDecision",
+        &serde_json::to_value(&d).map_err(agentos_store::db::DbError::from)?,
+    )?;
     tracing::info!(task_id = %cx.task, effect_id = %rec.effect_id, ?decision, reason, "recovery decision");
     report.decisions.push(d);
     Ok(())
@@ -223,7 +260,10 @@ fn decide<E>(cx: &Cx<'_, E>, report: &mut RecoveryReport, rec: &EffectRecord, de
 
 fn expect_applied(rec: &EffectRecord, verdict: ReceiptVerdict) -> Result<()> {
     if verdict != ReceiptVerdict::Apply {
-        return Err(EngineError::ReceiptNotApplied { effect: rec.effect_id.clone(), verdict });
+        return Err(EngineError::ReceiptNotApplied {
+            effect: rec.effect_id.clone(),
+            verdict,
+        });
     }
     Ok(())
 }
@@ -264,21 +304,28 @@ async fn use_retained<E: Executor>(
         expect_applied(rec, finish_attempt(cx, rec, &out)?)?;
         return Ok(true);
     }
-    let attempt = serde_json::to_value(&out.receipt.attempt_id).map_err(agentos_store::db::DbError::from)?;
+    let attempt =
+        serde_json::to_value(&out.receipt.attempt_id).map_err(agentos_store::db::DbError::from)?;
     if !journal::receipt_audited(cx.db, &cx.task, &attempt)? {
         if verdict == ReceiptVerdict::Apply {
             // Applicable by lease, but it does not describe its own output.
             let audit = json!({ "reason": "ResultDigestMismatch", "effect_id": rec.effect_id, "receipt": out.receipt });
-            cx.db.append_audit(&cx.task, "RetainedReceiptRejected", &audit)?;
+            cx.db
+                .append_audit(&cx.task, "RetainedReceiptRejected", &audit)?;
         } else {
             // The store re-derives the same verdict and journals the receipt as ignored.
-            cx.db.complete_effect(&rec.effect_id, &out.receipt, None, None)?;
+            cx.db
+                .complete_effect(&rec.effect_id, &out.receipt, None, None)?;
         }
     }
     Ok(false)
 }
 
-async fn recover_effect<E: Executor>(cx: &Cx<'_, E>, rec: EffectRecord, report: &mut RecoveryReport) -> Result<()> {
+async fn recover_effect<E: Executor>(
+    cx: &Cx<'_, E>,
+    rec: EffectRecord,
+    report: &mut RecoveryReport,
+) -> Result<()> {
     let t = cx.db.task(&cx.task)?;
     let can_dispatch = t.may_dispatch() && cx.closing.is_none();
     // Terminal, cancel pending (cancel always wins), or being closed: this task never
@@ -291,13 +338,29 @@ async fn recover_effect<E: Executor>(cx: &Cx<'_, E>, rec: EffectRecord, report: 
     if rec.state == EffectState::Intended {
         if can_dispatch {
             let Some(payload) = payload(cx, &rec)? else {
-                return unreconcilable(cx, report, &rec, "its request payload is no longer available");
+                return unreconcilable(
+                    cx,
+                    report,
+                    &rec,
+                    "its request payload is no longer available",
+                );
             };
-            decide(cx, report, &rec, Decision::Dispatch, "intended, never dispatched")?;
+            decide(
+                cx,
+                report,
+                &rec,
+                Decision::Dispatch,
+                "intended, never dispatched",
+            )?;
             return expect_attempt(&rec, run_attempt(cx, &rec, payload).await?);
         }
         if closing {
-            return abandon(cx, report, &rec, "never dispatched, and the task can no longer dispatch it");
+            return abandon(
+                cx,
+                report,
+                &rec,
+                "never dispatched, and the task can no longer dispatch it",
+            );
         }
         report.deferred.push(rec.effect_id);
         return Ok(());
@@ -325,7 +388,10 @@ async fn recover_effect<E: Executor>(cx: &Cx<'_, E>, rec: EffectRecord, report: 
     let waited = started.elapsed();
     let reason = match waited.as_millis() {
         0 => RETAINED.to_string(),
-        _ => format!("published after waiting {:.1} s for a live job", waited.as_secs_f64()),
+        _ => format!(
+            "published after waiting {:.1} s for a live job",
+            waited.as_secs_f64()
+        ),
     };
     if use_retained(cx, &rec, report, &reason).await? {
         return Ok(());
@@ -334,9 +400,20 @@ async fn recover_effect<E: Executor>(cx: &Cx<'_, E>, rec: EffectRecord, report: 
     match rec.kind.retry_policy() {
         RetryPolicy::Retry if can_dispatch => {
             let Some(payload) = payload(cx, &rec)? else {
-                return unreconcilable(cx, report, &rec, "its request payload is no longer available");
+                return unreconcilable(
+                    cx,
+                    report,
+                    &rec,
+                    "its request payload is no longer available",
+                );
             };
-            decide(cx, report, &rec, Decision::Redispatch, "no receipt; retry policy Retry: safe to run again")?;
+            decide(
+                cx,
+                report,
+                &rec,
+                Decision::Redispatch,
+                "no receipt; retry policy Retry: safe to run again",
+            )?;
             expect_attempt(&rec, run_attempt(cx, &rec, payload).await?)
         }
         RetryPolicy::Retry => {
@@ -348,7 +425,9 @@ async fn recover_effect<E: Executor>(cx: &Cx<'_, E>, rec: EffectRecord, report: 
             Ok(())
         }
         RetryPolicy::ReconcileThenRetry => reconcile_effect(cx, rec, report, can_dispatch).await,
-        RetryPolicy::NoRetry => unreconcilable(cx, report, &rec, "no receipt; retry policy NoRetry"),
+        RetryPolicy::NoRetry => {
+            unreconcilable(cx, report, &rec, "no receipt; retry policy NoRetry")
+        }
         RetryPolicy::ForfeitThenRetry => forfeit(
             cx,
             report,
@@ -365,25 +444,47 @@ async fn reconcile_effect<E: Executor>(
     can_dispatch: bool,
 ) -> Result<()> {
     let Some(payload) = payload(cx, &rec)? else {
-        return unreconcilable(cx, report, &rec, "its request payload is no longer available");
+        return unreconcilable(
+            cx,
+            report,
+            &rec,
+            "its request payload is no longer available",
+        );
     };
-    let ctx = AttemptCtx { attempt_id: AttemptId::new(), lease_generation: rec.lease_generation, worker: WORKER.into() };
-    let req = request(&rec, payload.clone(), &cx.contract, cx.db.deadline_ts(&cx.task)?);
+    let ctx = AttemptCtx {
+        attempt_id: AttemptId::new(),
+        lease_generation: rec.lease_generation,
+        worker: WORKER.into(),
+    };
+    let req = request(
+        &rec,
+        payload.clone(),
+        &cx.contract,
+        cx.db.deadline_ts(&cx.task)?,
+    );
     match cx.exec.reconcile(&req, &ctx).await {
         Reconciliation::Applied(out) if usable(&rec, &out) => {
             let reason = "no receipt; reconciliation found the effect applied";
             decide(cx, report, &rec, Decision::PublishReconciled, reason)?;
             expect_applied(&rec, finish_attempt(cx, &rec, &out)?)
         }
-        Reconciliation::Applied(_) => unreconcilable(cx, report, &rec, "reconciliation returned an unusable outcome"),
+        Reconciliation::Applied(_) => unreconcilable(
+            cx,
+            report,
+            &rec,
+            "reconciliation returned an unusable outcome",
+        ),
         Reconciliation::NotApplied if can_dispatch => {
             let reason = "no receipt; reconciliation found it not applied, so retry policy ReconcileThenRetry retries it";
             decide(cx, report, &rec, Decision::Redispatch, reason)?;
             expect_attempt(&rec, run_attempt(cx, &rec, payload).await?)
         }
-        Reconciliation::NotApplied => {
-            abandon(cx, report, &rec, "reconciliation found it not applied, and the task can no longer dispatch it")
-        }
+        Reconciliation::NotApplied => abandon(
+            cx,
+            report,
+            &rec,
+            "reconciliation found it not applied, and the task can no longer dispatch it",
+        ),
         Reconciliation::Unknown => unreconcilable(
             cx,
             report,
@@ -397,7 +498,12 @@ fn usable(rec: &EffectRecord, out: &ExecOutcome) -> bool {
     check_outcome(rec, out).is_ok() && accept_receipt(rec, &out.receipt) == ReceiptVerdict::Apply
 }
 
-fn abandon<E>(cx: &Cx<'_, E>, report: &mut RecoveryReport, rec: &EffectRecord, reason: &str) -> Result<()> {
+fn abandon<E>(
+    cx: &Cx<'_, E>,
+    report: &mut RecoveryReport,
+    rec: &EffectRecord,
+    reason: &str,
+) -> Result<()> {
     if cx.closing.is_some() {
         let t = cx.db.task(&cx.task)?;
         if !t.state.is_terminal() && !t.cancel_requested {
@@ -414,8 +520,16 @@ fn abandon<E>(cx: &Cx<'_, E>, report: &mut RecoveryReport, rec: &EffectRecord, r
 
 /// FAILED without a result, the reservation `Uncertain`; the task goes on and the agent asks
 /// again. A no-op once the effect is no longer DISPATCHED/UNKNOWN (decided before).
-fn forfeit<E>(cx: &Cx<'_, E>, report: &mut RecoveryReport, rec: &EffectRecord, reason: &str) -> Result<()> {
-    if !matches!(cx.db.effect(&rec.effect_id)?.state, EffectState::Dispatched | EffectState::Unknown) {
+fn forfeit<E>(
+    cx: &Cx<'_, E>,
+    report: &mut RecoveryReport,
+    rec: &EffectRecord,
+    reason: &str,
+) -> Result<()> {
+    if !matches!(
+        cx.db.effect(&rec.effect_id)?.state,
+        EffectState::Dispatched | EffectState::Unknown
+    ) {
         return Ok(());
     }
     decide(cx, report, rec, Decision::Forfeit, reason)?;
@@ -429,14 +543,25 @@ fn fence_failed<E>(cx: &Cx<'_, E>, report: &mut RecoveryReport, rec: &EffectReco
     if cx.db.task(&cx.task)?.state.is_terminal() && rec.state == EffectState::Unknown {
         return Ok(());
     }
-    decide(cx, report, rec, Decision::FenceFailed, "a job of the effect is still alive and could not be stopped")?;
+    decide(
+        cx,
+        report,
+        rec,
+        Decision::FenceFailed,
+        "a job of the effect is still alive and could not be stopped",
+    )?;
     mark_unreconcilable(cx.db, rec)?;
     Ok(())
 }
 
 /// Leaves the effect UNKNOWN (its reservation `Uncertain`) and fails the task. A no-op for
 /// an effect already UNKNOWN on a terminal task: that decision was taken before.
-fn unreconcilable<E>(cx: &Cx<'_, E>, report: &mut RecoveryReport, rec: &EffectRecord, reason: &str) -> Result<()> {
+fn unreconcilable<E>(
+    cx: &Cx<'_, E>,
+    report: &mut RecoveryReport,
+    rec: &EffectRecord,
+    reason: &str,
+) -> Result<()> {
     let terminal = cx.db.task(&cx.task)?.state.is_terminal();
     if terminal && matches!(rec.state, EffectState::Unknown | EffectState::Intended) {
         return Ok(());

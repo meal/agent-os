@@ -19,10 +19,19 @@ pub fn pause(home: &Home, task: &TaskId) -> Result<(), CliError> {
     let t = store.db.task(task)?;
     let state = match t.state {
         TaskState::Paused => t.state,
-        TaskState::Running | TaskState::Waiting => store.db.append(task, &TaskEvent::Paused).map_err(|e| {
-            CliError::other(format!("cannot pause task {task}: {e}"))
-        })?.state,
-        other => return Err(CliError::other(format!("cannot pause task {task}: it is {}", other.label()))),
+        TaskState::Running | TaskState::Waiting => {
+            store
+                .db
+                .append(task, &TaskEvent::Paused)
+                .map_err(|e| CliError::other(format!("cannot pause task {task}: {e}")))?
+                .state
+        }
+        other => {
+            return Err(CliError::other(format!(
+                "cannot pause task {task}: it is {}",
+                other.label()
+            )));
+        }
     };
     print_state(task, state);
     Ok(())
@@ -30,7 +39,12 @@ pub fn pause(home: &Home, task: &TaskId) -> Result<(), CliError> {
 
 /// What a restarted controller does: approve a READY task, resume a PAUSED one, recover
 /// the effects a dead process left in flight, and run the task on.
-pub async fn resume(home: &Home, task: &TaskId, patch: Option<&Path>, crash: Option<&CrashSpec>) -> Result<(), CliError> {
+pub async fn resume(
+    home: &Home,
+    task: &TaskId,
+    patch: Option<&Path>,
+    crash: Option<&CrashSpec>,
+) -> Result<(), CliError> {
     let store = home.open()?;
     home.model_endpoint(&store, task)?;
     agentos_engine::model::policy::versions(&store.db, task)?;
@@ -38,7 +52,11 @@ pub async fn resume(home: &Home, task: &TaskId, patch: Option<&Path>, crash: Opt
     if t.state.is_terminal() {
         // A task that ended with effects still in flight (left by an older build or a
         // failure path) gets them decided; otherwise this only reports.
-        let in_flight = store.db.outstanding_effects(task)?.iter().any(|e| matches!(e.state, EffectState::Intended | EffectState::Dispatched));
+        let in_flight = store
+            .db
+            .outstanding_effects(task)?
+            .iter()
+            .any(|e| matches!(e.state, EffectState::Intended | EffectState::Dispatched));
         if in_flight {
             let lock = home.lock()?;
             let exec = home.recovery_executor(&store, task)?;
@@ -62,7 +80,11 @@ pub async fn resume(home: &Home, task: &TaskId, patch: Option<&Path>, crash: Opt
         // Resuming a READY task is the owner's approval: issue its capability handles.
         store.db.approve_task(task)?;
     }
-    let state = if t.state.is_terminal() { t.state } else { drive(home, &store, &lock, task, agent, crash, exec).await? };
+    let state = if t.state.is_terminal() {
+        t.state
+    } else {
+        drive(home, &store, &lock, task, agent, crash, exec).await?
+    };
     print_state(task, state);
     Ok(())
 }
@@ -74,7 +96,9 @@ pub async fn cancel(home: &Home, task: &TaskId) -> Result<(), CliError> {
     let store = home.open()?;
     let t = store.db.task(task)?;
     if t.state.is_terminal() {
-        print(&json!({ "task_id": task, "state": t.state.label(), "note": "already finished; nothing to cancel" }));
+        print(
+            &json!({ "task_id": task, "state": t.state.label(), "note": "already finished; nothing to cancel" }),
+        );
         return Ok(());
     }
     // The intent and the stop come first, whatever the worker's state: a job that outlived
@@ -88,13 +112,16 @@ pub async fn cancel(home: &Home, task: &TaskId) -> Result<(), CliError> {
     let Some(lock) = home.try_lock()? else {
         let state = store.db.task(task)?.state;
         let note = if home.driven_task().as_deref() == Some(task.as_str()) {
-            "another agentos process is driving this task; it completes the cancel at its next step".to_string()
+            "another agentos process is driving this task; it completes the cancel at its next step"
+                .to_string()
         } else {
             format!(
                 "another agentos process is driving tasks; the cancel completes on the next `agentos resume {task}` or `agentos cancel {task}`"
             )
         };
-        print(&json!({ "task_id": task, "state": state.label(), "cancel_requested": true, "note": note }));
+        print(
+            &json!({ "task_id": task, "state": state.label(), "cancel_requested": true, "note": note }),
+        );
         return Ok(());
     };
     lock.driving(task)?;

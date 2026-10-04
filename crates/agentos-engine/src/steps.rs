@@ -4,9 +4,11 @@
 //! crash hook is consulted at each of those boundaries ([`run_attempt`], [`finish_attempt`]).
 
 use agentos_core::broker::Resource;
-use agentos_core::budget::{model_requests_for, Reservation};
+use agentos_core::budget::{Reservation, model_requests_for};
 use agentos_core::contract::Contract;
-use agentos_core::effect::{AttemptId, EffectKind, EffectRecord, EffectState, Outcome, ReceiptVerdict, RetryPolicy};
+use agentos_core::effect::{
+    AttemptId, EffectKind, EffectRecord, EffectState, Outcome, ReceiptVerdict, RetryPolicy,
+};
 use agentos_core::ids::{Digest, TaskId};
 use agentos_core::state::{Task, TaskEvent, TaskState};
 use agentos_store::blob::BlobStore;
@@ -15,7 +17,7 @@ use serde_json::json;
 
 use crate::crash::{CrashPoint, RunOptions};
 use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor};
-use crate::runner::{capability_name, fail, EngineError, Result};
+use crate::runner::{EngineError, Result, capability_name, fail};
 
 pub const WORKER: &str = "fixture-executor";
 
@@ -35,10 +37,26 @@ pub(crate) struct Cx<'a, E> {
 }
 
 impl<'a, E> Cx<'a, E> {
-    pub fn new(db: &'a Db, blobs: &'a BlobStore, exec: &'a E, task: &TaskId, opts: &'a RunOptions) -> Result<Self> {
-        let (model_policy_version, model_limits_version) = crate::model::policy::versions(db, task)?;
-        Ok(Cx { db, blobs, exec, contract: db.contract(task)?, task: task.clone(), opts, closing: None,
-            model_policy_version, model_limits_version })
+    pub fn new(
+        db: &'a Db,
+        blobs: &'a BlobStore,
+        exec: &'a E,
+        task: &TaskId,
+        opts: &'a RunOptions,
+    ) -> Result<Self> {
+        let (model_policy_version, model_limits_version) =
+            crate::model::policy::versions(db, task)?;
+        Ok(Cx {
+            db,
+            blobs,
+            exec,
+            contract: db.contract(task)?,
+            task: task.clone(),
+            opts,
+            closing: None,
+            model_policy_version,
+            model_limits_version,
+        })
     }
 
     /// The same run in closing mode: the task is being ended with `reason`.
@@ -91,7 +109,12 @@ pub fn dispatch(db: &Db, rec: &EffectRecord) -> Result<AttemptCtx> {
         lease_generation: rec.lease_generation + 1,
         worker: WORKER.to_string(),
     };
-    db.mark_dispatched(&rec.effect_id, &ctx.attempt_id, &ctx.worker, ctx.lease_generation)?;
+    db.mark_dispatched(
+        &rec.effect_id,
+        &ctx.attempt_id,
+        &ctx.worker,
+        ctx.lease_generation,
+    )?;
     tracing::info!(
         task_id = %rec.task_id, effect_id = %rec.effect_id, lease = ctx.lease_generation,
         "effect dispatched"
@@ -100,7 +123,12 @@ pub fn dispatch(db: &Db, rec: &EffectRecord) -> Result<AttemptCtx> {
 }
 
 /// `deadline_ts` is the task's deadline in unix seconds (`Db::deadline_ts`), 0 for none.
-pub fn request(rec: &EffectRecord, payload: Vec<u8>, contract: &Contract, deadline_ts: i64) -> EffectRequest {
+pub fn request(
+    rec: &EffectRecord,
+    payload: Vec<u8>,
+    contract: &Contract,
+    deadline_ts: i64,
+) -> EffectRequest {
     EffectRequest {
         effect_id: rec.effect_id.clone(),
         task_id: rec.task_id.clone(),
@@ -114,7 +142,10 @@ pub fn request(rec: &EffectRecord, payload: Vec<u8>, contract: &Contract, deadli
 /// An outcome is usable only if its receipt names `rec` and describes its own output.
 pub fn check_outcome(rec: &EffectRecord, out: &ExecOutcome) -> Result<()> {
     if out.receipt.effect_id != rec.effect_id {
-        let msg = format!("receipt for {} returned for {}", out.receipt.effect_id, rec.effect_id);
+        let msg = format!(
+            "receipt for {} returned for {}",
+            out.receipt.effect_id, rec.effect_id
+        );
         return Err(EngineError::Protocol(msg));
     }
     if out.receipt.result_digest != Some(Digest::of(&out.output)) {
@@ -134,7 +165,9 @@ pub async fn execute<E: Executor>(
     deadline_ts: i64,
     ctx: &AttemptCtx,
 ) -> Result<ExecOutcome> {
-    let out = executor.run(&request(rec, payload, contract, deadline_ts), ctx).await;
+    let out = executor
+        .run(&request(rec, payload, contract, deadline_ts), ctx)
+        .await;
     check_outcome(rec, &out)?;
     tracing::info!(
         task_id = %rec.task_id, effect_id = %rec.effect_id, outcome = ?out.receipt.outcome,
@@ -162,7 +195,12 @@ pub fn store_result(blobs: &BlobStore, out: &ExecOutcome) -> Result<Digest> {
 }
 
 /// Step 5: register the stored result as the effect's artifact.
-pub fn register_result(db: &Db, rec: &EffectRecord, out: &ExecOutcome, digest: &Digest) -> Result<()> {
+pub fn register_result(
+    db: &Db,
+    rec: &EffectRecord,
+    out: &ExecOutcome,
+    digest: &Digest,
+) -> Result<()> {
     let provenance = json!({ "worker": WORKER, "attempt_id": out.receipt.attempt_id, "effect_id": rec.effect_id });
     db.register_artifact(
         digest,
@@ -204,7 +242,11 @@ pub(crate) enum Attempt {
 
 /// Steps 2-6 for an effect that is INTENDED, or DISPATCHED/UNKNOWN without a usable
 /// receipt: a new attempt under the next lease generation.
-pub(crate) async fn run_attempt<E: Executor>(cx: &Cx<'_, E>, rec: &EffectRecord, payload: Vec<u8>) -> Result<Attempt> {
+pub(crate) async fn run_attempt<E: Executor>(
+    cx: &Cx<'_, E>,
+    rec: &EffectRecord,
+    payload: Vec<u8>,
+) -> Result<Attempt> {
     let kind = Some(rec.kind.tag());
     // Before dispatch: past the deadline nothing new runs. In closing mode this effect is
     // abandoned (it is still INTENDED) or decided like any in-flight one.
@@ -238,7 +280,8 @@ pub(crate) async fn run_attempt<E: Executor>(cx: &Cx<'_, E>, rec: &EffectRecord,
         if rec.kind.retry_policy() == RetryPolicy::ForfeitThenRetry {
             // The store checks neither task state nor lease: only this attempt's own
             // DISPATCHED effect is forfeited (anything else was decided elsewhere).
-            if now.state == EffectState::Dispatched && now.lease_generation == ctx.lease_generation {
+            if now.state == EffectState::Dispatched && now.lease_generation == ctx.lease_generation
+            {
                 cx.db.forfeit_effect(&rec.effect_id, &reason_of(&out))?;
             }
             return Ok(Attempt::Forfeited);
@@ -268,19 +311,33 @@ pub(crate) fn mark_unreconcilable(db: &Db, rec: &EffectRecord) -> Result<TaskSta
     if t.state.is_terminal() {
         return Ok(t.state);
     }
-    fail(db, &rec.task_id, &format!("unreconcilable effect {}", rec.effect_id))
+    fail(
+        db,
+        &rec.task_id,
+        &format!("unreconcilable effect {}", rec.effect_id),
+    )
 }
 
 /// Steps 4-6 for an outcome in hand, whether just executed, retained by the executor
 /// across a crash, or found by reconciliation.
-pub(crate) fn finish_attempt<E>(cx: &Cx<'_, E>, rec: &EffectRecord, out: &ExecOutcome) -> Result<ReceiptVerdict> {
+pub(crate) fn finish_attempt<E>(
+    cx: &Cx<'_, E>,
+    rec: &EffectRecord,
+    out: &ExecOutcome,
+) -> Result<ReceiptVerdict> {
     let kind = Some(rec.kind.tag());
     let artifact = store_result(cx.blobs, out)?;
     cx.crash(CrashPoint::AfterBlobPut, kind)?;
     register_result(cx.db, rec, out, &artifact)?;
     cx.crash(CrashPoint::AfterRegister, kind)?;
     let task = cx.db.task(&rec.task_id)?;
-    let verdict = complete(cx.db, rec, out, &artifact, follow_up_event(&rec.kind, out, &task))?;
+    let verdict = complete(
+        cx.db,
+        rec,
+        out,
+        &artifact,
+        follow_up_event(&rec.kind, out, &task),
+    )?;
     if verdict == ReceiptVerdict::Apply {
         cx.crash(CrashPoint::AfterComplete, kind)?;
     }
@@ -298,12 +355,16 @@ pub(crate) fn finish_attempt<E>(cx: &Cx<'_, E>, rec: &EffectRecord, out: &ExecOu
 /// - ExportBundle, ModelCall, ListFiles, ReadFile: none.
 pub fn follow_up_event(kind: &EffectKind, out: &ExecOutcome, task: &Task) -> Option<TaskEvent> {
     match kind {
-        EffectKind::ReadSnapshot | EffectKind::ApplyPatch { .. } => match (&out.receipt.outcome, out.new_workspace) {
-            (Outcome::Success, Some(digest)) => Some(TaskEvent::WorkspaceUpdated { digest }),
-            _ => None,
-        },
+        EffectKind::ReadSnapshot | EffectKind::ApplyPatch { .. } => {
+            match (&out.receipt.outcome, out.new_workspace) {
+                (Outcome::Success, Some(digest)) => Some(TaskEvent::WorkspaceUpdated { digest }),
+                _ => None,
+            }
+        }
         EffectKind::RunVerification => Some(if verification_verdict(out, task).0 {
-            TaskEvent::VerifyPassed { digest: task.workspace_digest }
+            TaskEvent::VerifyPassed {
+                digest: task.workspace_digest,
+            }
         } else {
             TaskEvent::VerifyFailed
         }),
@@ -318,12 +379,20 @@ pub fn follow_up_event(kind: &EffectKind, out: &ExecOutcome, task: &Task) -> Opt
 /// agent. Evidence counts only for the digest the task holds right now.
 pub fn verification_verdict(out: &ExecOutcome, task: &Task) -> (bool, String) {
     match (&out.receipt.outcome, &out.verification) {
-        (Outcome::Success, Some(r)) if r.workspace == task.workspace_digest => (r.passed, r.summary.clone()),
-        (Outcome::Success, Some(r)) => {
-            (false, format!("evidence is for workspace {}, task has {}", r.workspace, task.workspace_digest))
+        (Outcome::Success, Some(r)) if r.workspace == task.workspace_digest => {
+            (r.passed, r.summary.clone())
         }
+        (Outcome::Success, Some(r)) => (
+            false,
+            format!(
+                "evidence is for workspace {}, task has {}",
+                r.workspace, task.workspace_digest
+            ),
+        ),
         (Outcome::Success, None) => (false, "executor returned no verification report".into()),
-        (Outcome::Failure(reason), _) => (false, format!("verification did not complete: {reason}")),
+        (Outcome::Failure(reason), _) => {
+            (false, format!("verification did not complete: {reason}"))
+        }
     }
 }
 
@@ -335,7 +404,10 @@ mod tests {
     use crate::executor::VerificationReport;
 
     fn task(state: TaskState, workspace: Digest) -> Task {
-        Task { state, ..Task::new(TaskId::new(), workspace) }
+        Task {
+            state,
+            ..Task::new(TaskId::new(), workspace)
+        }
     }
 
     fn outcome(kind: &EffectKind, ok: bool) -> ExecOutcome {
@@ -353,7 +425,11 @@ mod tests {
             .unwrap(),
             deadline_ts: 0,
         };
-        let ctx = AttemptCtx { attempt_id: AttemptId::new(), lease_generation: 1, worker: "w".into() };
+        let ctx = AttemptCtx {
+            attempt_id: AttemptId::new(),
+            lease_generation: 1,
+            worker: "w".into(),
+        };
         if ok {
             ExecOutcome::success(&req, &ctx, b"{}".to_vec())
         } else {
@@ -367,7 +443,12 @@ mod tests {
 
     #[test]
     fn workspace_changing_effects_follow_up_with_the_new_digest() {
-        for kind in [EffectKind::ReadSnapshot, EffectKind::ApplyPatch { expected_base: d("w0") }] {
+        for kind in [
+            EffectKind::ReadSnapshot,
+            EffectKind::ApplyPatch {
+                expected_base: d("w0"),
+            },
+        ] {
             let mut out = outcome(&kind, true);
             out.new_workspace = Some(d("w1"));
             // Applied whatever the state: the store decides (Paused accepts it too).
@@ -378,7 +459,14 @@ mod tests {
                     "{kind:?} {state:?}"
                 );
             }
-            assert_eq!(follow_up_event(&kind, &outcome(&kind, false), &task(TaskState::Running, d("w0"))), None);
+            assert_eq!(
+                follow_up_event(
+                    &kind,
+                    &outcome(&kind, false),
+                    &task(TaskState::Running, d("w0"))
+                ),
+                None
+            );
         }
     }
 
@@ -388,16 +476,35 @@ mod tests {
         let now = task(TaskState::Verifying, d("w1"));
         let report = |passed: bool, workspace: Digest| {
             let mut out = outcome(&kind, true);
-            out.verification = Some(VerificationReport { passed, workspace, summary: "s".into() });
+            out.verification = Some(VerificationReport {
+                passed,
+                workspace,
+                summary: "s".into(),
+            });
             out
         };
-        assert_eq!(follow_up_event(&kind, &report(true, d("w1")), &now), Some(TaskEvent::VerifyPassed { digest: d("w1") }));
-        assert_eq!(follow_up_event(&kind, &report(false, d("w1")), &now), Some(TaskEvent::VerifyFailed));
+        assert_eq!(
+            follow_up_event(&kind, &report(true, d("w1")), &now),
+            Some(TaskEvent::VerifyPassed { digest: d("w1") })
+        );
+        assert_eq!(
+            follow_up_event(&kind, &report(false, d("w1")), &now),
+            Some(TaskEvent::VerifyFailed)
+        );
         // Passing evidence for another workspace version is not success.
-        assert_eq!(follow_up_event(&kind, &report(true, d("w0")), &now), Some(TaskEvent::VerifyFailed));
+        assert_eq!(
+            follow_up_event(&kind, &report(true, d("w0")), &now),
+            Some(TaskEvent::VerifyFailed)
+        );
         // Timeout (effect failure) and a missing report both fail verification.
-        assert_eq!(follow_up_event(&kind, &outcome(&kind, false), &now), Some(TaskEvent::VerifyFailed));
-        assert_eq!(follow_up_event(&kind, &outcome(&kind, true), &now), Some(TaskEvent::VerifyFailed));
+        assert_eq!(
+            follow_up_event(&kind, &outcome(&kind, false), &now),
+            Some(TaskEvent::VerifyFailed)
+        );
+        assert_eq!(
+            follow_up_event(&kind, &outcome(&kind, true), &now),
+            Some(TaskEvent::VerifyFailed)
+        );
         let (passed, summary) = verification_verdict(&outcome(&kind, false), &now);
         assert!(!passed && summary.contains("timeout"), "{summary}");
     }
@@ -427,8 +534,17 @@ mod tests {
         assert!(check_outcome(&rec, &out).is_ok());
         let mut tampered = out.clone();
         tampered.output = b"other".to_vec();
-        assert!(matches!(check_outcome(&rec, &tampered), Err(EngineError::Protocol(_))));
-        let other = EffectRecord { effect_id: EffectId::derive(&TaskId::new(), 1, &rec.kind, &d("x")), ..rec };
-        assert!(matches!(check_outcome(&other, &out), Err(EngineError::Protocol(_))));
+        assert!(matches!(
+            check_outcome(&rec, &tampered),
+            Err(EngineError::Protocol(_))
+        ));
+        let other = EffectRecord {
+            effect_id: EffectId::derive(&TaskId::new(), 1, &rec.kind, &d("x")),
+            ..rec
+        };
+        assert!(matches!(
+            check_outcome(&other, &out),
+            Err(EngineError::Protocol(_))
+        ));
     }
 }

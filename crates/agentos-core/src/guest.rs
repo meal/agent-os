@@ -30,7 +30,8 @@ pub const INIT_PATH: &str = "/sbin/agentos-guest";
 /// The guest kernel command line; Firecracker appends `root=/dev/vda ro` and the
 /// `virtio_mmio.device=` entries. It carries nothing secret. Here (not in the engine) so the
 /// guest can check it names `INIT_PATH`.
-pub const BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off nomodule quiet loglevel=4 init=/sbin/agentos-guest";
+pub const BOOT_ARGS: &str =
+    "console=ttyS0 reboot=k panic=1 pci=off nomodule quiet loglevel=4 init=/sbin/agentos-guest";
 /// Without a bound `Hello` this long after boot, the guest shuts itself down.
 pub const HELLO_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -52,15 +53,49 @@ pub enum PatchStateKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Message {
-    Hello { protocol: u32, attempt_token: String, task_id: String, effect_id: String, attempt_id: String, lease_generation: u64, mode: Mode },
-    Ready { protocol: u32, agent_version: String, mode: Mode, vcpus: u32, memory_mib: u32 },
-    ReadSnapshot { file_count: u64, total_bytes: u64 },
-    File { path: String, len: u64 },
+    Hello {
+        protocol: u32,
+        attempt_token: String,
+        task_id: String,
+        effect_id: String,
+        attempt_id: String,
+        lease_generation: u64,
+        mode: Mode,
+    },
+    Ready {
+        protocol: u32,
+        agent_version: String,
+        mode: Mode,
+        vcpus: u32,
+        memory_mib: u32,
+    },
+    ReadSnapshot {
+        file_count: u64,
+        total_bytes: u64,
+    },
+    File {
+        path: String,
+        len: u64,
+    },
     EndFiles,
-    SnapshotDone { files: Vec<String>, workspace_digest: Digest },
-    ApplyPatch { expected_base: Digest, editable_paths: Vec<String> },
-    PatchApplied { paths: Vec<String>, workspace_digest: Digest },
-    RunVerification { profile_digest: Option<Digest>, timeout_secs: u64, file_count: u64, total_bytes: u64 },
+    SnapshotDone {
+        files: Vec<String>,
+        workspace_digest: Digest,
+    },
+    ApplyPatch {
+        expected_base: Digest,
+        editable_paths: Vec<String>,
+    },
+    PatchApplied {
+        paths: Vec<String>,
+        workspace_digest: Digest,
+    },
+    RunVerification {
+        profile_digest: Option<Digest>,
+        timeout_secs: u64,
+        file_count: u64,
+        total_bytes: u64,
+    },
     Verified {
         profile_id: String,
         command: Vec<String>,
@@ -73,10 +108,21 @@ pub enum Message {
         stderr_truncated: bool,
     },
     Digest,
-    DigestIs { workspace_digest: Digest },
-    PatchState { expected_base: Digest },
-    PatchStateIs { state: PatchStateKind, paths: Vec<String>, workspace_digest: Option<Digest>, reason: Option<String> },
-    Refused { reason: String },
+    DigestIs {
+        workspace_digest: Digest,
+    },
+    PatchState {
+        expected_base: Digest,
+    },
+    PatchStateIs {
+        state: PatchStateKind,
+        paths: Vec<String>,
+        workspace_digest: Option<Digest>,
+        reason: Option<String>,
+    },
+    Refused {
+        reason: String,
+    },
     Shutdown,
     Bye,
 }
@@ -106,7 +152,11 @@ pub enum Frame {
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
     #[error("frame too large: {kind} {len} > {limit}")]
-    TooLarge { kind: FrameKind, len: usize, limit: usize },
+    TooLarge {
+        kind: FrameKind,
+        len: usize,
+        limit: usize,
+    },
     #[error("unknown frame kind {0}")]
     UnknownKind(u8),
     #[error("invalid json frame: {0}")]
@@ -129,7 +179,8 @@ pub fn write_frame(w: &mut impl Write, frame: &Frame) -> io::Result<()> {
             b
         }
     };
-    let len = u32::try_from(body.len()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame body exceeds u32"))?;
+    let len = u32::try_from(body.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame body exceeds u32"))?;
     let mut header = [0u8; 5];
     header[..4].copy_from_slice(&len.to_be_bytes());
     header[4] = kind as u8;
@@ -154,7 +205,9 @@ pub fn read_frame(r: &mut impl Read, raw_limit: usize) -> Result<Frame, FrameErr
     let mut body = vec![0u8; len];
     r.read_exact(&mut body)?;
     match kind {
-        FrameKind::Json => serde_json::from_slice(&body).map(Frame::Json).map_err(|e| FrameError::Json(e.to_string())),
+        FrameKind::Json => serde_json::from_slice(&body)
+            .map(Frame::Json)
+            .map_err(|e| FrameError::Json(e.to_string())),
         FrameKind::Raw => Ok(Frame::Raw(body)),
     }
 }
@@ -179,7 +232,9 @@ pub fn b64(bytes: &[u8]) -> String {
 }
 
 pub fn unb64(s: &str) -> Result<Vec<u8>, String> {
-    base64::engine::general_purpose::STANDARD.decode(s).map_err(|e| e.to_string())
+    base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -193,21 +248,115 @@ mod tests {
 
     fn all_messages() -> Vec<(&'static str, Message)> {
         vec![
-            ("Hello", Message::Hello { protocol: GUEST_PROTOCOL, attempt_token: "a".repeat(32), task_id: "t".into(), effect_id: "e".into(), attempt_id: "at".into(), lease_generation: 7, mode: Mode::Job }),
-            ("Ready", Message::Ready { protocol: 1, agent_version: "0.1.0".into(), mode: Mode::Inspect, vcpus: 2, memory_mib: 256 }),
-            ("ReadSnapshot", Message::ReadSnapshot { file_count: 3, total_bytes: 99 }),
-            ("File", Message::File { path: "src/a.py".into(), len: 5 }),
+            (
+                "Hello",
+                Message::Hello {
+                    protocol: GUEST_PROTOCOL,
+                    attempt_token: "a".repeat(32),
+                    task_id: "t".into(),
+                    effect_id: "e".into(),
+                    attempt_id: "at".into(),
+                    lease_generation: 7,
+                    mode: Mode::Job,
+                },
+            ),
+            (
+                "Ready",
+                Message::Ready {
+                    protocol: 1,
+                    agent_version: "0.1.0".into(),
+                    mode: Mode::Inspect,
+                    vcpus: 2,
+                    memory_mib: 256,
+                },
+            ),
+            (
+                "ReadSnapshot",
+                Message::ReadSnapshot {
+                    file_count: 3,
+                    total_bytes: 99,
+                },
+            ),
+            (
+                "File",
+                Message::File {
+                    path: "src/a.py".into(),
+                    len: 5,
+                },
+            ),
             ("EndFiles", Message::EndFiles),
-            ("SnapshotDone", Message::SnapshotDone { files: vec!["a".into(), "b".into()], workspace_digest: d(1) }),
-            ("ApplyPatch", Message::ApplyPatch { expected_base: d(2), editable_paths: vec!["src/**".into()] }),
-            ("PatchApplied", Message::PatchApplied { paths: vec!["src/a.py".into()], workspace_digest: d(3) }),
-            ("RunVerification", Message::RunVerification { profile_digest: Some(d(4)), timeout_secs: 60, file_count: 1, total_bytes: 10 }),
-            ("Verified", Message::Verified { profile_id: "p".into(), command: vec!["python3".into(), "-m".into()], profile_digest: d(5), workspace_digest: d(6), exit_code: Some(0), stdout_b64: b64(b"out"), stdout_truncated: false, stderr_b64: b64(b""), stderr_truncated: true }),
+            (
+                "SnapshotDone",
+                Message::SnapshotDone {
+                    files: vec!["a".into(), "b".into()],
+                    workspace_digest: d(1),
+                },
+            ),
+            (
+                "ApplyPatch",
+                Message::ApplyPatch {
+                    expected_base: d(2),
+                    editable_paths: vec!["src/**".into()],
+                },
+            ),
+            (
+                "PatchApplied",
+                Message::PatchApplied {
+                    paths: vec!["src/a.py".into()],
+                    workspace_digest: d(3),
+                },
+            ),
+            (
+                "RunVerification",
+                Message::RunVerification {
+                    profile_digest: Some(d(4)),
+                    timeout_secs: 60,
+                    file_count: 1,
+                    total_bytes: 10,
+                },
+            ),
+            (
+                "Verified",
+                Message::Verified {
+                    profile_id: "p".into(),
+                    command: vec!["python3".into(), "-m".into()],
+                    profile_digest: d(5),
+                    workspace_digest: d(6),
+                    exit_code: Some(0),
+                    stdout_b64: b64(b"out"),
+                    stdout_truncated: false,
+                    stderr_b64: b64(b""),
+                    stderr_truncated: true,
+                },
+            ),
             ("Digest", Message::Digest),
-            ("DigestIs", Message::DigestIs { workspace_digest: d(7) }),
-            ("PatchState", Message::PatchState { expected_base: d(8) }),
-            ("PatchStateIs", Message::PatchStateIs { state: PatchStateKind::Unknown, paths: vec![], workspace_digest: None, reason: Some("why".into()) }),
-            ("Refused", Message::Refused { reason: "no".into() }),
+            (
+                "DigestIs",
+                Message::DigestIs {
+                    workspace_digest: d(7),
+                },
+            ),
+            (
+                "PatchState",
+                Message::PatchState {
+                    expected_base: d(8),
+                },
+            ),
+            (
+                "PatchStateIs",
+                Message::PatchStateIs {
+                    state: PatchStateKind::Unknown,
+                    paths: vec![],
+                    workspace_digest: None,
+                    reason: Some("why".into()),
+                },
+            ),
+            (
+                "Refused",
+                Message::Refused {
+                    reason: "no".into(),
+                },
+            ),
             ("Shutdown", Message::Shutdown),
             ("Bye", Message::Bye),
         ]
@@ -229,8 +378,14 @@ mod tests {
 
     fn json_body_of_len(n: usize) -> Message {
         // Refused{reason} serializes to a fixed overhead plus the reason's bytes.
-        let overhead = serde_json::to_vec(&Message::Refused { reason: String::new() }).unwrap().len();
-        Message::Refused { reason: "x".repeat(n - overhead) }
+        let overhead = serde_json::to_vec(&Message::Refused {
+            reason: String::new(),
+        })
+        .unwrap()
+        .len();
+        Message::Refused {
+            reason: "x".repeat(n - overhead),
+        }
     }
 
     #[test]
@@ -239,13 +394,19 @@ mod tests {
         let mut buf = Vec::new();
         write_frame(&mut buf, &Frame::Json(m.clone())).unwrap();
         assert_eq!(buf.len(), 5 + JSON_FRAME_LIMIT);
-        assert_eq!(read_frame(&mut Cursor::new(&buf), RAW_FRAME_LIMIT).unwrap(), Frame::Json(m));
+        assert_eq!(
+            read_frame(&mut Cursor::new(&buf), RAW_FRAME_LIMIT).unwrap(),
+            Frame::Json(m)
+        );
 
         let raw = vec![0xabu8; RAW_FRAME_LIMIT];
         let mut buf = Vec::new();
         write_frame(&mut buf, &Frame::Raw(raw.clone())).unwrap();
         assert_eq!(&buf[..5], &[0x01, 0x00, 0x00, 0x00, 1]);
-        assert_eq!(read_frame(&mut Cursor::new(&buf), RAW_FRAME_LIMIT).unwrap(), Frame::Raw(raw));
+        assert_eq!(
+            read_frame(&mut Cursor::new(&buf), RAW_FRAME_LIMIT).unwrap(),
+            Frame::Raw(raw)
+        );
     }
 
     #[test]
@@ -253,12 +414,24 @@ mod tests {
         let mut hdr = u32::MAX.to_be_bytes().to_vec();
         hdr.push(FrameKind::Raw as u8);
         let err = read_frame(&mut Cursor::new(hdr), RAW_FRAME_LIMIT).unwrap_err();
-        assert!(matches!(err, FrameError::TooLarge { kind: FrameKind::Raw, len, limit } if len == u32::MAX as usize && limit == RAW_FRAME_LIMIT), "{err:?}");
+        assert!(
+            matches!(err, FrameError::TooLarge { kind: FrameKind::Raw, len, limit } if len == u32::MAX as usize && limit == RAW_FRAME_LIMIT),
+            "{err:?}"
+        );
 
         let mut hdr = ((JSON_FRAME_LIMIT + 1) as u32).to_be_bytes().to_vec();
         hdr.push(FrameKind::Json as u8);
         let err = read_frame(&mut Cursor::new(hdr), RAW_FRAME_LIMIT).unwrap_err();
-        assert!(matches!(err, FrameError::TooLarge { kind: FrameKind::Json, .. }), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                FrameError::TooLarge {
+                    kind: FrameKind::Json,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
 
         let mut hdr = (17u32 << 20).to_be_bytes().to_vec();
         hdr.push(1);
@@ -268,24 +441,36 @@ mod tests {
         // A smaller caller-chosen raw limit is honoured.
         let mut hdr = 11u32.to_be_bytes().to_vec();
         hdr.push(1);
-        assert!(matches!(read_frame(&mut Cursor::new(hdr), 10).unwrap_err(), FrameError::TooLarge { limit: 10, .. }));
+        assert!(matches!(
+            read_frame(&mut Cursor::new(hdr), 10).unwrap_err(),
+            FrameError::TooLarge { limit: 10, .. }
+        ));
     }
 
     #[test]
     fn decode_rejects_an_unknown_kind_and_invalid_json() {
         let mut buf = 1u32.to_be_bytes().to_vec();
         buf.extend([9, 0]);
-        assert!(matches!(read_frame(&mut Cursor::new(buf), RAW_FRAME_LIMIT).unwrap_err(), FrameError::UnknownKind(9)));
+        assert!(matches!(
+            read_frame(&mut Cursor::new(buf), RAW_FRAME_LIMIT).unwrap_err(),
+            FrameError::UnknownKind(9)
+        ));
         let mut buf = 3u32.to_be_bytes().to_vec();
         buf.push(0);
         buf.extend(b"{x}");
-        assert!(matches!(read_frame(&mut Cursor::new(buf), RAW_FRAME_LIMIT).unwrap_err(), FrameError::Json(_)));
+        assert!(matches!(
+            read_frame(&mut Cursor::new(buf), RAW_FRAME_LIMIT).unwrap_err(),
+            FrameError::Json(_)
+        ));
         // Valid JSON of an unknown message type is also a Json error.
         let body = br#"{"type":"Nope"}"#;
         let mut buf = (body.len() as u32).to_be_bytes().to_vec();
         buf.push(0);
         buf.extend(body);
-        assert!(matches!(read_frame(&mut Cursor::new(buf), RAW_FRAME_LIMIT).unwrap_err(), FrameError::Json(_)));
+        assert!(matches!(
+            read_frame(&mut Cursor::new(buf), RAW_FRAME_LIMIT).unwrap_err(),
+            FrameError::Json(_)
+        ));
     }
 
     #[test]
@@ -293,8 +478,14 @@ mod tests {
         let mut buf = Vec::new();
         write_frame(&mut buf, &Frame::Raw(vec![1; 10])).unwrap();
         buf.truncate(buf.len() - 1);
-        assert!(matches!(read_frame(&mut Cursor::new(buf), RAW_FRAME_LIMIT).unwrap_err(), FrameError::Io(_)));
-        assert!(matches!(read_frame(&mut Cursor::new(vec![0u8, 0]), RAW_FRAME_LIMIT).unwrap_err(), FrameError::Io(_)));
+        assert!(matches!(
+            read_frame(&mut Cursor::new(buf), RAW_FRAME_LIMIT).unwrap_err(),
+            FrameError::Io(_)
+        ));
+        assert!(matches!(
+            read_frame(&mut Cursor::new(vec![0u8, 0]), RAW_FRAME_LIMIT).unwrap_err(),
+            FrameError::Io(_)
+        ));
     }
 
     #[test]

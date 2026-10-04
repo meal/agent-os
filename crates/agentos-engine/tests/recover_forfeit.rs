@@ -9,7 +9,7 @@ use agentos_core::effect::{AttemptId, EffectId, EffectKind, EffectRecord, Effect
 use agentos_core::ids::Digest;
 use agentos_core::state::{TaskEvent, TaskState};
 use agentos_engine::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor};
-use agentos_engine::recover::{recover, Decision};
+use agentos_engine::recover::{Decision, recover};
 use common::Env;
 
 /// An executor that never ran anything and kept nothing.
@@ -43,7 +43,11 @@ impl Executor for Retained {
             contract: self.contract.clone(),
             deadline_ts: 0,
         };
-        let ctx = AttemptCtx { attempt_id: self.attempt.clone(), lease_generation: 1, worker: "w".into() };
+        let ctx = AttemptCtx {
+            attempt_id: self.attempt.clone(),
+            lease_generation: 1,
+            worker: "w".into(),
+        };
         let body = b"{\"content\":[],\"stop_reason\":\"end_turn\",\"usage\":{\"output_tokens\":1}}";
         Some(ExecOutcome::success(&req, &ctx, body.to_vec()))
     }
@@ -59,17 +63,31 @@ impl Executor for Unresolved {
 }
 
 fn intend_model_call(env: &Env, body: &[u8]) -> EffectRecord {
-    let kind = EffectKind::ModelCall { model: "fake".into(), turn: 1 };
+    let kind = EffectKind::ModelCall {
+        model: "fake".into(),
+        turn: 1,
+    };
     let base = env.db.task(&env.task).unwrap().workspace_digest;
     let reserve = Reservation::for_kind(&kind, 1);
-    env.db.record_intent(&env.task, kind, Digest::of(body), &base, reserve, &Resource::Task).unwrap()
+    env.db
+        .record_intent(
+            &env.task,
+            kind,
+            Digest::of(body),
+            &base,
+            reserve,
+            &Resource::Task,
+        )
+        .unwrap()
 }
 
 fn dispatched_model_call(env: &Env) -> (EffectRecord, AttemptId) {
     env.db.append(&env.task, &TaskEvent::Started).unwrap();
     let rec = intend_model_call(env, b"body");
     let attempt = AttemptId::new();
-    env.db.mark_dispatched(&rec.effect_id, &attempt, "w", 1).unwrap();
+    env.db
+        .mark_dispatched(&rec.effect_id, &attempt, "w", 1)
+        .unwrap();
     (rec, attempt)
 }
 
@@ -78,7 +96,9 @@ async fn a_dispatched_model_call_without_a_receipt_is_forfeited_not_unreconcilab
     let env = Env::with_model(3, 5);
     let (rec, _) = dispatched_model_call(&env);
 
-    let report = recover(&env.db, &env.blobs, &NoReceipt, &env.task).await.unwrap();
+    let report = recover(&env.db, &env.blobs, &NoReceipt, &env.task)
+        .await
+        .unwrap();
 
     assert_eq!(report.decisions.len(), 1, "{report:?}");
     let d = &report.decisions[0];
@@ -87,15 +107,30 @@ async fn a_dispatched_model_call_without_a_receipt_is_forfeited_not_unreconcilab
     assert_eq!(d.found_state, EffectState::Dispatched);
     assert_eq!(d.lease_generation, 1);
     let after = env.db.effect(&rec.effect_id).unwrap();
-    assert_eq!((after.state, after.result_digest), (EffectState::Failed, None));
-    assert_eq!(env.db.usage_summary(&env.task).unwrap().uncertain_model_requests, 1);
-    assert_eq!(env.db.task(&env.task).unwrap().state, TaskState::Running, "the task goes on");
+    assert_eq!(
+        (after.state, after.result_digest),
+        (EffectState::Failed, None)
+    );
+    assert_eq!(
+        env.db
+            .usage_summary(&env.task)
+            .unwrap()
+            .uncertain_model_requests,
+        1
+    );
+    assert_eq!(
+        env.db.task(&env.task).unwrap().state,
+        TaskState::Running,
+        "the task goes on"
+    );
     assert_eq!(report.state, Some(TaskState::Running));
     assert_eq!(env.count("EffectForfeited"), 1);
     assert_eq!(env.count("EffectUnknown"), 0);
 
     let n = env.events().len();
-    let again = recover(&env.db, &env.blobs, &NoReceipt, &env.task).await.unwrap();
+    let again = recover(&env.db, &env.blobs, &NoReceipt, &env.task)
+        .await
+        .unwrap();
     assert!(again.decisions.is_empty(), "{again:?}");
     assert_eq!(env.events().len(), n, "recovering again journals nothing");
 }
@@ -105,15 +140,33 @@ async fn an_unknown_model_call_is_forfeited_on_a_terminal_task_too() {
     let env = Env::with_model(3, 5);
     let (rec, _) = dispatched_model_call(&env);
     env.db.mark_unknown(&rec.effect_id).unwrap();
-    env.db.append(&env.task, &TaskEvent::Failed { reason: "something else".into() }).unwrap();
+    env.db
+        .append(
+            &env.task,
+            &TaskEvent::Failed {
+                reason: "something else".into(),
+            },
+        )
+        .unwrap();
 
-    let report = recover(&env.db, &env.blobs, &NoReceipt, &env.task).await.unwrap();
+    let report = recover(&env.db, &env.blobs, &NoReceipt, &env.task)
+        .await
+        .unwrap();
 
     assert_eq!(report.decisions.len(), 1, "{report:?}");
     assert_eq!(report.decisions[0].decision, Decision::Forfeit);
     assert_eq!(report.decisions[0].found_state, EffectState::Unknown);
-    assert_eq!(env.db.effect(&rec.effect_id).unwrap().state, EffectState::Failed);
-    assert_eq!(env.db.usage_summary(&env.task).unwrap().uncertain_model_requests, 1);
+    assert_eq!(
+        env.db.effect(&rec.effect_id).unwrap().state,
+        EffectState::Failed
+    );
+    assert_eq!(
+        env.db
+            .usage_summary(&env.task)
+            .unwrap()
+            .uncertain_model_requests,
+        1
+    );
     assert!(report.abandoned.is_empty(), "{report:?}");
     assert_eq!(env.db.task(&env.task).unwrap().state, TaskState::Failed);
 }
@@ -122,15 +175,27 @@ async fn an_unknown_model_call_is_forfeited_on_a_terminal_task_too() {
 async fn a_retained_model_response_is_published_not_forfeited() {
     let env = Env::with_model(3, 5);
     let (rec, attempt) = dispatched_model_call(&env);
-    let exec = Retained { attempt, contract: env.contract.clone(), rec: rec.clone() };
+    let exec = Retained {
+        attempt,
+        contract: env.contract.clone(),
+        rec: rec.clone(),
+    };
 
-    let report = recover(&env.db, &env.blobs, &exec, &env.task).await.unwrap();
+    let report = recover(&env.db, &env.blobs, &exec, &env.task)
+        .await
+        .unwrap();
 
     assert_eq!(report.decisions.len(), 1, "{report:?}");
     assert_eq!(report.decisions[0].decision, Decision::PublishRetained);
-    assert_eq!(env.db.effect(&rec.effect_id).unwrap().state, EffectState::Completed);
+    assert_eq!(
+        env.db.effect(&rec.effect_id).unwrap().state,
+        EffectState::Completed
+    );
     let usage = env.db.usage_summary(&env.task).unwrap();
-    assert_eq!((usage.settled_model_requests, usage.uncertain_model_requests), (1, 0));
+    assert_eq!(
+        (usage.settled_model_requests, usage.uncertain_model_requests),
+        (1, 0)
+    );
     assert_eq!(env.count("EffectForfeited"), 0);
 }
 
@@ -141,20 +206,46 @@ async fn run_attempt_forfeits_an_unresolved_model_call() {
     env.blobs.put(b"body").unwrap();
     let rec = intend_model_call(&env, b"body");
     // Registered, or recovery's blob collection would remove it.
-    env.db.register_artifact(&rec.request_digest, 4, "model-request", Some(&rec.effect_id), "{}").unwrap();
+    env.db
+        .register_artifact(
+            &rec.request_digest,
+            4,
+            "model-request",
+            Some(&rec.effect_id),
+            "{}",
+        )
+        .unwrap();
     assert_eq!(rec.state, EffectState::Intended);
 
-    let report = recover(&env.db, &env.blobs, &Unresolved, &env.task).await.unwrap();
+    let report = recover(&env.db, &env.blobs, &Unresolved, &env.task)
+        .await
+        .unwrap();
 
     let decisions: Vec<Decision> = report.decisions.iter().map(|d| d.decision).collect();
     assert_eq!(decisions, vec![Decision::Dispatch], "{report:?}");
     let after = env.db.effect(&rec.effect_id).unwrap();
-    assert_eq!((after.state, after.result_digest), (EffectState::Failed, None));
-    assert_eq!(env.db.usage_summary(&env.task).unwrap().uncertain_model_requests, 1);
+    assert_eq!(
+        (after.state, after.result_digest),
+        (EffectState::Failed, None)
+    );
+    assert_eq!(
+        env.db
+            .usage_summary(&env.task)
+            .unwrap()
+            .uncertain_model_requests,
+        1
+    );
     assert_eq!(env.db.task(&env.task).unwrap().state, TaskState::Running);
-    let forfeited: Vec<_> = env.events().into_iter().filter(|e| e.event_type == "EffectForfeited").collect();
+    let forfeited: Vec<_> = env
+        .events()
+        .into_iter()
+        .filter(|e| e.event_type == "EffectForfeited")
+        .collect();
     assert_eq!(forfeited.len(), 1);
-    assert_eq!(forfeited[0].payload["reason"], "transport failure: timed out");
+    assert_eq!(
+        forfeited[0].payload["reason"],
+        "transport failure: timed out"
+    );
     assert_eq!(forfeited[0].payload["lease_generation"], 1);
 }
 
@@ -164,10 +255,15 @@ async fn an_intended_model_call_whose_body_is_gone_is_unreconcilable() {
     env.db.append(&env.task, &TaskEvent::Started).unwrap();
     let rec = intend_model_call(&env, b"body");
 
-    let report = recover(&env.db, &env.blobs, &NoReceipt, &env.task).await.unwrap();
+    let report = recover(&env.db, &env.blobs, &NoReceipt, &env.task)
+        .await
+        .unwrap();
 
     let decisions: Vec<Decision> = report.decisions.iter().map(|d| d.decision).collect();
     assert_eq!(decisions, vec![Decision::Unreconcilable], "{report:?}");
     assert_eq!(report.state, Some(TaskState::Failed));
-    assert_ne!(env.db.effect(&rec.effect_id).unwrap().state, EffectState::Failed);
+    assert_ne!(
+        env.db.effect(&rec.effect_id).unwrap().state,
+        EffectState::Failed
+    );
 }

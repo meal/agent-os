@@ -8,8 +8,8 @@ use agentos_core::effect::{AttemptId, EffectId, EffectKind};
 use agentos_core::ids::Digest;
 use serde_json::Value;
 
+use super::policy::{ModelFailure, ModelFailureClass, classify};
 use super::provider::{ModelProvider, ProviderResult};
-use super::policy::{classify, ModelFailure, ModelFailureClass};
 use crate::crash::{CrashHook, CrashPoint};
 use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor};
 use crate::guestlink::guest_text;
@@ -48,8 +48,17 @@ mod deadline_tests {
 }
 
 impl ModelExecutor {
-    pub fn new(root: PathBuf, provider: Option<Box<dyn ModelProvider>>, counts: ExecCounts) -> ModelExecutor {
-        ModelExecutor { root, provider, counts, crash: None }
+    pub fn new(
+        root: PathBuf,
+        provider: Option<Box<dyn ModelProvider>>,
+        counts: ExecCounts,
+    ) -> ModelExecutor {
+        ModelExecutor {
+            root,
+            provider,
+            counts,
+            crash: None,
+        }
     }
 
     pub fn with_crash(mut self, hook: Option<CrashHook>) -> Self {
@@ -71,7 +80,12 @@ impl ModelExecutor {
     /// Writes the answer durably: the file and its directory are synced by `atomic_write`;
     /// the directory's entry in `root` (and `root`'s own entry, when this created it) are
     /// synced here, so a power loss cannot leave a synced file under a vanished directory.
-    fn try_retain(&self, req: &EffectRequest, ctx: &AttemptCtx, out: &ExecOutcome) -> std::io::Result<()> {
+    fn try_retain(
+        &self,
+        req: &EffectRequest,
+        ctx: &AttemptCtx,
+        out: &ExecOutcome,
+    ) -> std::io::Result<()> {
         check_plain_name("effect id", req.effect_id.as_str())?;
         let attempt = ctx.attempt_id.to_string();
         check_plain_name("attempt id", &attempt)?;
@@ -79,7 +93,10 @@ impl ModelExecutor {
         std::fs::create_dir_all(&self.root)?;
         let dir = self.retention_dir(&req.effect_id, &ctx.attempt_id);
         std::fs::create_dir_all(&dir)?;
-        atomic_write(&dir.join("response.json"), &serde_json::to_vec(out).expect("an outcome serializes"))?;
+        atomic_write(
+            &dir.join("response.json"),
+            &serde_json::to_vec(out).expect("an outcome serializes"),
+        )?;
         sync_dir(&self.root)?;
         if created_root && let Some(parent) = self.root.parent() {
             sync_dir(parent)?;
@@ -100,10 +117,16 @@ fn deadline_remaining(deadline_ts: i64, at: SystemTime) -> Option<Duration> {
 /// Whether `bytes` look like a Messages response: an object with a `content` array and a
 /// string `stop_reason`.
 fn well_formed(bytes: &[u8]) -> bool {
-    serde_json::from_slice::<Value>(bytes).is_ok_and(|v| v["content"].is_array() && v["stop_reason"].is_string())
+    serde_json::from_slice::<Value>(bytes)
+        .is_ok_and(|v| v["content"].is_array() && v["stop_reason"].is_string())
 }
 
-fn classified_failure(req: &EffectRequest, ctx: &AttemptCtx, reason: String, failure: ModelFailure) -> ExecOutcome {
+fn classified_failure(
+    req: &EffectRequest,
+    ctx: &AttemptCtx,
+    reason: String,
+    failure: ModelFailure,
+) -> ExecOutcome {
     let mut out = ExecOutcome::failure(req, ctx, reason);
     let mut value: Value = serde_json::from_slice(&out.output).expect("failure JSON");
     value["failure"] = serde_json::to_value(failure).expect("failure metadata");
@@ -128,31 +151,67 @@ impl Executor for ModelExecutor {
             };
             match tokio::time::timeout(remaining, provider.complete(&req.payload)).await {
                 Ok(result) => result,
-                Err(_) => ProviderResult::Transport("task deadline exceeded during model call".into()),
+                Err(_) => {
+                    ProviderResult::Transport("task deadline exceeded during model call".into())
+                }
             }
         };
         let out = match result {
-            ProviderResult::Response(bytes, _usage) if well_formed(&bytes) => ExecOutcome::success(req, ctx, bytes),
+            ProviderResult::Response(bytes, _usage) if well_formed(&bytes) => {
+                ExecOutcome::success(req, ctx, bytes)
+            }
             ProviderResult::Response(bytes, _usage) => {
-                let excerpt = String::from_utf8_lossy(&bytes[..bytes.len().min(EXCERPT)]).into_owned();
-                classified_failure(req, ctx, format!("malformed model response: {}", guest_text(&excerpt)),
-                    ModelFailure { class: ModelFailureClass::Permanent, retry_not_before_ts: None })
+                let excerpt =
+                    String::from_utf8_lossy(&bytes[..bytes.len().min(EXCERPT)]).into_owned();
+                classified_failure(
+                    req,
+                    ctx,
+                    format!("malformed model response: {}", guest_text(&excerpt)),
+                    ModelFailure {
+                        class: ModelFailureClass::Permanent,
+                        retry_not_before_ts: None,
+                    },
+                )
             }
-            ProviderResult::Rejected { status, body } => {
-                classified_failure(req, ctx, format!("http {status}: {}", guest_text(&body)),
-                    ModelFailure { class: classify(status), retry_not_before_ts: None })
-            }
-            ProviderResult::RejectedWithRetryAfter { status, body, retry_not_before_ts } => {
-                classified_failure(req, ctx, format!("http {status}: {}", guest_text(&body)),
-                    ModelFailure { class: classify(status), retry_not_before_ts: Some(retry_not_before_ts) })
-            }
-            ProviderResult::Transport(why) => {
-                ExecOutcome::unresolved(req, ctx, format!("transport failure: {}", guest_text(&why)))
-            }
+            ProviderResult::Rejected { status, body } => classified_failure(
+                req,
+                ctx,
+                format!("http {status}: {}", guest_text(&body)),
+                ModelFailure {
+                    class: classify(status),
+                    retry_not_before_ts: None,
+                },
+            ),
+            ProviderResult::RejectedWithRetryAfter {
+                status,
+                body,
+                retry_not_before_ts,
+            } => classified_failure(
+                req,
+                ctx,
+                format!("http {status}: {}", guest_text(&body)),
+                ModelFailure {
+                    class: classify(status),
+                    retry_not_before_ts: Some(retry_not_before_ts),
+                },
+            ),
+            ProviderResult::Transport(why) => ExecOutcome::unresolved(
+                req,
+                ctx,
+                format!("transport failure: {}", guest_text(&why)),
+            ),
         };
         self.counts.record(&req.kind);
-        if self.crash.as_ref().is_some_and(|h| h.check(CrashPoint::DuringExecute, Some("model_call"))) {
-            return ExecOutcome::failure(req, ctx, "injected crash before the response was retained");
+        if self
+            .crash
+            .as_ref()
+            .is_some_and(|h| h.check(CrashPoint::DuringExecute, Some("model_call")))
+        {
+            return ExecOutcome::failure(
+                req,
+                ctx,
+                "injected crash before the response was retained",
+            );
         }
         if !out.unresolved {
             self.retain(req, ctx, &out);
@@ -167,12 +226,19 @@ impl Executor for ModelExecutor {
             if !entry.file_name().to_string_lossy().starts_with(&prefix) {
                 continue;
             }
-            let Ok(bytes) = std::fs::read(entry.path().join("response.json")) else { continue };
-            let Ok(out) = serde_json::from_slice::<ExecOutcome>(&bytes) else { continue };
+            let Ok(bytes) = std::fs::read(entry.path().join("response.json")) else {
+                continue;
+            };
+            let Ok(out) = serde_json::from_slice::<ExecOutcome>(&bytes) else {
+                continue;
+            };
             if out.receipt.effect_id != *effect || out.unresolved {
                 continue;
             }
-            if best.as_ref().is_none_or(|b| out.receipt.lease_generation > b.receipt.lease_generation) {
+            if best
+                .as_ref()
+                .is_none_or(|b| out.receipt.lease_generation > b.receipt.lease_generation)
+            {
                 best = Some(out);
             }
         }

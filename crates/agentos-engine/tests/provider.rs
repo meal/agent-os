@@ -20,7 +20,14 @@ async fn retry_after_headers_reach_the_caller_without_client_retry() {
         let api = serve(Reply::Raw(format!("HTTP/1.1 429 Too Many Requests\r\nretry-after: {header}\r\ncontent-length: 4\r\nconnection: close\r\n\r\nbusy").into_bytes()));
         let result = provider(&api, Duration::from_secs(5)).complete(BODY).await;
         match (expected, result) {
-            (Some(want), ProviderResult::RejectedWithRetryAfter { status: 429, body, retry_not_before_ts }) => {
+            (
+                Some(want),
+                ProviderResult::RejectedWithRetryAfter {
+                    status: 429,
+                    body,
+                    retry_not_before_ts,
+                },
+            ) => {
                 assert_eq!(body, "busy");
                 assert_eq!(retry_not_before_ts, want);
             }
@@ -35,7 +42,11 @@ fn raw_success(payload: &[u8], chunked: bool) -> Vec<u8> {
     let mut wire = if chunked {
         b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n".to_vec()
     } else {
-        format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", payload.len()).into_bytes()
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            payload.len()
+        )
+        .into_bytes()
     };
     if chunked {
         wire.extend_from_slice(format!("{:x}\r\n", payload.len()).as_bytes());
@@ -56,9 +67,14 @@ async fn response_byte_limit_applies_to_fixed_length_and_chunked_bodies() {
             let api = serve(Reply::Raw(raw_success(&payload, chunked)));
             let result = provider(&api, Duration::from_secs(5)).complete(BODY).await;
             if length == CAP {
-                assert!(matches!(result, ProviderResult::Response(ref bytes, _) if bytes.len() == length));
+                assert!(
+                    matches!(result, ProviderResult::Response(ref bytes, _) if bytes.len() == length)
+                );
             } else {
-                assert!(matches!(result, ProviderResult::Transport(ref reason) if reason.contains("response body exceeds")), "unexpected oversized result");
+                assert!(
+                    matches!(result, ProviderResult::Transport(ref reason) if reason.contains("response body exceeds")),
+                    "unexpected oversized result"
+                );
             }
             assert_eq!(api.hits(), 1);
         }
@@ -67,18 +83,26 @@ async fn response_byte_limit_applies_to_fixed_length_and_chunked_bodies() {
 
 #[tokio::test]
 async fn rejected_status_does_not_require_draining_the_body() {
-    let mut wire = b"HTTP/1.1 429 Too Many Requests\r\ncontent-length: 8192\r\nconnection: close\r\n\r\n".to_vec();
+    let mut wire =
+        b"HTTP/1.1 429 Too Many Requests\r\ncontent-length: 8192\r\nconnection: close\r\n\r\n"
+            .to_vec();
     wire.extend_from_slice(&vec![b'x'; PROVIDER_TEXT_LIMIT]);
     let api = serve(Reply::Raw(wire));
     let result = provider(&api, Duration::from_secs(2)).complete(BODY).await;
-    assert_eq!(result, ProviderResult::Rejected {
-        status: 429, body: "x".repeat(PROVIDER_TEXT_LIMIT),
-    });
+    assert_eq!(
+        result,
+        ProviderResult::Rejected {
+            status: 429,
+            body: "x".repeat(PROVIDER_TEXT_LIMIT),
+        }
+    );
     assert_eq!(api.hits(), 1);
 }
 
 fn provider(api: &FakeApi, timeout: Duration) -> AnthropicProvider {
-    AnthropicProvider::new(ApiKey::new("sk-ant-test-SECRET").unwrap()).with_base_url(api.url()).with_timeout(timeout)
+    AnthropicProvider::new(ApiKey::new("sk-ant-test-SECRET").unwrap())
+        .with_base_url(api.url())
+        .with_timeout(timeout)
 }
 
 fn secs2() -> Duration {
@@ -90,7 +114,13 @@ async fn a_2xx_is_a_response_with_its_usage() {
     let api = serve(Reply::Transcript(transcript("parser-fix-direct")));
     match provider(&api, secs2()).complete(BODY).await {
         ProviderResult::Response(bytes, usage) => {
-            assert_eq!(usage, Usage { input_tokens: 100, output_tokens: 20 });
+            assert_eq!(
+                usage,
+                Usage {
+                    input_tokens: 100,
+                    output_tokens: 20
+                }
+            );
             let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(v["content"][1]["name"], "list_files");
         }
@@ -98,7 +128,13 @@ async fn a_2xx_is_a_response_with_its_usage() {
     }
     let reqs = api.requests();
     assert_eq!(reqs.len(), 1);
-    let header = |k: &str| reqs[0].headers.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+    let header = |k: &str| {
+        reqs[0]
+            .headers
+            .iter()
+            .find(|(n, _)| n == k)
+            .map(|(_, v)| v.clone())
+    };
     assert_eq!(header("x-api-key").as_deref(), Some("sk-ant-test-SECRET"));
     assert_eq!(header("anthropic-version").as_deref(), Some("2023-06-01"));
     assert_eq!(header("content-type").as_deref(), Some("application/json"));
@@ -112,7 +148,10 @@ async fn a_4xx_is_rejected_with_its_status_and_body_and_one_send() {
     let api = serve(Reply::Status(400, text.into()));
     assert_eq!(
         provider(&api, secs2()).complete(BODY).await,
-        ProviderResult::Rejected { status: 400, body: text.into() }
+        ProviderResult::Rejected {
+            status: 400,
+            body: text.into()
+        }
     );
     assert_eq!(api.hits(), 1);
 }
@@ -122,7 +161,10 @@ async fn a_5xx_and_429_are_rejected_not_retried() {
     for status in [500u16, 503, 429] {
         let api = serve(Reply::Status(status, "{}".into()));
         let r = provider(&api, secs2()).complete(BODY).await;
-        assert!(matches!(r, ProviderResult::Rejected { status: s, .. } if s == status), "{r:?}");
+        assert!(
+            matches!(r, ProviderResult::Rejected { status: s, .. } if s == status),
+            "{r:?}"
+        );
         assert_eq!(api.hits(), 1, "status {status}");
     }
 }
@@ -131,9 +173,15 @@ async fn a_5xx_and_429_are_rejected_not_retried() {
 async fn a_timeout_is_a_transport_failure_after_exactly_one_send() {
     let api = serve(Reply::Hang(Duration::from_secs(5)));
     let t = Instant::now();
-    let r = provider(&api, Duration::from_millis(300)).complete(BODY).await;
+    let r = provider(&api, Duration::from_millis(300))
+        .complete(BODY)
+        .await;
     assert!(matches!(r, ProviderResult::Transport(_)), "{r:?}");
-    assert!(t.elapsed() < Duration::from_millis(1500), "took {:?}", t.elapsed());
+    assert!(
+        t.elapsed() < Duration::from_millis(1500),
+        "took {:?}",
+        t.elapsed()
+    );
     assert_eq!(api.hits(), 1);
 }
 
@@ -157,7 +205,10 @@ async fn a_refused_connection_is_a_transport_failure() {
     let p = AnthropicProvider::new(ApiKey::new("sk-ant-test-SECRET").unwrap())
         .with_base_url(closed_port_url())
         .with_timeout(secs2());
-    assert!(matches!(p.complete(BODY).await, ProviderResult::Transport(_)));
+    assert!(matches!(
+        p.complete(BODY).await,
+        ProviderResult::Transport(_)
+    ));
 }
 
 #[tokio::test]
@@ -187,7 +238,13 @@ async fn provider_errors_never_quote_the_key() {
             assert!(!t.contains("SECRET"), "{t}");
         }
     }
-    assert!(results.iter().filter(|r| matches!(r, ProviderResult::Transport(_))).count() >= 3);
+    assert!(
+        results
+            .iter()
+            .filter(|r| matches!(r, ProviderResult::Transport(_)))
+            .count()
+            >= 3
+    );
     for d in debugs {
         assert!(!d.contains("SECRET"), "{d}");
     }
@@ -203,19 +260,43 @@ async fn provider_error_bodies_are_bounded_before_they_reach_the_journal() {
 }
 
 fn tools(name: &str) -> Vec<serde_json::Value> {
-    load_transcript(&transcript(name)).unwrap().responses.into_iter().map(|e| e.response["content"][1].clone()).collect()
+    load_transcript(&transcript(name))
+        .unwrap()
+        .responses
+        .into_iter()
+        .map(|e| e.response["content"][1].clone())
+        .collect()
 }
 
 #[test]
 fn the_fixture_transcripts_parse_and_have_the_documented_tool_sequence() {
     let full = tools("parser-fix");
-    let names: Vec<_> = full.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
-    assert_eq!(names, ["list_files", "read_file", "apply_patch", "run_verification", "apply_patch", "run_verification"]);
+    let names: Vec<_> = full
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "list_files",
+            "read_file",
+            "apply_patch",
+            "run_verification",
+            "apply_patch",
+            "run_verification"
+        ]
+    );
     assert_eq!(full[4]["input"]["patch"], fix_patch());
     assert_eq!(full[1]["input"]["path"], "src/parser.py");
     let direct = tools("parser-fix-direct");
-    let names: Vec<_> = direct.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
-    assert_eq!(names, ["list_files", "read_file", "apply_patch", "run_verification"]);
+    let names: Vec<_> = direct
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        names,
+        ["list_files", "read_file", "apply_patch", "run_verification"]
+    );
     assert_eq!(direct[2]["input"]["patch"], fix_patch());
 }
 
@@ -223,12 +304,27 @@ fn the_fixture_transcripts_parse_and_have_the_documented_tool_sequence() {
 async fn a_redirect_is_rejected_never_followed() {
     for status in [301u16, 307] {
         let target = serve(Reply::Status(200, "{}".into()));
-        let api = serve(Reply::Redirect(status, format!("{}/v1/messages", target.url())));
+        let api = serve(Reply::Redirect(
+            status,
+            format!("{}/v1/messages", target.url()),
+        ));
         let r = provider(&api, secs2()).complete(BODY).await;
-        assert!(matches!(r, ProviderResult::Rejected { status: s, .. } if s == status), "{status}: {r:?}");
+        assert!(
+            matches!(r, ProviderResult::Rejected { status: s, .. } if s == status),
+            "{status}: {r:?}"
+        );
         assert_eq!(api.hits(), 1, "{status}");
-        assert_eq!(target.hits(), 0, "{status}: the redirect target was contacted");
-        assert!(target.requests().iter().all(|q| q.headers.iter().all(|(k, _)| k != "x-api-key")));
+        assert_eq!(
+            target.hits(),
+            0,
+            "{status}: the redirect target was contacted"
+        );
+        assert!(
+            target
+                .requests()
+                .iter()
+                .all(|q| q.headers.iter().all(|(k, _)| k != "x-api-key"))
+        );
     }
 }
 

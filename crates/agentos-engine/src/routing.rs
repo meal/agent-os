@@ -24,13 +24,17 @@ impl<J: Executor + Sync> Executor for RoutingExecutor<J> {
     async fn run(&self, req: &EffectRequest, ctx: &AttemptCtx) -> ExecOutcome {
         match req.kind {
             EffectKind::ModelCall { .. } => self.model.run(req, ctx).await,
-            EffectKind::ListFiles { .. } | EffectKind::ReadFile { .. } => self.reads.run(req, ctx).await,
+            EffectKind::ListFiles { .. } | EffectKind::ReadFile { .. } => {
+                self.reads.run(req, ctx).await
+            }
             _ => self.jobs.run(req, ctx).await,
         }
     }
 
     fn retained_outcome(&self, effect: &EffectId) -> Option<ExecOutcome> {
-        self.jobs.retained_outcome(effect).or_else(|| self.model.retained_outcome(effect))
+        self.jobs
+            .retained_outcome(effect)
+            .or_else(|| self.model.retained_outcome(effect))
     }
 
     async fn reconcile(&self, req: &EffectRequest, ctx: &AttemptCtx) -> Reconciliation {

@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
-use rustix::process::{kill_process_group, Pid, Signal};
+use rustix::process::{Pid, Signal, kill_process_group};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
@@ -28,7 +28,10 @@ pub(crate) enum GroupError {
 /// a full pipe.
 async fn capture(mut pipe: impl AsyncRead + Unpin, limit: usize) -> Vec<u8> {
     let mut kept = Vec::new();
-    let _ = (&mut pipe).take(limit as u64 + 1).read_to_end(&mut kept).await;
+    let _ = (&mut pipe)
+        .take(limit as u64 + 1)
+        .read_to_end(&mut kept)
+        .await;
     let _ = tokio::io::copy(&mut pipe, &mut tokio::io::sink()).await;
     kept
 }
@@ -79,11 +82,20 @@ pub(crate) async fn run_in_group(
         if let Err(e) = recorded {
             kill_group(pgid);
             let _ = child.kill().await;
-            return Err(GroupError::Io(io::Error::new(e.kind(), format!("cannot record process group: {e}"))));
+            return Err(GroupError::Io(io::Error::new(
+                e.kind(),
+                format!("cannot record process group: {e}"),
+            )));
         }
     }
-    let stdout = tokio::spawn(capture(child.stdout.take().expect("stdout is piped"), limit));
-    let stderr = tokio::spawn(capture(child.stderr.take().expect("stderr is piped"), limit));
+    let stdout = tokio::spawn(capture(
+        child.stdout.take().expect("stdout is piped"),
+        limit,
+    ));
+    let stderr = tokio::spawn(capture(
+        child.stderr.take().expect("stderr is piped"),
+        limit,
+    ));
 
     let waited = tokio::time::timeout(timeout, child.wait()).await;
     // Kill the group before reaping matters: survivors would otherwise keep the pipes open.
@@ -95,6 +107,12 @@ pub(crate) async fn run_in_group(
         }
         Ok(status) => status.map_err(GroupError::Io)?,
     };
-    let join = |r: Result<Vec<u8>, tokio::task::JoinError>| r.map_err(|e| GroupError::Io(io::Error::other(e)));
-    Ok(GroupOutput { status, stdout: join(stdout.await)?, stderr: join(stderr.await)? })
+    let join = |r: Result<Vec<u8>, tokio::task::JoinError>| {
+        r.map_err(|e| GroupError::Io(io::Error::other(e)))
+    };
+    Ok(GroupOutput {
+        status,
+        stdout: join(stdout.await)?,
+        stderr: join(stderr.await)?,
+    })
 }

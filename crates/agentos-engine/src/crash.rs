@@ -76,13 +76,21 @@ pub struct CrashHook {
 
 impl fmt::Debug for CrashHook {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CrashHook").field("tripped", &self.tripped()).finish_non_exhaustive()
+        f.debug_struct("CrashHook")
+            .field("tripped", &self.tripped())
+            .finish_non_exhaustive()
     }
 }
 
 impl CrashHook {
-    pub fn new(decide: impl Fn(CrashPoint, &CrashCtx) -> bool + Send + Sync + 'static) -> CrashHook {
-        CrashHook { decide: Arc::new(decide), seen: Arc::default(), tripped: Arc::default() }
+    pub fn new(
+        decide: impl Fn(CrashPoint, &CrashCtx) -> bool + Send + Sync + 'static,
+    ) -> CrashHook {
+        CrashHook {
+            decide: Arc::new(decide),
+            seen: Arc::default(),
+            tripped: Arc::default(),
+        }
     }
 
     /// Fires the first time `point` is passed for an effect of kind `kind`.
@@ -144,10 +152,16 @@ mod tests {
         let hook = CrashHook::new(|p, ctx| p == CrashPoint::AfterDispatch && ctx.occurrence == 1);
         let clone = hook.clone();
         assert!(!hook.check(CrashPoint::AfterDispatch, Some("a")));
-        assert!(!hook.check(CrashPoint::AfterDispatch, Some("b")), "counted per kind");
+        assert!(
+            !hook.check(CrashPoint::AfterDispatch, Some("b")),
+            "counted per kind"
+        );
         assert!(!hook.check(CrashPoint::AfterIntent, Some("a")));
         assert_eq!(clone.tripped(), None);
-        assert!(clone.check(CrashPoint::AfterDispatch, Some("a")), "clones share counters");
+        assert!(
+            clone.check(CrashPoint::AfterDispatch, Some("a")),
+            "clones share counters"
+        );
         assert_eq!(hook.tripped(), Some(CrashPoint::AfterDispatch));
     }
 

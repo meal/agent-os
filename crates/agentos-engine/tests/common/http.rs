@@ -62,7 +62,11 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
         let (k, v) = l.split_once(':')?;
         headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
     }
-    let len = headers.iter().find(|(k, _)| k == "content-length").and_then(|(_, v)| v.parse().ok()).unwrap_or(0);
+    let len = headers
+        .iter()
+        .find(|(k, _)| k == "content-length")
+        .and_then(|(_, v)| v.parse().ok())
+        .unwrap_or(0);
     let mut body = vec![0u8; len];
     reader.read_exact(&mut body).ok()?;
     Some(Request { headers, body })
@@ -104,8 +108,15 @@ fn transcript_reply(path: &PathBuf, body: &[u8]) -> (u16, Vec<u8>) {
     }
 }
 
-fn handle(mut stream: TcpStream, reply: &Reply, hits: &AtomicUsize, requests: &Mutex<Vec<Request>>) {
-    let Some(req) = read_request(&stream) else { return };
+fn handle(
+    mut stream: TcpStream,
+    reply: &Reply,
+    hits: &AtomicUsize,
+    requests: &Mutex<Vec<Request>>,
+) {
+    let Some(req) = read_request(&stream) else {
+        return;
+    };
     hits.fetch_add(1, Ordering::SeqCst);
     let body = req.body.clone();
     requests.lock().unwrap().push(req);
@@ -150,5 +161,9 @@ pub fn serve(reply: Reply) -> FakeApi {
             thread::spawn(move || handle(stream, &reply, &h, &r));
         }
     });
-    FakeApi { addr, hits, requests }
+    FakeApi {
+        addr,
+        hits,
+        requests,
+    }
 }
