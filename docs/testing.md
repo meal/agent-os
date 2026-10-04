@@ -10,11 +10,12 @@ offline tier does not close them.
 Use a Linux x86_64 machine with Git and Docker Engine plus the Compose plugin.
 The checked-in image supplies Rust, Git and the pinned pyenv/Python runtime; you do
 not need to install Python or Ruby on the host. Ruby is not used by this project.
-Run these commands from the repository root. Use the branch from [PR #1](https://github.com/meal/agent-os/pull/1)
-while it is under review; the repository's default branch may lag it.
+Run these commands from the repository root. Use `main`, which carries the
+published walkthrough and its runnable examples; the repository's default branch
+may lag documentation updates.
 
 ```sh
-git clone --branch codex/v01-completion https://github.com/meal/agent-os.git
+git clone --branch main https://github.com/meal/agent-os.git
 cd agent-os
 docker compose version
 docker compose build test
