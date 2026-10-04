@@ -22,8 +22,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7, checked 2026-10-04
       - run: docker compose build test
       - run: sh scripts/test-check.sh
+      - run: sh scripts/test-check-pages.sh
       - run: sh scripts/test-acceptance.sh
       - run: sh scripts/build-guest-image.sh --self-test
       - run: docker compose run --rm test sh scripts/test-python-runtime.sh
-      - run: docker compose run --rm test pyenv exec python scripts/test-pages.py
+      - run: docker compose run --rm test sh scripts/check-pages.sh
       - run: sh scripts/check.sh "${{ matrix.check }}"
