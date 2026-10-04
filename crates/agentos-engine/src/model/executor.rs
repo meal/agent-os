@@ -2,7 +2,7 @@
 //! before returning it, so recovery publishes the answer instead of sending again.
 
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentos_core::effect::{AttemptId, EffectId, EffectKind};
 use serde_json::Value;
@@ -23,6 +23,26 @@ pub struct ModelExecutor {
     provider: Option<Box<dyn ModelProvider>>,
     counts: ExecCounts,
     crash: Option<CrashHook>,
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn remaining_duration_preserves_fractional_seconds() {
+        let at = UNIX_EPOCH + Duration::from_millis(9_750);
+        assert_eq!(deadline_remaining(10, at), Some(Duration::from_millis(250)));
+    }
+
+    #[test]
+    fn elapsed_or_invalid_deadlines_have_no_remaining_duration() {
+        let at = UNIX_EPOCH + Duration::from_secs(10);
+        assert_eq!(deadline_remaining(10, at), None);
+        assert_eq!(deadline_remaining(9, at), None);
+        assert_eq!(deadline_remaining(-1, at), None);
+    }
 }
 
 impl ModelExecutor {
@@ -66,8 +86,13 @@ impl ModelExecutor {
     }
 }
 
-fn now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+fn deadline_remaining(deadline_ts: i64, at: SystemTime) -> Option<Duration> {
+    let seconds = u64::try_from(deadline_ts).ok()?;
+    UNIX_EPOCH
+        .checked_add(Duration::from_secs(seconds))?
+        .duration_since(at)
+        .ok()
+        .filter(|remaining| !remaining.is_zero())
 }
 
 /// Whether `bytes` look like a Messages response: an object with a `content` array and a
@@ -84,10 +109,18 @@ impl Executor for ModelExecutor {
         let Some(provider) = &self.provider else {
             return ExecOutcome::failure(req, ctx, "no model provider configured");
         };
-        if req.deadline_ts != 0 && now() >= req.deadline_ts {
-            return ExecOutcome::failure(req, ctx, "deadline exceeded");
-        }
-        let out = match provider.complete(&req.payload).await {
+        let result = if req.deadline_ts == 0 {
+            provider.complete(&req.payload).await
+        } else {
+            let Some(remaining) = deadline_remaining(req.deadline_ts, SystemTime::now()) else {
+                return ExecOutcome::failure(req, ctx, "deadline exceeded");
+            };
+            match tokio::time::timeout(remaining, provider.complete(&req.payload)).await {
+                Ok(result) => result,
+                Err(_) => ProviderResult::Transport("task deadline exceeded during model call".into()),
+            }
+        };
+        let out = match result {
             ProviderResult::Response(bytes, _usage) if well_formed(&bytes) => ExecOutcome::success(req, ctx, bytes),
             ProviderResult::Response(bytes, _usage) => {
                 let excerpt = String::from_utf8_lossy(&bytes[..bytes.len().min(EXCERPT)]).into_owned();
