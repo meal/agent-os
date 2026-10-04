@@ -34,8 +34,37 @@ pub fn load_transcript(path: &Path) -> io::Result<Transcript> {
     })
 }
 
+/// Ordered attempts produced by `Recording`. Legacy response-only transcripts remain
+/// conversation-depth keyed; this version also preserves failures and repeated requests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttemptRecording {
+    pub schema_version: u32,
+    pub attempts: Vec<RecordedAttempt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordedAttempt {
+    pub request_digest: Digest,
+    pub outcome: ProviderResult,
+}
+
+pub fn load_recording(path: &Path) -> io::Result<AttemptRecording> {
+    let recording: AttemptRecording = serde_json::from_slice(&std::fs::read(path)?)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if recording.schema_version != 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported attempt recording version",
+        ));
+    }
+    Ok(recording)
+}
+
 enum Mode {
     Transcript(Transcript),
+    Recorded(Mutex<VecDeque<RecordedAttempt>>),
     Scripted(Mutex<VecDeque<ProviderResult>>),
 }
 
@@ -49,7 +78,17 @@ pub struct FakeProvider {
 
 impl FakeProvider {
     pub fn from_file(path: &Path) -> io::Result<FakeProvider> {
-        Ok(FakeProvider::from_transcript(load_transcript(path)?))
+        let shape: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if shape.get("schema_version").is_some() {
+            let recording = load_recording(path)?;
+            Ok(FakeProvider {
+                mode: Arc::new(Mode::Recorded(Mutex::new(recording.attempts.into()))),
+                calls: Arc::new(AtomicUsize::new(0)),
+            })
+        } else {
+            Ok(FakeProvider::from_transcript(load_transcript(path)?))
+        }
     }
 
     pub fn from_transcript(t: Transcript) -> FakeProvider {
@@ -113,6 +152,20 @@ impl ModelProvider for FakeProvider {
             self.calls.fetch_add(1, Ordering::SeqCst);
             match &*self.mode {
                 Mode::Transcript(t) => answer(t, body),
+                Mode::Recorded(q) => {
+                    let mut q = q.lock().expect("recording lock");
+                    let Some(entry) = q.front() else {
+                        return reject("attempt recording exhausted".into());
+                    };
+                    if entry.request_digest != Digest::of(body) {
+                        return reject(format!(
+                            "recorded attempt expects request {}, got {}",
+                            entry.request_digest,
+                            Digest::of(body)
+                        ));
+                    }
+                    q.pop_front().unwrap().outcome
+                }
                 Mode::Scripted(q) => q
                     .lock()
                     .expect("script lock")
@@ -123,12 +176,12 @@ impl ModelProvider for FakeProvider {
     }
 }
 
-/// Wraps a provider and writes every `Response` it sees to `path` as a [`Transcript`]
-/// (request digest pinned, request bytes never stored).
+/// Writes every completed provider attempt to `path` as a versioned [`AttemptRecording`].
+/// Pins request digests without storing request bytes; outcomes and retry metadata replay exactly.
 pub struct Recording<P: ModelProvider> {
     inner: P,
     path: PathBuf,
-    entries: Mutex<Vec<TranscriptEntry>>,
+    entries: Mutex<Vec<RecordedAttempt>>,
 }
 
 impl<P: ModelProvider> Recording<P> {
@@ -145,23 +198,20 @@ impl<P: ModelProvider> ModelProvider for Recording<P> {
     fn complete<'a>(&'a self, body: &'a [u8]) -> BoxFuture<'a, ProviderResult> {
         Box::pin(async move {
             let result = self.inner.complete(body).await;
-            if let ProviderResult::Response(bytes, _) = &result
-                && let Ok(response) = serde_json::from_slice::<serde_json::Value>(bytes)
-            {
-                let transcript = {
-                    let mut entries = self.entries.lock().expect("recording lock");
-                    entries.push(TranscriptEntry {
-                        expect_request_digest: Some(Digest::of(body)),
-                        response,
-                    });
-                    Transcript {
-                        responses: entries.clone(),
-                    }
-                };
-                let json = serde_json::to_vec_pretty(&transcript).expect("a transcript serializes");
-                if let Err(e) = atomic_write(&self.path, &json) {
-                    tracing::warn!("recording {}: {e}", self.path.display());
+            let recording = {
+                let mut entries = self.entries.lock().expect("recording lock");
+                entries.push(RecordedAttempt {
+                    request_digest: Digest::of(body),
+                    outcome: result.clone(),
+                });
+                AttemptRecording {
+                    schema_version: 2,
+                    attempts: entries.clone(),
                 }
+            };
+            let json = serde_json::to_vec_pretty(&recording).expect("a recording serializes");
+            if let Err(e) = atomic_write(&self.path, &json) {
+                tracing::warn!("recording {}: {e}", self.path.display());
             }
             result
         })
@@ -265,7 +315,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recording_writes_the_transcript_format_without_the_request_bytes() {
+    async fn recording_writes_ordered_attempts_without_the_request_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rec.json");
         let rec = Recording::new(
@@ -278,15 +328,60 @@ mod tests {
         let b2 = br#"{"messages":[{"role":"user","content":"PRIVATE-REQUEST-TEXT"},{"role":"assistant","content":"a"},{"role":"user","content":"PRIVATE-2"}]}"#.to_vec();
         rec.complete(&b1).await;
         rec.complete(&b2).await;
-        rec.complete(b"not json").await; // rejected: unrecorded
-        let t = load_transcript(&path).unwrap();
-        assert_eq!(t.responses.len(), 2);
-        assert_eq!(t.responses[0].expect_request_digest, Some(Digest::of(&b1)));
-        assert_eq!(t.responses[1].expect_request_digest, Some(Digest::of(&b2)));
+        rec.complete(b"not json").await; // definite rejection is recorded too
+        let t = load_recording(&path).unwrap();
+        assert_eq!(t.attempts.len(), 3);
+        assert_eq!(t.attempts[0].request_digest, Digest::of(&b1));
+        assert_eq!(t.attempts[1].request_digest, Digest::of(&b2));
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("PRIVATE"));
         // and it replays
         let replay = FakeProvider::from_file(&path).unwrap();
         assert_eq!(id_of(&replay.complete(&b1).await), "msg_0");
+    }
+
+    #[tokio::test]
+    async fn attempt_recording_preserves_all_outcomes_and_repeated_request_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attempts.json");
+        let outcomes = vec![
+            ProviderResult::Rejected {
+                status: 503,
+                body: "overloaded".into(),
+            },
+            ProviderResult::RejectedWithRetryAfter {
+                status: 429,
+                body: "slow".into(),
+                retry_not_before_ts: 123456,
+            },
+            ProviderResult::Transport("disconnected".into()),
+            ProviderResult::Response(
+                b" {invalid JSON} ".to_vec(),
+                super::super::provider::Usage {
+                    input_tokens: 7,
+                    output_tokens: 2,
+                },
+            ),
+        ];
+        let rec = Recording::new(FakeProvider::scripted(outcomes.clone()), path.clone());
+        for expected in &outcomes {
+            assert_eq!(&rec.complete(b"identical request").await, expected);
+        }
+        let replay = FakeProvider::from_file(&path).unwrap();
+        assert!(matches!(
+            replay.complete(b"different request").await,
+            ProviderResult::Rejected { status: 400, .. }
+        ));
+        for expected in outcomes {
+            assert_eq!(replay.complete(b"identical request").await, expected);
+        }
+        assert!(matches!(
+            replay.complete(b"identical request").await,
+            ProviderResult::Rejected { status: 400, .. }
+        ));
+        let mut recorded = load_recording(&path).unwrap();
+        recorded.schema_version = 999;
+        std::fs::write(&path, serde_json::to_vec(&recorded).unwrap()).unwrap();
+        assert!(FakeProvider::from_file(&path).is_err());
     }
 }

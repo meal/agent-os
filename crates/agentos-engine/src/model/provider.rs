@@ -22,7 +22,8 @@ pub fn usage_of(response: &serde_json::Value) -> Usage {
 }
 
 /// What one send of a model request came to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ProviderResult {
     /// A 2xx answer: the raw response bytes and the usage they report.
     Response(Vec<u8>, Usage),

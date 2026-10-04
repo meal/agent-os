@@ -55,7 +55,7 @@ The default tier needs neither KVM nor privilege beyond the container's own. Eve
 prints `SKIPPED: set AGENTOS_KVM_TESTS=1 and pass /dev/kvm (docker compose run --rm test-kvm …)`
 and returns. The two live-model tests print `SKIPPED: set AGENTOS_LIVE_MODEL_TESTS=1 and
 ANTHROPIC_API_KEY (or AGENTOS_API_KEY_FILE) to run the live model test` and return, so the
-default `cargo test` makes no network call; with `AGENTOS_LIVE_MODEL_TESTS` set and no key
+default `cargo test` makes no network call; with `AGENTOS_LIVE_MODEL_TESTS=1` and no key
 they panic.
 
 ### Test tiers

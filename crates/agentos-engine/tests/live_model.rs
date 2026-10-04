@@ -426,14 +426,15 @@ async fn the_live_harness_runs_offline_against_the_local_fake_api() {
         );
     }
 
-    let recorded = agentos_engine::model::fake::load_transcript(&path).unwrap();
-    assert_eq!(recorded.responses.len(), 4);
-    assert!(
+    let recorded = agentos_engine::model::fake::load_recording(&path).unwrap();
+    assert_eq!(recorded.attempts.len(), 4);
+    assert_eq!(
         recorded
-            .responses
+            .attempts
             .iter()
-            .all(|e| e.expect_request_digest.is_some()),
-        "every entry pins its request"
+            .map(|e| e.request_digest)
+            .collect::<Vec<_>>(),
+        run.requests
     );
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(
@@ -515,4 +516,34 @@ fn live_gate_requires_explicit_opt_in_and_bounded_regular_key_file() {
     let started = Instant::now();
     assert!(live::read_key_file(&fifo).is_err());
     assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn transient_rejections_record_and_replay_every_attempt_on_both_worker_paths() {
+    for tier in [WorkerTier::Host, WorkerTier::FakeJailed] {
+        let api = serve(Reply::RetryThenTranscript(transcript("parser-fix-direct")));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retry-recording.json");
+        let run = execute_for(
+            recording_over(
+                ApiKey::new("sk-ant-FAKE-retry-harness").unwrap(),
+                Some(&api.url()),
+                path.clone(),
+            ),
+            "claude-opus-5-5",
+            tier,
+            &api.url(),
+        )
+        .await;
+        assert_eq!(api.hits(), 5);
+        assert_eq!(run.model_calls, 5);
+        let replay = execute_for(
+            Box::new(FakeProvider::from_file(&path).unwrap()),
+            "claude-opus-5-5",
+            tier,
+            &api.url(),
+        )
+        .await;
+        assert_same_replay(&run, &replay);
+    }
 }

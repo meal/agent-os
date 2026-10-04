@@ -12,6 +12,7 @@ use std::time::Duration;
 pub enum Reply {
     Raw(Vec<u8>),
     Transcript(PathBuf),
+    RetryThenTranscript(PathBuf),
     Status(u16, String),
     Hang(Duration),
     CloseMidBody,
@@ -117,13 +118,22 @@ fn handle(
     let Some(req) = read_request(&stream) else {
         return;
     };
-    hits.fetch_add(1, Ordering::SeqCst);
+    let attempt = hits.fetch_add(1, Ordering::SeqCst);
     let body = req.body.clone();
     requests.lock().unwrap().push(req);
     match reply {
         Reply::Raw(bytes) => {
             let _ = stream.write_all(bytes);
             let _ = stream.flush();
+        }
+        Reply::RetryThenTranscript(path) => {
+            if attempt == 0 {
+                let _ = stream.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 4\r\nConnection: close\r\n\r\nslow");
+                let _ = stream.flush();
+            } else {
+                let (status, out) = transcript_reply(path, &body);
+                respond(&mut stream, status, &out);
+            }
         }
         Reply::Transcript(path) => {
             let (status, out) = transcript_reply(path, &body);

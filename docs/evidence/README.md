@@ -25,7 +25,9 @@ environment variables. Offline tests use clearly fake keys and a loopback fake A
 Each invocation writes private logs and setup metadata to a distinct `build/evidence/`
 directory. `AGENTOS_ACCEPTANCE_OUTPUT` can select a durable runner path. Live additionally
 writes recordings, an export bundle, a structured success report, and an offline replay
-report per worker. Replay asserts exact request digests, call count, final workspace,
+report per worker. Recordings use schema version 2, preserving every ordered provider attempt, raw response,
+usage and rejection/retry metadata; legacy response-only fixtures retain their depth semantics.
+Replay asserts exact request digests, call count, final workspace,
 protected profile, and exported patch. A failed test exits nonzero; its log and any
 completed recording/export remain for diagnosis. A replay report exists only after its
 assertions pass. Preserve failed-attempt logs alongside successful results.

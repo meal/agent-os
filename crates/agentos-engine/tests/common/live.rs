@@ -1,8 +1,8 @@
 //! The gate of the live model test (`tests/live_model.rs`), the same convention as
 //! [`super::kvm::require`]: `let Some(live) = live::require() else { return };`.
 //!
-//! Without `AGENTOS_LIVE_MODEL_TESTS` the test prints [`SKIP_MESSAGE`] and returns, and the
-//! default `cargo test` makes no network call. With it set, an unusable setup (no key) panics:
+//! Without `AGENTOS_LIVE_MODEL_TESTS=1` the test prints [`SKIP_MESSAGE`] and returns, and the
+//! default `cargo test` makes no network call. With it explicitly enabled, an unusable setup (no key) panics:
 //! a test that was asked for must not pass by doing nothing. The key is read into an
 //! [`ApiKey`] (redacted `Debug`) and never printed, logged or written down; panic texts name
 //! the variables, never their values.

@@ -166,8 +166,8 @@ docker compose run --rm test cargo test --workspace --locked
 
 **Files:** new `.github/workflows/ci.yml`, new `scripts/check.sh`; formatting/lint fixes in files named by the review and any subsequent diagnostics; `README.md`, `Agent_OS_v1_Build_Plan.md`, `docs/index.html`, Phase 4 spec/plan status.
 
-- [ ] Run default rustfmt once as an isolated formatting commit. Resolve Clippy findings without changing state/recovery behavior; use a narrowly documented allowance when boxing/changing a protocol type only for lint would create needless churn.
-- [ ] Make `scripts/check.sh` fail on the first failed required command and run these four checks:
+- [x] Run default rustfmt once as an isolated formatting commit. Resolve Clippy findings without changing state/recovery behavior; use a narrowly documented allowance when boxing/changing a protocol type only for lint would create needless churn.
+- [x] Make `scripts/check.sh` fail on the first failed required command and run these four checks:
 
 ```sh
 docker compose run --rm test cargo fmt --all -- --check
@@ -176,9 +176,9 @@ docker compose run --rm test cargo test --workspace --locked
 docker compose run --rm -e AGENTOS_TEST_WORKER=firecracker-fake -e AGENTOS_TEST_JAIL=fake test cargo test --workspace --locked
 ```
 
-- [ ] Add PR/push workflow jobs using the same Compose commands. Give jobs separate project names/target caches when concurrency would collide. Prove an intentionally failing fixture/check makes the workflow fail, then remove the injected failure.
-- [ ] Add manual KVM/live evidence jobs with fail-if-requested-but-unavailable semantics. Never enable privileged or credentialed jobs for untrusted fork code.
-- [ ] Update progress claims to distinguish implementation, offline acceptance, real KVM acceptance, and live acceptance; keep historical plans as historical with a current status note.
+- [x] Add PR/push workflow jobs using the same Compose commands. Give jobs separate project names/target caches when concurrency would collide. Prove an intentionally failing fixture/check makes the workflow fail, then remove the injected failure.
+- [x] Add manual KVM/live evidence jobs with fail-if-requested-but-unavailable semantics. Never enable privileged or credentialed jobs for untrusted fork code.
+- [x] Update progress claims to distinguish implementation, offline acceptance, real KVM acceptance, and live acceptance; keep historical plans as historical with a current status note.
 
 **Gate:** all four required commands green; evidence tiers explicitly enabled and recorded; no stale "fake agent only" landing-page claim.
 

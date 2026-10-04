@@ -48,7 +48,7 @@ if [ "$mode" = offline ]; then
   run offline docker compose run --rm test cargo test -p agentos-engine --locked --test live_model -- --nocapture --test-threads 1
   exit 0
 fi
-run build docker compose build test-kvm
+run build docker compose build test test-kvm
 run firecracker docker compose run --rm test-kvm sh scripts/fetch-firecracker.sh
 run image docker compose run --rm test-kvm sh scripts/build-guest-image.sh "guest/$image" "build/guest-images/$image" --verify
 if [ "$mode" = kvm ]; then
