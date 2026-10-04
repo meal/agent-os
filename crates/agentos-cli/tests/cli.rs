@@ -4797,3 +4797,66 @@ fn resume_refuses_a_bad_base_url_but_cancel_still_works() {
     );
     assert_eq!(api.hits(), 0, "the crash came before the send");
 }
+
+#[test]
+fn gc_dry_run_collection_and_exports_preserve_verified_results() {
+    let cli = Cli::new();
+    let contract = cli.contract(&cli.repo_copy());
+    let submitted = cli.submit_yes(&contract, &fix_patch());
+    let id = submitted["task_id"].as_str().unwrap();
+    let work = cli.home().join("work").join(id);
+    let before = cli.path("before-gc");
+    cli.json(&["export", id, before.to_str().unwrap()]);
+    let dry = cli.json(&["gc", "--dry-run"]);
+    assert!(
+        dry["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["status"] == "candidate"),
+        "{dry}"
+    );
+    assert!(
+        work.join(if fake_mode() { "workspace" } else { "ws" })
+            .exists()
+            || real_mode()
+    );
+    let report = cli.json(&["gc"]);
+    assert!(
+        report["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["status"] == "deleted"),
+        "{report}"
+    );
+    let after = cli.path("after-gc");
+    cli.json(&["export", id, after.to_str().unwrap()]);
+    assert_eq!(
+        fs::read(before.join("patch.diff")).unwrap(),
+        fs::read(after.join("patch.diff")).unwrap()
+    );
+    for entry in fs::read_dir(before.join("evidence")).unwrap() {
+        let entry = entry.unwrap();
+        assert_eq!(
+            fs::read(entry.path()).unwrap(),
+            fs::read(after.join("evidence").join(entry.file_name())).unwrap()
+        );
+    }
+    assert!(cli.json(&["gc"])["entries"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn gc_refuses_while_another_driver_holds_the_lock() {
+    let cli = Cli::bare();
+    cli.json(&["gc", "--dry-run"]);
+    let lock = fs::File::options()
+        .write(true)
+        .open(cli.home().join("driver.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    cli.cmd(&["gc"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("another agentos process"));
+}

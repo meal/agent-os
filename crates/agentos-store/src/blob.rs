@@ -10,6 +10,15 @@ use uuid::Uuid;
 pub struct BlobStore {
     objects: PathBuf,
     tmp: PathBuf,
+    publication_hook: Option<Box<dyn Fn(PublicationStage) -> io::Result<()> + Send + Sync>>,
+}
+
+/// Durable publication boundaries exposed to a scoped diagnostic hook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicationStage {
+    FileSync,
+    Rename,
+    DirectorySync,
 }
 
 fn sync_dir(path: &Path) -> io::Result<()> {
@@ -21,13 +30,31 @@ fn is_lower_hex(s: &str, len: usize) -> bool {
 }
 
 impl BlobStore {
+    /// Installs a publication diagnostic hook for this store instance only.
+    pub fn with_publication_hook(
+        mut self,
+        hook: impl Fn(PublicationStage) -> io::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.publication_hook = Some(Box::new(hook));
+        self
+    }
+
+    fn publication_boundary(&self, stage: PublicationStage) -> io::Result<()> {
+        self.publication_hook
+            .as_ref()
+            .map_or(Ok(()), |hook| hook(stage))
+    }
     pub fn open(dir: impl AsRef<Path>) -> io::Result<BlobStore> {
         let dir = dir.as_ref();
         let objects = dir.join("objects");
         let tmp = dir.join("tmp");
         fs::create_dir_all(&objects)?;
         fs::create_dir_all(&tmp)?;
-        Ok(BlobStore { objects, tmp })
+        Ok(BlobStore {
+            objects,
+            tmp,
+            publication_hook: None,
+        })
     }
 
     fn object_path(&self, d: &Digest) -> PathBuf {
@@ -42,7 +69,10 @@ impl BlobStore {
 
         let tmp_path = self.tmp.join(Uuid::new_v4().to_string());
         let mut file = File::create_new(&tmp_path)?;
-        let written = file.write_all(bytes).and_then(|()| file.sync_all());
+        let written = file
+            .write_all(bytes)
+            .and_then(|()| self.publication_boundary(PublicationStage::FileSync))
+            .and_then(|()| file.sync_all());
         drop(file);
         if let Err(e) = written {
             let _ = fs::remove_file(&tmp_path);
@@ -54,6 +84,7 @@ impl BlobStore {
                 // Existing object is kept even if corrupt; `get` reports InvalidData.
                 fs::remove_file(&tmp_path)
             } else {
+                self.publication_boundary(PublicationStage::Rename)?;
                 fs::rename(&tmp_path, &dest)
             }
         });
@@ -62,6 +93,7 @@ impl BlobStore {
             return Err(e);
         }
 
+        self.publication_boundary(PublicationStage::DirectorySync)?;
         sync_dir(shard)?;
         sync_dir(&self.objects)?;
         Ok(digest)

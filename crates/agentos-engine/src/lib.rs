@@ -4,6 +4,7 @@ pub mod executor;
 pub mod export;
 pub mod firecracker;
 pub mod fixture;
+pub mod gc;
 pub mod guestlink;
 pub mod jail;
 pub mod job;
