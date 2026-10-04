@@ -1,7 +1,7 @@
 # Local web UI for Agent OS
 
 Date: 2026-10-04
-Status: proposed written design; conversational scope approved, written-spec review pending.
+Status: written design approved by the owner's `continue` on 2026-10-04; implementation-plan review pending.
 Base: `ddf4396` on `codex/v01-completion`.
 
 ## Intent and success criteria
