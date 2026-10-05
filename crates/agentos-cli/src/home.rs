@@ -98,6 +98,7 @@ pub struct RegistryEntry {
     pub registered_ms: i64,
 }
 
+#[derive(Clone)]
 pub struct Home {
     pub root: PathBuf,
     pub profiles: PathBuf,

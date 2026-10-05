@@ -74,6 +74,11 @@ pub struct Args {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Run the protected local task dashboard in the foreground.
+    Ui {
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+    },
     /// Validate a task contract, record its inputs and, with --yes, run it.
     Submit {
         /// The task contract (JSON).

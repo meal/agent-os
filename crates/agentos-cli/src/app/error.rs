@@ -15,7 +15,6 @@ pub(crate) enum AppErrorKind {
 }
 #[derive(Debug, Clone)]
 pub(crate) struct AppError {
-    #[allow(dead_code)] // Read by the following HTTP adapter increment.
     pub kind: AppErrorKind,
     pub cli_code: i32,
     pub message: String,

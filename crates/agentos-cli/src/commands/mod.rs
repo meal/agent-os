@@ -37,6 +37,7 @@ pub async fn dispatch(args: Args) -> Result<(), CliError> {
         home.task_worker(&home.open()?, &task_id(id)?)?;
     }
     match args.command {
+        Command::Ui { port } => crate::ui::serve(home, crate::ui::UiConfig { port }).await,
         Command::Submit {
             task,
             yes,
@@ -107,7 +108,7 @@ fn task_arg(command: &Command) -> Option<&str> {
 }
 
 /// Task ids are UUIDs; anything else is refused before it can reach a path.
-fn task_id(id: &str) -> Result<TaskId, CliError> {
+pub(crate) fn task_id(id: &str) -> Result<TaskId, CliError> {
     let uuid_shaped = id.len() == 36
         && id.chars().enumerate().all(|(i, c)| match i {
             8 | 13 | 18 | 23 => c == '-',

@@ -10,6 +10,7 @@ mod drive;
 mod error;
 mod home;
 mod secrets;
+mod ui;
 
 use clap::Parser;
 
