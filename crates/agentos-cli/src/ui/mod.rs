@@ -1,5 +1,6 @@
 mod downloads;
 mod error;
+mod forms;
 mod routes;
 mod session;
 mod views;
@@ -17,6 +18,7 @@ pub(crate) struct UiConfig {
 pub(crate) struct UiState {
     pub home: Arc<Home>,
     runner: Arc<crate::app::runner::RunnerManager>,
+    forms: Arc<forms::SubmissionForms>,
     pub queries: Arc<Semaphore>,
     sessions: session::Sessions,
     downloads: Arc<downloads::DownloadCache>,
@@ -68,6 +70,9 @@ pub(crate) async fn serve(home: Home, config: UiConfig) -> Result<(), CliError> 
         clock.elapsed()
     }))?);
     let state = Arc::new(UiState {
+        forms: Arc::new(forms::SubmissionForms::new(Arc::new(move || {
+            clock.elapsed()
+        }))),
         runner: Arc::new(crate::app::runner::RunnerManager::new(home.clone())),
         downloads,
         streams: Arc::new(Semaphore::new(4)),

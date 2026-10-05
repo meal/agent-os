@@ -85,6 +85,7 @@ impl From<ReviewContents> for ResultView {
 #[derive(Template)]
 #[template(path = "ui/task.html")]
 pub(super) struct TaskPage<'a> {
+    pub actions: String,
     pub detail: &'a TaskDetail,
     pub contract: String,
     pub csrf: &'a str,

@@ -74,6 +74,13 @@ async function refreshActions() {
   if (actions) {actions.innerHTML = html;htmx.process(actions);}
 }
 const actionHost = document.querySelector('[data-task]');
-if (actionHost) {const actions = document.createElement('div');actions.id = 'run-actions';document.querySelector('#actions').before(actions);refreshActions().catch(() => {});}
+if (actionHost) refreshActions().catch(() => {});
 document.addEventListener('agentos:state', () => refreshActions().catch(() => {}));
 document.addEventListener('htmx:afterSwap', e => {if (e.detail.target.id === 'status') {refreshActions().catch(() => {});pollTask();}});
+
+document.querySelector('#contract-file')?.addEventListener('change', async event => {
+ const file = event.target.files[0];
+ if (!file) return;
+ if (file.size > 256 * 1024) {document.querySelector('#request-error').textContent = 'Contract exceeds 256 KiB.';return;}
+ document.querySelector('#contract-json').value = await file.text();
+});

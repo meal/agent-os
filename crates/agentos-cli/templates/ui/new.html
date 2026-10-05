@@ -1,0 +1,11 @@
+{% extends "ui/base.html" %}{% block title %}New task · Agent OS{% endblock %}{% block content %}
+<meta name="csrf-token" content="{{ csrf }}"><p class="eyebrow">CREATE TASK</p><h1>Record a contract</h1><p>Creation records the inputs in READY. Review the recorded permissions and limits before approving a run.</p>
+<form action="/tasks" method="post" hx-post="/tasks" hx-target="#request-error" class="contract-form">
+<input type="hidden" name="_csrf" value="{{ csrf }}"><input type="hidden" name="nonce" value="{{ nonce }}">
+<label for="contract-file">Load a local JSON file</label><input id="contract-file" type="file" accept=".json,application/json"><p class="muted">The file fills the contract below. Repository and transcript paths refer to the server filesystem.</p>
+<label for="contract-json">Task contract JSON</label><textarea id="contract-json" name="contract_json" rows="18" required spellcheck="false">{{ example }}</textarea>
+<label for="model">Model</label><input id="model" name="model" required placeholder="anthropic:model-id or fake:/server/path/transcript.json">
+<label for="worker">Worker</label><select id="worker" name="worker"><option value="host">Host · executes on this machine</option><option value="firecracker">Firecracker · registered guest image</option></select>
+<p class="muted">Host execution has no VM isolation. Firecracker needs a registered image and configured launcher.</p><button class="primary">Create task</button></form>
+<details><summary>Server paths and available profiles/images</summary><p>Home <code class="digest">{{ home }}</code></p><p>Profiles <code class="digest">{{ profiles_path }}</code></p><p>Images <code class="digest">{{ images_path }}</code></p><pre class="code">{{ registries }}</pre></details><div id="request-error" role="alert"></div>
+{% endblock %}

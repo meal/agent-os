@@ -644,3 +644,197 @@ async fn web_controls_normal_shutdown_drains_owned_driver() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 }
+
+#[tokio::test]
+async fn contract_form_coalesces_duplicates_and_binds_approval_to_recorded_inputs() {
+    let fixture = UiFixture::new();
+    let server = fixture.start();
+    let session = server.session().await;
+    let nonce = session.nonce(&server).await;
+    let contract = std::fs::read_to_string(&fixture.contract).unwrap();
+    let model = fixture.model();
+    let (first, repeated) = tokio::join!(
+        session.create(&server, &nonce, &contract, &model),
+        session.create(&server, &nonce, &contract, &model)
+    );
+    assert_eq!(first.task_id, repeated.task_id);
+    let replay = session.create(&server, &nonce, &contract, &model).await;
+    assert_eq!(first.task_id, replay.task_id);
+    let before = fixture.events(&first.task_id);
+    assert!(!before.iter().any(|e| e["type"] == "CapabilitiesIssued"));
+    assert_eq!(
+        session
+            .post(
+                &server,
+                "/tasks",
+                &[
+                    ("nonce", &nonce),
+                    ("contract_json", "{}"),
+                    ("model", &model),
+                    ("worker", "host")
+                ]
+            )
+            .await
+            .status(),
+        409
+    );
+    fixture.change_staged_profile(&first.task_id);
+    assert_eq!(
+        session
+            .post(
+                &server,
+                &format!("/tasks/{}/start", first.task_id),
+                &[("contract_digest", &first.contract_digest)]
+            )
+            .await
+            .status(),
+        409
+    );
+    assert_eq!(fixture.status(&first.task_id)["state"], "READY");
+    assert_eq!(fixture.events(&first.task_id), before);
+    let nonce = session.nonce(&server).await;
+    let second = session.create(&server, &nonce, &contract, &model).await;
+    std::fs::write(
+        fixture.repo.join("src/parser.py"),
+        "source changed after recording",
+    )
+    .unwrap();
+    assert_eq!(
+        session
+            .post(
+                &server,
+                &format!("/tasks/{}/start", second.task_id),
+                &[("contract_digest", &second.contract_digest)]
+            )
+            .await
+            .status(),
+        202
+    );
+    fixture.wait_state(&second.task_id, "SUCCEEDED").await;
+}
+
+#[tokio::test]
+async fn contract_form_rejects_invalid_inputs_and_stale_or_cross_session_nonce() {
+    let fixture = UiFixture::new();
+    let mut server = fixture.start();
+    let session = server.session().await;
+    let contract = std::fs::read_to_string(&fixture.contract).unwrap();
+    let model = fixture.model();
+    for (body, agent, worker) in [
+        ("bad".to_string(), model.clone(), "host"),
+        ("{}".to_string(), model.clone(), "host"),
+        (contract.clone(), "bad-model".into(), "host"),
+        (contract.clone(), "".into(), "host"),
+        (contract.clone(), model.clone(), "firecracker"),
+    ] {
+        let nonce = session.nonce(&server).await;
+        assert_eq!(
+            session
+                .post(
+                    &server,
+                    "/tasks",
+                    &[
+                        ("nonce", &nonce),
+                        ("contract_json", &body),
+                        ("model", &agent),
+                        ("worker", worker)
+                    ]
+                )
+                .await
+                .status(),
+            400
+        );
+    }
+    for field in ["source", "profile", "transcript"] {
+        let mut body: serde_json::Value = serde_json::from_str(&contract).unwrap();
+        let mut agent = model.clone();
+        if field == "source" {
+            body["repository"]["source"] = json!("/missing-repository");
+        }
+        if field == "profile" {
+            body["verification_profile"] = json!("missing-profile");
+        }
+        if field == "transcript" {
+            agent = "fake:/missing-transcript".into();
+        }
+        let nonce = session.nonce(&server).await;
+        assert_eq!(
+            session
+                .post(
+                    &server,
+                    "/tasks",
+                    &[
+                        ("nonce", &nonce),
+                        ("contract_json", &body.to_string()),
+                        ("model", &agent),
+                        ("worker", "host")
+                    ]
+                )
+                .await
+                .status(),
+            400
+        );
+    }
+    let nonce = session.nonce(&server).await;
+    let other = server.session().await;
+    assert_eq!(
+        other
+            .post(
+                &server,
+                "/tasks",
+                &[
+                    ("nonce", &nonce),
+                    ("contract_json", &contract),
+                    ("model", &model),
+                    ("worker", "host")
+                ]
+            )
+            .await
+            .status(),
+        410
+    );
+    server.stop();
+    let restarted = fixture.start();
+    let fresh = restarted.session().await;
+    assert_eq!(
+        fresh
+            .post(
+                &restarted,
+                "/tasks",
+                &[
+                    ("nonce", &nonce),
+                    ("contract_json", &contract),
+                    ("model", &model),
+                    ("worker", "host")
+                ]
+            )
+            .await
+            .status(),
+        410
+    );
+}
+
+#[tokio::test]
+async fn contract_form_missing_key_start_preserves_ready_and_grants() {
+    let fixture = UiFixture::new();
+    let server = fixture.start();
+    let session = server.session().await;
+    let nonce = session.nonce(&server).await;
+    let contract = std::fs::read_to_string(&fixture.contract).unwrap();
+    let created = session
+        .create(&server, &nonce, &contract, "anthropic:test-model")
+        .await;
+    std::fs::remove_file(fixture.root.path().join("provider-key")).unwrap();
+    let before = fixture.events(&created.task_id);
+    let response = session
+        .post(
+            &server,
+            &format!("/tasks/{}/start", created.task_id),
+            &[("contract_digest", &created.contract_digest)],
+        )
+        .await;
+    assert_eq!(response.status(), 400);
+    assert_eq!(fixture.status(&created.task_id)["state"], "READY");
+    assert_eq!(fixture.events(&created.task_id), before);
+    assert!(!before.iter().any(|e| e["type"] == "CapabilitiesIssued"));
+}

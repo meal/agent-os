@@ -41,7 +41,8 @@ pub(super) fn router() -> Router<Arc<UiState>> {
         .route("/", get(|| async { Html(Bootstrap.render().unwrap()) }))
         .route("/session", post(bootstrap))
         .route("/assets/{*path}", get(asset))
-        .route("/tasks", get(tasks))
+        .route("/tasks", get(tasks).post(create))
+        .route("/tasks/new", get(new_task))
         .route("/tasks/{id}", get(task))
         .route("/tasks/{id}/status", get(status))
         .route("/tasks/{id}/result", get(result))
@@ -163,11 +164,13 @@ async fn task(
 ) -> AppResult<Html<String>> {
     let id = task_id(id)?;
     let detail = state.query(move |home| queries::detail(home, &id)).await?;
+    let actions = action_view(&state, &session, &detail).await?;
     render(TaskPage {
         active: views::active(&detail.status),
         contract: serde_json::to_string_pretty(&detail.contract)?,
         detail: &detail,
         csrf: &session.csrf,
+        actions,
     })
 }
 async fn status(
@@ -408,22 +411,123 @@ async fn actions(
     Path(id): Path<String>,
 ) -> AppResult<Html<String>> {
     let id = task_id(id)?;
-    let (detail, external, has_agent) = state
+    let detail = state.query(move |home| queries::detail(home, &id)).await?;
+    Ok(Html(action_view(&state, &session, &detail).await?))
+}
+async fn action_view(
+    state: &UiState,
+    session: &Session,
+    detail: &crate::app::types::TaskDetail,
+) -> AppResult<String> {
+    let id = detail.status.task_id.clone();
+    let (external, patch) = state
         .query(move |home| {
-            let d = queries::detail(home, &id)?;
-            let agent = d.status.model != crate::drive::FAKE_AGENT
-                || home.task_dir(&id).join(crate::drive::AGENT_PATCH).is_file();
-            Ok((d, home.driver_status()?, agent))
+            Ok((
+                home.driver_status()?,
+                home.task_dir(&id).join(crate::drive::AGENT_PATCH).is_file(),
+            ))
         })
         .await?;
-    render(Actions {
+    let has_agent = detail.status.model != crate::drive::FAKE_AGENT || patch;
+    Ok(render(Actions {
         id: detail.status.task_id.to_string(),
-        state: detail.status.state,
+        state: detail.status.state.clone(),
         digest: detail.contract_digest.to_string(),
         csrf: &session.csrf,
         busy: state.runner.busy() || external.is_some(),
         has_agent,
         outstanding: !detail.status.outstanding_effects.is_empty(),
         diagnostic: state.runner.diagnostic().unwrap_or_default(),
+    })?
+    .0)
+}
+
+#[derive(Template)]
+#[template(path = "ui/new.html")]
+struct NewTask<'a> {
+    csrf: &'a str,
+    nonce: String,
+    home: String,
+    profiles_path: String,
+    images_path: String,
+    registries: String,
+    example: String,
+}
+async fn new_task(
+    State(state): State<Arc<UiState>>,
+    axum::Extension(session): axum::Extension<Session>,
+) -> AppResult<Html<String>> {
+    let nonce = state.forms.issue(&session.id)?;
+    let registries = state
+        .query(|home| {
+            Ok(serde_json::to_string_pretty(
+                &serde_json::json!({"profiles":home.registry_list().into_iter().map(registry_entry).collect::<Vec<_>>(),"images":home.image_list().into_iter().map(registry_entry).collect::<Vec<_>>()}),
+            )?)
+        })
+        .await?;
+    render(NewTask {
+        csrf: &session.csrf,
+        nonce: nonce.0,
+        home: state.home.root.display().to_string(),
+        profiles_path: state.home.profiles.display().to_string(),
+        images_path: state.home.images_dir().display().to_string(),
+        registries,
+        example: serde_json::to_string_pretty(
+            &serde_json::json!({"goal":"Describe the task", "repository":{"source":"/server/path/repository","revision":"recorded-at-submission"}, "profile":"python-stdlib-v1", "verification_profile":"parser-checks-v1", "editable_paths":["src/**"], "capabilities":["snapshot.read","workspace.apply_patch","verification.run","artifact.export","model.request"], "limits":{"model_requests":12,"max_output_tokens_per_request":4096,"tool_actions":50,"deadline_seconds":600,"worker_vcpus":1,"worker_memory_mib":256}}),
+        )?,
     })
+}
+#[derive(serde::Deserialize)]
+struct CreateInput {
+    nonce: String,
+    contract_json: String,
+    model: String,
+    worker: String,
+}
+async fn create(
+    State(state): State<Arc<UiState>>,
+    axum::Extension(session): axum::Extension<Session>,
+    headers: axum::http::HeaderMap,
+    input: Result<axum::Form<CreateInput>, axum::extract::rejection::FormRejection>,
+) -> AppResult<Response> {
+    let axum::Form(input) = input.map_err(|_| invalid("Invalid task form"))?;
+    if input.model.trim().is_empty() {
+        return Err(invalid("A model spec is required"));
+    }
+    let worker = match input.worker.as_str() {
+        "host" => crate::args::WorkerKind::Host,
+        "firecracker" => crate::args::WorkerKind::Firecracker,
+        _ => return Err(invalid("Unknown worker")),
+    };
+    let submission = state
+        .forms
+        .submit(
+            &state.runner,
+            &session.id,
+            &super::forms::FormNonce(input.nonce),
+            crate::app::submission::CreateRequest {
+                contract_json: input.contract_json,
+                worker,
+                model: Some(input.model),
+                patch: None,
+            },
+        )
+        .await?;
+    let path = format!("/tasks/{}", submission.task_id);
+    if headers
+        .get("hx-request")
+        .is_some_and(|value| value == "true")
+    {
+        let mut response = Html("Task recorded. Opening review.").into_response();
+        response
+            .headers_mut()
+            .insert("hx-redirect", HeaderValue::from_str(&path).unwrap());
+        Ok(response)
+    } else {
+        Ok(axum::response::Redirect::to(&path).into_response())
+    }
+}
+
+fn registry_entry(entry: crate::home::RegistryEntry) -> serde_json::Value {
+    serde_json::json!({"id":entry.id,"digest":entry.digest,"path":entry.dir,"registered_ms":entry.registered_ms})
 }

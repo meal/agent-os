@@ -271,3 +271,77 @@ impl UiFixture {
         }
     }
 }
+
+pub struct CreatedTask {
+    pub task_id: String,
+    pub contract_digest: String,
+}
+fn attribute(html: &str, name: &str) -> String {
+    html.split(&format!("{name}=\""))
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap()
+        .to_owned()
+}
+impl UiSession {
+    pub async fn nonce(&self, server: &UiServer) -> String {
+        let response = self
+            .client
+            .get(format!("{}/tasks/new", server.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let html = response.text().await.unwrap();
+        attribute(html.split("name=\"nonce\"").nth(1).unwrap(), "value")
+    }
+    pub async fn create(
+        &self,
+        server: &UiServer,
+        nonce: &str,
+        contract: &str,
+        model: &str,
+    ) -> CreatedTask {
+        let response = self
+            .post(
+                server,
+                "/tasks",
+                &[
+                    ("nonce", nonce),
+                    ("contract_json", contract),
+                    ("model", model),
+                    ("worker", "host"),
+                ],
+            )
+            .await;
+        let code = response.status();
+        let html = response.text().await.unwrap();
+        assert_eq!(code, 200, "{html}");
+        CreatedTask {
+            task_id: attribute(&html, "data-task-id"),
+            contract_digest: attribute(&html, "data-contract-digest"),
+        }
+    }
+}
+impl UiFixture {
+    pub fn change_staged_profile(&self, id: &str) {
+        fs::write(
+            self.home
+                .join("tasks")
+                .join(id)
+                .join("profile/tampered.txt"),
+            "changed",
+        )
+        .unwrap();
+    }
+    pub fn model(&self) -> String {
+        format!(
+            "fake:{}",
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/transcripts/parser-fix.json")
+                .display()
+        )
+    }
+}

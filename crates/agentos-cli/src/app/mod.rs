@@ -4,7 +4,6 @@ pub(crate) mod error;
 pub(crate) mod export;
 pub(crate) mod queries;
 pub(crate) mod runner;
-#[allow(dead_code)] // Next UI form increment consumes this service.
 pub(crate) mod submission;
 pub(crate) mod types;
 pub(crate) use error::{AppError, AppErrorKind, AppResult};
