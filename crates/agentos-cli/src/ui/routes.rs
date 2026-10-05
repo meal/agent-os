@@ -47,6 +47,11 @@ pub(super) fn router() -> Router<Arc<UiState>> {
         .route("/tasks/{id}/result", get(result))
         .route("/tasks/{id}/events", get(events))
         .route("/tasks/{id}/export", post(export))
+        .route("/tasks/{id}/start", post(start))
+        .route("/tasks/{id}/resume", post(resume))
+        .route("/tasks/{id}/pause", post(pause))
+        .route("/tasks/{id}/cancel", post(cancel))
+        .route("/tasks/{id}/actions", get(actions))
         .route("/downloads/{id}", get(download))
         .fallback(|| async { AppError::new(AppErrorKind::NotFound, "Page not found") })
 }
@@ -263,4 +268,162 @@ async fn download(
         HeaderValue::from_str(&bytes.to_string()).unwrap(),
     );
     Ok(response)
+}
+
+#[derive(serde::Deserialize)]
+struct StartInput {
+    contract_digest: String,
+}
+fn request(
+    id: agentos_core::ids::TaskId,
+    reviewed_contract: Option<agentos_core::ids::Digest>,
+) -> crate::app::control::RunRequest {
+    crate::app::control::RunRequest {
+        task: id,
+        patch: None,
+        crash: None,
+        reviewed_contract,
+    }
+}
+async fn admission(
+    state: &UiState,
+    admitted: crate::app::runner::RunAdmission,
+) -> AppResult<Response> {
+    let (id, code) = match admitted {
+        crate::app::runner::RunAdmission::Started(id) => (id, axum::http::StatusCode::ACCEPTED),
+        crate::app::runner::RunAdmission::Reported(r) => (r.task_id, axum::http::StatusCode::OK),
+    };
+    let status = state
+        .query(move |home| queries::status(home, &id, Some(queries::RESULT_LIMIT)))
+        .await?;
+    Ok((
+        code,
+        render(StatusPage {
+            active: views::active(&status),
+            status: &status,
+        })?,
+    )
+        .into_response())
+}
+async fn start(
+    State(state): State<Arc<UiState>>,
+    Path(id): Path<String>,
+    input: Result<axum::Form<StartInput>, axum::extract::rejection::FormRejection>,
+) -> AppResult<Response> {
+    let id = task_id(id)?;
+    let axum::Form(input) = input.map_err(|_| invalid("A reviewed contract digest is required"))?;
+    let digest = agentos_core::ids::Digest::from_hex(&input.contract_digest)
+        .map_err(|_| invalid("Invalid reviewed digest"))?;
+    let admitted = state.runner.admit(request(id, Some(digest))).await?;
+    admission(&state, admitted).await
+}
+async fn resume(State(state): State<Arc<UiState>>, Path(id): Path<String>) -> AppResult<Response> {
+    let id = task_id(id)?;
+    let check = id.clone();
+    let status = state
+        .query(move |home| queries::status(home, &check, Some(queries::RESULT_LIMIT)))
+        .await?;
+    if status.state == "READY" {
+        return Err(AppError::new(
+            AppErrorKind::Conflict,
+            "Review the READY contract and explicitly approve it before starting",
+        ));
+    }
+    let admitted = state.runner.admit(request(id, None)).await?;
+    admission(&state, admitted).await
+}
+async fn pause(State(state): State<Arc<UiState>>, Path(id): Path<String>) -> AppResult<Response> {
+    let id = task_id(id)?;
+    let result = state
+        .runner
+        .operation(move |home| crate::app::control::pause(home, &id))?
+        .await
+        .map_err(|_| {
+            AppError::new(
+                AppErrorKind::Unavailable,
+                "Control operation was interrupted",
+            )
+        })??;
+    let id = result.task_id;
+    let status = state
+        .query(move |home| queries::status(home, &id, Some(queries::RESULT_LIMIT)))
+        .await?;
+    Ok(render(StatusPage {
+        active: views::active(&status),
+        status: &status,
+    })?
+    .into_response())
+}
+async fn cancel(State(state): State<Arc<UiState>>, Path(id): Path<String>) -> AppResult<Response> {
+    let id = task_id(id)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _completion = state.runner.operation(move |home| {
+        crate::app::runner::runtime()?.block_on(crate::app::control::cancel_acknowledged(
+            home,
+            &id,
+            move |result| {
+                let _ = tx.send(result);
+            },
+        ))
+    })?;
+    let result = rx.await.map_err(|_| {
+        AppError::new(
+            AppErrorKind::Unavailable,
+            "Cancellation could not be admitted; check the recorded state",
+        )
+    })?;
+    let terminal = result.state.is_terminal();
+    let id = result.task_id;
+    let status = state
+        .query(move |home| queries::status(home, &id, Some(queries::RESULT_LIMIT)))
+        .await?;
+    Ok((
+        if terminal {
+            axum::http::StatusCode::OK
+        } else {
+            axum::http::StatusCode::ACCEPTED
+        },
+        render(StatusPage {
+            active: views::active(&status),
+            status: &status,
+        })?,
+    )
+        .into_response())
+}
+#[derive(Template)]
+#[template(path = "ui/actions.html")]
+struct Actions<'a> {
+    id: String,
+    state: String,
+    csrf: &'a str,
+    digest: String,
+    busy: bool,
+    has_agent: bool,
+    outstanding: bool,
+    diagnostic: String,
+}
+async fn actions(
+    State(state): State<Arc<UiState>>,
+    axum::Extension(session): axum::Extension<Session>,
+    Path(id): Path<String>,
+) -> AppResult<Html<String>> {
+    let id = task_id(id)?;
+    let (detail, external, has_agent) = state
+        .query(move |home| {
+            let d = queries::detail(home, &id)?;
+            let agent = d.status.model != crate::drive::FAKE_AGENT
+                || home.task_dir(&id).join(crate::drive::AGENT_PATCH).is_file();
+            Ok((d, home.driver_status()?, agent))
+        })
+        .await?;
+    render(Actions {
+        id: detail.status.task_id.to_string(),
+        state: detail.status.state,
+        digest: detail.contract_digest.to_string(),
+        csrf: &session.csrf,
+        busy: state.runner.busy() || external.is_some(),
+        has_agent,
+        outstanding: !detail.status.outstanding_effects.is_empty(),
+        diagnostic: state.runner.diagnostic().unwrap_or_default(),
+    })
 }

@@ -209,3 +209,65 @@ impl UiSession {
             .unwrap()
     }
 }
+impl UiFixture {
+    pub fn seed_ready_patch(&self) -> String {
+        let patch =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/parser-repo.fix.patch");
+        self.cli(&[
+            "submit",
+            self.contract.to_str().unwrap(),
+            "--fake-agent-patch",
+            patch.to_str().unwrap(),
+        ])["task_id"]
+            .as_str()
+            .unwrap()
+            .into()
+    }
+    pub fn reviewed_digest(&self, id: &str) -> String {
+        self.events(id)
+            .into_iter()
+            .find(|e| e["type"] == "TaskCreated")
+            .unwrap()["payload"]["contract_digest"]
+            .as_str()
+            .unwrap()
+            .into()
+    }
+    pub fn slow() -> Self {
+        let mut fixture = Self::new();
+        let profiles = fixture.root.path().join("profiles");
+        agentos_engine::workspace::copy_tree(&fixture.profiles, &profiles).unwrap();
+        fixture.profiles = profiles;
+        let path = fixture.profiles.join("parser-checks-v1/check_parser.py");
+        let original = fs::read_to_string(&path).unwrap();
+        let entered = serde_json::to_string(&fixture.root.path().join("entered")).unwrap();
+        let release = serde_json::to_string(&fixture.root.path().join("release")).unwrap();
+        fs::write(path,format!("import pathlib,time\npathlib.Path({entered}).write_text('entered')\nwhile not pathlib.Path({release}).exists(): time.sleep(0.02)\n{original}")).unwrap();
+        fixture
+    }
+    pub fn release(&self) {
+        fs::write(self.root.path().join("release"), b"release").unwrap();
+    }
+    pub async fn wait_entered(&self) {
+        let start = std::time::Instant::now();
+        while !self.root.path().join("entered").exists() {
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "verification never entered"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    pub async fn wait_state(&self, id: &str, state: &str) {
+        let start = std::time::Instant::now();
+        loop {
+            if self.status(id)["state"] == state {
+                return;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(20),
+                "state did not reach {state}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}

@@ -65,3 +65,15 @@ document.querySelectorAll('[role=tab]').forEach(tab => {
   event.preventDefault();tabs[index].focus();
  });
 });
+async function refreshActions() {
+  const task = document.querySelector('[data-task]')?.dataset.task;
+  if (!task || document.hidden) return;
+  const response = await fetch(`/tasks/${task}/actions`);
+  if (!response.ok) return;
+  const html = await response.text();const actions = document.querySelector('#run-actions');
+  if (actions) {actions.innerHTML = html;htmx.process(actions);}
+}
+const actionHost = document.querySelector('[data-task]');
+if (actionHost) {const actions = document.createElement('div');actions.id = 'run-actions';document.querySelector('#actions').before(actions);refreshActions().catch(() => {});}
+document.addEventListener('agentos:state', () => refreshActions().catch(() => {}));
+document.addEventListener('htmx:afterSwap', e => {if (e.detail.target.id === 'status') {refreshActions().catch(() => {});pollTask();}});

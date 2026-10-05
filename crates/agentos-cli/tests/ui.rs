@@ -414,3 +414,233 @@ async fn export_download_is_scoped_and_matches_cli_bytes_after_gc() {
     );
     assert_eq!(fixture.events(id), revoked);
 }
+
+#[tokio::test]
+async fn web_controls_admit_one_owned_run_and_preserve_query_responsiveness() {
+    let fixture = UiFixture::slow();
+    let id = fixture.seed_ready_patch();
+    let digest = fixture.reviewed_digest(&id);
+    let server = fixture.start();
+    let session = server.session().await;
+    assert_eq!(
+        session
+            .post(&server, &format!("/tasks/{id}/resume"), &[])
+            .await
+            .status(),
+        409
+    );
+    assert_eq!(
+        session
+            .post(
+                &server,
+                &format!("/tasks/{id}/start"),
+                &[("contract_digest", &digest)]
+            )
+            .await
+            .status(),
+        202
+    );
+    fixture.wait_entered().await;
+    assert_eq!(
+        session
+            .post(
+                &server,
+                &format!("/tasks/{id}/start"),
+                &[("contract_digest", &digest)]
+            )
+            .await
+            .status(),
+        409
+    );
+    assert_eq!(
+        fixture
+            .events(&id)
+            .iter()
+            .filter(|e| e["type"] == "CapabilitiesIssued")
+            .count(),
+        1
+    );
+    assert_eq!(
+        session
+            .client
+            .get(format!("{}/tasks/{id}/status", server.url))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        session
+            .post(&server, &format!("/tasks/{id}/pause"), &[])
+            .await
+            .status(),
+        409
+    ); // VERIFYING follows reducer rules.
+    fixture.release();
+    fixture.wait_state(&id, "SUCCEEDED").await;
+    assert_eq!(
+        session
+            .post(&server, &format!("/tasks/{id}/resume"), &[])
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(
+        session
+            .post(&server, &format!("/tasks/{id}/cancel"), &[])
+            .await
+            .status(),
+        200
+    );
+}
+
+#[tokio::test]
+async fn web_controls_refuse_forged_review_missing_agent_and_external_driver() {
+    let fixture = UiFixture::new();
+    let id = fixture.seed_ready();
+    let digest = fixture.reviewed_digest(&id);
+    let server = fixture.start();
+    let session = server.session().await;
+    let before = fixture.events(&id);
+    let wrong = "0".repeat(64);
+    assert_eq!(
+        session
+            .post(
+                &server,
+                &format!("/tasks/{id}/start"),
+                &[("contract_digest", &wrong)]
+            )
+            .await
+            .status(),
+        409
+    );
+    assert_eq!(
+        session
+            .post(
+                &server,
+                &format!("/tasks/{id}/start"),
+                &[("contract_digest", &digest)]
+            )
+            .await
+            .status(),
+        400
+    );
+    assert_eq!(fixture.events(&id), before);
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(fixture.home.join("driver.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    let runnable = fixture.seed_ready_patch();
+    let reviewed = fixture.reviewed_digest(&runnable);
+    assert_eq!(
+        session
+            .post(
+                &server,
+                &format!("/tasks/{runnable}/start"),
+                &[("contract_digest", &reviewed)]
+            )
+            .await
+            .status(),
+        409
+    );
+    drop(lock);
+    assert_eq!(fixture.status(&runnable)["state"], "READY");
+    assert!(
+        !fixture
+            .events(&runnable)
+            .iter()
+            .any(|e| e["type"] == "CapabilitiesIssued")
+    );
+}
+
+#[tokio::test]
+async fn web_controls_cancel_pending_external_driver_and_active_verification() {
+    let fixture = UiFixture::slow();
+    let id = fixture.seed_ready_patch();
+    let server = fixture.start();
+    let session = server.session().await;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(fixture.home.join("driver.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    assert_eq!(
+        session
+            .post(&server, &format!("/tasks/{id}/cancel"), &[])
+            .await
+            .status(),
+        202
+    );
+    assert_eq!(fixture.status(&id)["cancel_requested"], true);
+    assert_eq!(fixture.status(&id)["state"], "READY");
+    drop(lock);
+    session
+        .post(&server, &format!("/tasks/{id}/cancel"), &[])
+        .await;
+    fixture.wait_state(&id, "CANCELLED").await;
+    let active = fixture.seed_ready_patch();
+    let digest = fixture.reviewed_digest(&active);
+    assert_eq!(
+        session
+            .post(
+                &server,
+                &format!("/tasks/{active}/start"),
+                &[("contract_digest", &digest)]
+            )
+            .await
+            .status(),
+        202
+    );
+    fixture.wait_entered().await;
+    assert_eq!(
+        session
+            .post(&server, &format!("/tasks/{active}/cancel"), &[])
+            .await
+            .status(),
+        202
+    );
+    fixture.wait_state(&active, "CANCELLED").await;
+}
+
+#[tokio::test]
+async fn web_controls_normal_shutdown_drains_owned_driver() {
+    let fixture = UiFixture::slow();
+    let id = fixture.seed_ready_patch();
+    let digest = fixture.reviewed_digest(&id);
+    let mut server = fixture.start();
+    let session = server.session().await;
+    assert_eq!(
+        session
+            .post(
+                &server,
+                &format!("/tasks/{id}/start"),
+                &[("contract_digest", &digest)]
+            )
+            .await
+            .status(),
+        202
+    );
+    fixture.wait_entered().await;
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-TERM", &server.child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(server.child.try_wait().unwrap().is_none());
+    fixture.release();
+    fixture.wait_state(&id, "SUCCEEDED").await;
+    let start = std::time::Instant::now();
+    while server.child.try_wait().unwrap().is_none() {
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}

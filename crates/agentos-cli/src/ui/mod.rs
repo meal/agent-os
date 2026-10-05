@@ -16,6 +16,7 @@ pub(crate) struct UiConfig {
 }
 pub(crate) struct UiState {
     pub home: Arc<Home>,
+    runner: Arc<crate::app::runner::RunnerManager>,
     pub queries: Arc<Semaphore>,
     sessions: session::Sessions,
     downloads: Arc<downloads::DownloadCache>,
@@ -67,6 +68,7 @@ pub(crate) async fn serve(home: Home, config: UiConfig) -> Result<(), CliError> 
         clock.elapsed()
     }))?);
     let state = Arc::new(UiState {
+        runner: Arc::new(crate::app::runner::RunnerManager::new(home.clone())),
         downloads,
         streams: Arc::new(Semaphore::new(4)),
         home: Arc::new(home),
@@ -75,9 +77,14 @@ pub(crate) async fn serve(home: Home, config: UiConfig) -> Result<(), CliError> 
         authority,
         origin,
     });
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown())
+    let shutting_down = state.clone();
+    axum::serve(listener, router(state.clone()))
+        .with_graceful_shutdown(async move {
+            shutdown().await;
+            shutting_down.runner.close();
+        })
         .await?;
+    state.runner.drain().await?;
     Ok(())
 }
 async fn shutdown() {

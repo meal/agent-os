@@ -194,19 +194,29 @@ pub(crate) fn pause(home: &Home, task: &TaskId) -> AppResult<ControlOutcome> {
     outcome(&store, task, None)
 }
 pub(crate) async fn cancel(home: &Home, task: &TaskId) -> AppResult<ControlOutcome> {
+    cancel_acknowledged(home, task, |_| {}).await
+}
+pub(crate) async fn cancel_acknowledged(
+    home: &Home,
+    task: &TaskId,
+    acknowledge: impl FnOnce(ControlOutcome),
+) -> AppResult<ControlOutcome> {
     let store = home.open()?;
     let t = store.db.task(task)?;
     if t.state.is_terminal() {
-        return outcome(
+        let result = outcome(
             &store,
             task,
             Some("already finished; nothing to cancel".into()),
-        );
+        )?;
+        acknowledge(result.clone());
+        return Ok(result);
     }
     if !t.cancel_requested {
         store.db.append(task, &TaskEvent::CancelRequested)?;
     }
     crate::commands::revoke::cancel_running_jobs(home, &store, task, None)?;
+    acknowledge(outcome(&store, task, None)?);
     let Some(lock) = home.try_lock()? else {
         let note = if home.driven_task().as_deref() == Some(task.as_str()) {
             "another agentos process is driving this task; it completes the cancel at its next step"
@@ -234,13 +244,13 @@ pub(crate) async fn cancel(home: &Home, task: &TaskId) -> AppResult<ControlOutco
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::app::{
         queries,
         submission::{self, CreateRequest},
     };
-    fn fixture() -> (tempfile::TempDir, Home, TaskId) {
+    pub(crate) fn fixture() -> (tempfile::TempDir, Home, TaskId) {
         let root = tempfile::tempdir().unwrap();
         let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
         let home = Home::new(

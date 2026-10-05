@@ -199,7 +199,6 @@ impl DriverLock {
 }
 
 impl Home {
-    #[allow(dead_code)] // Used by the following UI server increment.
     pub(crate) fn driver_status(&self) -> crate::app::AppResult<Option<TaskId>> {
         use std::io::Read;
         let file = match File::open(self.root.join("driver.lock")) {
