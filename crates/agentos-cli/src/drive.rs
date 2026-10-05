@@ -196,7 +196,11 @@ fn survive<T>(task: &TaskId, r: Result<T, EngineError>) -> Result<T, CliError> {
 
 /// The inputs recorded at submission must still be what was approved; a task whose inputs
 /// changed is failed rather than run on something else.
-fn check_inputs(home: &Home, store: &Store, task: &TaskId) -> Result<Option<TaskState>, CliError> {
+pub(crate) fn input_problem(
+    home: &Home,
+    store: &Store,
+    task: &TaskId,
+) -> Result<Option<String>, CliError> {
     let events = store.db.events(task)?;
     let submitted = events
         .iter()
@@ -216,12 +220,22 @@ fn check_inputs(home: &Home, store: &Store, task: &TaskId) -> Result<Option<Task
             .map_err(|e| CliError::other(format!("cannot digest recorded {sub}: {e}")))?;
         if actual.to_string() != recorded {
             let reason = format!("recorded {sub} changed: expected {recorded}, found {actual}");
-            return Ok(Some(
-                store.db.append(task, &TaskEvent::Failed { reason })?.state,
-            ));
+            return Ok(Some(reason));
         }
     }
     Ok(None)
+}
+
+fn check_inputs(home: &Home, store: &Store, task: &TaskId) -> Result<Option<TaskState>, CliError> {
+    input_problem(home, store, task)?
+        .map(|reason| {
+            store
+                .db
+                .append(task, &TaskEvent::Failed { reason })
+                .map(|t| t.state)
+                .map_err(CliError::from)
+        })
+        .transpose()
 }
 
 /// Recovers `task` and runs it with `agent` on `exec` (built by the caller before it changed

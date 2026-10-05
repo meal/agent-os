@@ -4860,3 +4860,34 @@ fn gc_refuses_while_another_driver_holds_the_lock() {
         .code(1)
         .stderr(predicate::str::contains("another agentos process"));
 }
+
+#[test]
+fn staged_task_does_not_approve_until_resume_and_adapters_keep_exact_json() {
+    let cli = Cli::new();
+    let contract = cli.contract(&cli.repo_copy());
+    let created = cli.json(&[
+        "submit",
+        &contract,
+        "--fake-agent-patch",
+        fix_patch().to_str().unwrap(),
+    ]);
+    let id = created["task_id"].as_str().unwrap();
+    assert_eq!(cli.status(id)["state"], "READY");
+    assert!(
+        !cli.events(id)
+            .iter()
+            .any(|e| e["type"] == "CapabilitiesIssued")
+    );
+    assert_eq!(
+        cli.json(&["resume", id]),
+        json!({"task_id":id,"state":"SUCCEEDED"})
+    );
+    assert_eq!(
+        cli.json(&["cancel", id]),
+        json!({"task_id":id,"state":"SUCCEEDED","note":"already finished; nothing to cancel"})
+    );
+    assert_eq!(
+        cli.json(&["resume", id]),
+        json!({"task_id":id,"state":"SUCCEEDED"})
+    );
+}

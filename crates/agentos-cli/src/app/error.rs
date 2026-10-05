@@ -3,7 +3,6 @@ use agentos_engine::export::ExportError;
 use agentos_store::db::DbError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // HTTP/download adapters consume the remaining categories.
 pub(crate) enum AppErrorKind {
     Invalid,
     Forbidden,

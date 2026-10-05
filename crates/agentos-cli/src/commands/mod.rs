@@ -5,7 +5,7 @@ mod image;
 mod inspect;
 mod profile;
 pub(crate) mod registry;
-mod revoke;
+pub(crate) mod revoke;
 mod submit;
 pub mod supervise;
 
