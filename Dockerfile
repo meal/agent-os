@@ -1,4 +1,4 @@
-FROM rust:1.98.1-bookworm
+FROM rust:1.98.1-bookworm AS development
 RUN rustup component add clippy rustfmt
 # mmdebstrap, squashfs-tools: the guest image (scripts/build-guest-image.sh); musl-tools and
 # the musl target: the static agentos-guest; curl: Firecracker and the guest kernel.
@@ -22,3 +22,11 @@ ENV PATH="/opt/pyenv/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/us
 RUN rustup target add x86_64-unknown-linux-musl
 ENV CC_x86_64_unknown_linux_musl=musl-gcc
 WORKDIR /work
+
+# Optional offline UI acceptance environment; production has no browser dependency.
+FROM development AS ui-test
+COPY runtime/ui-browser-requirements.txt /opt/agentos-runtime/ui-browser-requirements.txt
+RUN pyenv exec python -m venv /opt/agentos-ui-venv && \
+    /opt/agentos-ui-venv/bin/python -m pip install --no-cache-dir -r /opt/agentos-runtime/ui-browser-requirements.txt && \
+    /opt/agentos-ui-venv/bin/python -m playwright install --with-deps chromium
+FROM development AS default

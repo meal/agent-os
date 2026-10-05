@@ -118,11 +118,7 @@ pub(super) struct EventsPage<'a> {
     pub page: &'a EventPage,
 }
 pub(super) fn active(status: &StatusView) -> bool {
-    (!matches!(status.state.as_str(), "SUCCEEDED" | "FAILED" | "CANCELLED")
-        && status.state != "READY"
-        && status.state != "PAUSED")
-        || status.cancel_requested
-            && !matches!(status.state.as_str(), "SUCCEEDED" | "FAILED" | "CANCELLED")
+    !matches!(status.state.as_str(), "SUCCEEDED" | "FAILED" | "CANCELLED")
         || !status.outstanding_effects.is_empty()
 }
 #[cfg(test)]

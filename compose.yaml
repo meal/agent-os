@@ -1,9 +1,15 @@
 services:
   test:
-    build: .
+    build: {context: ., target: development}
     volumes: [".:/work", "cargo-cache:/usr/local/cargo/registry", "target:/work/target"]
     init: true
     command: cargo test --workspace
+  test-ui:
+    extends: test
+    build: {context: ., target: ui-test}
+    shm_size: 1gb
+    network_mode: none
+    command: sh scripts/test-ui.sh
   # The KVM tier: `docker compose run --rm test-kvm …`. The `test` service above is unchanged;
   # each setting below is the one the "Jailer experiments" (E1-E12) in
   # docs/superpowers/specs/2026-10-02-phase-3b-firecracker-worker-design.md found necessary.

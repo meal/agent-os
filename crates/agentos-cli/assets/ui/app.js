@@ -7,8 +7,8 @@ function formatTimes(root = document) {
 formatTimes();
 if (window.htmx) {htmx.config.allowEval = false; htmx.config.allowScriptTags = false; htmx.config.includeIndicatorStyles = false;}
 document.addEventListener('htmx:configRequest', e => {e.detail.headers['X-CSRF-Token'] = document.querySelector('meta[name=csrf-token]')?.content || '';});
-document.addEventListener('htmx:beforeSwap', e => {if (e.detail.xhr.status >= 400) {e.detail.shouldSwap = false;document.querySelector('#request-error').textContent = 'Request failed. Refresh the view or reopen the launch link.';}});
-document.addEventListener('htmx:afterSwap', () => {formatTimes();loadEvents();});
+document.addEventListener('htmx:beforeSwap', e => {if (e.detail.xhr.status >= 400) {e.detail.shouldSwap = false;const message = new DOMParser().parseFromString(e.detail.xhr.responseText, 'text/html').querySelector('.error p')?.textContent || 'Refresh the view or reopen the launch link.';document.querySelector('#request-error').textContent = `Request failed (${e.detail.xhr.status}). ${message}`;}});
+document.addEventListener('htmx:afterSwap', () => {formatTimes();selectView();loadEvents().catch(() => {document.querySelector('#freshness').textContent = 'Stale · event read failed. Retrying…';});});
 let polling = false;
 let lastSuccess = new Date();
 async function loadEvents() {
@@ -44,3 +44,24 @@ const pollTimer = setInterval(() => {
   if (document.querySelector('[data-active=true]')) pollTask();
 }, 2000);
 document.addEventListener('visibilitychange', () => {if (!document.hidden) pollTask();});
+
+function selectView() {
+ const pane = document.querySelector('#pane');
+ if (!pane) return;
+ pane.querySelectorAll('[data-view-section]').forEach(section => {section.hidden = pane.dataset.view && section.dataset.viewSection !== pane.dataset.view;});
+}
+document.querySelectorAll('[role=tab]').forEach(tab => {
+ tab.addEventListener('click', () => {
+  document.querySelectorAll('[role=tab]').forEach(other => {other.setAttribute('aria-selected', String(other === tab));other.removeAttribute('aria-current');});
+  tab.setAttribute('aria-current', 'page');document.querySelector('#pane').dataset.view = tab.dataset.view || 'contract';
+ });
+ tab.addEventListener('keydown', event => {
+  const tabs = [...document.querySelectorAll('[role=tab]')];let index = tabs.indexOf(tab);
+  if (event.key === 'ArrowRight') index = (index + 1) % tabs.length;
+  else if (event.key === 'ArrowLeft') index = (index + tabs.length - 1) % tabs.length;
+  else if (event.key === 'Home') index = 0;
+  else if (event.key === 'End') index = tabs.length - 1;
+  else return;
+  event.preventDefault();tabs[index].focus();
+ });
+});
