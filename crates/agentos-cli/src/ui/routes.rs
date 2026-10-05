@@ -46,6 +46,8 @@ pub(super) fn router() -> Router<Arc<UiState>> {
         .route("/tasks/{id}/status", get(status))
         .route("/tasks/{id}/result", get(result))
         .route("/tasks/{id}/events", get(events))
+        .route("/tasks/{id}/export", post(export))
+        .route("/downloads/{id}", get(download))
         .fallback(|| async { AppError::new(AppErrorKind::NotFound, "Page not found") })
 }
 async fn bootstrap(
@@ -205,4 +207,60 @@ async fn events(
         .query(move |home| queries::events(home, &id, input.after))
         .await?;
     render(EventsPage { page: &page })
+}
+
+#[derive(Template)]
+#[template(path = "ui/export.html")]
+struct ExportPage {
+    path: String,
+    bytes: u64,
+    task: String,
+}
+async fn export(
+    State(state): State<Arc<UiState>>,
+    axum::Extension(session): axum::Extension<Session>,
+    Path(id): Path<String>,
+) -> AppResult<Html<String>> {
+    let id = task_id(id)?;
+    let cache = state.downloads.clone();
+    let ticket = state
+        .query(move |home| cache.create(&session.id, home, &id))
+        .await?;
+    render(ExportPage {
+        path: format!("/downloads/{}", ticket.id.0),
+        bytes: ticket.bytes,
+        task: ticket.task.to_string(),
+    })
+}
+async fn download(
+    State(state): State<Arc<UiState>>,
+    axum::Extension(session): axum::Extension<Session>,
+    Path(id): Path<String>,
+) -> AppResult<Response> {
+    let permit = state
+        .streams
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AppError::new(AppErrorKind::Unavailable, "Download streams are busy"))?;
+    let cache = state.downloads.clone();
+    let mut reader = state
+        .query(move |home| cache.open(&session.id, &super::downloads::DownloadId(id), home))
+        .await?;
+    reader.permit = Some(permit);
+    let bytes = reader.bytes;
+    let mut response =
+        axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(reader)).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-tar"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment; filename=agentos-export.tar"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&bytes.to_string()).unwrap(),
+    );
+    Ok(response)
 }

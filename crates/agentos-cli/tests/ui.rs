@@ -308,3 +308,109 @@ async fn terminal_review_checks_integrity_bounds_and_current_export_authority() 
         413
     );
 }
+
+#[tokio::test]
+async fn export_download_is_scoped_and_matches_cli_bytes_after_gc() {
+    let fixture = UiFixture::new();
+    let patch = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/parser-repo.fix.patch");
+    let ready = fixture.cli(&[
+        "submit",
+        fixture.contract.to_str().unwrap(),
+        "--fake-agent-patch",
+        patch.to_str().unwrap(),
+        "--yes",
+    ]);
+    let id = ready["task_id"].as_str().unwrap();
+    let server = fixture.start();
+    let a = server.session().await;
+    let b = server.session().await;
+    let response = a.post(&server, &format!("/tasks/{id}/export"), &[]).await;
+    assert_eq!(response.status(), 200);
+    let html = response.text().await.unwrap();
+    let path = html
+        .split("href=\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+    assert!(path.starts_with("/downloads/"));
+    let before = fixture.events(id);
+    let response = a
+        .client
+        .get(format!("{}{path}", server.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["content-type"], "application/x-tar");
+    let archive = response.bytes().await.unwrap();
+    assert!(archive.windows(10).any(|w| w == b"patch.diff"));
+    assert_eq!(fixture.events(id), before);
+    let bundle = fixture.root.path().join("cli-bundle");
+    fixture.cli(&["export", id, bundle.to_str().unwrap()]);
+    let mut tar = tar::Archive::new(&archive[..]);
+    for entry in tar.entries().unwrap() {
+        use std::io::Read;
+        let mut entry = entry.unwrap();
+        assert!(entry.header().entry_type().is_file());
+        let rel = entry.path().unwrap().into_owned();
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).unwrap();
+        let original = std::fs::read(bundle.join(&rel)).unwrap();
+        if rel == std::path::Path::new("manifest.json") {
+            let mut actual: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let mut expected: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            actual.as_object_mut().unwrap().remove("generated_events");
+            expected.as_object_mut().unwrap().remove("generated_events");
+            assert_eq!(actual, expected);
+        } else {
+            assert_eq!(bytes, original, "{}", rel.display());
+        }
+    }
+
+    let before = fixture.events(id);
+    assert_eq!(
+        a.client
+            .get(format!("{}/downloads/invalid", server.url))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    assert_eq!(
+        b.client
+            .get(format!("{}{path}", server.url))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(fixture.events(id), before);
+    fixture.cli(&["gc"]);
+    let again = a
+        .client
+        .get(format!("{}{path}", server.url))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(archive, again);
+    fixture.cli(&["revoke", id, "--capability", "artifact.export"]);
+    let revoked = fixture.events(id);
+    assert_eq!(
+        a.client
+            .get(format!("{}{path}", server.url))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(fixture.events(id), revoked);
+}

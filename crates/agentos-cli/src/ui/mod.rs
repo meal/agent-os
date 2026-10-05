@@ -1,3 +1,4 @@
+mod downloads;
 mod error;
 mod routes;
 mod session;
@@ -17,6 +18,8 @@ pub(crate) struct UiState {
     pub home: Arc<Home>,
     pub queries: Arc<Semaphore>,
     sessions: session::Sessions,
+    downloads: Arc<downloads::DownloadCache>,
+    streams: Arc<Semaphore>,
     pub authority: String,
     pub origin: String,
 }
@@ -59,7 +62,13 @@ pub(crate) async fn serve(home: Home, config: UiConfig) -> Result<(), CliError> 
         "{}",
         serde_json::json!({"listening":origin,"launch_url":format!("{origin}/#{}",sessions.launch)})
     );
+    let clock = std::time::Instant::now();
+    let downloads = Arc::new(downloads::DownloadCache::new(Arc::new(move || {
+        clock.elapsed()
+    }))?);
     let state = Arc::new(UiState {
+        downloads,
+        streams: Arc::new(Semaphore::new(4)),
         home: Arc::new(home),
         queries: Arc::new(Semaphore::new(4)),
         sessions,

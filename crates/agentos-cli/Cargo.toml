@@ -25,6 +25,9 @@ axum = "0.8.9"
 askama = "0.16.1"
 base64.workspace = true
 getrandom.workspace = true
+blake3.workspace = true
+tar = "0.4.46"
+tokio-util = { version = "0.7.19", features = ["io"] }
 
 [dev-dependencies]
 reqwest = { workspace = true, features = ["cookies", "form"] }

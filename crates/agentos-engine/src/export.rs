@@ -288,10 +288,6 @@ impl ReadBudget {
     }
 }
 
-fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<ReviewContents> {
-    collect_review(db, blobs, task, None)
-}
-
 /// Pure projection: no authorization audit or Exported event; caller decides authority.
 pub fn collect_review(
     db: &Db,
@@ -617,7 +613,20 @@ pub fn export_bundle(
     task: &TaskId,
     out_dir: &Path,
 ) -> Result<Manifest> {
-    let written = write_bundle(collect(db, blobs, task)?, out_dir, &|_| Ok(()))?;
+    export_bundle_bounded(db, blobs, task, out_dir, None)
+}
+pub fn export_bundle_bounded(
+    db: &Db,
+    blobs: &BlobStore,
+    task: &TaskId,
+    out_dir: &Path,
+    max_bytes: Option<u64>,
+) -> Result<Manifest> {
+    let written = write_bundle(
+        collect_review(db, blobs, task, max_bytes)?,
+        out_dir,
+        &|_| Ok(()),
+    )?;
     let payload = serde_json::json!({
         "manifest_digest": written.manifest_digest,
         "dir": out_dir.display().to_string(),
