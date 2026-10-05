@@ -76,3 +76,15 @@ pub(crate) struct TaskDetail {
     pub repository_digest: Option<Digest>,
     pub profile_digest: Option<Digest>,
 }
+impl OutstandingEffect {
+    pub(crate) fn state_label(&self) -> &'static str {
+        match self.state {
+            EffectState::Intended => "INTENDED",
+            EffectState::Dispatched => "DISPATCHED",
+            EffectState::Completed => "COMPLETED",
+            EffectState::Failed => "FAILED",
+            EffectState::Unknown => "UNKNOWN",
+            EffectState::Abandoned => "ABANDONED",
+        }
+    }
+}

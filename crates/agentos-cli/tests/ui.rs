@@ -189,3 +189,122 @@ async fn local_session_bounds_bootstrap_body_and_allowlists_assets() {
         );
     }
 }
+
+#[tokio::test]
+async fn review_routes_are_read_only_escaped_and_distinguish_unfinished_results() {
+    let fixture = UiFixture::new();
+    let mut contract: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&fixture.contract).unwrap()).unwrap();
+    contract["goal"] = json!("<script>goal-sentinel</script>");
+    std::fs::write(&fixture.contract, contract.to_string()).unwrap();
+    let id = fixture.seed_ready();
+    let server = fixture.start();
+    let session = server.session().await;
+    let before = fixture.events(&id);
+    let status = fixture.status(&id);
+    for _ in 0..2 {
+        for tail in ["", "/status", "/events?after=0"] {
+            let response = session
+                .client
+                .get(format!("{}/tasks/{}{tail}", server.url, id))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            let text = response.text().await.unwrap();
+            assert!(!text.contains("<script>goal-sentinel"));
+            if tail.is_empty() {
+                assert!(text.contains("goal-sentinel"));
+                assert!(text.contains("READY"));
+            }
+        }
+        assert_eq!(
+            session
+                .client
+                .get(format!("{}/tasks/{id}/result", server.url))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+    }
+    assert_eq!(fixture.events(&id), before);
+    assert_eq!(fixture.status(&id), status);
+    assert_eq!(
+        session
+            .client
+            .get(format!("{}/tasks/not-a-uuid/status", server.url))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    assert_eq!(
+        session
+            .client
+            .get(format!("{}/tasks/{id}/events?after=bad", server.url))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+}
+
+#[tokio::test]
+async fn terminal_review_checks_integrity_bounds_and_current_export_authority() {
+    let fixture = UiFixture::new();
+    let patch = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/parser-repo.fix.patch");
+    let result = fixture.cli(&[
+        "submit",
+        fixture.contract.to_str().unwrap(),
+        "--fake-agent-patch",
+        patch.to_str().unwrap(),
+        "--yes",
+    ]);
+    let id = result["task_id"].as_str().unwrap();
+    assert_eq!(result["state"], "SUCCEEDED");
+    let server = fixture.start();
+    let session = server.session().await;
+    let before = fixture.events(id);
+    let response = session
+        .client
+        .get(format!("{}/tasks/{id}/result", server.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let text = response.text().await.unwrap();
+    assert!(text.contains("Verified final workspace"));
+    assert!(text.contains("accepted_for_final_workspace"));
+    assert_eq!(fixture.events(id), before);
+    fixture.cli(&["revoke", id, "--capability", "artifact.export"]);
+    let revoked = fixture.events(id);
+    assert_eq!(
+        session
+            .client
+            .get(format!("{}/tasks/{id}/result", server.url))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(fixture.events(id), revoked);
+    let conn = rusqlite::Connection::open(fixture.home.join("agentos.db")).unwrap();
+    conn.execute("UPDATE tasks SET contract_json=?1", ["x".repeat(300_000)])
+        .unwrap();
+    assert_eq!(
+        session
+            .client
+            .get(format!("{}/tasks/{id}", server.url))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        413
+    );
+}

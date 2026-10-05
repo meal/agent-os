@@ -1,0 +1,2 @@
+<section><h2>Patch</h2><p class="muted">{{ preview.bytes }} of {{ preview.total }} source bytes{% if preview.truncated %} · Preview truncated; export contains the full bytes{% endif %}</p><pre class="diff" aria-label="Patch diff">{% for line in lines %}<span class="{{ line.kind }}">{{ line.text }}
+</span>{% endfor %}</pre></section>

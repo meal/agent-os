@@ -1,3 +1,4 @@
+use super::views::{self, EventsPage, ResultView, StatusPage, TaskPage};
 use super::{UiState, error::invalid, session::Session};
 use crate::app::{AppError, AppErrorKind, AppResult, queries, types::TaskSummary};
 use agentos_core::state::TaskState;
@@ -41,6 +42,10 @@ pub(super) fn router() -> Router<Arc<UiState>> {
         .route("/session", post(bootstrap))
         .route("/assets/{*path}", get(asset))
         .route("/tasks", get(tasks))
+        .route("/tasks/{id}", get(task))
+        .route("/tasks/{id}/status", get(status))
+        .route("/tasks/{id}/result", get(result))
+        .route("/tasks/{id}/events", get(events))
         .fallback(|| async { AppError::new(AppErrorKind::NotFound, "Page not found") })
 }
 async fn bootstrap(
@@ -62,6 +67,10 @@ async fn bootstrap(
 }
 async fn asset(Path(path): Path<String>) -> AppResult<Response> {
     let (kind, body) = match path.as_str() {
+        "htmx.min.js" => (
+            "text/javascript; charset=utf-8",
+            include_str!("../../assets/ui/htmx.min.js"),
+        ),
         "bootstrap.js" => (
             "text/javascript; charset=utf-8",
             include_str!("../../assets/ui/bootstrap.js"),
@@ -130,4 +139,70 @@ async fn tasks(
         .render()
         .map_err(|_| AppError::new(AppErrorKind::Unavailable, "Could not render tasks"))?,
     ))
+}
+
+fn task_id(id: String) -> AppResult<agentos_core::ids::TaskId> {
+    crate::commands::task_id(&id).map_err(|_| invalid("Invalid task ID"))
+}
+fn render<T: Template>(value: T) -> AppResult<Html<String>> {
+    Ok(Html(value.render().map_err(|_| {
+        AppError::new(AppErrorKind::Unavailable, "Could not render task view")
+    })?))
+}
+async fn task(
+    State(state): State<Arc<UiState>>,
+    axum::Extension(session): axum::Extension<Session>,
+    Path(id): Path<String>,
+) -> AppResult<Html<String>> {
+    let id = task_id(id)?;
+    let detail = state.query(move |home| queries::detail(home, &id)).await?;
+    render(TaskPage {
+        active: views::active(&detail.status),
+        contract: serde_json::to_string_pretty(&detail.contract)?,
+        detail: &detail,
+        csrf: &session.csrf,
+    })
+}
+async fn status(
+    State(state): State<Arc<UiState>>,
+    Path(id): Path<String>,
+) -> AppResult<Html<String>> {
+    let id = task_id(id)?;
+    let status = state
+        .query(move |home| queries::status(home, &id, Some(queries::RESULT_LIMIT)))
+        .await?;
+    render(StatusPage {
+        active: views::active(&status),
+        status: &status,
+    })
+}
+async fn result(
+    State(state): State<Arc<UiState>>,
+    Path(id): Path<String>,
+) -> AppResult<Html<String>> {
+    let id = task_id(id)?;
+    let result: ResultView = state
+        .query(move |home| queries::review(home, &id))
+        .await?
+        .into();
+    Ok(Html(views::render_result(&result).map_err(|_| {
+        AppError::new(AppErrorKind::Unavailable, "Could not render result")
+    })?))
+}
+#[derive(serde::Deserialize, Default)]
+struct EventInput {
+    #[serde(default)]
+    after: u64,
+}
+async fn events(
+    State(state): State<Arc<UiState>>,
+    Path(id): Path<String>,
+    input: Result<Query<EventInput>, QueryRejection>,
+) -> AppResult<Html<String>> {
+    let id = task_id(id)?;
+    let Query(input) = input.map_err(|_| invalid("Invalid event sequence"))?;
+    let page = state
+        .query(move |home| queries::events(home, &id, input.after))
+        .await?;
+    render(EventsPage { page: &page })
 }

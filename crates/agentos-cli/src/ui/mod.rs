@@ -1,6 +1,7 @@
 mod error;
 mod routes;
 mod session;
+mod views;
 use crate::{
     app::{AppError, AppErrorKind, AppResult},
     error::CliError,
