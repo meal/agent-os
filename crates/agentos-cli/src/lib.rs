@@ -2,6 +2,7 @@
 //! one short-lived controller process over the on-disk home ([`home`]); a run that dies is
 //! picked up by the next `resume` or `cancel`.
 
+mod app;
 mod args;
 mod commands;
 pub mod crash;

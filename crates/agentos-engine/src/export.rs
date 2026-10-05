@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use agentos_core::effect::{EffectId, EffectKind, EffectRecord, EffectState};
 use agentos_core::ids::{Digest, TaskId};
 use agentos_core::state::TaskState;
-use agentos_store::blob::BlobStore;
+use agentos_store::blob::{BlobReadError, BlobStore};
 use agentos_store::db::{Db, DbError, StoredEvent};
 use agentos_store::effects::UsageSummary;
 use serde::{Deserialize, Serialize};
@@ -53,6 +53,8 @@ pub enum ExportError {
     Integrity(String),
     #[error("journal is inconsistent: {0}")]
     Inconsistent(String),
+    #[error("result exceeds the {limit}-byte limit")]
+    ReadLimit { limit: u64 },
 }
 
 impl From<EngineError> for ExportError {
@@ -198,23 +200,36 @@ fn result_of(rec: &EffectRecord) -> Result<Digest> {
 }
 
 /// Effects in intent order.
-fn effects(db: &Db, events: &[StoredEvent]) -> Result<Vec<EffectRecord>> {
+fn effects(db: &Db, events: &[StoredEvent], budget: &mut ReadBudget) -> Result<Vec<EffectRecord>> {
     events
         .iter()
         .filter(|e| e.event_type == "EffectIntended")
         .map(|e| {
             let id: EffectId =
                 serde_json::from_value(e.payload["effect_id"].clone()).map_err(DbError::from)?;
-            Ok(db.effect(&id)?)
+            let rec = match budget.limit {
+                Some(_) => db.effect_bounded(&id, budget.remaining)?,
+                None => db.effect(&id)?,
+            };
+            budget.charge(serde_json::to_vec(&rec.kind).map_err(DbError::from)?.len() as u64)?;
+            Ok(rec)
         })
         .collect()
 }
 
 /// The text of an applied patch: from its journaled agent turn, else its blob.
-fn patch_text(db: &Db, blobs: &BlobStore, task: &TaskId, rec: &EffectRecord) -> Result<Vec<u8>> {
-    let bytes = match journal::journaled_patch(db, task, &rec.request_digest)? {
-        Some(text) => text.into_bytes(),
-        None if blobs.exists(&rec.request_digest) => read_blob(blobs, &rec.request_digest)?,
+fn patch_text(
+    events: &[StoredEvent],
+    blobs: &BlobStore,
+    rec: &EffectRecord,
+    budget: &mut ReadBudget,
+) -> Result<Vec<u8>> {
+    let bytes = match journal::patch_from_events(events, &rec.request_digest)? {
+        Some(text) => {
+            budget.charge(text.len() as u64)?;
+            text.as_bytes().to_vec()
+        }
+        None if blobs.exists(&rec.request_digest) => budget.blob(blobs, &rec.request_digest)?,
         None => {
             return Err(inconsistent(format!(
                 "the patch of effect {} is gone",
@@ -232,22 +247,81 @@ fn patch_text(db: &Db, blobs: &BlobStore, task: &TaskId, rec: &EffectRecord) -> 
 }
 
 /// Everything the bundle holds, gathered and checked before anything is written.
-struct Contents {
-    manifest: Manifest,
-    patch_diff: Vec<u8>,
-    patches: Vec<(String, Vec<u8>)>,
+pub struct ReviewContents {
+    pub manifest: Manifest,
+    pub patch_diff: Vec<u8>,
+    pub patches: Vec<(String, Vec<u8>)>,
     /// `model/NNNN-request.json` and `-response.json` files, in order.
-    model_files: Vec<(String, Vec<u8>)>,
-    evidence: BTreeMap<Digest, Vec<u8>>,
+    pub model_files: Vec<(String, Vec<u8>)>,
+    pub evidence: BTreeMap<Digest, Vec<u8>>,
 }
 
-fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
+struct ReadBudget {
+    limit: Option<u64>,
+    remaining: u64,
+}
+impl ReadBudget {
+    fn charge(&mut self, bytes: u64) -> Result<()> {
+        if let Some(limit) = self.limit {
+            self.remaining = self
+                .remaining
+                .checked_sub(bytes)
+                .ok_or(ExportError::ReadLimit { limit })?;
+        }
+        Ok(())
+    }
+    fn blob(&mut self, blobs: &BlobStore, digest: &Digest) -> Result<Vec<u8>> {
+        let bytes = match self.limit {
+            None => read_blob(blobs, digest)?,
+            Some(limit) => blobs
+                .get_bounded(digest, self.remaining)
+                .map_err(|e| match e {
+                    BlobReadError::TooLarge { .. } => ExportError::ReadLimit { limit },
+                    BlobReadError::Io(e) if e.kind() == io::ErrorKind::InvalidData => {
+                        ExportError::Integrity(e.to_string())
+                    }
+                    BlobReadError::Io(e) => ExportError::Io(e),
+                })?,
+        };
+        self.charge(bytes.len() as u64)?;
+        Ok(bytes)
+    }
+}
+
+fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<ReviewContents> {
+    collect_review(db, blobs, task, None)
+}
+
+/// Pure projection: no authorization audit or Exported event; caller decides authority.
+pub fn collect_review(
+    db: &Db,
+    blobs: &BlobStore,
+    task: &TaskId,
+    max_bytes: Option<u64>,
+) -> Result<ReviewContents> {
+    let mut budget = ReadBudget {
+        limit: max_bytes,
+        remaining: max_bytes.unwrap_or(u64::MAX),
+    };
+    let contract = match max_bytes {
+        Some(limit) => db.contract_bounded(task, limit.min(256 * 1024))?,
+        None => db.contract(task)?,
+    };
+    budget.charge(serde_json::to_vec(&contract).map_err(DbError::from)?.len() as u64)?;
     let t = db.task(task)?;
     if !t.state.is_terminal() {
         return Err(ExportError::NotTerminal(t.state));
     }
-    let events = db.events(task)?;
-    let contract = db.contract(task)?;
+    let events = match max_bytes {
+        Some(_) => db.events_bounded(task, budget.remaining)?,
+        None => db.events(task)?,
+    };
+    for e in &events {
+        budget.charge(
+            (serde_json::to_vec(&e.payload).map_err(DbError::from)?.len() + e.event_type.len())
+                as u64,
+        )?;
+    }
     let created = events
         .iter()
         .find(|e| e.event_type == "TaskCreated")
@@ -280,11 +354,11 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
     let (mut patch_diff, mut patches, mut entries) = (Vec::new(), Vec::new(), Vec::new());
     let mut results = Vec::new();
     let (mut model_calls, mut model_files) = (Vec::new(), Vec::new());
-    for rec in effects(db, &events)? {
+    for rec in effects(db, &events, &mut budget)? {
         match (&rec.kind, rec.state) {
             (EffectKind::ReadSnapshot, EffectState::Completed) => {
                 let d = result_of(&rec)?;
-                let bytes = read_blob(blobs, &d)?;
+                let bytes = budget.blob(blobs, &d)?;
                 let ws = digest_field(
                     &parse("snapshot manifest", &bytes)?,
                     "workspace_digest",
@@ -294,16 +368,18 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
                 evidence.insert(d, bytes);
             }
             (EffectKind::ApplyPatch { .. }, EffectState::Completed) => {
-                let result = read_blob(blobs, &result_of(&rec)?)?;
+                let result = budget.blob(blobs, &result_of(&rec)?)?;
                 last = Some(digest_field(
                     &parse("patch result", &result)?,
                     "workspace_digest",
                     "patch result",
                 )?);
-                let text = patch_text(db, blobs, task, &rec)?;
+                let text = patch_text(&events, blobs, &rec, &mut budget)?;
                 if !patch_diff.is_empty() && !patch_diff.ends_with(b"\n") {
+                    budget.charge(1)?;
                     patch_diff.push(b'\n');
                 }
+                budget.charge(text.len() as u64)?;
                 patch_diff.extend_from_slice(&text);
                 let file = format!(
                     "patches/{:04}-{}.patch",
@@ -319,7 +395,7 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
             }
             (EffectKind::RunVerification, EffectState::Completed | EffectState::Failed) => {
                 let d = result_of(&rec)?;
-                let bytes = read_blob(blobs, &d)?;
+                let bytes = budget.blob(blobs, &d)?;
                 let v = parse("verification result", &bytes)?;
                 let completed = rec.state == EffectState::Completed;
                 let what = format!("evidence {d}");
@@ -350,7 +426,7 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
             (EffectKind::ModelCall { .. }, EffectState::Completed | EffectState::Failed) => {
                 let n = model_calls.len() + 1;
                 let request = match blobs.exists(&rec.request_digest) {
-                    true => read_blob(blobs, &rec.request_digest)?,
+                    true => budget.blob(blobs, &rec.request_digest)?,
                     false => {
                         return Err(inconsistent(format!(
                             "the request of model call {} is gone",
@@ -363,7 +439,7 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
                 let response_file = match rec.result_digest {
                     Some(d) => {
                         let file = format!("model/{n:04}-response.json");
-                        model_files.push((file.clone(), read_blob(blobs, &d)?));
+                        model_files.push((file.clone(), budget.blob(blobs, &d)?));
                         Some(file)
                     }
                     None => None,
@@ -453,8 +529,8 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
         model: submitted
             .and_then(|s| s["model"].as_str())
             .map(str::to_string),
-        model_policy_version: crate::model::policy::versions(db, task)?.0,
-        model_limits_version: crate::model::policy::versions(db, task)?.1,
+        model_policy_version: crate::model::policy::versions_from_submitted(submitted)?.0,
+        model_limits_version: crate::model::policy::versions_from_submitted(submitted)?.1,
         model_endpoint: submitted
             .filter(|s| {
                 s["model"]
@@ -482,7 +558,7 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
             .collect(),
         guest_image_digest,
     };
-    Ok(Contents {
+    Ok(ReviewContents {
         manifest,
         patch_diff,
         patches,
@@ -558,7 +634,7 @@ struct Written {
     files: usize,
 }
 
-fn write_bundle(contents: Contents, out_dir: &Path, before: BeforeWrite) -> Result<Written> {
+fn write_bundle(contents: ReviewContents, out_dir: &Path, before: BeforeWrite) -> Result<Written> {
     let parent = match out_dir.parent() {
         Some(p) if p.as_os_str().is_empty() => Path::new("."),
         Some(p) => p,
@@ -632,7 +708,7 @@ fn write_bundle(contents: Contents, out_dir: &Path, before: BeforeWrite) -> Resu
 mod tests {
     use super::*;
 
-    fn contents() -> Contents {
+    fn contents() -> ReviewContents {
         let manifest = Manifest {
             task_id: TaskId::new(),
             state: "SUCCEEDED".into(),
@@ -659,7 +735,7 @@ mod tests {
             .into_iter()
             .map(|b| (Digest::of(&b), b))
             .collect();
-        Contents {
+        ReviewContents {
             manifest,
             patch_diff: b"diff".to_vec(),
             patches: vec![("patches/0001-x.patch".into(), b"p".to_vec())],

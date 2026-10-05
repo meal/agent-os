@@ -166,15 +166,27 @@ pub(crate) fn denial_observation(payload: &Value) -> Result<Observation> {
 
 /// The text of a journaled `ApplyPatch` action whose digest is `request`, from any session.
 pub(crate) fn journaled_patch(db: &Db, task: &TaskId, request: &Digest) -> Result<Option<String>> {
-    for e in db
-        .events(task)?
-        .iter()
-        .filter(|e| e.event_type == "AgentTurn")
-    {
-        if let AgentAction::ApplyPatch(patch) = decode(&e.payload["action"])?
-            && Digest::of(patch.as_bytes()) == *request
+    let events = db.events(task)?;
+    Ok(patch_from_events(&events, request)?.map(str::to_owned))
+}
+
+/// Borrow patch text so a bounded consumer can charge bytes before copying them.
+pub(crate) fn patch_from_events<'a>(
+    events: &'a [StoredEvent],
+    request: &Digest,
+) -> Result<Option<&'a str>> {
+    for e in events.iter().filter(|e| e.event_type == "AgentTurn") {
+        let action = &e.payload["action"];
+        if let Some(map) = action.as_object()
+            && map.len() == 1
+            && let Some(patch) = map.get("ApplyPatch").and_then(Value::as_str)
         {
-            return Ok(Some(patch));
+            if Digest::of(patch.as_bytes()) == *request {
+                return Ok(Some(patch));
+            }
+        } else {
+            // Keep the old malformed-action refusal for every other variant.
+            let _: AgentAction = decode(action)?;
         }
     }
     Ok(None)

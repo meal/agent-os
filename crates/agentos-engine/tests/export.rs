@@ -11,6 +11,7 @@ use agentos_core::ids::{Digest, TaskId};
 use agentos_core::state::{TaskEvent, TaskState};
 use agentos_engine::agent::{AgentAction, FakeAgent};
 use agentos_engine::executor::EffectRequest;
+use agentos_engine::export::collect_review;
 use agentos_engine::export::{ExportError, Manifest, export_bundle};
 use agentos_engine::runner::run_task;
 use agentos_engine::workspace::{copy_tree, workspace_digest};
@@ -82,6 +83,86 @@ fn replay(env: &Env, bundle: &Path) -> Digest {
 
 fn read_manifest(bundle: &Path) -> Manifest {
     serde_json::from_slice(&fs::read(bundle.join("manifest.json")).unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn pure_review_keeps_journal_and_matches_export_bytes() {
+    let env = Env::new(10);
+    succeeded(&env).await;
+    let before = env.db.events(&env.task).unwrap();
+    let review = collect_review(&env.db, &env.blobs, &env.task, Some(128 * 1024 * 1024)).unwrap();
+    assert_eq!(env.db.events(&env.task).unwrap(), before);
+    let root = tempfile::tempdir().unwrap();
+    export(&env, &env.task, &root.path().join("bundle")).unwrap();
+    assert_eq!(
+        review.patch_diff,
+        fs::read(root.path().join("bundle/patch.diff")).unwrap()
+    );
+    assert_eq!(
+        review.manifest.verified_digest,
+        review.manifest.final_workspace_digest
+    );
+    assert!(
+        review
+            .manifest
+            .verification_results
+            .iter()
+            .any(|r| r.accepted_for_final_workspace)
+    );
+    for (digest, bytes) in review.evidence {
+        assert_eq!(
+            bytes,
+            fs::read(root.path().join(format!("bundle/evidence/{digest}.json"))).unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn pure_review_rejects_journal_and_blob_budgets_without_audit() {
+    let env = Env::new(10);
+    succeeded(&env).await;
+    let before = env.db.events(&env.task).unwrap();
+    assert!(matches!(
+        collect_review(&env.db, &env.blobs, &env.task, Some(1)),
+        Err(ExportError::ReadLimit { .. })
+            | Err(ExportError::Db(
+                agentos_store::db::DbError::ReadLimit { .. }
+            ))
+    ));
+    assert_eq!(env.db.events(&env.task).unwrap(), before);
+    // Inflate a retained evidence object: refuse on metadata length before checking
+    // its now-wrong digest. The collector must never use BlobStore::get here.
+    let contents = collect_review(&env.db, &env.blobs, &env.task, None).unwrap();
+    let digest = *contents.evidence.keys().next().unwrap();
+    let f = fs::File::options()
+        .write(true)
+        .open(blob_path(&env, &digest))
+        .unwrap();
+    f.set_len(256 * 1024 * 1024).unwrap();
+    assert!(matches!(
+        collect_review(&env.db, &env.blobs, &env.task, Some(128 * 1024 * 1024)),
+        Err(ExportError::ReadLimit { .. })
+    ));
+    assert_eq!(env.db.events(&env.task).unwrap(), before);
+}
+
+#[tokio::test]
+async fn pure_review_bounds_journaled_patches_without_a_blob() {
+    let env = Env::new(10);
+    succeeded(&env).await;
+    env.db
+        .append_audit(
+            &env.task,
+            "AgentTurn",
+            &json!({"action":{"ApplyPatch":"x".repeat(100_000)}}),
+        )
+        .unwrap();
+    assert!(matches!(
+        collect_review(&env.db, &env.blobs, &env.task, Some(90_000)),
+        Err(ExportError::Db(
+            agentos_store::db::DbError::ReadLimit { .. }
+        )) | Err(ExportError::ReadLimit { .. })
+    ));
 }
 
 #[tokio::test]

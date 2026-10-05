@@ -62,12 +62,16 @@ pub fn versions(
     db: &agentos_store::db::Db,
     task: &agentos_core::ids::TaskId,
 ) -> Result<(u32, u32), agentos_store::db::DbError> {
-    let submitted = db
-        .events(task)?
-        .into_iter()
-        .find(|e| e.event_type == "Submitted");
+    let submitted = db.first_event_bounded(task, "Submitted", None)?;
+    versions_from_submitted(submitted.as_ref().map(|e| &e.payload))
+}
+
+/// Interpret already-read provenance without scanning the journal again.
+pub fn versions_from_submitted(
+    submitted: Option<&serde_json::Value>,
+) -> Result<(u32, u32), agentos_store::db::DbError> {
     let version = |name: &str| {
-        let value = submitted.as_ref().and_then(|e| e.payload.get(name));
+        let value = submitted.and_then(|p| p.get(name));
         match value {
             None => Ok(0),
             Some(v) if v.as_u64() == Some(0) => Ok(0),

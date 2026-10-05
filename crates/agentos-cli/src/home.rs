@@ -40,6 +40,7 @@ use crate::args::WorkerKind;
 use crate::commands::registry::{check_id, list_entries};
 use crate::commands::supervise::supervisor_cmd;
 use crate::error::CliError;
+pub(crate) mod provenance;
 
 /// How long a verification check may run (the fixture executor's default).
 const VERIFY_TIMEOUT_SECS: u64 = 60;
@@ -197,6 +198,26 @@ impl DriverLock {
 }
 
 impl Home {
+    #[allow(dead_code)] // Used by the following UI server increment.
+    pub(crate) fn driver_status(&self) -> crate::app::AppResult<Option<TaskId>> {
+        use std::io::Read;
+        let file = match File::open(self.root.join("driver.lock")) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        match file.try_lock() {
+            Ok(()) => Ok(None), // Dropping this read-only descriptor releases observation.
+            Err(TryLockError::WouldBlock) => {
+                let mut text = String::new();
+                file.take(64).read_to_string(&mut text)?;
+                Ok(uuid::Uuid::parse_str(&text)
+                    .ok()
+                    .and_then(|_| serde_json::from_value(Value::String(text)).ok()))
+            }
+            Err(TryLockError::Error(e)) => Err(e.into()),
+        }
+    }
     pub fn new(home: Option<PathBuf>, profiles: Option<PathBuf>) -> Result<Home, CliError> {
         let root = match home {
             Some(h) => h,
@@ -428,44 +449,8 @@ impl Home {
         store: &Store,
         task: &TaskId,
     ) -> Result<RecordedWorker, CliError> {
-        let events = store.db.events(task)?;
-        let host = RecordedWorker {
-            kind: WorkerKind::Host,
-            image: None,
-            jailed: None,
-        };
-        let Some(submitted) = events.iter().find(|e| e.event_type == "Submitted") else {
-            return Ok(host);
-        };
-        let p = &submitted.payload;
-        match p.get("worker").and_then(Value::as_str) {
-            None | Some("host") => Ok(host),
-            Some("firecracker") => {
-                let broken = |what: &str| {
-                    CliError::other(format!(
-                        "task {task} was submitted to the firecracker worker without a valid recorded {what}"
-                    ))
-                };
-                let id = p["guest_image_id"]
-                    .as_str()
-                    .ok_or_else(|| broken("guest_image_id"))?
-                    .to_string();
-                let digest = p["guest_image_digest"]
-                    .as_str()
-                    .and_then(|d| Digest::from_hex(d).ok())
-                    .ok_or_else(|| broken("guest_image_digest"))?;
-                let jailed = p["jailed"].as_bool().ok_or_else(|| broken("jailed"))?;
-                Ok(RecordedWorker {
-                    kind: WorkerKind::Firecracker,
-                    image: Some((id, digest)),
-                    jailed: Some(jailed),
-                })
-            }
-            Some(other) => Err(CliError::other(format!(
-                "task {task} was submitted with an unknown worker {:?}",
-                other
-            ))),
-        }
+        let submitted = self.recorded_payload(&store.db, task, None)?;
+        provenance::worker(task, submitted.as_ref())
     }
 
     /// `task`'s recorded worker, checked against `--worker`: a flag naming another worker
@@ -607,20 +592,15 @@ impl Home {
 
     /// The `Submitted` payload of `task`, if it has one.
     fn submitted_payload(&self, store: &Store, task: &TaskId) -> Result<Option<Value>, CliError> {
-        Ok(store
-            .db
-            .events(task)?
-            .into_iter()
-            .find(|e| e.event_type == "Submitted")
-            .map(|e| e.payload))
+        self.recorded_payload(&store.db, task, None)
     }
 
     /// The model recorded at `task`'s submission (`Submitted.model`); `None` when the task has
     /// no `Submitted` event or no such field (a 3a task).
     pub fn recorded_model(&self, store: &Store, task: &TaskId) -> Result<Option<String>, CliError> {
-        Ok(self
-            .submitted_payload(store, task)?
-            .and_then(|p| p["model"].as_str().map(str::to_string)))
+        Ok(provenance::model(
+            self.submitted_payload(store, task)?.as_ref(),
+        ))
     }
 
     /// The Anthropic key: the first line-and-trim of `--api-key-file`, else `ANTHROPIC_API_KEY`.
@@ -666,22 +646,7 @@ impl Home {
         store: &Store,
         task: &TaskId,
     ) -> Result<Option<String>, CliError> {
-        if !self
-            .recorded_model(store, task)?
-            .is_some_and(|m| m.starts_with("anthropic:"))
-        {
-            return Ok(None);
-        }
-        let payload = self.submitted_payload(store, task)?;
-        let endpoint = payload
-            .as_ref()
-            .and_then(|p| p["model_endpoint"].as_str())
-            .unwrap_or(agentos_engine::model::anthropic::ANTHROPIC_BASE_URL);
-        Ok(Some(
-            validate_base_url(endpoint)?
-                .trim_end_matches('/')
-                .to_string(),
-        ))
+        provenance::endpoint(self.submitted_payload(store, task)?.as_ref())
     }
 
     /// Resolve before reading credentials or mutating the task. Legacy tasks with no
