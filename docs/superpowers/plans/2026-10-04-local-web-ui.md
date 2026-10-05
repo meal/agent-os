@@ -12,6 +12,8 @@
 
 **Base:** `1564c08`, existing isolated `codex/v01-completion` worktree. This plan is a separate milestone from the remaining v0.1 packages. No product code has been implemented by this planning commit.
 
+Implementation status (2026-10-05): Tasks 1–10 implemented and verified through real HTTP/browser workflows. Final independent whole-branch review is pending; evidence and rulings are in [the review record](../../reviews/2026-10-04-local-web-ui-review.md).
+
 ## Global Constraints
 
 - One local owner, one Agent OS home, and the existing one-driver-per-home rule.

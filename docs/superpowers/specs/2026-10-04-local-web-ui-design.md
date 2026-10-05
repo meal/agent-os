@@ -1,7 +1,7 @@
 # Local web UI for Agent OS
 
 Date: 2026-10-04
-Status: written design approved by the owner's `continue` on 2026-10-04; implementation-plan review pending.
+Status: design and ten-task native implementation approved by the owner. Implementation and offline browser acceptance complete; final independent branch review pending (see [review record](../../reviews/2026-10-04-local-web-ui-review.md)).
 Base: `ddf4396` on `codex/v01-completion`.
 
 ## Intent and success criteria
@@ -220,7 +220,7 @@ omit CORS grants. Application POSTs after bootstrap also require a random per-se
 CSRF token; `/session` is authenticated by the launch token and same-origin check.
 Parse task IDs with the existing UUID validation before any store/path access; download
 IDs are opaque cache keys and asset paths are an allowlist of packaged resources. Use no-store
-responses, a self-only content security policy, and escaped template content. Do not mark
+responses, a self-only content security policy, same-origin referrer policy and escaped template content. The referrer policy permits ordinary same-origin form POSTs to retain their Origin; cross-origin referrers are suppressed. Do not mark
 repository text, diff lines, journal values or command output as trusted HTML. Provider
 credentials and full capability handles never enter page/view data.
 

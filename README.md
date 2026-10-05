@@ -20,6 +20,15 @@ one Firecracker microVM per effect, booted from a registered guest image, with n
 device, and **jailed by default** (the official `jailer`: chroot, uid 61000, cgroup v2
 limits). The plan for later phases is in [`Agent_OS_v1_Build_Plan.md`](Agent_OS_v1_Build_Plan.md).
 
+## Local browser UI
+
+Run `docker compose run --rm ui` on Linux and open the printed local launch link.
+Create a contract, review its recorded permissions and inputs, then explicitly approve
+a run. The workbench shows task state, patches and final verification and downloads
+CLI-compatible export archives. Closing the tab leaves a run active; restarting the
+server requires explicit recovery. See [the UI guide](docs/ui.md) for filesystem mounts,
+credentials, worker setup, limits and offline browser acceptance.
+
 ## Build and test
 
 For a first hands-on session, follow the [testing guide](docs/testing.md) and the

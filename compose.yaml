@@ -10,6 +10,11 @@ services:
     shm_size: 1gb
     network_mode: none
     command: sh scripts/test-ui.sh
+  ui:
+    extends: test
+    network_mode: host
+    volumes: [".:/work:ro", "cargo-cache:/usr/local/cargo/registry", "target:/work/target", "ui-home:/data"]
+    command: ["cargo", "run", "--locked", "-p", "agentos-cli", "--", "--home", "/data", "--profiles", "/work/fixtures/profiles", "ui", "--port", "8080"]
   # The KVM tier: `docker compose run --rm test-kvm …`. The `test` service above is unchanged;
   # each setting below is the one the "Jailer experiments" (E1-E12) in
   # docs/superpowers/specs/2026-10-02-phase-3b-firecracker-worker-design.md found necessary.
@@ -38,4 +43,4 @@ services:
       - AGENTOS_GUEST_IMAGE=/work/build/guest-images/python-stdlib-v1
     # The built guest image (scripts/build-guest-image.sh) persists here between runs.
     volumes: ["guest-images:/work/build/guest-images"]
-volumes: { cargo-cache: {}, target: {}, guest-images: {} }
+volumes: { cargo-cache: {}, target: {}, guest-images: {}, ui-home: {} }

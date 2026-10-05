@@ -9,6 +9,14 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 BINARY = ROOT / 'target/debug/agentos'
+SECRETS = set()
+
+def sanitize_test_output(output):
+    import re
+    for secret in SECRETS:
+        output = output.replace(secret, '[redacted]')
+    return re.sub(r"(http://127\.0\.0\.1:\d+/)#([^\s\"']+)", r'\1#[redacted]', output)
+
 SCRUBBED = ['ANTHROPIC_API_KEY', 'AGENTOS_API_KEY_FILE', 'AGENTOS_ANTHROPIC_BASE_URL',
             'AGENTOS_WORKER', 'AGENTOS_FIRECRACKER', 'AGENTOS_JAILER', 'AGENTOS_JAIL_UID',
             'AGENTOS_JAIL_GID', 'AGENTOS_ALLOW_UNJAILED', 'AGENTOS_TEST_WORKERS',
@@ -70,6 +78,7 @@ class BrowserFixture:
             line = self.process.stdout.readline()
         info = json.loads(line)
         self.url, self.launch_url = info['listening'], info['launch_url']
+        SECRETS.add(self.launch_url.split('#', 1)[1])
     def stop(self):
         if self.process is not None:
             if self.process.poll() is None:
@@ -106,3 +115,42 @@ class BrowserFixture:
         child = subprocess.Popen(self.command('resume', task), env=self.environment, stdout=output, stderr=output)
         output.close()
         return child
+
+    def create_contract_json(self):
+        return json.dumps(self.contract)
+    def wait_state(self, task, state, timeout=60):
+        import time
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if self.status(task)['state'] == state: return
+            time.sleep(0.02)
+        raise AssertionError('Task did not reach ' + state)
+    def wait_entered(self, timeout=20):
+        import time
+        end = time.monotonic() + timeout
+        while not self.entered.exists():
+            if time.monotonic() >= end: raise AssertionError('Verification did not enter owned barrier')
+            time.sleep(0.02)
+    def slow_profile(self):
+        self.slow_verification()
+    def restart(self):
+        self.stop()
+        self.start()
+    def crash_after_patch_dispatch(self):
+        result = subprocess.run(self.command('submit', self.contract_path, '--fake-agent-patch', ROOT / 'fixtures/parser-repo.fix.patch', '--yes', '--crash-at', 'after-dispatch:apply_patch'), env=self.environment, capture_output=True, text=True, timeout=20)
+        assert result.returncode == 75, result.stderr
+        for line in result.stderr.splitlines():
+            if line.startswith('{'):
+                record = json.loads(line)
+                if 'crashed' in record: return record['task_id']
+        raise AssertionError('Missing injected crash record')
+
+def create_in_browser(page, fixture, model=None):
+    from playwright.sync_api import expect
+    page.get_by_role('link', name='New task', exact=True).click()
+    page.get_by_label('Task contract JSON').fill(fixture.create_contract_json())
+    page.get_by_label('Model', exact=True).fill(model or 'fake:/work/fixtures/transcripts/parser-fix.json')
+    page.get_by_label('Worker', exact=True).select_option('firecracker' if fixture.worker == 'firecracker-fake' else 'host')
+    page.get_by_role('button', name='Create task', exact=True).click()
+    expect(page.locator('[data-task-id]')).to_be_visible()
+    return page.locator('[data-task-id]').get_attribute('data-task-id')

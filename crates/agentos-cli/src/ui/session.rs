@@ -120,6 +120,7 @@ pub(super) async fn boundary(
                         .map_err(|_| invalid("Invalid CSRF header"))?
                 } else {
                     let mut copy = Request::new(Body::from(bytes));
+                    *copy.method_mut() = request.method().clone();
                     *copy.headers_mut() = request.headers().clone();
                     Form::<CsrfForm>::from_request(copy, &())
                         .await
@@ -150,7 +151,7 @@ pub(super) async fn boundary(
     );
     headers.insert(
         header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
+        HeaderValue::from_static("same-origin"),
     );
     response
 }

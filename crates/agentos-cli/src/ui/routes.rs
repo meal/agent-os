@@ -162,9 +162,15 @@ async fn task(
     axum::Extension(session): axum::Extension<Session>,
     Path(id): Path<String>,
 ) -> AppResult<Html<String>> {
-    let id = task_id(id)?;
+    task_view(&state, &session, task_id(id)?).await
+}
+async fn task_view(
+    state: &UiState,
+    session: &Session,
+    id: agentos_core::ids::TaskId,
+) -> AppResult<Html<String>> {
     let detail = state.query(move |home| queries::detail(home, &id)).await?;
-    let actions = action_view(&state, &session, &detail).await?;
+    let actions = action_view(state, session, &detail).await?;
     render(TaskPage {
         active: views::active(&detail.status),
         contract: serde_json::to_string_pretty(&detail.contract)?,
@@ -291,11 +297,28 @@ fn request(
 async fn admission(
     state: &UiState,
     admitted: crate::app::runner::RunAdmission,
+    session: &Session,
+    headers: &axum::http::HeaderMap,
 ) -> AppResult<Response> {
     let (id, code) = match admitted {
         crate::app::runner::RunAdmission::Started(id) => (id, axum::http::StatusCode::ACCEPTED),
         crate::app::runner::RunAdmission::Reported(r) => (r.task_id, axum::http::StatusCode::OK),
     };
+    control_response(state, session, headers, id, code).await
+}
+async fn control_response(
+    state: &UiState,
+    session: &Session,
+    headers: &axum::http::HeaderMap,
+    id: agentos_core::ids::TaskId,
+    code: axum::http::StatusCode,
+) -> AppResult<Response> {
+    if !headers
+        .get("hx-request")
+        .is_some_and(|value| value == "true")
+    {
+        return Ok((code, task_view(state, session, id).await?).into_response());
+    }
     let status = state
         .query(move |home| queries::status(home, &id, Some(queries::RESULT_LIMIT)))
         .await?;
@@ -308,9 +331,12 @@ async fn admission(
     )
         .into_response())
 }
+
 async fn start(
     State(state): State<Arc<UiState>>,
+    axum::Extension(session): axum::Extension<Session>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
     input: Result<axum::Form<StartInput>, axum::extract::rejection::FormRejection>,
 ) -> AppResult<Response> {
     let id = task_id(id)?;
@@ -318,9 +344,14 @@ async fn start(
     let digest = agentos_core::ids::Digest::from_hex(&input.contract_digest)
         .map_err(|_| invalid("Invalid reviewed digest"))?;
     let admitted = state.runner.admit(request(id, Some(digest))).await?;
-    admission(&state, admitted).await
+    admission(&state, admitted, &session, &headers).await
 }
-async fn resume(State(state): State<Arc<UiState>>, Path(id): Path<String>) -> AppResult<Response> {
+async fn resume(
+    State(state): State<Arc<UiState>>,
+    axum::Extension(session): axum::Extension<Session>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> AppResult<Response> {
     let id = task_id(id)?;
     let check = id.clone();
     let status = state
@@ -333,9 +364,14 @@ async fn resume(State(state): State<Arc<UiState>>, Path(id): Path<String>) -> Ap
         ));
     }
     let admitted = state.runner.admit(request(id, None)).await?;
-    admission(&state, admitted).await
+    admission(&state, admitted, &session, &headers).await
 }
-async fn pause(State(state): State<Arc<UiState>>, Path(id): Path<String>) -> AppResult<Response> {
+async fn pause(
+    State(state): State<Arc<UiState>>,
+    axum::Extension(session): axum::Extension<Session>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> AppResult<Response> {
     let id = task_id(id)?;
     let result = state
         .runner
@@ -347,17 +383,22 @@ async fn pause(State(state): State<Arc<UiState>>, Path(id): Path<String>) -> App
                 "Control operation was interrupted",
             )
         })??;
-    let id = result.task_id;
-    let status = state
-        .query(move |home| queries::status(home, &id, Some(queries::RESULT_LIMIT)))
-        .await?;
-    Ok(render(StatusPage {
-        active: views::active(&status),
-        status: &status,
-    })?
-    .into_response())
+    control_response(
+        &state,
+        &session,
+        &headers,
+        result.task_id,
+        axum::http::StatusCode::OK,
+    )
+    .await
 }
-async fn cancel(State(state): State<Arc<UiState>>, Path(id): Path<String>) -> AppResult<Response> {
+
+async fn cancel(
+    State(state): State<Arc<UiState>>,
+    axum::Extension(session): axum::Extension<Session>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> AppResult<Response> {
     let id = task_id(id)?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     let _completion = state.runner.operation(move |home| {
@@ -376,23 +417,20 @@ async fn cancel(State(state): State<Arc<UiState>>, Path(id): Path<String>) -> Ap
         )
     })?;
     let terminal = result.state.is_terminal();
-    let id = result.task_id;
-    let status = state
-        .query(move |home| queries::status(home, &id, Some(queries::RESULT_LIMIT)))
-        .await?;
-    Ok((
+    control_response(
+        &state,
+        &session,
+        &headers,
+        result.task_id,
         if terminal {
             axum::http::StatusCode::OK
         } else {
             axum::http::StatusCode::ACCEPTED
         },
-        render(StatusPage {
-            active: views::active(&status),
-            status: &status,
-        })?,
     )
-        .into_response())
+    .await
 }
+
 #[derive(Template)]
 #[template(path = "ui/actions.html")]
 struct Actions<'a> {

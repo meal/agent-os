@@ -84,3 +84,7 @@ document.querySelector('#contract-file')?.addEventListener('change', async event
  if (file.size > 256 * 1024) {document.querySelector('#request-error').textContent = 'Contract exceeds 256 KiB.';return;}
  document.querySelector('#contract-json').value = await file.text();
 });
+
+document.addEventListener('htmx:afterSwap', event => {
+ if (event.detail.target.id === 'export-result') event.detail.target.querySelector('[data-download]')?.click();
+});

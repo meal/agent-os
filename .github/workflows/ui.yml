@@ -1,0 +1,33 @@
+name: Offline browser UI
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        worker: [host, firecracker-fake]
+    env:
+      COMPOSE_PROJECT_NAME: agentos-ui-${{ github.run_id }}-${{ matrix.worker }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, checked 2026-10-05
+      - run: docker compose build test-ui
+      - run: sh scripts/test-ui-compose.sh
+      # Resolve/build before the browser container runs with networking disabled.
+      - run: docker compose run --rm test cargo build -p agentos-cli --locked
+      - run: docker compose run --rm -e AGENTOS_UI_TEST_WORKER=${{ matrix.worker }} -e AGENTOS_TEST_JAIL=fake test-ui sh scripts/test-ui.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1, checked 2026-10-05
+        if: failure()
+        with:
+          name: ui-${{ matrix.worker }}
+          path: |
+            build/ui-evidence/*.png
+            build/ui-evidence/browser-tests.log
+          if-no-files-found: ignore
+          retention-days: 7
