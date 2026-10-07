@@ -32,7 +32,7 @@ grep -q 'run --rm -e AGENTOS_GC_MOUNT_TESTS=1 test-mount cargo test -p agentos-e
 sh "$REPO/scripts/check.sh" mount
 [ "$(wc -l < "$scratch/commands")" -eq 1 ]
 # A mount gate whose filter matched no test (or not all four) must fail.
-for passed in 0 3; do
+for passed in 0 3 14; do
     if AGENTOS_CHECK_TEST_MOUNT_PASSED=$passed sh "$REPO/scripts/check.sh" mount > "$scratch/stdout" 2> "$scratch/stderr"; then
         echo "a mount gate with $passed tests passed" >&2; exit 1
     fi

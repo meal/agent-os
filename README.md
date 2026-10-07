@@ -1193,3 +1193,13 @@ Known limits of `gc`:
 - Host-worker temporary directories under `work/<task>/` and `.output.bin.tmp`-style
   leftovers of interrupted atomic writes are never reclaimed.
 - The `test-mount` gate builds a second image (Compose `extends` without `image:`).
+
+Not verified offline:
+- Real foreign bind-mount roots: mount-root refusal is tested only with tmpfs mounts made in a
+  container with `CAP_SYS_ADMIN` (the `test-mount` gate).
+- Firecracker/KVM and jailed job directories: a real `v.sock`, `ws.img` owned by uid 61000,
+  and `ws.img` with a link count above 1 while a jail chroot still links it (that keeps its
+  task retained until the link is gone).
+- Power-loss durability: only injected interruptions were tested.
+- Kernels older than 5.8: every pass refuses (no `STATX_ATTR_MOUNT_ROOT`).
+- Reclaiming host-worker temporary directories and atomic-write leftovers: never done.

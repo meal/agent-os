@@ -115,7 +115,13 @@ its device/inode compared with the ticket, its tree checked again, and only then
 recursively by descriptor; the remover repeats the mount-root check at every level. The
 staging directory is removed, then the ticket.
 
-Within the moving pass the staged entry must have the validated device and inode. On a later
+Each ticket records the kind of file it staged, from the stat that captured its inode; one
+predicate (`ticket_accepts`) decides what staged data a ticket describes: a removal ticket only
+the kind expected for its entry, a restore ticket exactly the recorded kind (tickets of earlier
+builds without a record keep the expected-kind rule). Tickets are written only through
+`removal_ticket` and `restore_ticket`, and a table test asserts that every ticket they can
+write is accepted by the reader. Within the moving pass the staged entry must have the
+validated device and inode. On a later
 pass it must have the ticket's inode and kind of file and lie on the home's current device;
 the recorded device number is not compared, because it need not survive a reboot or remount
 (btrfs, overlayfs). Each ticket's state then decides: staged data matching its ticket and
