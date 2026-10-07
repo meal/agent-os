@@ -844,3 +844,359 @@ fn low_descriptor_child() {
     assert!(!retention.exists());
     println!("low-descriptor child collected {} jobs", jobs.len() + 1);
 }
+
+// ---- Hostile cases: forged tickets, redirected paths, unsettled effects, crash points ----
+
+fn ticket_key(relative: &str) -> String {
+    Digest::of(relative.as_bytes()).to_string()
+}
+
+fn ws_ticket(relative: &str, task: &TaskId, kind: &str, version: u64) -> serde_json::Value {
+    serde_json::json!({
+        "version": version,
+        "relative": relative,
+        "kind": kind,
+        "proof": {
+            "task": task, "effect": null, "attempt": null, "result": null,
+            "lease": 0, "firecracker_socket": false
+        },
+        "device": 0,
+        "inode": 0
+    })
+}
+
+/// Everything `settled()` made is still there and `secret` is untouched.
+fn nothing_deleted(env: &Env, job: &JobDir, retention: &Path, secret: &Path, report: &Report) {
+    assert!(report.failed(), "{report:?}");
+    assert!(
+        !report.entries.iter().any(|e| e.status == "deleted"),
+        "{report:?}"
+    );
+    assert!(job.path.join("output.bin").exists(), "{report:?}");
+    assert!(retention.exists());
+    let work = env.dir.path().join("work").join(env.task.as_str());
+    assert!(work.join("ws.img").exists());
+    assert_eq!(fs::read(secret).unwrap(), b"keep", "{report:?}");
+}
+
+#[test]
+fn forged_or_foreign_deletion_tickets_never_delete_anything() {
+    let cases = [
+        "traversal",
+        "absolute",
+        "dotdot-inside",
+        "kind-mismatch",
+        "key-mismatch",
+        "data-symlink",
+        "unowned-dir",
+        "version-1",
+        "garbage",
+        "foreign-tmp",
+    ];
+    for case in cases {
+        let (env, job, retention) = settled();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret");
+        fs::write(&secret, b"keep").unwrap();
+        let outside_name = outside.path().file_name().unwrap().to_str().unwrap();
+        let trash = env.dir.path().join("gc-trash");
+        fs::create_dir_all(&trash).unwrap();
+        let ws = format!("work/{}/ws", env.task);
+        let forge = |relative: &str, key: &str, kind: &str, version: u64| {
+            fs::write(
+                trash.join(format!("{key}.json")),
+                serde_json::to_vec(&ws_ticket(relative, &env.task, kind, version)).unwrap(),
+            )
+            .unwrap();
+        };
+        match case {
+            "traversal" => {
+                let rel = format!("../{outside_name}/secret");
+                forge(&rel, &ticket_key(&rel), "Workspace", 2)
+            }
+            "absolute" => {
+                let rel = secret.to_str().unwrap().to_string();
+                forge(&rel, &ticket_key(&rel), "Workspace", 2)
+            }
+            "dotdot-inside" => {
+                let rel = format!("work/../../{outside_name}/secret");
+                forge(&rel, &ticket_key(&rel), "Workspace", 2)
+            }
+            "kind-mismatch" => forge(&ws, &ticket_key(&ws), "Model", 2),
+            "key-mismatch" => forge(&ws, &ticket_key("work/other/ws"), "Workspace", 2),
+            "data-symlink" => {
+                forge(&ws, &ticket_key(&ws), "Workspace", 2);
+                fs::create_dir(trash.join(ticket_key(&ws))).unwrap();
+                std::os::unix::fs::symlink(
+                    outside.path(),
+                    trash.join(ticket_key(&ws)).join("data"),
+                )
+                .unwrap();
+            }
+            "unowned-dir" => fs::create_dir(trash.join(ticket_key(&ws))).unwrap(),
+            "version-1" => forge(&ws, &ticket_key(&ws), "Workspace", 1),
+            "garbage" => fs::write(trash.join(format!("{}.json", ticket_key(&ws))), b"{").unwrap(),
+            _ => fs::write(trash.join(".tmpABCDEF"), b"not ours").unwrap(),
+        }
+        let before: Vec<_> = fs::read_dir(&trash)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        let report = gc(env.dir.path(), &env, false);
+        nothing_deleted(&env, &job, &retention, &secret, &report);
+        assert_eq!(report.entries[0].status, "refused", "{case}: {report:?}");
+        let after: Vec<_> = fs::read_dir(&trash)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(before, after, "{case}: unknown entries are never removed");
+        assert!(outside.path().join("secret").exists());
+    }
+}
+
+#[test]
+fn symlinked_workspaces_model_dirs_and_task_dirs_stop_the_pass() {
+    for case in ["ws", "model", "task-dir"] {
+        let (env, job, retention) = settled();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret");
+        fs::write(&secret, b"keep").unwrap();
+        let root = env.dir.path();
+        match case {
+            "ws" => {
+                let ws = root.join("work").join(env.task.as_str()).join("ws");
+                fs::remove_dir_all(&ws).unwrap();
+                std::os::unix::fs::symlink(outside.path(), &ws).unwrap();
+            }
+            "model" => {
+                let name = format!("{}-{}", "a".repeat(64), uuid_like());
+                std::os::unix::fs::symlink(outside.path(), root.join("model").join(name)).unwrap();
+            }
+            _ => {
+                let other = second_task(&env);
+                finish(&env, &other);
+                std::os::unix::fs::symlink(outside.path(), root.join("work").join(other.as_str()))
+                    .unwrap();
+                fs::create_dir(outside.path().join("ws")).unwrap();
+            }
+        }
+        let report = gc(root, &env, false);
+        nothing_deleted(&env, &job, &retention, &secret, &report);
+        assert_eq!(report.entries[0].status, "refused", "{case}: {report:?}");
+    }
+}
+
+fn uuid_like() -> String {
+    agentos_core::effect::AttemptId::new().to_string()
+}
+
+#[test]
+fn a_superseded_attempt_with_its_own_receipt_is_kept() {
+    let (env, job, retention) = settled();
+    let mut req = job.request().unwrap();
+    req.attempt_id = agentos_core::effect::AttemptId::new();
+    req.lease_generation = 0;
+    let (old, lock) = JobDir::create(&env.dir.path().join("jobs"), &req).unwrap();
+    drop(lock);
+    let mut out: ExecOutcome =
+        serde_json::from_slice(&fs::read(job.path.join("receipt.json")).unwrap()).unwrap();
+    out.output = fs::read(job.path.join("output.bin")).unwrap();
+    out.receipt.attempt_id = req.attempt_id.clone();
+    out.receipt.lease_generation = 0;
+    old.write_receipt(&out).unwrap();
+    let report = gc(env.dir.path(), &env, false);
+    assert!(!report.failed(), "{report:?}");
+    assert!(old.path.join("output.bin").exists(), "{report:?}");
+    assert_eq!(status_of(&report, &rel(&env, &old.path)), ["retained"]);
+    assert!(!job.path.join("output.bin").exists() && !retention.exists());
+}
+
+#[test]
+fn a_dispatched_or_unknown_model_call_keeps_its_retained_response() {
+    for unknown in [false, true] {
+        let env = Env::with_model(3, 10);
+        env.db.append(&env.task, &TaskEvent::Started).unwrap();
+        let base = env.db.task(&env.task).unwrap().workspace_digest;
+        let model = steps::intend(
+            &env.db,
+            &env.task,
+            EffectKind::ModelCall {
+                model: "fake".into(),
+                turn: 1,
+            },
+            Digest::of(b"{}"),
+            &base,
+            &Resource::Task,
+        )
+        .unwrap();
+        let ctx = steps::dispatch(&env.db, &model).unwrap();
+        let out = ExecOutcome::success(
+            &steps::request(&model, Vec::new(), &env.contract, 0),
+            &ctx,
+            b"model response".to_vec(),
+        );
+        let retention = env
+            .dir
+            .path()
+            .join("model")
+            .join(format!("{}-{}", model.effect_id, ctx.attempt_id));
+        fs::create_dir_all(&retention).unwrap();
+        fs::write(
+            retention.join("response.json"),
+            serde_json::to_vec(&out).unwrap(),
+        )
+        .unwrap();
+        if unknown {
+            env.db.mark_unknown(&model.effect_id).unwrap();
+        }
+        finish(&env, &env.task);
+        let report = gc(env.dir.path(), &env, false);
+        assert!(retention.join("response.json").exists(), "{report:?}");
+        assert_eq!(
+            status_of(&report, &rel(&env, &retention)),
+            ["retained"],
+            "{report:?}"
+        );
+        assert!(report.entries[0].reason.contains("unsettled"), "{report:?}");
+    }
+}
+
+/// Crash points of a deletion: after the ticket is durable (before staging), after the
+/// move (before removal), after removal (before the ticket goes). A rerun finishes and
+/// nothing outside the home changes.
+#[test]
+fn every_crash_point_of_a_deletion_is_finished_by_a_rerun() {
+    for at in [
+        CollectionStage::TicketPublished,
+        CollectionStage::Staged,
+        CollectionStage::Removed,
+    ] {
+        for target in ["jobs", "model", "work"] {
+            let (env, job, retention) = settled();
+            let outside = tempfile::tempdir().unwrap();
+            fs::write(outside.path().join("secret"), b"keep").unwrap();
+            let root = env.dir.path();
+            let before = env.events();
+            let report = gc_hook(root, &env, false, &|stage, path| {
+                if stage == at && path.starts_with(target) {
+                    return Err(std::io::Error::other("injected crash"));
+                }
+                Ok(())
+            });
+            assert!(report.failed(), "{at:?} {target}: {report:?}");
+            let retry = gc(root, &env, false);
+            assert!(!retry.failed(), "{at:?} {target}: {retry:?}");
+            assert!(!job.path.join("output.bin").exists(), "{retry:?}");
+            assert!(job.path.join("receipt.json").exists());
+            assert!(!retention.exists(), "{at:?} {target}: {retry:?}");
+            let work = root.join("work").join(env.task.as_str());
+            assert!(!work.join("ws").exists() && !work.join("ws.img").exists());
+            assert_eq!(
+                fs::read_dir(root.join("gc-trash")).unwrap().count(),
+                0,
+                "{at:?} {target}: {retry:?}"
+            );
+            assert_eq!(fs::read(outside.path().join("secret")).unwrap(), b"keep");
+            assert_eq!(env.events(), before);
+            let third = gc(root, &env, false);
+            assert!(
+                third.entries.iter().all(|e| e.status == "collected"),
+                "{third:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_entry_swapped_before_staging_is_moved_back_and_kept() {
+    let (env, _, _) = settled();
+    let work = env.dir.path().join("work").join(env.task.as_str());
+    let report = gc_hook(env.dir.path(), &env, false, &|stage, path| {
+        if stage == CollectionStage::TicketPublished && path.ends_with("ws") {
+            fs::rename(work.join("ws"), work.join("ws-validated"))?;
+            fs::create_dir(work.join("ws"))?;
+            fs::write(work.join("ws/foreign"), b"not validated")?;
+        }
+        Ok(())
+    });
+    assert!(report.failed(), "{report:?}");
+    assert_eq!(fs::read(work.join("ws/foreign")).unwrap(), b"not validated");
+    assert!(work.join("ws-validated/file").exists());
+    assert_eq!(
+        fs::read_dir(env.dir.path().join("gc-trash"))
+            .unwrap()
+            .count(),
+        0,
+        "the unexecuted ticket is dropped, so later passes are not wedged"
+    );
+}
+
+#[test]
+fn unpublished_ticket_temp_files_are_cleaned() {
+    let (env, _, _) = settled();
+    let trash = env.dir.path().join("gc-trash");
+    fs::create_dir_all(&trash).unwrap();
+    fs::write(trash.join(".tmp-ticket-a1B2c3"), b"{\"half\":").unwrap();
+    let dry = gc(env.dir.path(), &env, true);
+    assert!(trash.join(".tmp-ticket-a1B2c3").exists(), "{dry:?}");
+    let report = gc(env.dir.path(), &env, false);
+    assert!(!report.failed(), "{report:?}");
+    assert_eq!(
+        status_of(&report, "gc-trash/.tmp-ticket-a1B2c3"),
+        ["deleted"],
+        "{report:?}"
+    );
+    assert_eq!(fs::read_dir(&trash).unwrap().count(), 0);
+}
+
+#[test]
+fn small_batches_collect_every_task_whole() {
+    let (env, job, retention) = settled();
+    let others: Vec<(TaskId, Vec<JobDir>)> = (0..3)
+        .map(|t| {
+            let task = second_task(&env);
+            let jobs = (0..4)
+                .map(|n| settle_job(&env, &task, format!("task {t} job {n}").as_bytes()))
+                .collect();
+            finish(&env, &task);
+            (task, jobs)
+        })
+        .collect();
+    let report = gc_with(
+        env.dir.path(),
+        &env,
+        Options {
+            dry_run: false,
+            batch_size: 1,
+        },
+        &|_, _| Ok(()),
+    );
+    assert!(!report.failed(), "{report:?}");
+    assert_eq!(report.batches, 4, "{report:?}");
+    for (_, jobs) in &others {
+        for j in jobs {
+            assert!(!j.path.join("output.bin").exists());
+        }
+    }
+    assert!(!job.path.join("output.bin").exists() && !retention.exists());
+}
+
+#[test]
+fn reasons_name_relative_paths_and_never_quote_file_content() {
+    let (env, job, retention) = settled();
+    std::os::unix::fs::symlink("/etc/passwd", job.path.join("redirect")).unwrap();
+    fs::write(
+        retention.join("response.json"),
+        b"{\"receipt\": \"SECRET-CONTENT\"",
+    )
+    .unwrap();
+    let other = second_task(&env);
+    let other_job = settle_job(&env, &other, b"other");
+    finish(&env, &other);
+    fs::write(other_job.path.join("receipt.json"), b"[\"SECRET-CONTENT\"]").unwrap();
+    let report = gc(env.dir.path(), &env, false);
+    let text = serde_json::to_string(&report).unwrap();
+    assert!(!text.contains("/proc/self/fd"), "{text}");
+    assert!(!text.contains("SECRET-CONTENT"), "{text}");
+    assert!(text.contains("symlink in the tree: redirect"), "{text}");
+}

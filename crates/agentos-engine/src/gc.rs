@@ -1148,9 +1148,14 @@ impl Pass<'_> {
         Ok(match data {
             Some((stage, st)) => {
                 self.validate_proof(&ticket)?;
-                if confined::identity_of(&st) != (ticket.device, ticket.inode)
-                    || check_tree(&confined::path(&stage).join("data"), ticket.rules()).is_err()
-                {
+                if confined::identity_of(&st) != (ticket.device, ticket.inode) {
+                    // Not provably what this ticket staged: never removed, never moved.
+                    return Err(Fail::Integrity(format!(
+                        "gc-trash/{key}/data is not the entry its ticket staged; inspect it manually"
+                    )));
+                }
+                if check_tree(&confined::path(&stage).join("data"), ticket.rules()).is_err() {
+                    // Ours, but no longer safe to remove blindly: move it back.
                     Action::Restore { key, ticket }
                 } else {
                     Action::Finish { key, ticket }
@@ -1418,9 +1423,14 @@ impl Pass<'_> {
             && let Some(st) = confined::stat(stage, OsStr::new("data"))?
         {
             let checked = if confined::identity_of(&st) != (ticket.device, ticket.inode) {
-                Err(Fail::Refuse(
-                    "staged data is not the entry that was validated".into(),
-                ))
+                if parent.is_none() {
+                    // Staged by an earlier pass: not provably ours, so never moved.
+                    return Err(Fail::Integrity(format!(
+                        "gc-trash/{key}/data is not the entry its ticket staged; inspect it manually"
+                    )));
+                }
+                // Moved by this very call: undo the move.
+                Err(Fail::Refuse("the entry changed after validation".into()))
             } else {
                 check_tree(&confined::path(stage).join("data"), ticket.rules())
             };
