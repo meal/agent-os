@@ -29,8 +29,8 @@ apply the reviewed patch to a clean copy.
 
 Current completion work is tracked in the [v0.1 plan](docs/superpowers/plans/2026-10-04-v01-completion.md).
 Model deadlines, bounded I/O, versioned retry/endpoint policy, the development runtime, and
-CI are implemented and tested offline. Conservative transient GC and host publication
-failure recovery are implemented in the current completion worktree. Real provider/KVM
+CI, conservative transient GC (`agentos gc`) and host publication failure recovery are
+implemented and tested offline. Real provider/KVM
 acceptance remains open; contract-driven VM resources, the component analyzer, and
 fresh-host release validation remain planned work.
 
