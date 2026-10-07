@@ -18,6 +18,8 @@
 use std::fs::{self, File, TryLockError};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agentos_core::contract::Limits;
 use agentos_core::ids::{Digest, TaskId};
@@ -115,6 +117,17 @@ pub struct Home {
     pub api_key_file: Option<PathBuf>,
     /// `--anthropic-base-url` [default: the provider's own].
     pub anthropic_base_url: Option<String>,
+    /// How many times [`Home::api_key`] resolved a key in this process: observability for
+    /// the guarantees that the key is read once per command and never by recovery.
+    pub(crate) key_reads: Arc<AtomicUsize>,
+}
+
+/// Whether an executor may send model requests.
+enum Dispatch {
+    /// It may; the key, if the caller resolved one already.
+    Model(Option<ApiKey>),
+    /// It never does (cancel, recovery): no provider is built.
+    Never,
 }
 
 /// The worker recorded in a task's `Submitted` event.
@@ -218,6 +231,7 @@ impl Home {
             allow_unjailed: false,
             api_key_file: None,
             anthropic_base_url: None,
+            key_reads: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -623,10 +637,13 @@ impl Home {
             .and_then(|p| p["model"].as_str().map(str::to_string)))
     }
 
-    /// The Anthropic key: the first line-and-trim of `--api-key-file`, else `ANTHROPIC_API_KEY`.
-    /// It is never taken from argv (so it never shows in `/proc/*/cmdline`), and no message
-    /// here quotes it.
+    /// The Anthropic key: the whole of `--api-key-file` (else `ANTHROPIC_API_KEY`), trimmed;
+    /// it must then be one line of printable ASCII, so a multi-line file is refused, not
+    /// truncated. It is never taken from argv (so it never shows in `/proc/*/cmdline`), and
+    /// no message here quotes it. Each call reads the source again: a command resolves it
+    /// once and passes the [`ApiKey`] on ([`Home::executor`]).
     pub fn api_key(&self) -> Result<ApiKey, CliError> {
+        self.key_reads.fetch_add(1, Ordering::SeqCst);
         let raw = match &self.api_key_file {
             Some(path) => crate::secrets::read_key_file(path)
                 .map_err(|e| CliError::usage(format!("cannot read {}: {e}", path.display())))?,
@@ -699,36 +716,34 @@ impl Home {
         Ok(recorded)
     }
 
-    /// The provider for `task`'s recorded model: Anthropic (needs the key), the scripted fake
-    /// over the task's own copy of the transcript, or none for the fake agent. With `lenient`
-    /// (recovery and cancel, which never send) a provider that cannot be built is `None`
-    /// instead of an error, so a task can always be cancelled.
+    /// The provider for `task`'s recorded model: Anthropic (over `key`, else the key resolved
+    /// now), the scripted fake over the task's own copy of the transcript, or none for the
+    /// fake agent.
     fn provider(
         &self,
         store: &Store,
         task: &TaskId,
-        lenient: bool,
+        key: Option<ApiKey>,
     ) -> Result<Option<Box<dyn ModelProvider>>, CliError> {
         let Some(model) = self.recorded_model(store, task)? else {
             return Ok(None);
         };
-        let built = if model.starts_with("anthropic:") {
-            self.model_endpoint(store, task).and_then(|base| {
-                let provider = AnthropicProvider::new(self.api_key()?);
-                let provider = match base {
-                    Some(url) => provider.with_base_url(url),
-                    None => provider,
-                };
-                Ok(Some(Box::new(provider) as Box<dyn ModelProvider>))
-            })
+        if model.starts_with("anthropic:") {
+            let base = self.model_endpoint(store, task)?;
+            let key = match key {
+                Some(key) => key,
+                None => self.api_key()?,
+            };
+            let provider = AnthropicProvider::new(key);
+            let provider = match base {
+                Some(url) => provider.with_base_url(url),
+                None => provider,
+            };
+            Ok(Some(Box::new(provider) as Box<dyn ModelProvider>))
         } else if model.starts_with("fake:") {
             self.fake_provider(store, task).map(Some)
         } else {
             Ok(None)
-        };
-        match built {
-            Err(_) if lenient => Ok(None),
-            r => r,
         }
     }
 
@@ -763,32 +778,35 @@ impl Home {
 
     /// The executor for `task`, over the inputs and the worker recorded at its submission.
     /// For the Firecracker worker the preflight and the jail are checked here, before the
-    /// caller touches the task. A model task needs its provider (the key, for Anthropic).
+    /// caller touches the task. A model task needs its provider: for Anthropic, `key` (the
+    /// one the caller already resolved) or, when `None`, the key resolved here, once.
     pub fn executor(
         &self,
         store: &Store,
         task: &TaskId,
+        key: Option<ApiKey>,
     ) -> Result<RoutingExecutor<SupervisedExecutor>, CliError> {
-        self.build_executor(store, task, false)
+        self.build_executor(store, task, Dispatch::Model(key))
     }
 
     /// Like [`Home::executor`] for paths that never send a model request (cancel, recovery of
-    /// a finished task): a missing key or transcript does not block them.
+    /// a finished task). Structurally so: its model executor has no provider, so no key or
+    /// transcript is read and a model dispatch fails with `no model provider configured`.
     pub fn recovery_executor(
         &self,
         store: &Store,
         task: &TaskId,
     ) -> Result<RoutingExecutor<SupervisedExecutor>, CliError> {
-        self.build_executor(store, task, true)
+        self.build_executor(store, task, Dispatch::Never)
     }
 
     fn build_executor(
         &self,
         store: &Store,
         task: &TaskId,
-        lenient: bool,
+        dispatch: Dispatch,
     ) -> Result<RoutingExecutor<SupervisedExecutor>, CliError> {
-        if !lenient {
+        if matches!(dispatch, Dispatch::Model(_)) {
             self.model_endpoint(store, task)?;
         }
         let recorded = self.task_worker(store, task)?;
@@ -837,7 +855,10 @@ impl Home {
                 profile_digest,
             }),
         };
-        let provider = self.provider(store, task, lenient)?;
+        let provider = match dispatch {
+            Dispatch::Model(key) => self.provider(store, task, key)?,
+            Dispatch::Never => None,
+        };
         let mut jobs = SupervisedExecutor::new(
             root.join("jobs"),
             supervisor_cmd()?,
@@ -865,6 +886,9 @@ impl Home {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentos_core::contract::Contract;
+    use agentos_core::effect::{AttemptId, EffectId, EffectKind, Outcome};
+    use agentos_engine::executor::{AttemptCtx, EffectRequest, Executor};
 
     #[test]
     fn base_urls_must_be_https_or_loopback_http_without_userinfo_query_or_fragment() {
@@ -901,6 +925,124 @@ mod tests {
         ] {
             validate_base_url(good).unwrap_or_else(|e| panic!("{good}: {e}"));
         }
+    }
+
+    const KEY_CANARY: &str = "sk-ant-unit-SECRET";
+
+    /// A home with one submitted, non-started `model` task: its recorded inputs and a
+    /// `Submitted` event naming the model, the endpoint and the profile digest.
+    fn home_with_task(
+        dir: &Path,
+        model: &str,
+        key_file: Option<PathBuf>,
+    ) -> (Home, Store, TaskId, EffectRequest) {
+        let mut home = Home::new(Some(dir.join("home")), None).unwrap();
+        home.api_key_file = key_file;
+        let store = home.open().unwrap();
+        let contract = Contract::parse(
+            &serde_json::json!({
+                "goal": "g",
+                "repository": { "source": dir, "revision": "recorded-at-submission" },
+                "profile": "python-stdlib-v1",
+                "editable_paths": ["src/**"],
+                "verification_profile": "parser-checks-v1",
+                "capabilities": ["snapshot.read", "model.request"],
+                "limits": {
+                    "model_requests": 3, "max_output_tokens_per_request": 100, "tool_actions": 3,
+                    "deadline_seconds": 600, "worker_vcpus": 1, "worker_memory_mib": 256
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let task = store
+            .db
+            .create_task(&contract, &Digest::of(b"contract"))
+            .unwrap();
+        store
+            .db
+            .append_audit(
+                &task,
+                "Submitted",
+                &serde_json::json!({
+                    "model": model,
+                    "model_endpoint": "https://api.anthropic.com",
+                    "profile_digest": Digest::of(b"profile"),
+                }),
+            )
+            .unwrap();
+        for d in ["snapshot", "profile"] {
+            fs::create_dir_all(home.task_dir(&task).join(d)).unwrap();
+        }
+        let kind = EffectKind::ModelCall {
+            model: model.into(),
+            turn: 1,
+        };
+        let payload = b"{\"messages\":[]}".to_vec();
+        let request = EffectRequest {
+            effect_id: EffectId::derive(&task, 0, &kind, &Digest::of(&payload)),
+            task_id: task.clone(),
+            kind,
+            payload,
+            contract,
+            deadline_ts: 0,
+        };
+        (home, store, task, request)
+    }
+
+    #[tokio::test]
+    async fn recovery_never_builds_a_provider_or_reads_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("key");
+        fs::write(&key, KEY_CANARY).unwrap();
+        for key_file in [Some(key), Some(dir.path().join("absent")), None] {
+            let (home, store, task, request) =
+                home_with_task(dir.path(), "anthropic:claude-x", key_file);
+            let exec = home.recovery_executor(&store, &task).unwrap();
+            assert_eq!(home.key_reads.load(Ordering::SeqCst), 0);
+            let ctx = AttemptCtx {
+                attempt_id: AttemptId::new(),
+                lease_generation: 1,
+                worker: "model".into(),
+            };
+            let out = exec.run(&request, &ctx).await;
+            assert_eq!(
+                out.receipt.outcome,
+                Outcome::Failure("no model provider configured".into())
+            );
+            fs::remove_dir_all(dir.path().join("home")).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fake_task_recovers_without_its_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, store, task, _) = home_with_task(dir.path(), "fake:/nowhere.json", None);
+        // No transcript file: a dispatching executor refuses, the recovery one does not.
+        assert!(home.executor(&store, &task, None).is_err());
+        home.recovery_executor(&store, &task).unwrap();
+    }
+
+    #[test]
+    fn a_resolved_key_is_used_without_reading_the_source_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("key");
+        fs::write(&key, KEY_CANARY).unwrap();
+        let (home, store, task, _) =
+            home_with_task(dir.path(), "anthropic:claude-x", Some(key.clone()));
+        // The caller resolves the key once...
+        let resolved = home.api_key().unwrap();
+        assert_eq!(resolved.expose(), KEY_CANARY);
+        assert_eq!(home.key_reads.load(Ordering::SeqCst), 1);
+        // ...the source then changes, and the executor is built from the resolved key.
+        fs::write(&key, "a-different-key").unwrap();
+        home.executor(&store, &task, Some(resolved)).unwrap();
+        fs::remove_file(&key).unwrap();
+        assert_eq!(home.key_reads.load(Ordering::SeqCst), 1);
+        // Without a resolved key the executor resolves one itself, exactly once (here it
+        // fails: the file is gone).
+        assert!(home.executor(&store, &task, None).is_err());
+        assert_eq!(home.key_reads.load(Ordering::SeqCst), 2);
     }
 
     fn entry(home: &Home, id: &str, digest: &str, ms: i64) {

@@ -10,6 +10,7 @@ use agentos_core::ids::{Digest, TaskId};
 use agentos_engine::firecracker::firecracker_version;
 use agentos_engine::guestlink::GuestLauncher;
 use agentos_engine::model::fake::Transcript;
+use agentos_engine::model::provider::ApiKey;
 use agentos_engine::workspace::{copy_tree, workspace_digest};
 use serde_json::json;
 
@@ -39,6 +40,8 @@ struct Request {
     model: Option<ModelSpec>,
     /// The bytes of a `fake:` transcript, read and parsed once: what is recorded and run.
     transcript: Option<Vec<u8>>,
+    /// The Anthropic key, resolved once here (with `--yes`) and handed to the executor.
+    api_key: Option<ApiKey>,
     /// `None` for the host worker.
     firecracker: Option<FirecrackerRecord>,
 }
@@ -155,6 +158,7 @@ fn validate(
             Some(wanted)
         }
     };
+    let mut api_key = None;
     let (patch, model, transcript) = match (yes, patch, model) {
         (_, Some(_), Some(_)) => {
             return Err(CliError::usage("pass either --fake-agent-patch or --model"));
@@ -188,7 +192,7 @@ fn validate(
                 ModelSpec::Anthropic(_) => {
                     home.checked_base_url()?;
                     if yes {
-                        home.api_key()?;
+                        api_key = Some(home.api_key()?);
                     }
                     (None, Some(spec), None)
                 }
@@ -208,6 +212,7 @@ fn validate(
         patch,
         model,
         transcript,
+        api_key,
         firecracker,
     })
 }
@@ -294,6 +299,7 @@ pub async fn submit(
         patch,
         model,
         transcript,
+        api_key,
         firecracker,
     } = validate(home, task_file, yes, patch, model)?;
 
@@ -392,7 +398,7 @@ pub async fn submit(
         Some(lock) => {
             // The executor (preflight and jail included) before the approval: a host that
             // changed since the checks above leaves the task READY, not approved.
-            let exec = home.executor(&store, &task)?;
+            let exec = home.executor(&store, &task, api_key)?;
             let agent = agent_for(home, &store, &task, None)?;
             // `--yes` is the owner's approval: issue the task's capability handles.
             store.db.approve_task(&task)?;
