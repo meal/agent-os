@@ -445,17 +445,11 @@ fn effect_n(n: u32) -> EffectRequest {
     r
 }
 
-/// Gives the directory an old mtime, as a home that has been idle for a while has.
-fn age(dir: &Path) {
-    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
-    std::fs::File::open(dir).unwrap().set_modified(old).unwrap();
-}
-
 #[test]
-fn retained_outcome_reads_only_the_requested_effects_attempts_among_many_entries() {
+fn the_right_attempt_is_found_among_many_unrelated_entries() {
     let dir = tempfile::tempdir().unwrap();
     let ex = ModelExecutor::new(dir.path().to_path_buf(), None, ExecCounts::default());
-    // Many unrelated retained effects, each with a corrupt file that would be noticed if read.
+    // Many unrelated retained effects, each with a corrupt file: reading any of them would log.
     for n in 0..300 {
         let other = effect_n(n);
         let d = ex.retention_dir(&other.effect_id, &AttemptId::new());
@@ -466,43 +460,32 @@ fn retained_outcome_reads_only_the_requested_effects_attempts_among_many_entries
     plant(&ex, &mine, &AttemptId::new(), 1);
     plant(&ex, &mine, &AttemptId::new(), 3);
     plant(&ex, &mine, &AttemptId::new(), 2);
-    age(dir.path());
 
-    let found = ex.retained_outcome(&mine.effect_id).unwrap();
+    let logs = capture_warnings(|| {
+        let found = ex.retained_outcome(&mine.effect_id).unwrap();
+        assert_eq!(found.receipt.lease_generation, 3, "the newest lease wins");
+        assert_eq!(ex.retained_outcome(&effect_n(2000).effect_id), None);
+    });
 
-    assert_eq!(found.receipt.lease_generation, 3, "the newest lease wins");
-    assert_eq!(
-        ex.response_reads(),
-        3,
-        "only this effect's attempts are read"
-    );
-    assert_eq!(ex.directory_scans(), 1);
-    // The directory is not listed again for a repeat or for an effect that was never retained.
-    assert!(ex.retained_outcome(&mine.effect_id).is_some());
-    assert_eq!(ex.retained_outcome(&effect_n(2000).effect_id), None);
-    assert_eq!(ex.retained_outcome(&effect_n(2000).effect_id), None);
-    assert_eq!(ex.directory_scans(), 1);
-    assert_eq!(ex.response_reads(), 6);
+    assert_eq!(logs, "", "only this effect's entries are opened");
 }
 
 #[tokio::test]
-async fn retained_outcome_sees_what_this_executor_retains_and_what_appears_outside_it() {
+async fn an_entry_planted_right_after_a_run_is_found_by_the_next_lookup() {
     let dir = tempfile::tempdir().unwrap();
     let (ex, _) = exec(
         dir.path(),
         vec![ProviderResult::Response(GOOD.to_vec(), Usage::default())],
         &ExecCounts::default(),
     );
-    let (early, late) = (effect_n(1), effect_n(2));
-    assert_eq!(ex.retained_outcome(&early.effect_id), None);
-    age(dir.path());
-    assert_eq!(ex.retained_outcome(&early.effect_id), None);
+    let late = effect_n(2);
+    assert_eq!(ex.retained_outcome(&late.effect_id), None);
 
     let run = req(model_kind());
     let kept = ex.run(&run, &ctx()).await;
     assert_eq!(ex.retained_outcome(&run.effect_id), Some(kept));
 
-    // A directory written by someone else changes the root; the next lookup lists it again.
+    // No pause: a lookup never depends on how much time has passed since the last one.
     plant(&ex, &late, &AttemptId::new(), 1);
     assert!(ex.retained_outcome(&late.effect_id).is_some());
 }

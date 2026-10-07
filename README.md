@@ -1023,9 +1023,11 @@ The model workflow (Phase 4):
   response, for a model call that failed with an HTTP error (the manifest's `state` says
   `FAILED`).
 - **`<home>/model/` is never garbage-collected.** Retained responses accumulate for the life of
-  the home. `retained_outcome` lists the directory's entry names once and then looks an effect up
-  by id (a stat of the directory plus the effect's own files); a changed directory, or a miss
-  right after a listing, lists the names again (O(entries), no file opened).
+  the home. `retained_outcome` lists `<home>/model` once per lookup and opens only that effect's
+  `<effect>-<attempt>` entries, so a lookup costs O(entries in `model/`); its one caller is
+  recovery's publish-retained step, at most twice per outstanding effect per pass. A read error
+  other than not-found and a corrupt `response.json` are logged and count as nothing retained
+  (so the effect is forfeited, never sent again on a guess).
 - **Resuming a cancel-pending `anthropic:` task without a key exits 2.** `resume` needs the
   provider; use `agentos cancel`, which does not.
 - **Older demo transcripts predate the `model` field** of `status` (and `Submitted.model` as a
