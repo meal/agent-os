@@ -64,7 +64,13 @@ failure or interruption in the middle of a task leaves it partly collected and t
 finishes it. Integrity problems and failures are `refused`; entries not processed after a
 stop are `skipped`. Unknown entries are never removed automatically. Descriptor or memory
 exhaustion (`EMFILE`, `ENFILE`, `ENOMEM`, `ENOBUFS`) is never an integrity problem: it is a
-refusal whose reason says to retry, and it leaves staged data under a valid ticket.
+refusal whose reason says to retry with a higher descriptor limit or more memory (a lower
+`--batch-size` does not help a deep tree, the task cap is already 1), and it leaves staged data
+under a valid ticket: the existing one when it names the staged inode, otherwise a ticket
+rewritten with `restore: true`. Only if that rewrite also fails is it an integrity stop naming
+the `gc-trash` entry. Classification stages only the shapes a later pass recognises (`ws` and
+`workspace` directories, `ws.img` and job files regular files, `v.sock` a socket, model
+copies directories); any other workspace shape retains its task.
 
 ## Passes, batches and descriptors
 
@@ -166,13 +172,18 @@ task with a stale pending cancel collected; 300 tasks at `--batch-size 4096` und
 its recorded device changed and refused while classifying when its inode differs; a dry run
 creating no lock file; a superseded model response kept; a job lock taken after validation
 keeping its job; the lock taken before the home is opened; the mount gate failing unless all
-three of its tests ran.
+of its tests ran; (third review) unusual workspace shapes retained instead of wedging later
+passes; staged data of another kind than its ticket names refused; a move back that runs out
+of descriptors retried (ticket unchanged, or rewritten with `restore` for a swapped entry);
+another home's database or blob store refused.
 
 The mount gate (`sh scripts/check.sh mount`, Compose service `test-mount` = the `test`
 image plus `CAP_SYS_ADMIN` and AppArmor unconfined, `AGENTOS_GC_MOUNT_TESTS=1`) mounts a
 writable tmpfs inside a real workspace candidate (validation refuses it), inside staged
 data after validation (only the remover's own check can refuse it), and on `gc-trash`
-(the staging rename fails with `EXDEV` and later passes are not wedged). In the gate a
+(the staging rename fails with `EXDEV` and later passes are not wedged), and stages data on a
+tmpfs under `gc-trash` with a ticket naming its inode (another device: refused). `check.sh`
+passes `AGENTOS_GC_MOUNT_TESTS=1` explicitly and requires exactly 4 passing tests. In the gate a
 failed mount fails the test; elsewhere the tests print a skip line and return. Without the
 statx check the first two tests fail (the remover empties the tmpfs).
 No dependency changes: checked current tempfile 3.27.0 and rustix 1.1.5 online at

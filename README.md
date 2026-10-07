@@ -1138,7 +1138,7 @@ The JSON report has a `summary` with a count per status, `batches`, and up to 10
 | `deleted` | removed | 0 |
 | `collected` | a job directory whose redundant copies are already gone | 0 |
 | `retained` | kept on purpose, e.g. the task is unfinished, a lock is held, a tree has symlinks, special files, hard links, more than 10000 entries or 64 levels | 0 |
-| `refused` | an integrity problem or a failure (a resource shortage such as running out of descriptors says "retry"); data kept or left staged for the next pass | 1 |
+| `refused` | an integrity problem or a failure (a resource shortage such as running out of descriptors says "retry"); data kept, or left staged under a ticket for the next pass | 1 |
 | `skipped` | not processed because the pass stopped | 1 |
 
 Any `refused` or `skipped` entry makes `gc` exit 1 after printing the report; a usage error
@@ -1163,7 +1163,11 @@ comes first, and the task cap is lowered further when the soft descriptor limit 
 in the batch, one per directory level of the tree being removed (at most 64; names are
 listed before descending), plus about 32 for everything else, so a soft limit of 128 or more
 covers the worst case. Below that, deep trees can still run out; that is reported as a
-retryable refusal and the staged data is finished by the next pass. Hundreds of tasks at
+retryable refusal (raise `ulimit -n`; a lower `--batch-size` does not help a deep tree) and the
+staged data is finished, or moved back, by the next pass. If even the ticket that marks staged
+data for moving back cannot be written, the pass stops with an integrity refusal naming the
+`gc-trash` entry. A workspace of an unexpected shape (`ws` or `workspace` that is not a
+directory, `ws.img` that is not a regular file) is retained, never staged. Hundreds of tasks at
 `--batch-size 4096`, and a task with more than a thousand job directories, are collected
 under a 256-descriptor limit. A dry run creates nothing (not even missing `ws.lock` files)
 and removes nothing.
