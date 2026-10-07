@@ -18,7 +18,9 @@
 use std::fs::{self, File, TryLockError};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+#[cfg(test)]
 use std::sync::Arc;
+#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agentos_core::contract::Limits;
@@ -117,8 +119,8 @@ pub struct Home {
     pub api_key_file: Option<PathBuf>,
     /// `--anthropic-base-url` [default: the provider's own].
     pub anthropic_base_url: Option<String>,
-    /// How many times [`Home::api_key`] resolved a key in this process: observability for
-    /// the guarantees that the key is read once per command and never by recovery.
+    /// How many times [`Home::api_key`] resolved a key in this process (unit tests only).
+    #[cfg(test)]
     pub(crate) key_reads: Arc<AtomicUsize>,
 }
 
@@ -231,6 +233,7 @@ impl Home {
             allow_unjailed: false,
             api_key_file: None,
             anthropic_base_url: None,
+            #[cfg(test)]
             key_reads: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -643,6 +646,7 @@ impl Home {
     /// no message here quotes it. Each call reads the source again: a command resolves it
     /// once and passes the [`ApiKey`] on ([`Home::executor`]).
     pub fn api_key(&self) -> Result<ApiKey, CliError> {
+        #[cfg(test)]
         self.key_reads.fetch_add(1, Ordering::SeqCst);
         let raw = match &self.api_key_file {
             Some(path) => crate::secrets::read_key_file(path)
