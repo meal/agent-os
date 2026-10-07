@@ -24,8 +24,12 @@ fi
 AGENTOS_CHECK_TEST_FAILURE=; export AGENTOS_CHECK_TEST_FAILURE
 : > "$scratch/commands"
 sh "$REPO/scripts/check.sh"
-[ "$(wc -l < "$scratch/commands")" -eq 4 ]
+[ "$(wc -l < "$scratch/commands")" -eq 5 ]
 grep -q 'AGENTOS_TEST_JAIL=fake' "$scratch/commands"
+grep -q 'run --rm test-mount cargo test -p agentos-engine --test gc --locked mount_gate_' "$scratch/commands"
+: > "$scratch/commands"
+sh "$REPO/scripts/check.sh" mount
+[ "$(wc -l < "$scratch/commands")" -eq 1 ]
 : > "$scratch/commands"
 sh "$REPO/scripts/check.sh" host
 [ "$(wc -l < "$scratch/commands")" -eq 1 ]

@@ -1200,3 +1200,118 @@ fn reasons_name_relative_paths_and_never_quote_file_content() {
     assert!(!text.contains("SECRET-CONTENT"), "{text}");
     assert!(text.contains("symlink in the tree: redirect"), "{text}");
 }
+
+// ---- Mount gate: real mount roots inside candidates (`sh scripts/check.sh mount`) ----
+
+const MOUNT_GATE: &str = "AGENTOS_GC_MOUNT_TESTS";
+
+/// Whether this run is the mount gate (the `test-mount` Compose service, CAP_SYS_ADMIN).
+/// Elsewhere the mount regressions are skipped, loudly.
+fn mount_gate() -> bool {
+    match std::env::var(MOUNT_GATE).as_deref() {
+        Ok("1") => true,
+        Err(_) | Ok("") => {
+            eprintln!("skipped: needs {MOUNT_GATE}=1 (sh scripts/check.sh mount)");
+            false
+        }
+        Ok(other) => panic!("{MOUNT_GATE}={other:?}: only 1 is known"),
+    }
+}
+
+/// A writable tmpfs mounted at a path; unmounted when dropped. In the gate a failed mount
+/// fails the test: it never silently passes.
+struct Mounted(PathBuf);
+impl Mounted {
+    fn tmpfs(at: &Path) -> Mounted {
+        fs::create_dir_all(at).unwrap();
+        let status = std::process::Command::new("mount")
+            .args(["-t", "tmpfs", "-o", "size=1m", "agentos-gc-test"])
+            .arg(at)
+            .status()
+            .expect("the mount gate needs mount(8)");
+        assert!(
+            status.success(),
+            "the mount gate could not mount tmpfs at {}",
+            at.display()
+        );
+        fs::write(at.join("foreign"), b"foreign data must remain").unwrap();
+        Mounted(at.to_path_buf())
+    }
+}
+impl Drop for Mounted {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("umount")
+            .arg("-l")
+            .arg(&self.0)
+            .status();
+    }
+}
+
+#[test]
+fn mount_gate_a_mount_root_inside_a_workspace_stops_the_pass() {
+    if !mount_gate() {
+        return;
+    }
+    let (env, job, retention) = settled();
+    let ws = env
+        .dir
+        .path()
+        .join("work")
+        .join(env.task.as_str())
+        .join("ws");
+    let mounted = Mounted::tmpfs(&ws.join("mounted"));
+    let report = gc(env.dir.path(), &env, false);
+    assert!(report.failed(), "{report:?}");
+    assert!(
+        !report.entries.iter().any(|e| e.status == "deleted"),
+        "{report:?}"
+    );
+    assert!(
+        report.entries[0].reason.contains("mount boundary"),
+        "{report:?}"
+    );
+    assert_eq!(
+        fs::read(mounted.0.join("foreign")).unwrap(),
+        b"foreign data must remain"
+    );
+    assert!(job.path.join("output.bin").exists() && retention.exists());
+}
+
+/// A mount that appears after validation and staging is caught by the recursive remover
+/// itself, not only by validation.
+#[test]
+fn mount_gate_the_remover_refuses_a_mount_that_appears_after_staging() {
+    if !mount_gate() {
+        return;
+    }
+    let (env, _, _) = settled();
+    let root = env.dir.path();
+    let mounted: std::cell::RefCell<Option<Mounted>> = std::cell::RefCell::new(None);
+    let report = gc_hook(root, &env, false, &|stage, path| {
+        if stage == CollectionStage::Staged && path.ends_with("ws") {
+            let key = Digest::of(path.as_os_str().as_encoded_bytes()).to_string();
+            let late = root.join("gc-trash").join(key).join("data").join("late");
+            *mounted.borrow_mut() = Some(Mounted::tmpfs(&late));
+        }
+        Ok(())
+    });
+    let at = mounted
+        .borrow()
+        .as_ref()
+        .map(|m| m.0.clone())
+        .expect("staged");
+    assert!(report.failed(), "{report:?}");
+    assert!(
+        report.entries[0].reason.contains("mount boundary"),
+        "{report:?}"
+    );
+    assert_eq!(
+        fs::read(at.join("foreign")).unwrap(),
+        b"foreign data must remain"
+    );
+    drop(mounted.borrow_mut().take());
+    // Without the mount the staged deletion is proven and finished.
+    let retry = gc(root, &env, false);
+    assert!(!retry.failed(), "{retry:?}");
+    assert_eq!(fs::read_dir(root.join("gc-trash")).unwrap().count(), 0);
+}
