@@ -48,3 +48,36 @@ Review exclusions remain open: actual live/KVM acceptance, external cgroup/inspe
 collection, active-task collection, and inherited general home-opening/driver-lock
 path handling. This patch adds no dependencies. Packages 9–12 still require focused
 resource/component/packaging designs and their real acceptance environments.
+
+## Adversarial review follow-up (2026-10-07)
+
+A second, adversarial review of commit `65e0478` found no critical defect (confinement,
+ticket validation and model-retention eligibility held) but four important findings, all
+addressed on `gc-collect`:
+
+1. **Unpublished evidence was deleted.** Whole job directories went, logs included. Owner
+   decision: keep the logs. Only `output.bin` (a copy of the published blob), `scratch.img`
+   and a Firecracker job's `v.sock` are removed now; logs, status, request, receipt and
+   outcome stay, and a later pass reports the remnant `collected`.
+2. **One problem anywhere stopped all collection, permanently, with exit 0.** Decisions are
+   now per task (`retained`); only integrity problems stop the pass. The 1000-candidate cap
+   became batches of whole tasks; descriptors are held only for the batch in flight (the
+   reviewer's 600-job home failed with `EMFILE`; a 1100-job task now collects under
+   `ulimit -n 256`). The home path is canonicalized once; oversized workspaces and outputs,
+   receipt-less and superseded attempts no longer block other work. `gc` exits 1 on
+   refusals or skips.
+3. **The mount regression never ran.** It now runs in the `test-mount` Compose service
+   (`sh scripts/check.sh mount`, a CI matrix entry) with a writable tmpfs inside real
+   candidates, including one that only the recursive remover can catch.
+4. **Hostile cases were untested.** Forged tickets, symlinked candidates and task dirs,
+   unsettled model calls, superseded attempts and three crash points per entry kind are
+   covered, and the publication test now drives ENOSPC through `run_task`.
+
+The cheap minor findings were fixed too: exit codes, `skipped`/`retained` statuses after a
+stop, identity captured during validation, ticket repair (unexecuted tickets dropped,
+mismatched in-pass moves undone, own temp files cleaned) instead of wedges, a
+`HeldDriverLock` proof for `collect`, no home creation by `gc`, and reasons without
+descriptor paths or quoted content. The current design is in the
+[focused spec](../superpowers/specs/2026-10-04-conservative-gc-design.md). Still not verified
+offline: real foreign bind mounts, jailed/KVM job directories, power-loss durability and
+kernels older than 5.8.

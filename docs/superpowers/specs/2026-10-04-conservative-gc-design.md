@@ -2,82 +2,151 @@
 
 This refines the approved v0.1 completion design, package 8. Development and
 verification use the existing isolated worktree and Docker Compose; actual live/KVM
-acceptance remains deferred.
+acceptance remains deferred. Revised 2026-10-07 after an adversarial review (see
+[the review record](../../reviews/2026-10-04-conservative-gc-review.md)): job evidence is
+kept, decisions are per task, work is batched, and the mount regressions run in a gate.
 
 ## Ownership and retention
 
-`agentos gc --dry-run` and `agentos gc` operate under the exclusive home driver lock.
-The collector accepts only terminal tasks with no pending cancellation and no
-INTENDED, DISPATCHED or UNKNOWN effects. It keeps journals, task inputs, registries
-and every blob. It checks every registered blob's integrity before deleting anything.
+`agentos gc --dry-run` and `agentos gc` operate under the exclusive home driver lock;
+`collect` demands a `HeldDriverLock`, verified against `<home>/driver.lock` (same inode,
+lock held), so it cannot be called without it. `gc` requires an existing home and never
+creates one. The home path is canonicalized once; everything inside it is opened
+descriptor-relative without following symlinks.
 
-Owned candidates are `<home>/jobs/<effect>-<attempt>` with matching request and
-published outcome, `<home>/model/<effect>-<attempt>` with matching retained response,
-and `<home>/work/<task>/{ws,workspace,ws.img}`. Job/model outcomes must match the
-settled effect's result digest and a readable registered blob. Missing or malformed
-receipts are retained. Unknown directories and names are refused.
+The collector accepts only terminal tasks with no pending cancellation and no INTENDED,
+DISPATCHED or UNKNOWN effects. It keeps journals, task inputs, registries and every blob.
+It checks every registered blob's integrity before deleting anything; a corrupt blob stops
+the pass (blobs are shared and not attributable to one task's exports, so this stays global).
 
-Job locks and workspace locks are taken exclusively and held during deletion. A live
-job, busy workspace, any inspection entry, or any leftover jail/cgroup marker blocks
-collection for its entire task. This first collector does not manage external cgroups
-or delete inspection directories; existing worker reconciliation owns those operations.
-Nested symlinks, special files, hard-linked regular files and traversal are refused.
-Mount roots inside candidate trees are refused using Linux statx; unavailable
-mount-root detection also retains data. The recursive remover repeats this check.
-The single-link top-level `v.sock` of a recorded Firecracker job is allowed after
-the same receipt and lock checks; the worker shuts down its VM before publishing.
-All eligible paths are planned before deletion, then ownership, references and locks
-are rechecked. Keep workspace parents and `ws.lock` so the held inode cannot be replaced.
-Delete job/model copies before terminal workspace contents. Interrupted collection
-can be rerun; exports use retained blobs and inputs and remain valid.
+What is removed:
+- `work/<task>/{ws,workspace,ws.img}` of an eligible task (the parent and `ws.lock` stay);
+- `model/<effect>-<attempt>` whose `response.json` is the settled effect's published result
+  (state COMPLETED/FAILED, digest, lease, attempt and kind match, result registered);
+- from `jobs/<effect>-<attempt>`, when its `receipt.json` is the settled published result
+  and its `request.json` names the same effect, task, kind, attempt and lease: `output.bin`
+  (only if its bytes hash to the published result), `scratch.img`, and the single-link
+  top-level `v.sock` of a Firecracker job.
+
+What is kept: every other file of a job directory (`console.log`, `stderr.log`,
+`firecracker.log`, `supervisor.log`, `status.json`, `request.json`, `receipt.json`,
+`outcome.json`/`outcome.bin`, `groups`, `vm.json`, `cancel`, `lock`). These are evidence that
+is neither exported nor journaled. `receipt.json` is small and makes a reduced directory
+self-describing: a later pass reports it `collected`. `outcome.bin` can duplicate the output
+bytes but is the worker's own record; it is kept because its redundancy is not proven.
+Attempts without a matching receipt (killed, superseded, unresolved, unreadable) are kept
+whole and do not block their task; a killed job's `scratch.img` therefore stays.
+
+## Decisions and integrity
+
+Collection is all-or-nothing within a task. Anything that may still be live, or that the
+collector will not remove blindly, retains that task only and is reported `retained`:
+an unfinished task or pending cancellation, unsettled effects, a held `ws.lock` or job lock,
+inspection entries, a job `jail/`, symlinks, special files or hard links inside a candidate
+tree, a tree of more than 10000 entries or 64 levels. Other tasks are still collected.
+
+An integrity problem stops the whole pass, and before any deletion when found while
+classifying: an unknown name under `jobs`, `model`, `work` or `gc-trash`; a symlink or
+non-directory where an owned directory is expected; a job or model directory naming an
+effect the journal does not know; a symlinked workspace; a mount root inside a candidate
+(Linux statx `STATX_ATTR_MOUNT_ROOT`; unavailable detection also refuses); an invalid,
+foreign or older-version deletion ticket; staged data that is not what its ticket staged;
+a corrupt blob. Integrity problems and failures are `refused`; entries not processed after
+a stop are `skipped`. Unknown entries are never removed automatically.
+
+## Passes, batches and descriptors
+
+A pass first scans names (one directory descriptor at a time) and groups entries by task;
+a job or model directory is attributed through the effect its name carries. It then
+classifies every task without deleting anything: locks are probed (taken and released),
+trees are walked by path below a pinned directory descriptor, and the device/inode of each
+entry and of its parent is captured during this validation.
+
+Eligible tasks are then processed in batches of whole tasks (`--batch-size`, default 64
+entries; a task larger than the batch is a batch of its own). For each batch the tasks are
+revalidated while their `ws.lock` is taken and held until the batch ends; the
+`Validated` boundary follows; then each entry is removed. A job lock is taken again and
+held while that job's files are removed. Releasing job locks between validation and
+deletion is sound because the driver lock is held: no new supervisor can start, and a
+lock seen free cannot be retaken by a dead job. A busy lock is retried for up to 100 ms
+before it counts as held (a process forked by another thread briefly shares a just-released
+lock). Within a task, job and model copies go before the workspace; a failure stops that
+task (its later entries are `skipped`) and the pass continues with the next task.
+
+Descriptors are bounded: one held `ws.lock` per task in the batch, one per directory level of
+the tree being removed (at most 64), and a small constant. Nothing is held between batches.
 
 ## Durable deletion
 
-Pin the home and each candidate parent using directory descriptors opened without
-following symlinks. Rename and recursive removal use descriptor-relative operations;
-substituting an absolute ancestor cannot redirect deletion. Capture the candidate's
-device/inode during revalidation and compare it again after staging. A replacement
-is retained. Lock-file descriptors and workspace parents remain held throughout.
+Each entry is removed through a version-2 ticket `gc-trash/<path-digest>.json` (written to
+`.tmp-ticket-XXXXXX`, synced, published without overwriting, directory synced). It records the
+owned relative path, its kind (`JobFile`, `Model`, `Workspace`), the terminal task, the
+settled effect/result/attempt/lease when applicable and the device/inode captured during
+validation. The parent is reopened from the pinned home descriptor without following
+symlinks and must have the device/inode captured during validation. The entry is then moved
+atomically to `gc-trash/<path-digest>/data` without replacing anything (`RENAME_NOREPLACE`),
+its device/inode compared with the ticket, its tree checked again, and only then removed
+recursively by descriptor; the remover repeats the mount-root check at every level. The
+staging directory is removed, then the ticket.
 
-Before moving data, publish a version-1 ticket as `gc-trash/<path-digest>.json`, sync
-its file and parent, then atomically move the candidate to `gc-trash/<path-digest>/data`
-without overwriting an existing destination. The ticket records the original owned
-relative path, terminal task, settled effect/result/attempt when applicable, and the
-source device/inode. Revalidate that proof against the journal and registered blobs
-on restart. A partially removed payload need not retain its original receipt files.
-The ticket outlives both payload and staging-directory removal. Interrupted moves,
-partial recursive deletion and completed deletion with a remaining ticket can retry.
-Unknown, redirected, corrupt or mismatched tickets/data are retained.
+On a later pass each ticket's state decides: staged data matching its ticket and proof is
+finished (even after the original receipt files are gone); staged data that is the ticket's
+inode but fails its checks is moved back (`refused`); staged data that is not the ticket's
+inode is an integrity problem and is neither removed nor moved; a ticket whose entry never
+moved is dropped and the entry classified afresh; a ticket whose data is gone is completed.
+A staging rename that fails (e.g. `EXDEV`) drops its unexecuted ticket at once, and an entry
+swapped between validation and the move is moved back, so neither wedges later passes.
+Unpublished `.tmp-ticket-XXXXXX` files are removed; any other unknown `gc-trash` entry stops
+the pass and is left for inspection. Interrupted collection can be rerun; exports use retained
+blobs and inputs and remain valid.
 
-## Bounded report and failures
+## Report and exit codes
 
-Report relative paths and `candidate`, `deleted` or `refused` status plus a reason.
-Reasons retain at most 1024 UTF-8 bytes plus an ellipsis, including malformed JSON errors.
-Limit the report to 1000 candidates and each candidate tree to 10000 entries.
-Historical workspace parents containing only locks are streamed past and do not
-consume the candidate limit. Any validation refusal, including limit exhaustion,
-retains the entire pass before deletion. Dry runs can create lock files but never
-remove task data. An I/O failure during deletion is reported as a refusal; no task
-state changes and no recovery/provider/VM execution occur.
+The report has `dry_run`, `batch_size`, `batches`, a `summary` counting every entry by status
+(`candidate`, `deleted`, `collected`, `retained`, `refused`, `skipped`), `truncated`, and at
+most 1000 `entries` (refused and skipped first) with a relative path, status and reason.
+Reasons hold at most 1024 UTF-8 bytes plus an ellipsis, name paths relative to the candidate
+(never `/proc/self/fd/...`), and summarize malformed JSON by error class and position without
+quoting content. `gc` prints the report, then exits 1 if anything was refused or skipped,
+0 otherwise; usage errors (including a missing home) exit 2. Dry runs can create workspace
+lock files but never remove task data. No task state changes and no recovery, provider or VM
+execution occur.
 
 ## Publication fault coverage
 
 A per-BlobStore publication hook injects errors before file fsync, rename or directory
-fsync; it has no environment/global switch. Default stores have no hook. Tests inject
-ENOSPC at each boundary, verify no artifact/effect success reference is committed,
-clear the fault and recover an intact retained receipt without reexecuting it.
+fsync; it has no environment/global switch. Default stores have no hook. The test drives a
+task with `run_task` over a store whose hook injects ENOSPC at each boundary once the first
+effect has really executed: the runner stops with the effect DISPATCHED, no artifact
+reference and no temporary file; recovery on a healthy store publishes the retained outcome
+without re-executing it, and the task then succeeds.
 
 ## Validation
 
-Cover completed collection and repeatability, nonterminal and pending-cancel retention,
-terminal outstanding effects, live job/workspace locks, inspection/jail leftovers,
-missing/corrupt receipts/blobs, symlink roots and children, hard links, unknown paths,
-bounded enumeration, driver-lock exclusion, unchanged exported patch/evidence,
-publication recovery, ancestor/candidate substitution after validation, interruption
-after receipt removal, and more than 1000 historical empty workspace parents.
-Run formatting, strict Clippy, full host and fake-jail suites.
-The mount regression is enabled with `AGENTOS_GC_MOUNT_FIXTURE` naming a tree
-containing a read-only Docker bind mount at `mounted/`, with `foreign` containing
-`foreign data must remain`. It tests the actual mount without KVM or extra capabilities.
+Covered offline (`tests/gc.rs`, `tests/publication.rs`, CLI `gc_*`): completed collection
+with logs, status and receipt kept and a `collected` rerun; non-terminal, pending-cancel and
+outstanding-effect retention, including dispatched/unknown model calls with a retained
+response; a non-terminal task beside a terminal one; live job and workspace locks;
+inspection/jail leftovers; missing, superseded and mismatched receipts kept without blocking;
+corrupt blobs and responses; symlink roots, children and hard links; symlinked workspaces,
+model and task directories; unknown names; forged tickets (traversal, absolute, dot-dot,
+kind and key mismatch, symlinked data, unowned directories, version 1, garbage, foreign temp
+files); an oversized workspace retaining only its task; an output over 32 MiB; a symlinked
+home path; more than 1000 job directories under a 256-descriptor limit (re-executed child
+with `ulimit -n 256`); batches of one; crash points after the ticket, after the move and
+after removal; ancestor and candidate substitution; an entry swapped before staging;
+bounded, content-free reasons; exit codes; never creating a home.
+
+The mount gate (`sh scripts/check.sh mount`, Compose service `test-mount` = the `test`
+image plus `CAP_SYS_ADMIN` and AppArmor unconfined, `AGENTOS_GC_MOUNT_TESTS=1`) mounts a
+writable tmpfs inside a real workspace candidate (validation refuses it), inside staged
+data after validation (only the remover's own check can refuse it), and on `gc-trash`
+(the staging rename fails with `EXDEV` and later passes are not wedged). In the gate a
+failed mount fails the test; elsewhere the tests print a skip line and return. Without the
+statx check the first two tests fail (the remover empties the tmpfs).
 No dependency changes: checked current tempfile 3.27.0 and rustix 1.1.5 online at
 https://docs.rs/crate/tempfile/latest and https://docs.rs/crate/rustix/latest.
+
+Not verified offline: real bind-mount roots of foreign filesystems, Firecracker/KVM and
+jailed job directories (`v.sock`, hard-link counts while jailed, `ws.img` owned by uid 61000),
+power-loss durability, and kernels older than 5.8 (where every pass refuses).

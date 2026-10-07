@@ -35,7 +35,11 @@ acceptance remains open; contract-driven VM resources, the component analyzer, a
 fresh-host release validation remain planned work.
 
 Required offline gates are centralized in `sh scripts/check.sh`: formatting, strict Clippy,
-host tests and fake-jail tests, all through Docker Compose with the lockfile enforced.
+host tests, fake-jail tests and the GC mount gate, all through Docker Compose with the
+lockfile enforced. The mount gate (`sh scripts/check.sh mount`) runs the GC mount-root
+regressions in the `test-mount` service, which adds only `CAP_SYS_ADMIN` (and AppArmor
+unconfined) so they can mount a tmpfs inside real candidates; elsewhere those tests print
+`skipped: needs AGENTOS_GC_MOUNT_TESTS=1` and return.
 The PR/push workflow uses the same commands with separate Compose projects. Run
 `docker compose build test` after runtime changes. Development uses pyenv 2.8.6 and Python
 3.14.8 pinned by source checksums; `pyenv exec python` selects the project version.
@@ -956,8 +960,9 @@ The Firecracker worker:
   again when building the executor). A host change in between leaves the task READY and
   unapproved.
 - **Workspace and scratch image sizes are constants** (`ws.img` 1 GiB, `scratch.img` 512 MiB),
-  not contract limits. `gc` collects eligible terminal workspace images and settled job
-  copies; a killed job's `scratch.img` stays while its receipt or effect is unresolved.
+  not contract limits. `gc` removes the workspace images of eligible terminal tasks and, from
+  a job directory whose receipt is the settled published result, `scratch.img`; a killed
+  job's `scratch.img` stays while it has no such receipt or its effect is unsettled.
 - **One VM boot per effect** (about 0.65 s to `Ready` here) and one inspector boot per resume
   and per receipt-less patch; no VM reuse or snapshots.
 - **Executable bits are lost** in the guest: the protocol's `File{path, len}` carries no mode, so
@@ -977,7 +982,7 @@ The Firecracker worker:
   `Submitted` has no `guest_image` field (it would falsely name `fixture-executor-v0`); it has
   `guest_image_id` and `guest_image_digest`.
 - **The guest trusts the host's clock** (`kvm-clock`) and entropy, and the serial console
-  (`console.log`) is the only guest log.
+  (`console.log`) is the only guest log. `gc` never removes it.
 - **The image build needs network and root** in the build container (snapshot.debian.org, the
   Firecracker CI bucket); the kernel is a pinned download, not built from source.
 - **x86_64 only** (the image recipe pins the x86_64 kernel).
@@ -1064,7 +1069,8 @@ Carried from 3a:
 - **`Denied` rows are forgeable.** They are audit rows any caller can append; only the
   `Capability*` rows are written by the broker itself.
 - **Job collection is conservative.** `gc` requires terminal tasks, settled effects,
-  published receipts and free locks; unknown or unresolved copies remain.
+  published receipts and free locks; unknown or unresolved copies remain, and job
+  directories themselves (logs, status, request, receipt, outcome) are never removed.
 - **Export bypasses the effect model.** It is authorized through the broker
   (`artifact.export`, journaled, revocable) but is not a journaled effect; it leaves an
   `Exported` audit row.
@@ -1084,7 +1090,8 @@ Carried from 3a:
 - Block-device rate limiting for the drives.
 - Contract-driven disk sizes (`worker_disk_mib`, an optional contract field) instead of the
   1 GiB / 512 MiB constants.
-- Garbage collection of workspace and scratch images together with the job directories.
+- Removing whole job directories (their logs and receipts included), e.g. after export or a
+  retention period; `gc` keeps them today and removes only their redundant copies.
 - Building the guest kernel from source (the build plan's Phase 6 "reproducible guest image
   build" finishes there).
 - Jailer extras that need a different supervision model or more privilege: `--new-pid-ns` (the
@@ -1103,26 +1110,57 @@ See [evidence collection](docs/evidence/README.md) for runner setup and pending 
 
 ```sh
 agentos --home /path/to/home gc --dry-run
-agentos --home /path/to/home gc
+agentos --home /path/to/home gc [--batch-size N]
 ```
 
-Both commands return JSON entries with `candidate`, `deleted` or `refused` status and a
-reason. The driver lock excludes running controllers. This first collector removes only
-published job/model copies and workspaces of fully settled terminal tasks. It preserves
-the journal, task inputs, registries, every blob, and exported patch/evidence. Dry-run
-can create workspace lock files but deletes no task data.
+`gc` needs an existing home (it never creates one: a mistyped `--home` exits 2) and takes the
+driver lock, so no controller runs meanwhile. It never launches a model, worker or inspector
+and does not clean external cgroups or inspection directories.
 
-Any validation refusal retains the entire pass: finish/reconcile outstanding work and
-inspect the reported reason before retrying. Active tasks, busy locks, missing/corrupt
-receipts or blobs, inspection/jail leftovers, symlinks, hard links, mounted data and unexpected special
-files are retained. The owned top-level Firecracker `v.sock` is allowed after the same
-receipt and lock checks. The report is capped at 1000 candidates and each tree
-at 10000 entries; an over-limit home is retained rather than partially collected. Empty
-historical workspace parents do not consume the candidate limit. GC
-never launches a model, worker or inspector and does not clean external cgroups.
+What it removes, only for terminal tasks with no pending cancellation and no unsettled
+effect: the task's workspace (`work/<task>/ws`, `workspace` or `ws.img`; the parent and
+`ws.lock` stay), each settled model response copy (`model/<effect>-<attempt>`), and, in each
+job directory whose receipt is the effect's settled published result, `output.bin` (a copy
+of the published blob), `scratch.img` and a Firecracker job's `v.sock`. What it keeps: the
+journal, task inputs, registries, every blob, exported bundles, and every other file of a
+job directory: `console.log`, `stderr.log`, `firecracker.log`, `supervisor.log`,
+`status.json`, `request.json`, `receipt.json`, `outcome.json`/`outcome.bin`, `groups`,
+`vm.json`, `lock`. Attempts without such a receipt (killed, superseded, unresolved) are kept
+whole. A later pass reports a job directory it already reduced as `collected`.
 
-Deletion uses pinned directory handles and stages each candidate under `gc-trash` with
-a durable ownership ticket before removal. After interruption, rerun `gc`; it can finish
-an eligible staged deletion even after its original receipt files have been removed.
-Mount-root detection requires a supported Linux kernel; when unavailable, GC reports
-a refusal and retains the data.
+The JSON report has a `summary` with a count per status, `batches`, and up to 1000 `entries`
+(`truncated` says when more were counted; refusals are listed first), each with a relative
+`path`, a `status` and a bounded `reason` that never quotes file content:
+
+| status | meaning | exit code |
+| --- | --- | --- |
+| `candidate` | `--dry-run`: would be removed | 0 |
+| `deleted` | removed | 0 |
+| `collected` | a job directory whose redundant copies are already gone | 0 |
+| `retained` | kept on purpose, e.g. the task is unfinished, a lock is held, a tree has symlinks, special files, hard links, more than 10000 entries or 64 levels | 0 |
+| `refused` | an integrity problem or a failure; data kept | 1 |
+| `skipped` | not processed because the pass stopped | 1 |
+
+Any `refused` or `skipped` entry makes `gc` exit 1 after printing the report; a usage error
+exits 2. Collection is all-or-nothing within a task: anything that may still be live (an
+unfinished task, a busy job or workspace lock, inspection or jail leftovers, a tree it will
+not walk) retains that task only, and other tasks are still collected. An integrity problem
+stops the whole pass before anything is deleted: an unknown name, a symlink or non-directory
+where an owned directory is expected (inside the home; the home path itself may be a
+symlink, it is resolved once), a mount root inside a candidate, an unowned or invalid
+`gc-trash` entry, or a corrupt registered blob. Fix or inspect the reported path, then rerun.
+
+Tasks are revalidated and deleted in batches of whole tasks (`--batch-size`, default 64
+entries; a larger task is one batch). Descriptors stay bounded: one held workspace lock per
+task in the batch, one per directory level of the tree being removed (at most 64), plus a
+small constant; a task with more than a thousand job directories is collected under a
+256-descriptor limit. Dry-run can create missing `ws.lock` files but removes nothing.
+
+Each removal is staged under `gc-trash` with a durable ownership ticket, moved there with
+descriptor-relative operations that never follow symlinks, checked against the device/inode
+captured while validating, and only then removed. After an interruption, rerun `gc`: it
+finishes a staged removal even after the original receipt files are gone, drops tickets
+whose entry never moved, moves back staged data that no longer passes its checks, and
+cleans its own unpublished ticket temporary files. Mount-root detection requires a Linux
+kernel that reports `STATX_ATTR_MOUNT_ROOT` (5.8+); when it is unavailable, `gc` refuses
+and retains the data.

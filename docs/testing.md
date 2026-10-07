@@ -181,7 +181,8 @@ sh scripts/acceptance.sh offline
 The crash demo intentionally exits the controller at code 75, then resumes the
 same task. Its export succeeds; its later revoked export deliberately fails.
 The demo prints those outcomes and is a demonstration, not a fail-fast acceptance
-test. `scripts/check.sh` runs all four required gates and propagates failures.
+test. `scripts/check.sh` runs all five required gates (formatting, Clippy, host tests, fake-jail
+tests, and the GC mount gate in the `test-mount` service) and propagates failures.
 Offline acceptance tests host and fake-jail repair/replay through a loopback fake
 API, preserving a log under a new private `build/evidence/` directory.
 

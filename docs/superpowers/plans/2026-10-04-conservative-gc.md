@@ -13,9 +13,14 @@ path replacement cannot redirect removal and partial deletion can retry.
 
 ## Global constraints
 
-Keep every task/input/journal/registry/blob; collect only terminal, fully settled tasks.
-Bound the report to 1000 entries and trees to 10000 entries. Retain inspection/jail
-leftovers. Hold locks until removal ends. Never use real user data in deletion tests.
+Keep every task/input/journal/registry/blob and job evidence (logs, status, request,
+receipt, outcome); collect only terminal, fully settled tasks, all-or-nothing per task.
+List at most 1000 report entries (the summary counts all) and walk trees of at most 10000
+entries and 64 levels. Retain inspection/jail leftovers. Hold `ws.lock` for the batch and a
+job's lock while its files go. Never use real user data in deletion tests.
+
+Revised 2026-10-07 after the adversarial review (see the review record): per-task decisions,
+batches with bounded descriptors, kept job evidence, a real mount gate, exit codes.
 
 ## Review focus
 
@@ -41,8 +46,10 @@ Interface: `PublicationStage` and `BlobStore::with_publication_hook`.
 
 Files: engine `src/gc.rs`, `src/gc/confined.rs`, `tests/gc.rs`, `src/lib.rs`; CLI `src/commands/gc.rs`,
 `src/commands/mod.rs`, `src/args.rs`, `tests/cli.rs`.
-Interface: `collect(root: &Path, db: &Db, blobs: &BlobStore, dry_run: bool)`;
-caller holds driver lock. JSON report contains bounded entries/status/reason.
+Interface: `collect(lock: &HeldDriverLock, db: &Db, blobs: &BlobStore, opts: Options)`;
+`HeldDriverLock::verify(root, &driver_lock_file)` proves the driver lock. The JSON report
+has a per-status summary and bounded entries with status/reason; the CLI exits 1 when
+anything was refused or skipped.
 
 - [x] Write behavioral tests for the complete validation list in the focused spec.
   Add CLI test invoking the absent `gc --dry-run`; expect command rejection.
@@ -65,5 +72,6 @@ run the mount test with a read-only disposable Docker bind mount.
 docker compose run --rm test cargo test -p agentos-store --locked
 docker compose run --rm test cargo test -p agentos-engine --test publication --test gc --locked
 docker compose run --rm test cargo test -p agentos-cli --test cli --locked gc_
+sh scripts/check.sh mount   # the test-mount service: real tmpfs mounts inside candidates
 sh scripts/check.sh
 ```
