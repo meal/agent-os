@@ -53,13 +53,18 @@ pub struct RecordedAttempt {
 pub fn load_recording(path: &Path) -> io::Result<AttemptRecording> {
     let recording: AttemptRecording = serde_json::from_slice(&std::fs::read(path)?)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    check_recording(&recording)?;
+    Ok(recording)
+}
+
+fn check_recording(recording: &AttemptRecording) -> io::Result<()> {
     if recording.schema_version != 2 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unsupported attempt recording version",
         ));
     }
-    Ok(recording)
+    Ok(())
 }
 
 enum Mode {
@@ -78,16 +83,27 @@ pub struct FakeProvider {
 
 impl FakeProvider {
     pub fn from_file(path: &Path) -> io::Result<FakeProvider> {
-        let shape: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        FakeProvider::from_bytes(&std::fs::read(path)?, &path.display().to_string())
+    }
+
+    /// The provider for exactly `bytes` (a transcript or an attempt recording; `origin` names
+    /// them in errors). A caller that digested the bytes builds from them, not from a re-read
+    /// of the file.
+    pub fn from_bytes(bytes: &[u8], origin: &str) -> io::Result<FakeProvider> {
+        let invalid = |e: serde_json::Error| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("{origin}: {e}"))
+        };
+        let shape: serde_json::Value = serde_json::from_slice(bytes).map_err(invalid)?;
         if shape.get("schema_version").is_some() {
-            let recording = load_recording(path)?;
+            let recording: AttemptRecording = serde_json::from_slice(bytes).map_err(invalid)?;
+            check_recording(&recording)?;
             Ok(FakeProvider {
                 mode: Arc::new(Mode::Recorded(Mutex::new(recording.attempts.into()))),
                 calls: Arc::new(AtomicUsize::new(0)),
             })
         } else {
-            Ok(FakeProvider::from_transcript(load_transcript(path)?))
+            let transcript: Transcript = serde_json::from_slice(bytes).map_err(invalid)?;
+            Ok(FakeProvider::from_transcript(transcript))
         }
     }
 
@@ -227,6 +243,20 @@ mod tests {
             expect_request_digest: None,
             response: serde_json::json!({"id": format!("msg_{i}"), "usage": {"input_tokens": 10 + i, "output_tokens": 1}}),
         }
+    }
+
+    #[tokio::test]
+    async fn from_bytes_serves_exactly_the_bytes_it_is_given() {
+        let t = serde_json::to_vec(&Transcript {
+            responses: vec![entry(7)],
+        })
+        .unwrap();
+        let p = FakeProvider::from_bytes(&t, "t.json").unwrap();
+        assert_eq!(id_of(&p.complete(&body(1)).await), "msg_7");
+        let err = FakeProvider::from_bytes(b"{", "t.json").err().unwrap();
+        assert!(err.to_string().starts_with("t.json: "), "{err}");
+        let v1 = br#"{"schema_version":1,"attempts":[]}"#;
+        assert!(FakeProvider::from_bytes(v1, "r.json").is_err());
     }
 
     fn body(messages: usize) -> Vec<u8> {

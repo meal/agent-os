@@ -771,9 +771,10 @@ impl Home {
                 recorded.as_deref().unwrap_or("none")
             )));
         }
-        Ok(Box::new(FakeProvider::from_file(&path).map_err(|e| {
-            CliError::other(format!("task {task}: {e}"))
-        })?))
+        // From the bytes that were just digested, not from a second read of the file.
+        let provider = FakeProvider::from_bytes(&bytes, &path.display().to_string())
+            .map_err(|e| CliError::other(format!("task {task}: {e}")))?;
+        Ok(Box::new(provider))
     }
 
     /// The executor for `task`, over the inputs and the worker recorded at its submission.

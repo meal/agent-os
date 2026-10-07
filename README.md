@@ -1022,8 +1022,10 @@ The model workflow (Phase 4):
 - **An exported `model/NNNN-response.json` can be the engine's failure record**, not an API
   response, for a model call that failed with an HTTP error (the manifest's `state` says
   `FAILED`).
-- **`<home>/model/` is never garbage-collected, and `retained_outcome` scans it.** Retained
-  responses accumulate for the life of the home, and each lookup lists the whole directory.
+- **`<home>/model/` is never garbage-collected.** Retained responses accumulate for the life of
+  the home. `retained_outcome` lists the directory's entry names once and then looks an effect up
+  by id (a stat of the directory plus the effect's own files); a changed directory, or a miss
+  right after a listing, lists the names again (O(entries), no file opened).
 - **Resuming a cancel-pending `anthropic:` task without a key exits 2.** `resume` needs the
   provider; use `agentos cancel`, which does not.
 - **Older demo transcripts predate the `model` field** of `status` (and `Submitted.model` as a

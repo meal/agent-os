@@ -1,7 +1,11 @@
 //! Runs a `ModelCall` effect: sends the request exactly once and retains the answer
 //! before returning it, so recovery publishes the answer instead of sending again.
 
+use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::path::PathBuf;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentos_core::effect::{AttemptId, EffectId, EffectKind};
@@ -20,11 +24,31 @@ use crate::supervised::ExecCounts;
 /// `guest_text`).
 const EXCERPT: usize = 256;
 
+/// A change of the retention root younger than this at the time of a listing might share its
+/// timestamp with a later change (file systems stamp directories coarsely), so a listing
+/// that young is not trusted to prove that nothing else appeared.
+const MTIME_TRUST_AFTER: Duration = Duration::from_secs(2);
+
+/// The retention root's entries by effect id, as of one listing (names only: no file is
+/// opened to build it).
+#[derive(Default)]
+struct RetentionIndex {
+    by_effect: HashMap<String, Vec<PathBuf>>,
+    /// `(root mtime, when listed)` of the last listing; `None` before the first.
+    listed: Option<(Option<SystemTime>, SystemTime)>,
+}
+
 pub struct ModelExecutor {
     root: PathBuf,
     provider: Option<Box<dyn ModelProvider>>,
     counts: ExecCounts,
     crash: Option<CrashHook>,
+    /// Effect id -> its retention directories; see [`ModelExecutor::retained_outcome`].
+    index: Mutex<RetentionIndex>,
+    /// How many times the retention directory was listed.
+    scans: AtomicUsize,
+    /// How many `response.json` files were opened by `retained_outcome`.
+    response_reads: AtomicUsize,
 }
 
 impl ModelExecutor {
@@ -38,7 +62,20 @@ impl ModelExecutor {
             provider,
             counts,
             crash: None,
+            index: Mutex::new(RetentionIndex::default()),
+            scans: AtomicUsize::new(0),
+            response_reads: AtomicUsize::new(0),
         }
+    }
+
+    /// How many times `retained_outcome` listed the retention directory (observability).
+    pub fn directory_scans(&self) -> usize {
+        self.scans.load(Ordering::SeqCst)
+    }
+
+    /// How many `response.json` files `retained_outcome` opened (observability).
+    pub fn response_reads(&self) -> usize {
+        self.response_reads.load(Ordering::SeqCst)
     }
 
     pub fn with_crash(mut self, hook: Option<CrashHook>) -> Self {
@@ -81,7 +118,95 @@ impl ModelExecutor {
         if created_root && let Some(parent) = self.root.parent() {
             sync_dir(parent)?;
         }
+        self.note_retained(req.effect_id.as_str(), dir);
         Ok(())
+    }
+
+    /// Records a directory this executor just wrote, so the index stays complete without a
+    /// new listing.
+    fn note_retained(&self, effect: &str, dir: PathBuf) {
+        let mut index = self.index.lock().unwrap_or_else(|e| e.into_inner());
+        if index.listed.is_none() {
+            return; // the first lookup will list everything, this directory included
+        }
+        let dirs = index.by_effect.entry(effect.to_string()).or_default();
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+        let mtime = self.root_mtime();
+        if let Some((listed_mtime, _)) = &mut index.listed {
+            *listed_mtime = mtime;
+        }
+    }
+
+    fn root_mtime(&self) -> Option<SystemTime> {
+        std::fs::metadata(&self.root)
+            .and_then(|m| m.modified())
+            .ok()
+    }
+
+    /// Lists the root once, by name: `<effect>-<attempt>` entries grouped by effect id (an
+    /// effect id is hex, so it ends at the first `-`). Nothing inside an entry is read.
+    fn list_root(&self) -> RetentionIndex {
+        self.scans.fetch_add(1, Ordering::SeqCst);
+        let at = SystemTime::now();
+        let mtime = self.root_mtime();
+        let mut by_effect: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        match std::fs::read_dir(&self.root) {
+            Ok(entries) => {
+                for entry in entries {
+                    match entry {
+                        Ok(entry) => {
+                            let name = entry.file_name().to_string_lossy().into_owned();
+                            if let Some((effect, _attempt)) = name.split_once('-') {
+                                by_effect
+                                    .entry(effect.to_string())
+                                    .or_default()
+                                    .push(entry.path());
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            root = %self.root.display(), error = %e,
+                            "cannot read an entry of the model retention directory"
+                        ),
+                    }
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                root = %self.root.display(), error = %e,
+                "cannot list the model retention directory; treating nothing as retained"
+            ),
+        }
+        RetentionIndex {
+            by_effect,
+            listed: Some((mtime, at)),
+        }
+    }
+
+    /// The retention directories of `effect`. The root is listed (names only) on the first
+    /// call and again whenever its mtime changed since, or when `effect` is not indexed and the
+    /// last listing is too young for its mtime to prove that nothing was added. Otherwise a
+    /// lookup costs one `stat` of the root.
+    fn retention_dirs(&self, effect: &EffectId) -> Vec<PathBuf> {
+        let mut index = self.index.lock().unwrap_or_else(|e| e.into_inner());
+        let mtime = self.root_mtime();
+        let stale = match index.listed {
+            None => true,
+            Some((listed_mtime, _)) => listed_mtime != mtime,
+        };
+        let hit = |index: &RetentionIndex| index.by_effect.get(effect.as_str()).cloned();
+        if !stale && let Some(dirs) = hit(&index) {
+            return dirs;
+        }
+        let young = match (mtime, index.listed) {
+            (Some(m), Some((_, at))) => at.duration_since(m).is_ok_and(|d| d < MTIME_TRUST_AFTER),
+            _ => true,
+        };
+        if stale || young {
+            *index = self.list_root();
+        }
+        hit(&index).unwrap_or_default()
     }
 }
 
@@ -199,18 +324,38 @@ impl Executor for ModelExecutor {
         out
     }
 
+    /// The newest-lease resolved outcome retained for `effect`, if any. Anything this cannot
+    /// read or parse is logged (`warn`) and counts as not retained: the caller then treats
+    /// the effect as lost, which is the safe side (it is never sent again on a guess).
+    ///
+    /// Cost: the retention directory is indexed by effect id, so a lookup opens only that
+    /// effect's own `response.json` files. The index is a listing of entry names (O(entries),
+    /// no file opened), made on the first call, whenever the root's mtime changed since, and
+    /// on a miss while the last listing is under two seconds old (timestamps are coarse); in
+    /// between, a lookup is one `stat` plus a map probe. The index also assumes this executor
+    /// is the only writer, as it is under the driver lock; entries it retains itself are added
+    /// as they are written.
     fn retained_outcome(&self, effect: &EffectId) -> Option<ExecOutcome> {
-        let prefix = format!("{effect}-");
         let mut best: Option<ExecOutcome> = None;
-        for entry in std::fs::read_dir(&self.root).ok()?.flatten() {
-            if !entry.file_name().to_string_lossy().starts_with(&prefix) {
-                continue;
-            }
-            let Ok(bytes) = std::fs::read(entry.path().join("response.json")) else {
-                continue;
+        for dir in self.retention_dirs(effect) {
+            let file = dir.join("response.json");
+            self.response_reads.fetch_add(1, Ordering::SeqCst);
+            let bytes = match std::fs::read(&file) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                Err(e) => {
+                    tracing::warn!(%effect, file = %file.display(), error = %e,
+                        "cannot read a retained model response; treating it as not retained");
+                    continue;
+                }
             };
-            let Ok(out) = serde_json::from_slice::<ExecOutcome>(&bytes) else {
-                continue;
+            let out = match serde_json::from_slice::<ExecOutcome>(&bytes) {
+                Ok(out) => out,
+                Err(e) => {
+                    tracing::warn!(%effect, file = %file.display(), error = %e,
+                        "cannot parse a retained model response; treating it as not retained");
+                    continue;
+                }
             };
             if out.receipt.effect_id != *effect || out.unresolved {
                 continue;
