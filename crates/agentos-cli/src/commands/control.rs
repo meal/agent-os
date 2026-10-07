@@ -70,7 +70,7 @@ pub async fn resume(
     let lock = home.lock()?;
     // Before anything is written: a worker that cannot run (preflight, jail) leaves the task
     // exactly as it was.
-    let exec = home.executor(&store, task)?;
+    let exec = home.executor(&store, task, None)?;
     let t = store.db.task(task)?;
     if t.state == TaskState::Paused && !t.cancel_requested {
         // Before recovery, which leaves a paused task's effects untouched.

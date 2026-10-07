@@ -4797,3 +4797,46 @@ fn resume_refuses_a_bad_base_url_but_cancel_still_works() {
     );
     assert_eq!(api.hits(), 0, "the crash came before the send");
 }
+
+#[test]
+fn cancel_of_an_anthropic_task_needs_no_key_and_never_contacts_the_api() {
+    let cli = Cli::new();
+    let api = fake_api("parser-fix-direct.json");
+    let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
+    let assert = cli
+        .cmd(&[
+            "submit",
+            &contract,
+            "--yes",
+            "--model",
+            "anthropic:claude-opus-5-5",
+            "--anthropic-base-url",
+            &api.url(),
+            "--crash-at",
+            "after-dispatch:model_call",
+        ])
+        .env("ANTHROPIC_API_KEY", CANARY)
+        .assert()
+        .code(75);
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    let id = stderr
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find_map(|v| v["task_id"].as_str().map(str::to_string))
+        .unwrap();
+    // Neither a key in the environment nor a readable key file: recovery does not look.
+    let absent = cli.path("no-such-key");
+    let cancelled = cli
+        .cmd(&["cancel", &id, "--api-key-file", absent.to_str().unwrap()])
+        .env_remove("ANTHROPIC_API_KEY")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&cancelled).unwrap()["state"],
+        "CANCELLED"
+    );
+    assert_eq!(api.hits(), 0, "the crash came before the send");
+}

@@ -998,13 +998,6 @@ The model workflow (Phase 4):
   `AGENTOS_ANTHROPIC_BASE_URL` is refused before credentials or task writes. Legacy tasks
   lacking an endpoint may only resume with the official endpoint; re-submit custom tasks.
   HTTPS URLs can name any host, so select the provider when submitting.
-- **`cancel` and recovery of a terminal task build a live provider when a key is available.**
-  They build the provider leniently (`Home::recovery_executor`), so with a key an
-  `AnthropicProvider` is constructed although those paths never dispatch a model call (recovery
-  of a terminal or cancel-pending task never dispatches; it only abandons, forfeits or publishes
-  retained receipts). Without a key the provider is `None` and
-  a dispatch would fail with `no model provider configured`. The "never sends" guarantee rests on
-  recovery's behaviour, not on the type.
 - **Key files are bounded regular files.** Files over 4096 bytes and nonregular or symlink
   final components are refused. There is no mode warning; an unreadable key file's error echoes its path.
 - **Provider bodies are bounded.** Successful bodies over 4 MiB become unresolved calls
