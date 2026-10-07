@@ -5,17 +5,22 @@ verification use the existing isolated worktree and Docker Compose; actual live/
 acceptance remains deferred. Revised 2026-10-07 after an adversarial review (see
 [the review record](../../reviews/2026-10-04-conservative-gc-review.md)): job evidence is
 kept, decisions are per task, work is batched, and the mount regressions run in a gate.
+Revised again the same day after a second review: held locks are capped per batch, resource
+exhaustion is retryable, and staged data is matched by inode across passes.
 
 ## Ownership and retention
 
-`agentos gc --dry-run` and `agentos gc` operate under the exclusive home driver lock;
-`collect` demands a `HeldDriverLock`, verified against `<home>/driver.lock` (same inode,
-lock held), so it cannot be called without it. `gc` requires an existing home and never
-creates one. The home path is canonicalized once; everything inside it is opened
-descriptor-relative without following symlinks.
+`agentos gc --dry-run` and `agentos gc` operate under the exclusive home driver lock, taken
+before the store is opened; `collect` demands a `HeldDriverLock`. `HeldDriverLock::verify`
+canonicalizes the home path once, opens the home directory, checks `driver.lock` through
+that descriptor (same inode, lock held) and keeps the descriptor: `collect` anchors every
+operation on it, so the proven lock and the collected home are the same directory. `collect`
+also refuses a database or blob store that is not that home's `agentos.db` and
+`blobs/objects` (device and inode). `gc` requires an existing home and never creates one.
 
-The collector accepts only terminal tasks with no pending cancellation and no INTENDED,
-DISPATCHED or UNKNOWN effects. It keeps journals, task inputs, registries and every blob.
+The collector accepts only terminal tasks with no INTENDED, DISPATCHED or UNKNOWN effects.
+A terminal task accepts no further event, so a cancellation still marked pending on a task
+that failed meanwhile is irrelevant and does not retain it. It keeps journals, task inputs, registries and every blob.
 It checks every registered blob's integrity before deleting anything; a corrupt blob stops
 the pass (blobs are shared and not attributable to one task's exports, so this stays global).
 
@@ -45,14 +50,21 @@ an unfinished task or pending cancellation, unsettled effects, a held `ws.lock` 
 inspection entries, a job `jail/`, symlinks, special files or hard links inside a candidate
 tree, a tree of more than 10000 entries or 64 levels. Other tasks are still collected.
 
-An integrity problem stops the whole pass, and before any deletion when found while
-classifying: an unknown name under `jobs`, `model`, `work` or `gc-trash`; a symlink or
+An integrity problem stops the pass: an unknown name under `jobs`, `model`, `work` or `gc-trash`; a symlink or
 non-directory where an owned directory is expected; a job or model directory naming an
 effect the journal does not know; a symlinked workspace; a mount root inside a candidate
 (Linux statx `STATX_ATTR_MOUNT_ROOT`; unavailable detection also refuses); an invalid,
 foreign or older-version deletion ticket; staged data that is not what its ticket staged;
-a corrupt blob. Integrity problems and failures are `refused`; entries not processed after
-a stop are `skipped`. Unknown entries are never removed automatically.
+a corrupt blob. One found while classifying (the first phase reads everything) stops the
+pass before any deletion; one found later (during a batch's revalidation or execution, e.g. a
+mount appearing after staging, staged data that changed, data that cannot be moved back)
+stops the remaining batches after earlier batches, and earlier tasks of the same batch, were
+collected. The all-or-nothing rule is about the decision: execution is entry by entry, so a
+failure or interruption in the middle of a task leaves it partly collected and the next pass
+finishes it. Integrity problems and failures are `refused`; entries not processed after a
+stop are `skipped`. Unknown entries are never removed automatically. Descriptor or memory
+exhaustion (`EMFILE`, `ENFILE`, `ENOMEM`, `ENOBUFS`) is never an integrity problem: it is a
+refusal whose reason says to retry, and it leaves staged data under a valid ticket.
 
 ## Passes, batches and descriptors
 
@@ -62,8 +74,10 @@ classifies every task without deleting anything: locks are probed (taken and rel
 trees are walked by path below a pinned directory descriptor, and the device/inode of each
 entry and of its parent is captured during this validation.
 
-Eligible tasks are then processed in batches of whole tasks (`--batch-size`, default 64
-entries; a task larger than the batch is a batch of its own). For each batch the tasks are
+Eligible tasks are then processed in batches of whole tasks. A batch closes at
+`--batch-size` entries (default 64, at most 4096; a task larger than that is a batch of its
+own) or at `MAX_TASKS_PER_BATCH` = 32 tasks, whichever comes first; the task cap is lowered to
+`soft RLIMIT_NOFILE - 64 - 32` (at least 1) when the descriptor limit is low. For each batch the tasks are
 revalidated while their `ws.lock` is taken and held until the batch ends; the
 `Validated` boundary follows; then each entry is removed. A job lock is taken again and
 held while that job's files are removed. Releasing job locks between validation and
@@ -73,8 +87,14 @@ before it counts as held (a process forked by another thread briefly shares a ju
 lock). Within a task, job and model copies go before the workspace; a failure stops that
 task (its later entries are `skipped`) and the pass continues with the next task.
 
-Descriptors are bounded: one held `ws.lock` per task in the batch, one per directory level of
-the tree being removed (at most 64), and a small constant. Nothing is held between batches.
+Descriptors are bounded: one held `ws.lock` per task in the batch (at most 32), one per
+directory level of the tree being removed (at most 64: the remover lists a directory's names
+and closes the listing before descending), and a reserve of about 32 for the home, database,
+staging, ticket, parent and job-lock descriptors and transient listings. A soft limit of 128
+covers the worst case; below it a deep tree can still exhaust descriptors, which is a
+retryable refusal. Nothing is held between batches. The checks run under `ulimit -n 256`
+with 300 tasks at `--batch-size 4096` and with a 1100-job task, and under a soft limit of 40
+with a 60-level tree (refused with a retry reason, finished once the limit is raised).
 
 ## Durable deletion
 
@@ -89,10 +109,15 @@ its device/inode compared with the ticket, its tree checked again, and only then
 recursively by descriptor; the remover repeats the mount-root check at every level. The
 staging directory is removed, then the ticket.
 
-On a later pass each ticket's state decides: staged data matching its ticket and proof is
-finished (even after the original receipt files are gone); staged data that is the ticket's
-inode but fails its checks is moved back (`refused`); staged data that is not the ticket's
-inode is an integrity problem and is neither removed nor moved; a ticket whose entry never
+Within the moving pass the staged entry must have the validated device and inode. On a later
+pass it must have the ticket's inode and kind of file and lie on the home's current device;
+the recorded device number is not compared, because it need not survive a reboot or remount
+(btrfs, overlayfs). Each ticket's state then decides: staged data matching its ticket and
+proof is finished (even after the original receipt files are gone); staged data that is the
+ticket's inode but fails its checks is moved back (`refused`); staged data that is not the
+ticket's inode is an integrity problem and is neither removed nor moved; a move back that
+fails for lack of resources leaves the data staged under a ticket naming it (rewritten with
+`restore: true` when the data changed after validation, so it is only ever moved back); a ticket whose entry never
 moved is dropped and the entry classified afresh; a ticket whose data is gone is completed.
 A staging rename that fails (e.g. `EXDEV`) drops its unexecuted ticket at once, and an entry
 swapped between validation and the move is moved back, so neither wedges later passes.
@@ -108,8 +133,8 @@ most 1000 `entries` (refused and skipped first) with a relative path, status and
 Reasons hold at most 1024 UTF-8 bytes plus an ellipsis, name paths relative to the candidate
 (never `/proc/self/fd/...`), and summarize malformed JSON by error class and position without
 quoting content. `gc` prints the report, then exits 1 if anything was refused or skipped,
-0 otherwise; usage errors (including a missing home) exit 2. Dry runs can create workspace
-lock files but never remove task data. No task state changes and no recovery, provider or VM
+0 otherwise; usage errors (including a missing home) exit 2. Dry runs create nothing (a
+missing `ws.lock` is one nobody holds) and remove nothing. No task state changes and no recovery, provider or VM
 execution occur.
 
 ## Publication fault coverage
@@ -135,7 +160,13 @@ files); an oversized workspace retaining only its task; an output over 32 MiB; a
 home path; more than 1000 job directories under a 256-descriptor limit (re-executed child
 with `ulimit -n 256`); batches of one; crash points after the ticket, after the move and
 after removal; ancestor and candidate substitution; an entry swapped before staging;
-bounded, content-free reasons; exit codes; never creating a home.
+bounded, content-free reasons; exit codes; never creating a home; (second review) a failed
+task with a stale pending cancel collected; 300 tasks at `--batch-size 4096` under
+`ulimit -n 256`; descriptor exhaustion mid-removal retried; a staged entry finished although
+its recorded device changed and refused while classifying when its inode differs; a dry run
+creating no lock file; a superseded model response kept; a job lock taken after validation
+keeping its job; the lock taken before the home is opened; the mount gate failing unless all
+three of its tests ran.
 
 The mount gate (`sh scripts/check.sh mount`, Compose service `test-mount` = the `test`
 image plus `CAP_SYS_ADMIN` and AppArmor unconfined, `AGENTOS_GC_MOUNT_TESTS=1`) mounts a
@@ -146,6 +177,12 @@ failed mount fails the test; elsewhere the tests print a skip line and return. W
 statx check the first two tests fail (the remover empties the tmpfs).
 No dependency changes: checked current tempfile 3.27.0 and rustix 1.1.5 online at
 https://docs.rs/crate/tempfile/latest and https://docs.rs/crate/rustix/latest.
+
+Known limits (not addressed): restoring onto a reoccupied path is refused and needs manual
+cleanup (never data loss); the tree check walks paths (read-only); every pass re-reads all
+job-directory remnants and every blob fully into memory (O(history) time, O(largest blob)
+memory); host-worker temporary directories under `work/<task>/` and atomic-write leftovers
+are never reclaimed; `test-mount` builds a second image.
 
 Not verified offline: real bind-mount roots of foreign filesystems, Firecracker/KVM and
 jailed job directories (`v.sock`, hard-link counts while jailed, `ws.img` owned by uid 61000),

@@ -81,3 +81,19 @@ descriptor paths or quoted content. The current design is in the
 [focused spec](../superpowers/specs/2026-10-04-conservative-gc-design.md). Still not verified
 offline: real foreign bind mounts, jailed/KVM job directories, power-loss durability and
 kernels older than 5.8.
+
+### Second review (2026-10-07)
+
+A second adversarial review ("merge after fixes", no critical defect) found that the held
+`ws.lock`s were bounded by `--batch-size` entries, not tasks: 300 tasks at batch size 4096
+under `ulimit -n 256` exhausted descriptors, and a failed move back was reported as an
+integrity stop that stranded staged data. Batches are now capped at 32 tasks (lower when
+the descriptor limit is low), the remover holds one descriptor per level, and resource
+exhaustion is a retryable refusal that never strands staged data. The docs now state that
+only problems found while classifying stop a pass before any deletion, and that a task
+interrupted mid-way is finished by the next pass. Also fixed: failed tasks with a stale
+pending cancel were never collected; staged data was matched by a device number that need
+not survive a reboot; the lock proof and the collected directory could differ; `gc` opened
+the home before locking; the mount gate passed with zero tests; dry runs created lock files.
+Three mutants that survived the suite (no `settled()` check for model copies, no job-lock
+re-take before deletion, no staged-identity check while classifying) are now killed by tests.

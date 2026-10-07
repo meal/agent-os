@@ -1114,11 +1114,11 @@ agentos --home /path/to/home gc [--batch-size N]
 ```
 
 `gc` needs an existing home (it never creates one: a mistyped `--home` exits 2) and takes the
-driver lock, so no controller runs meanwhile. It never launches a model, worker or inspector
+driver lock before it opens anything else, so no controller runs meanwhile. It never launches a model, worker or inspector
 and does not clean external cgroups or inspection directories.
 
-What it removes, only for terminal tasks with no pending cancellation and no unsettled
-effect: the task's workspace (`work/<task>/ws`, `workspace` or `ws.img`; the parent and
+What it removes, only for terminal tasks with no unsettled effect (a cancellation still
+marked pending on a task that has already failed or finished no longer matters): the task's workspace (`work/<task>/ws`, `workspace` or `ws.img`; the parent and
 `ws.lock` stay), each settled model response copy (`model/<effect>-<attempt>`), and, in each
 job directory whose receipt is the effect's settled published result, `output.bin` (a copy
 of the published blob), `scratch.img` and a Firecracker job's `v.sock`. What it keeps: the
@@ -1138,29 +1138,54 @@ The JSON report has a `summary` with a count per status, `batches`, and up to 10
 | `deleted` | removed | 0 |
 | `collected` | a job directory whose redundant copies are already gone | 0 |
 | `retained` | kept on purpose, e.g. the task is unfinished, a lock is held, a tree has symlinks, special files, hard links, more than 10000 entries or 64 levels | 0 |
-| `refused` | an integrity problem or a failure; data kept | 1 |
+| `refused` | an integrity problem or a failure (a resource shortage such as running out of descriptors says "retry"); data kept or left staged for the next pass | 1 |
 | `skipped` | not processed because the pass stopped | 1 |
 
 Any `refused` or `skipped` entry makes `gc` exit 1 after printing the report; a usage error
-exits 2. Collection is all-or-nothing within a task: anything that may still be live (an
+exits 2. The decision is all-or-nothing per task: anything that may still be live (an
 unfinished task, a busy job or workspace lock, inspection or jail leftovers, a tree it will
-not walk) retains that task only, and other tasks are still collected. An integrity problem
-stops the whole pass before anything is deleted: an unknown name, a symlink or non-directory
-where an owned directory is expected (inside the home; the home path itself may be a
-symlink, it is resolved once), a mount root inside a candidate, an unowned or invalid
-`gc-trash` entry, or a corrupt registered blob. Fix or inspect the reported path, then rerun.
+not walk) retains that task only, and other tasks are still collected. Execution is entry by
+entry: a failure in the middle of a task (or an interruption) leaves it partly collected, and
+the next pass finishes it. Integrity problems are an unknown name, a symlink or
+non-directory where an owned directory is expected (inside the home; the home path itself may
+be a symlink, it is resolved once), a mount root inside a candidate, an unowned or invalid
+`gc-trash` entry, staged data that is not what its ticket staged, or a corrupt registered
+blob. One found while classifying (the first phase, which reads everything) stops the pass
+before anything is deleted; one found later (a mount appearing after staging, a staged entry
+that changed, data that cannot be moved back) stops the remaining batches, after earlier
+batches, and earlier tasks of the same batch, were already collected. Fix or inspect the
+reported path, then rerun.
 
-Tasks are revalidated and deleted in batches of whole tasks (`--batch-size`, default 64
-entries; a larger task is one batch). Descriptors stay bounded: one held workspace lock per
-task in the batch, one per directory level of the tree being removed (at most 64), plus a
-small constant; a task with more than a thousand job directories is collected under a
-256-descriptor limit. Dry-run can create missing `ws.lock` files but removes nothing.
+Tasks are revalidated and deleted in batches of whole tasks: a batch closes at `--batch-size`
+entries (default 64, at most 4096; a larger task is one batch) or at 32 tasks, whichever
+comes first, and the task cap is lowered further when the soft descriptor limit is low
+(the report shows `tasks_per_batch`). Descriptors held at once: one workspace lock per task
+in the batch, one per directory level of the tree being removed (at most 64; names are
+listed before descending), plus about 32 for everything else, so a soft limit of 128 or more
+covers the worst case. Below that, deep trees can still run out; that is reported as a
+retryable refusal and the staged data is finished by the next pass. Hundreds of tasks at
+`--batch-size 4096`, and a task with more than a thousand job directories, are collected
+under a 256-descriptor limit. A dry run creates nothing (not even missing `ws.lock` files)
+and removes nothing.
 
 Each removal is staged under `gc-trash` with a durable ownership ticket, moved there with
 descriptor-relative operations that never follow symlinks, checked against the device/inode
 captured while validating, and only then removed. After an interruption, rerun `gc`: it
-finishes a staged removal even after the original receipt files are gone, drops tickets
-whose entry never moved, moves back staged data that no longer passes its checks, and
-cleans its own unpublished ticket temporary files. Mount-root detection requires a Linux
-kernel that reports `STATX_ATTR_MOUNT_ROOT` (5.8+); when it is unavailable, `gc` refuses
-and retains the data.
+finishes a staged removal even after the original receipt files are gone (an entry staged by
+an earlier pass is recognised by its inode and kind on the home's current device, since a
+device number need not survive a reboot), drops tickets whose entry never moved, moves back
+staged data that no longer passes its checks, and cleans its own unpublished ticket
+temporary files. Mount-root detection requires a Linux kernel that reports
+`STATX_ATTR_MOUNT_ROOT` (5.8+); when it is unavailable, `gc` refuses and retains the data.
+
+Known limits of `gc`:
+- A staged entry whose original path has been reoccupied cannot be moved back
+  (`RENAME_NOREPLACE` never overwrites, so nothing is lost); the pass refuses and the
+  reported `gc-trash` entry needs manual cleanup.
+- Candidate trees are checked by walking paths below a pinned directory descriptor; this walk
+  only reads, and removal itself is descriptor-relative and re-checks mounts at each level.
+- Every pass re-reads every job directory remnant and reads every registered blob fully into
+  memory to check it: time grows with the home's history, memory with the largest blob.
+- Host-worker temporary directories under `work/<task>/` and `.output.bin.tmp`-style
+  leftovers of interrupted atomic writes are never reclaimed.
+- The `test-mount` gate builds a second image (Compose `extends` without `image:`).
