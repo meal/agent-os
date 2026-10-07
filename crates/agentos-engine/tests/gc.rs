@@ -1315,3 +1315,30 @@ fn mount_gate_the_remover_refuses_a_mount_that_appears_after_staging() {
     assert!(!retry.failed(), "{retry:?}");
     assert_eq!(fs::read_dir(root.join("gc-trash")).unwrap().count(), 0);
 }
+
+/// A staging rename that fails after the ticket is durable (here EXDEV: `gc-trash` is
+/// another filesystem) drops the unexecuted ticket, so later passes are not wedged.
+#[test]
+fn mount_gate_a_cross_device_staging_failure_never_wedges_later_passes() {
+    if !mount_gate() {
+        return;
+    }
+    let (env, job, retention) = settled();
+    let root = env.dir.path();
+    let trash = Mounted::tmpfs(&root.join("gc-trash"));
+    fs::remove_file(trash.0.join("foreign")).unwrap();
+    for pass in 0..2 {
+        let report = gc(root, &env, false);
+        assert!(report.failed(), "pass {pass}: {report:?}");
+        assert!(
+            report.entries[0].reason.contains("cannot stage"),
+            "{report:?}"
+        );
+        assert!(job.path.join("output.bin").exists() && retention.exists());
+        assert_eq!(fs::read_dir(&trash.0).unwrap().count(), 0, "{report:?}");
+    }
+    drop(trash);
+    let report = gc(root, &env, false);
+    assert!(!report.failed(), "{report:?}");
+    assert!(!job.path.join("output.bin").exists() && !retention.exists());
+}

@@ -894,8 +894,9 @@ impl Pass<'_> {
                 "ws.lock is not a single-link regular file".into(),
             ));
         }
-        lock.try_lock()
-            .map_err(|_| Fail::Retain("the workspace lock is held".into()))?;
+        if !try_lock_briefly(&lock) {
+            return Err(Fail::Retain("the workspace lock is held".into()));
+        }
         Ok(Some((lock, confined::dir_identity(&dir)?)))
     }
 
@@ -918,8 +919,9 @@ impl Pass<'_> {
                 "job lock is not a single-link regular file".into(),
             ));
         }
-        lock.try_lock()
-            .map_err(|_| Fail::Retain("the job is live (its lock is held)".into()))?;
+        if !try_lock_briefly(&lock) {
+            return Err(Fail::Retain("the job is live (its lock is held)".into()));
+        }
         Ok(Some(lock))
     }
 
@@ -1448,6 +1450,21 @@ impl Pass<'_> {
         confined::unlink_if_present(trash, OsStr::new(&format!("{key}.json")), false)?;
         Ok(())
     }
+}
+
+/// Takes an exclusive lock without waiting for a real holder. A process forked by another
+/// thread shares the open file description of a lock this pass just released until it
+/// execs, so a busy answer is retried for a moment before it counts as held.
+fn try_lock_briefly(lock: &File) -> bool {
+    for attempt in 0..5 {
+        if lock.try_lock().is_ok() {
+            return true;
+        }
+        if attempt < 4 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    false
 }
 
 fn publish_ticket(trash: &File, key: &str, ticket: &Ticket) -> io::Result<()> {
