@@ -99,6 +99,11 @@ impl BlobStore {
         Ok(digest)
     }
 
+    /// Where the objects live (`<dir>/objects`).
+    pub fn objects_dir(&self) -> &Path {
+        &self.objects
+    }
+
     pub fn get(&self, d: &Digest) -> io::Result<Vec<u8>> {
         let bytes = fs::read(self.object_path(d))?;
         if Digest::of(&bytes) != *d {

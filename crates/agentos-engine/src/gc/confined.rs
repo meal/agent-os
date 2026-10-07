@@ -10,7 +10,8 @@ use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 
 /// Deepest directory level the collector checks or removes. The remover holds one
-/// descriptor per level, so this also bounds its descriptor use.
+/// descriptor per level (directory names are listed before it descends), so this also
+/// bounds its descriptor use.
 pub(super) const DEPTH_LIMIT: usize = 64;
 
 /// A mount root inside data the collector would otherwise remove, or a kernel that cannot
@@ -102,9 +103,13 @@ fn remove_at(parent: &File, name: &OsStr, remaining: &mut usize, depth: usize) -
     if file_type(&meta) == FileType::Directory {
         let child = open_dir(parent, name)?;
         refuse_mount_at(&child, OsStr::new("."))?;
-        for entry in std::fs::read_dir(path(&child))? {
-            let entry = entry?;
-            remove_at(&child, &entry.file_name(), remaining, depth + 1)?;
+        // Names are read (and the listing descriptor closed) before descending, so a level
+        // holds exactly one descriptor: its own directory.
+        let names = std::fs::read_dir(path(&child))?
+            .map(|entry| entry.map(|e| e.file_name()))
+            .collect::<io::Result<Vec<_>>>()?;
+        for child_name in names {
+            remove_at(&child, &child_name, remaining, depth + 1)?;
         }
         child.sync_all()?;
         unlinkat(parent, name, AtFlags::REMOVEDIR)?;

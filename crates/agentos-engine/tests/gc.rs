@@ -41,6 +41,11 @@ fn gc(root: &Path, env: &Env, dry_run: bool) -> Report {
 }
 
 fn settled() -> (Env, JobDir, PathBuf) {
+    settled_with(|_| {})
+}
+
+/// `settled()`, running `before_failed` just before the task fails.
+fn settled_with(before_failed: impl Fn(&Env)) -> (Env, JobDir, PathBuf) {
     let env = Env::with_model(3, 10);
     env.db.append(&env.task, &TaskEvent::Started).unwrap();
     let base = env.db.task(&env.task).unwrap().workspace_digest;
@@ -111,6 +116,7 @@ fn settled() -> (Env, JobDir, PathBuf) {
     env.db
         .complete_effect(&model.effect_id, &out.receipt, Some(&digest), None)
         .unwrap();
+    before_failed(&env);
     env.db
         .append(
             &env.task,
@@ -787,22 +793,15 @@ const FD_CHILD: &str = "AGENTOS_GC_TEST_FD_CHILD";
 
 /// Hundreds of settled job directories in one task, plus other tasks, collected in a
 /// process whose descriptor limit is far below the number of entries.
-#[test]
-fn many_settled_jobs_are_collected_under_a_low_descriptor_limit() {
-    if std::env::var_os(FD_CHILD).is_some() {
-        return low_descriptor_child();
-    }
+/// Re-executes this test binary for exactly `test` under `ulimit -n 256` and asserts the
+/// child printed `marker`.
+fn run_in_low_descriptor_child(test: &str, marker: &str) {
     let exe = std::env::current_exe().unwrap();
     let out = std::process::Command::new("sh")
         .arg("-c")
         .arg("ulimit -n 256 && exec \"$0\" \"$@\"")
         .arg(exe)
-        .args([
-            "--exact",
-            "many_settled_jobs_are_collected_under_a_low_descriptor_limit",
-            "--nocapture",
-            "--test-threads=1",
-        ])
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
         .env(FD_CHILD, "1")
         .output()
         .unwrap();
@@ -812,10 +811,10 @@ fn many_settled_jobs_are_collected_under_a_low_descriptor_limit() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(String::from_utf8_lossy(&out.stdout).contains("low-descriptor child collected"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains(marker));
 }
 
-fn low_descriptor_child() {
+fn assert_descriptor_limit_256() {
     let limit = std::fs::read_to_string("/proc/self/limits").unwrap();
     let line = limit
         .lines()
@@ -823,6 +822,84 @@ fn low_descriptor_child() {
         .unwrap()
         .to_string();
     assert!(line.split_whitespace().nth(3) == Some("256"), "{line}");
+}
+
+/// Hundreds of settled job directories in one task, plus other tasks, collected in a
+/// process whose descriptor limit is far below the number of entries.
+#[test]
+fn many_settled_jobs_are_collected_under_a_low_descriptor_limit() {
+    if std::env::var_os(FD_CHILD).is_some() {
+        return low_descriptor_child();
+    }
+    run_in_low_descriptor_child(
+        "many_settled_jobs_are_collected_under_a_low_descriptor_limit",
+        "low-descriptor child collected",
+    );
+}
+
+/// Hundreds of terminal tasks, each with a nested workspace, at the largest allowed batch
+/// size: the held workspace locks per batch stay bounded whatever the flag says.
+#[test]
+fn many_tasks_are_collected_at_the_largest_batch_under_a_low_descriptor_limit() {
+    if std::env::var_os(FD_CHILD).is_some() {
+        return many_tasks_child();
+    }
+    run_in_low_descriptor_child(
+        "many_tasks_are_collected_at_the_largest_batch_under_a_low_descriptor_limit",
+        "many-tasks child collected",
+    );
+}
+
+fn many_tasks_child() {
+    assert_descriptor_limit_256();
+    let (env, _, _) = settled();
+    let mut workspaces = Vec::new();
+    for t in 0..300 {
+        let task = second_task(&env);
+        finish(&env, &task);
+        let ws = env.dir.path().join("work").join(task.as_str()).join("ws");
+        let mut deep = ws.clone();
+        for level in 0..20 {
+            deep = deep.join(format!("d{level}"));
+        }
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("file"), format!("task {t}")).unwrap();
+        workspaces.push(ws);
+    }
+    let report = gc_with(
+        env.dir.path(),
+        &env,
+        Options {
+            dry_run: false,
+            batch_size: 4096,
+        },
+        &|_, _| Ok(()),
+    );
+    let bad: Vec<_> = report
+        .entries
+        .iter()
+        .filter(|e| e.status != "deleted" && e.status != "collected")
+        .take(3)
+        .collect();
+    assert!(
+        bad.is_empty() && !report.failed(),
+        "{:?} {bad:?}",
+        report.summary
+    );
+    for ws in &workspaces {
+        assert!(!ws.exists(), "{}", ws.display());
+    }
+    assert_eq!(
+        fs::read_dir(env.dir.path().join("gc-trash"))
+            .unwrap()
+            .count(),
+        0
+    );
+    println!("many-tasks child collected {} workspaces", workspaces.len());
+}
+
+fn low_descriptor_child() {
+    assert_descriptor_limit_256();
     let (env, job, retention) = settled();
     let other = second_task(&env);
     let jobs: Vec<JobDir> = (0..1100)
@@ -1341,4 +1418,214 @@ fn mount_gate_a_cross_device_staging_failure_never_wedges_later_passes() {
     let report = gc(root, &env, false);
     assert!(!report.failed(), "{report:?}");
     assert!(!job.path.join("output.bin").exists() && !retention.exists());
+}
+
+// ---- Round 2: liveness, cross-pass identity, transient errors, mutation killers ----
+
+#[test]
+fn a_failed_task_with_a_pending_cancel_is_collected_but_a_running_one_is_not() {
+    let (env, job, retention) = settled_with(|env| {
+        env.db
+            .append(&env.task, &TaskEvent::CancelRequested)
+            .unwrap();
+    });
+    assert!(env.db.task(&env.task).unwrap().cancel_requested);
+    let report = gc(env.dir.path(), &env, false);
+    assert!(!report.failed(), "{report:?}");
+    assert!(
+        !job.path.join("output.bin").exists() && !retention.exists(),
+        "{report:?}"
+    );
+
+    let other = second_task(&env);
+    env.db.append(&other, &TaskEvent::CancelRequested).unwrap();
+    let ws = env.dir.path().join("work").join(other.as_str()).join("ws");
+    fs::create_dir_all(&ws).unwrap();
+    let report = gc(env.dir.path(), &env, false);
+    assert!(ws.exists(), "{report:?}");
+    assert_eq!(status_of(&report, &rel(&env, &ws)), ["retained"]);
+}
+
+/// Stages the workspace of `settled()` and stops (as a crash would) before removal.
+fn staged_workspace(env: &Env) -> (PathBuf, PathBuf) {
+    let relative = format!("work/{}/ws", env.task);
+    let report = gc_hook(env.dir.path(), env, false, &|stage, path| {
+        if stage == CollectionStage::Staged && path.ends_with("ws") {
+            return Err(std::io::Error::other("injected crash"));
+        }
+        Ok(())
+    });
+    assert!(report.failed(), "{report:?}");
+    let key = ticket_key(&relative);
+    let trash = env.dir.path().join("gc-trash");
+    assert!(trash.join(&key).join("data/file").exists());
+    (
+        trash.join(format!("{key}.json")),
+        trash.join(key).join("data"),
+    )
+}
+
+fn edit_ticket(ticket: &Path, field: &str, delta: u64) {
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(ticket).unwrap()).unwrap();
+    let n = value[field].as_u64().unwrap();
+    value[field] = serde_json::json!(n.wrapping_add(delta));
+    fs::write(ticket, serde_json::to_vec(&value).unwrap()).unwrap();
+}
+
+#[test]
+fn a_staged_entry_is_finished_even_if_its_device_number_changed_across_passes() {
+    let (env, _, _) = settled();
+    let (ticket, data) = staged_workspace(&env);
+    edit_ticket(&ticket, "device", 1);
+    let report = gc(env.dir.path(), &env, false);
+    assert!(!report.failed(), "{report:?}");
+    assert!(!data.exists());
+    assert_eq!(
+        fs::read_dir(env.dir.path().join("gc-trash"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn staged_data_with_another_inode_is_refused_while_classifying_and_left_untouched() {
+    let (env, job, _) = settled();
+    let (ticket, data) = staged_workspace(&env);
+    edit_ticket(&ticket, "inode", 1);
+    let dry = gc(env.dir.path(), &env, true);
+    assert!(dry.failed(), "{dry:?}");
+    assert_eq!(dry.entries[0].status, "refused", "{dry:?}");
+    assert!(dry.entries[0].reason.contains("not the entry"), "{dry:?}");
+    let report = gc(env.dir.path(), &env, false);
+    assert!(report.failed(), "{report:?}");
+    assert!(
+        !report.entries.iter().any(|e| e.status == "deleted"),
+        "an integrity problem found while classifying deletes nothing: {report:?}"
+    );
+    assert!(data.join("file").exists() && ticket.exists());
+    let _ = job;
+}
+
+#[test]
+fn a_dry_run_creates_no_lock_files() {
+    let (env, _, _) = settled();
+    let lock = env
+        .dir
+        .path()
+        .join("work")
+        .join(env.task.as_str())
+        .join("ws.lock");
+    assert!(!lock.exists());
+    let report = gc(env.dir.path(), &env, true);
+    assert!(!report.failed(), "{report:?}");
+    assert!(!lock.exists(), "{report:?}");
+}
+
+#[test]
+fn a_model_response_of_a_superseded_attempt_is_kept() {
+    let (env, _, retention) = settled();
+    let mut out: ExecOutcome =
+        serde_json::from_slice(&fs::read(retention.join("response.json")).unwrap()).unwrap();
+    out.receipt.attempt_id = agentos_core::effect::AttemptId::new();
+    out.receipt.lease_generation = out.receipt.lease_generation.wrapping_sub(1);
+    let old = env.dir.path().join("model").join(format!(
+        "{}-{}",
+        out.receipt.effect_id, out.receipt.attempt_id
+    ));
+    fs::create_dir_all(&old).unwrap();
+    fs::write(old.join("response.json"), serde_json::to_vec(&out).unwrap()).unwrap();
+    let report = gc(env.dir.path(), &env, false);
+    assert!(old.join("response.json").exists(), "{report:?}");
+    assert_eq!(
+        status_of(&report, &rel(&env, &old)),
+        ["retained"],
+        "{report:?}"
+    );
+    assert!(!retention.exists());
+}
+
+#[test]
+fn a_job_lock_taken_after_validation_keeps_the_job() {
+    let (env, job, _) = settled();
+    let held: std::cell::RefCell<Option<File>> = std::cell::RefCell::new(None);
+    let report = gc_hook(env.dir.path(), &env, false, &|stage, _| {
+        if stage == CollectionStage::Validated {
+            let f = File::options().write(true).open(job.path.join("lock"))?;
+            f.lock()?;
+            *held.borrow_mut() = Some(f);
+        }
+        Ok(())
+    });
+    assert!(job.path.join("output.bin").exists(), "{report:?}");
+    assert!(report.failed(), "{report:?}");
+    assert!(
+        report.entries[0].reason.contains("the job is live"),
+        "{report:?}"
+    );
+}
+
+/// A deletion interrupted by descriptor exhaustion is a retryable refusal, never an
+/// integrity stop, and the next pass (with descriptors) finishes it.
+#[test]
+fn descriptor_exhaustion_mid_removal_is_retryable_and_never_strands_data() {
+    if std::env::var_os(FD_CHILD).is_some() {
+        return exhaustion_child();
+    }
+    let exe = std::env::current_exe().unwrap();
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("ulimit -S -n 40 && exec \"$0\" \"$@\"")
+        .arg(exe)
+        .args([
+            "--exact",
+            "descriptor_exhaustion_mid_removal_is_retryable_and_never_strands_data",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(FD_CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "child failed: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("exhaustion child finished"));
+}
+
+fn exhaustion_child() {
+    use rustix::process::{Resource, getrlimit, setrlimit};
+    let (env, _, _) = settled();
+    let ws = env
+        .dir
+        .path()
+        .join("work")
+        .join(env.task.as_str())
+        .join("ws");
+    let mut deep = ws.clone();
+    for level in 0..60 {
+        deep = deep.join(format!("d{level}"));
+    }
+    fs::create_dir_all(&deep).unwrap();
+    fs::write(deep.join("file"), b"deep").unwrap();
+    let first = gc(env.dir.path(), &env, false);
+    assert!(first.failed(), "{first:?}");
+    let text = serde_json::to_string(&first).unwrap();
+    assert!(!text.contains("integrity"), "{text}");
+    assert!(text.contains("retry"), "{text}");
+    let mut limit = getrlimit(Resource::Nofile);
+    limit.current = limit.maximum;
+    setrlimit(Resource::Nofile, limit).unwrap();
+    let second = gc(env.dir.path(), &env, false);
+    assert!(!second.failed(), "{second:?}");
+    assert!(!ws.exists());
+    assert_eq!(
+        fs::read_dir(env.dir.path().join("gc-trash"))
+            .unwrap()
+            .count(),
+        0
+    );
+    println!("exhaustion child finished");
 }

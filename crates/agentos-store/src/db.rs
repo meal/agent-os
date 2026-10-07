@@ -347,6 +347,11 @@ pub(crate) fn store_task(tx: &Transaction, t: &Task) -> Result<()> {
 }
 
 impl Db {
+    /// The database file, as SQLite opened it (`None` for an in-memory database).
+    pub fn path(&self) -> Option<&Path> {
+        self.conn.path().map(Path::new)
+    }
+
     pub fn open(path: &Path) -> Result<Db> {
         let conn = Connection::open(path)?;
         // busy_timeout first so the remaining setup also waits out concurrent openers.

@@ -23,7 +23,6 @@ use std::path::{Component, Path, PathBuf};
 
 use agentos_core::effect::{AttemptId, EffectId, EffectKind, EffectRecord, EffectState};
 use agentos_core::ids::{Digest, TaskId};
-use agentos_core::state::TaskState;
 use agentos_store::{blob::BlobStore, db::Db};
 use rustix::fs::{FileType, Mode, OFlags, openat};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -33,6 +32,12 @@ use crate::job::{JobRequest, WorkerConfig};
 
 /// Default number of entries revalidated and deleted together (whole tasks per batch).
 pub const DEFAULT_BATCH_SIZE: usize = 64;
+/// Most tasks (each holding its `ws.lock`) revalidated and deleted together, whatever the
+/// batch size; also capped by the descriptor limit (see `tasks_per_batch`).
+pub const MAX_TASKS_PER_BATCH: usize = 32;
+/// Descriptors kept free for everything but held workspace locks and the remover's levels:
+/// the home, database, staging, ticket, parent and job-lock descriptors and their listings.
+const FD_RESERVE: usize = 32;
 /// Most entries listed in a report; the summary always counts every entry.
 pub const REPORT_LIMIT: usize = 1000;
 const TREE_LIMIT: usize = 10000;
@@ -96,6 +101,8 @@ pub struct Summary {
 pub struct Report {
     pub dry_run: bool,
     pub batch_size: usize,
+    /// The tasks-per-batch cap in force (fixed maximum, lowered by the descriptor limit).
+    pub tasks_per_batch: usize,
     pub batches: usize,
     pub summary: Summary,
     /// Entries beyond [`REPORT_LIMIT`] were omitted (refused and skipped ones come first).
@@ -128,6 +135,9 @@ impl Options {
 /// later operation inside it is descriptor-relative and never follows a symlink.
 pub struct HeldDriverLock<'a> {
     root: PathBuf,
+    /// The home directory, opened once; the lock was checked through it and every
+    /// collection operation starts from it, so proof and anchor are the same directory.
+    anchor: File,
     _lock: &'a File,
 }
 impl<'a> HeldDriverLock<'a> {
@@ -135,16 +145,28 @@ impl<'a> HeldDriverLock<'a> {
     /// take now) the exclusive lock.
     pub fn verify(root: &Path, lock: &'a File) -> io::Result<HeldDriverLock<'a>> {
         let root = fs::canonicalize(root)?;
-        let on_disk = fs::symlink_metadata(root.join("driver.lock"))?;
+        // The root was canonicalized once: from here on nothing follows a symlink.
+        let anchor = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags((OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC).bits() as i32)
+            .open(&root)?;
+        let on_disk = confined::stat(&anchor, OsStr::new("driver.lock"))?
+            .ok_or_else(|| io::Error::other("the home has no driver.lock"))?;
         let held = lock.metadata()?;
-        if !on_disk.is_file() || (on_disk.dev(), on_disk.ino()) != (held.dev(), held.ino()) {
+        if confined::file_type(&on_disk) != FileType::RegularFile
+            || confined::identity_of(&on_disk) != (held.dev(), held.ino())
+        {
             return Err(io::Error::other(
                 "the given file is not this home's driver.lock",
             ));
         }
         lock.try_lock()
             .map_err(|e| io::Error::other(format!("the driver lock is not held: {e}")))?;
-        Ok(HeldDriverLock { root, _lock: lock })
+        Ok(HeldDriverLock {
+            root,
+            anchor,
+            _lock: lock,
+        })
     }
     pub fn root(&self) -> &Path {
         &self.root
@@ -171,13 +193,16 @@ enum Fail {
     Retain(String),
     /// Retain the task and report a failure.
     Refuse(String),
+    /// Like `Refuse`, for a resource shortage (descriptors, memory): staged data and its
+    /// ticket stay as they are and the next pass finishes them.
+    Transient(String),
     /// Stop the whole pass.
     Integrity(String),
 }
 impl Fail {
     fn text(&self) -> &str {
         match self {
-            Fail::Retain(r) | Fail::Refuse(r) | Fail::Integrity(r) => r,
+            Fail::Retain(r) | Fail::Refuse(r) | Fail::Transient(r) | Fail::Integrity(r) => r,
         }
     }
 }
@@ -187,6 +212,12 @@ impl From<io::Error> for Fail {
             .is_some_and(|inner| inner.is::<confined::MountBoundary>())
         {
             Fail::Integrity(reason(&e))
+        } else if transient(&e) {
+            Fail::Transient(format!(
+                "{}: a resource shortage, not a problem with the data; retry with more free \
+                 descriptors or memory, or a lower --batch-size",
+                reason(&e)
+            ))
         } else {
             Fail::Refuse(reason(&e))
         }
@@ -196,6 +227,30 @@ impl From<rustix::io::Errno> for Fail {
     fn from(e: rustix::io::Errno) -> Fail {
         io::Error::from(e).into()
     }
+}
+
+/// Descriptor or memory exhaustion: says nothing about the data, so never an integrity stop.
+fn transient(e: &io::Error) -> bool {
+    [
+        rustix::io::Errno::MFILE,
+        rustix::io::Errno::NFILE,
+        rustix::io::Errno::NOMEM,
+        rustix::io::Errno::NOBUFS,
+    ]
+    .iter()
+    .any(|errno| e.raw_os_error() == Some(errno.raw_os_error()))
+}
+
+/// Tasks per batch: `MAX_TASKS_PER_BATCH`, lowered so that one held `ws.lock` per task,
+/// one descriptor per removed tree level and `FD_RESERVE` fit the soft descriptor limit.
+fn tasks_per_batch() -> usize {
+    let soft = rustix::process::getrlimit(rustix::process::Resource::Nofile)
+        .current
+        .unwrap_or(u64::MAX);
+    let spare = soft.saturating_sub((confined::DEPTH_LIMIT + FD_RESERVE) as u64);
+    usize::try_from(spare)
+        .unwrap_or(usize::MAX)
+        .clamp(1, MAX_TASKS_PER_BATCH)
 }
 
 /// A human-readable, bounded reason: descriptor paths are dropped and long text is cut.
@@ -447,6 +502,10 @@ struct Ticket {
     proof: Proof,
     device: u64,
     inode: u64,
+    /// The staged data was not validated (it changed between validation and the move) and
+    /// moving it back failed: a later pass moves it back and never removes it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    restore: bool,
 }
 impl Ticket {
     fn rules(&self) -> Rules {
@@ -607,6 +666,10 @@ enum JobClass {
 
 struct Pass<'a> {
     anchor: File,
+    /// The home's device now: staged data of an earlier pass must be on it (a recorded
+    /// device number need not survive a reboot or remount, its inode does).
+    home_dev: u64,
+    dry_run: bool,
     db: &'a Db,
     referenced: HashSet<Digest>,
     hook: &'a dyn Fn(CollectionStage, &Path) -> io::Result<()>,
@@ -841,9 +904,11 @@ impl Pass<'_> {
             .db
             .task(task)
             .map_err(|e| Fail::Integrity(format!("task is not in the journal: {}", reason(e))))?;
-        if !t.state.is_terminal() || (t.cancel_requested && t.state != TaskState::Cancelled) {
+        // A terminal task accepts no further event, so a cancellation still marked pending
+        // (a task that failed while it was requested) can no longer start anything.
+        if !t.state.is_terminal() {
             return Err(Fail::Retain(format!(
-                "task is not finished ({:?}) or its cancellation is pending",
+                "task is not finished ({:?})",
                 t.state
             )));
         }
@@ -874,20 +939,25 @@ impl Pass<'_> {
         let Some(dir) = owned_dir_opt(&work, task.as_str())? else {
             return Ok(None);
         };
-        let lock: File = openat(
+        // A dry run creates nothing: a missing lock file is one nobody holds.
+        let create = if self.dry_run {
+            OFlags::empty()
+        } else {
+            OFlags::CREATE
+        };
+        let lock: File = match openat(
             &dir,
             "ws.lock",
-            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            OFlags::RDWR | create | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
             Mode::from_raw_mode(0o644),
-        )
-        .map_err(|e| {
-            if e == rustix::io::Errno::LOOP {
-                Fail::Integrity("ws.lock is a symlink".into())
-            } else {
-                e.into()
+        ) {
+            Ok(fd) => fd.into(),
+            Err(rustix::io::Errno::NOENT) if self.dry_run => return Ok(None),
+            Err(rustix::io::Errno::LOOP) => {
+                return Err(Fail::Integrity("ws.lock is a symlink".into()));
             }
-        })?
-        .into();
+            Err(e) => return Err(e.into()),
+        };
         let meta = lock.metadata()?;
         if !meta.is_file() || meta.nlink() != 1 {
             return Err(Fail::Retain(
@@ -1149,23 +1219,41 @@ impl Pass<'_> {
         let ticket = ticket.clone();
         Ok(match data {
             Some((stage, st)) => {
-                self.validate_proof(&ticket)?;
-                if confined::identity_of(&st) != (ticket.device, ticket.inode) {
+                if !self.staged_by(&ticket, &st) {
                     // Not provably what this ticket staged: never removed, never moved.
                     return Err(Fail::Integrity(format!(
                         "gc-trash/{key}/data is not the entry its ticket staged; inspect it manually"
                     )));
                 }
-                if check_tree(&confined::path(&stage).join("data"), ticket.rules()).is_err() {
+                if ticket.restore {
+                    return Ok(Action::Restore { key, ticket });
+                }
+                self.validate_proof(&ticket)?;
+                match check_tree(&confined::path(&stage).join("data"), ticket.rules()) {
+                    Ok(()) => Action::Finish { key, ticket },
+                    Err(Fail::Transient(why)) => return Err(Fail::Transient(why)),
                     // Ours, but no longer safe to remove blindly: move it back.
-                    Action::Restore { key, ticket }
-                } else {
-                    Action::Finish { key, ticket }
+                    Err(_) => Action::Restore { key, ticket },
                 }
             }
             None if source => Action::Retire { key },
             None => Action::Finish { key, ticket },
         })
+    }
+
+    /// Whether `st` (staged by an earlier pass) is the entry `ticket` staged: the same inode
+    /// and kind of file, on the home's current device. The recorded device number is not
+    /// compared across passes: it need not survive a reboot or remount.
+    fn staged_by(&self, ticket: &Ticket, st: &rustix::fs::Stat) -> bool {
+        let name = ticket.relative.file_name().and_then(OsStr::to_str);
+        let expected = match (ticket.kind, name) {
+            (Kind::JobFile, Some("v.sock")) => FileType::Socket,
+            (Kind::JobFile, _) | (Kind::Workspace, Some("ws.img")) => FileType::RegularFile,
+            (Kind::Workspace, _) | (Kind::Model, _) => FileType::Directory,
+        };
+        st.st_ino == ticket.inode
+            && st.st_dev == self.home_dev
+            && confined::file_type(st) == expected
     }
 
     /// Classifies one task without deleting anything. `Err` is an integrity problem.
@@ -1261,7 +1349,7 @@ impl Pass<'_> {
         let Some((at, fail)) = &plan.blocked else {
             return;
         };
-        let refused = matches!(fail, Fail::Refuse(_));
+        let refused = matches!(fail, Fail::Refuse(_) | Fail::Transient(_));
         let mut seen = false;
         for path in items.paths(task) {
             let own = path == *at || at.starts_with(&format!("{path}/"));
@@ -1309,15 +1397,20 @@ impl Pass<'_> {
                 let trash = self.trash()?;
                 let stage = owned_dir(&trash, key)?;
                 // Reported as a refusal either way: something changed staged data.
+                let staged = confined::stat(&stage, OsStr::new("data"))?
+                    .ok_or_else(|| Fail::Refuse("staged data vanished".into()))?;
                 Err(self.put_back(
                     &trash,
                     key,
                     &stage,
                     ticket,
                     None,
-                    Fail::Refuse(
-                        "staged data did not match its deletion ticket or its checks".into(),
-                    ),
+                    Fail::Refuse(if ticket.restore {
+                        "staged data changed after validation".into()
+                    } else {
+                        "staged data no longer passes its checks".into()
+                    }),
+                    &staged,
                 ))
             }
         }
@@ -1337,6 +1430,11 @@ impl Pass<'_> {
     /// Moves staged data back to its original place and drops the ticket. Returns the
     /// failure to report: `fail` (as a refusal unless it is an integrity problem) when the
     /// data is back, an integrity problem when it could not be moved back.
+    ///
+    /// A move back that fails for lack of resources leaves the data staged under a ticket
+    /// that a later pass honours: the ticket already names this inode, or it is rewritten
+    /// to name it with `restore` set (data that changed after validation is never removed).
+    #[allow(clippy::too_many_arguments)]
     fn put_back(
         &self,
         trash: &File,
@@ -1345,13 +1443,14 @@ impl Pass<'_> {
         ticket: &Ticket,
         parent: Option<&File>,
         fail: Fail,
+        staged: &rustix::fs::Stat,
     ) -> Fail {
         let name = ticket.relative.file_name().expect("shape checked");
-        let parent = match parent {
-            Some(p) => p.try_clone(),
-            None => confined::parent(&self.anchor, &ticket.relative),
+        let moved = match parent {
+            Some(p) => confined::restore(stage, p, name),
+            None => confined::parent(&self.anchor, &ticket.relative)
+                .and_then(|p| confined::restore(stage, &p, name)),
         };
-        let moved = parent.and_then(|p| confined::restore(stage, &p, name));
         match moved
             .map_err(Fail::from)
             .and_then(|()| self.retire(trash, key))
@@ -1360,6 +1459,36 @@ impl Pass<'_> {
                 Fail::Integrity(why) => Fail::Integrity(format!("{why}; moved back and kept")),
                 other => Fail::Refuse(format!("{}; moved back and kept", other.text())),
             },
+            Err(Fail::Transient(why)) => {
+                // A ticket naming this very inode already leads the next pass to move it back
+                // (its checks fail again) or to finish it (they pass): no rewrite needed.
+                let named = (ticket.device, ticket.inode) == confined::identity_of(staged);
+                let marked = named
+                    || publish_ticket(
+                        trash,
+                        key,
+                        &Ticket {
+                            device: staged.st_dev,
+                            inode: staged.st_ino,
+                            restore: true,
+                            ..ticket.clone()
+                        },
+                        true,
+                    )
+                    .is_ok();
+                if marked {
+                    Fail::Transient(format!(
+                        "{}; moving it back failed ({why}); it stays staged and the next pass \
+                         moves it back",
+                        fail.text()
+                    ))
+                } else {
+                    Fail::Integrity(format!(
+                        "{}; the staged data could not be moved back ({why}); inspect gc-trash/{key}",
+                        fail.text()
+                    ))
+                }
+            }
             Err(e) => Fail::Integrity(format!(
                 "{}; the staged data could not be moved back ({}); inspect gc-trash/{key}",
                 fail.text(),
@@ -1398,8 +1527,9 @@ impl Pass<'_> {
             proof: d.proof.clone(),
             device: d.identity.0,
             inode: d.identity.1,
+            restore: false,
         };
-        publish_ticket(&trash, &key, &ticket)?;
+        publish_ticket(&trash, &key, &ticket, false)?;
         self.stage(CollectionStage::TicketPublished, &d.relative)?;
         let stage = confined::directory(&trash, OsStr::new(&key))?;
         if let Err(e) = confined::move_entry(&parent, name, &stage) {
@@ -1424,7 +1554,12 @@ impl Pass<'_> {
         if let Some(stage) = stage
             && let Some(st) = confined::stat(stage, OsStr::new("data"))?
         {
-            let checked = if confined::identity_of(&st) != (ticket.device, ticket.inode) {
+            let same = match parent {
+                // Moved by this very call: same boot and mount, so device and inode.
+                Some(_) => confined::identity_of(&st) == (ticket.device, ticket.inode),
+                None => self.staged_by(ticket, &st),
+            };
+            let checked = if !same {
                 if parent.is_none() {
                     // Staged by an earlier pass: not provably ours, so never moved.
                     return Err(Fail::Integrity(format!(
@@ -1436,8 +1571,18 @@ impl Pass<'_> {
             } else {
                 check_tree(&confined::path(stage).join("data"), ticket.rules())
             };
-            if let Err(fail) = checked {
-                return Err(self.put_back(trash, key, stage, ticket, parent, fail));
+            match checked {
+                Ok(()) => {}
+                // The data is the validated entry and its ticket holds: the next pass checks
+                // and finishes it.
+                Err(Fail::Transient(why)) if same => {
+                    return Err(Fail::Transient(format!(
+                        "{why}; staged, finished by the next pass"
+                    )));
+                }
+                Err(fail) => {
+                    return Err(self.put_back(trash, key, stage, ticket, parent, fail, &st));
+                }
             }
             self.stage(CollectionStage::Staged, &ticket.relative)?;
             let mut remaining = TREE_LIMIT;
@@ -1467,7 +1612,40 @@ fn try_lock_briefly(lock: &File) -> bool {
     false
 }
 
-fn publish_ticket(trash: &File, key: &str, ticket: &Ticket) -> io::Result<()> {
+/// Publishes `ticket` durably; `replace` overwrites an existing ticket of the same key
+/// atomically (only to mark staged data for moving back).
+/// The database and blob store handed to `collect` are this home's (`agentos.db` and
+/// `blobs/objects` under the anchored directory, compared by device and inode).
+fn belongs_to_home(anchor: &File, db: &Db, blobs: &BlobStore) -> Result<(), String> {
+    let same = |relative: &[&str], path: Option<&Path>| -> bool {
+        let Some(path) = path else { return false };
+        let Ok(meta) = fs::metadata(path) else {
+            return false;
+        };
+        let mut dir = match anchor.try_clone() {
+            Ok(dir) => dir,
+            Err(_) => return false,
+        };
+        let (last, parents) = relative.split_last().expect("non-empty");
+        for name in parents {
+            match confined::open_dir(&dir, OsStr::new(name)) {
+                Ok(next) => dir = next,
+                Err(_) => return false,
+            }
+        }
+        matches!(confined::stat(&dir, OsStr::new(last)), Ok(Some(st))
+            if confined::identity_of(&st) == (meta.dev(), meta.ino()))
+    };
+    if !same(&["agentos.db"], db.path()) {
+        return Err("the database is not this home's agentos.db".into());
+    }
+    if !same(&["blobs", "objects"], Some(blobs.objects_dir())) {
+        return Err("the blob store is not this home's blobs".into());
+    }
+    Ok(())
+}
+
+fn publish_ticket(trash: &File, key: &str, ticket: &Ticket, replace: bool) -> io::Result<()> {
     use std::io::Write;
     let mut tmp = tempfile::Builder::new()
         .prefix(TICKET_TMP_PREFIX)
@@ -1475,8 +1653,12 @@ fn publish_ticket(trash: &File, key: &str, ticket: &Ticket) -> io::Result<()> {
         .tempfile_in(confined::path(trash))?;
     tmp.write_all(&serde_json::to_vec(ticket).map_err(io::Error::other)?)?;
     tmp.as_file().sync_all()?;
-    tmp.persist_noclobber(confined::path(trash).join(format!("{key}.json")))
-        .map_err(|e| e.error)?;
+    let path = confined::path(trash).join(format!("{key}.json"));
+    if replace {
+        tmp.persist(path).map_err(|e| e.error)?;
+    } else {
+        tmp.persist_noclobber(path).map_err(|e| e.error)?;
+    }
     trash.sync_all()
 }
 
@@ -1500,25 +1682,22 @@ pub fn collect_with_hook(
     hook: &dyn Fn(CollectionStage, &Path) -> io::Result<()>,
 ) -> io::Result<Report> {
     let batch_size = opts.batch_size.max(1);
+    let task_cap = tasks_per_batch();
     let mut out = Out {
         report: Report {
             dry_run: opts.dry_run,
             batch_size,
+            tasks_per_batch: task_cap,
             ..Report::default()
         },
     };
-    // The root was canonicalized once: from here on nothing follows a symlink.
-    let anchor = match fs::OpenOptions::new()
-        .read(true)
-        .custom_flags((OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC).bits() as i32)
-        .open(lock.root())
-    {
-        Ok(anchor) => anchor,
-        Err(e) => {
-            out.push(".", Status::Refused, reason(&e));
-            return Ok(out.finish());
-        }
-    };
+    // The directory the driver lock was proven through: never reopened by path.
+    let anchor = lock.anchor.try_clone()?;
+    let home_dev = rustix::fs::fstat(&anchor)?.st_dev;
+    if let Err(why) = belongs_to_home(&anchor, db, blobs) {
+        out.push(".", Status::Refused, why);
+        return Ok(out.finish());
+    }
     let referenced = db.referenced_blobs().map_err(io::Error::other)?;
     for digest in &referenced {
         if let Err(e) = blobs.get(digest) {
@@ -1532,6 +1711,8 @@ pub fn collect_with_hook(
     }
     let pass = Pass {
         anchor,
+        home_dev,
+        dry_run: opts.dry_run,
         db,
         referenced,
         hook,
@@ -1569,7 +1750,7 @@ pub fn collect_with_hook(
                 }
             }
             Err(abort) => {
-                let why = format!("pass stopped: integrity problem at {}", abort.path);
+                let why = format!("pass stopped at {}", abort.path);
                 out.report.entries.clear();
                 out.push(abort.path, Status::Refused, abort.reason);
                 stop(&mut out, 0, &why);
@@ -1601,7 +1782,12 @@ pub fn collect_with_hook(
     let mut batches: Vec<Vec<usize>> = Vec::new();
     let mut size = 0;
     for (i, n) in eligible {
-        if batches.is_empty() || size >= batch_size {
+        // A batch holds one `ws.lock` per task: the task count is capped whatever the
+        // entry-based batch size says.
+        if batches.is_empty()
+            || size >= batch_size
+            || batches.last().is_some_and(|b| b.len() >= task_cap)
+        {
             batches.push(Vec::new());
             size = 0;
         }
@@ -1627,7 +1813,7 @@ pub fn collect_with_hook(
                 }
                 Ok(plan) => prepared.push(plan),
                 Err(abort) => {
-                    let why = format!("pass stopped: integrity problem at {}", abort.path);
+                    let why = format!("pass stopped at {}", abort.path);
                     out.push(abort.path, Status::Refused, abort.reason);
                     for plan in &prepared {
                         for action in &plan.actions {
@@ -1665,7 +1851,7 @@ pub fn collect_with_hook(
                 match pass.execute(plan, action) {
                     Ok((status, why)) => out.push(path, status, why),
                     Err(Fail::Integrity(why)) => {
-                        let stop_why = format!("pass stopped: integrity problem at {path}");
+                        let stop_why = format!("pass stopped at {path}");
                         out.push(path, Status::Refused, why);
                         abort = Some(stop_why.clone());
                         stopped = Some(stop_why);
