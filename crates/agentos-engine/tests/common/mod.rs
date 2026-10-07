@@ -126,8 +126,10 @@ while [ $# -gt 0 ]; do case "$1" in
   --id) id=$2; shift 2;; --exec-file) exec_file=$2; shift 2;; --chroot-base-dir) base=$2; shift 2;;
   --parent-cgroup) parent=$2; shift 2;; --) shift; break;; *) shift;; esac; done
 chroot="$base/$(basename "$exec_file")/$id/root"
-printf '%s\n' "$all" > "$base/argv.txt"
 mkdir -p "$CGROUP_ROOT/$parent/$id"
+# argv.txt is the signal tests wait for: create the "cgroup" first, publish the file atomically
+printf '%s\n' "$all" > "$base/argv.txt.tmp"
+mv "$base/argv.txt.tmp" "$base/argv.txt"
 found=$(find "$WORK_ROOT" -samefile "$chroot/ws.img" -print -quit)   # the hard link finds the task
 [ -n "$found" ] || { echo "fake jailer: no task under $WORK_ROOT holds $chroot/ws.img" >&2; exit 1; }
 root=$(dirname "$found")
