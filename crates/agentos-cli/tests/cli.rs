@@ -4900,6 +4900,29 @@ fn gc_prints_its_report_and_exits_1_when_it_refuses() {
 }
 
 #[test]
+fn gc_takes_the_driver_lock_before_opening_the_home() {
+    let cli = Cli::bare();
+    create_home(&cli);
+    let tasks = cli.home().join("tasks");
+    fs::remove_dir_all(&tasks).unwrap();
+    let lock = fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(cli.home().join("driver.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    cli.cmd(&["gc", "--dry-run"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("another agentos process"));
+    assert!(
+        !tasks.exists(),
+        "the home was opened before the lock was taken"
+    );
+}
+
+#[test]
 fn gc_refuses_while_another_driver_holds_the_lock() {
     let cli = Cli::bare();
     create_home(&cli);

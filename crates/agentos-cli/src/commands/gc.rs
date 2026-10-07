@@ -10,9 +10,11 @@ pub fn gc(home: &Home, dry_run: bool, batch_size: usize) -> Result<(), CliError>
             home.root.display()
         )));
     }
-    let store = home.open()?;
+    // The driver lock first: opening the store (schema statements, the tasks directory)
+    // must not race a running controller.
     let lock = home.lock()?;
     let held = HeldDriverLock::verify(&home.root, lock.file())?;
+    let store = home.open()?;
     let report = collect(
         &held,
         &store.db,
