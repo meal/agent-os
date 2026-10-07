@@ -347,9 +347,10 @@ pub(crate) fn store_task(tx: &Transaction, t: &Task) -> Result<()> {
 }
 
 impl Db {
-    /// The database file, as SQLite opened it (`None` for an in-memory database).
+    /// The database file, as SQLite opened it; `None` for an in-memory or temporary
+    /// database (SQLite reports those with an empty name).
     pub fn path(&self) -> Option<&Path> {
-        self.conn.path().map(Path::new)
+        self.conn.path().filter(|p| !p.is_empty()).map(Path::new)
     }
 
     pub fn open(path: &Path) -> Result<Db> {

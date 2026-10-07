@@ -1613,7 +1613,7 @@ fn exhaustion_child() {
     let first = gc(env.dir.path(), &env, false);
     assert!(first.failed(), "{first:?}");
     let text = serde_json::to_string(&first).unwrap();
-    assert!(!text.contains("integrity"), "{text}");
+    no_pass_stop(&first);
     assert!(text.contains("retry"), "{text}");
     let mut limit = getrlimit(Resource::Nofile);
     limit.current = limit.maximum;
@@ -1628,4 +1628,229 @@ fn exhaustion_child() {
         0
     );
     println!("exhaustion child finished");
+}
+
+// ---- Round 3: shapes staged and recognised agree; put_back under exhaustion; foreign stores ----
+
+/// Every workspace shape the collector would stage is one a later pass recognises: an
+/// unusual shape is retained up front instead of wedging every later pass.
+#[test]
+fn unusual_workspace_shapes_are_retained_and_never_wedge_later_passes() {
+    for (name, as_dir) in [("ws", false), ("workspace", false), ("ws.img", true)] {
+        let (env, _, _) = settled();
+        let work = env.dir.path().join("work").join(env.task.as_str());
+        fs::remove_dir_all(work.join("ws")).unwrap();
+        fs::remove_file(work.join("ws.img")).unwrap();
+        if as_dir {
+            fs::create_dir(work.join(name)).unwrap();
+            fs::write(work.join(name).join("inner"), b"odd").unwrap();
+        } else {
+            fs::write(work.join(name), b"odd").unwrap();
+        }
+        let interrupted = gc_hook(env.dir.path(), &env, false, &|stage, path| {
+            if stage == CollectionStage::Staged && path.starts_with("work") {
+                return Err(std::io::Error::other("injected crash"));
+            }
+            Ok(())
+        });
+        let rerun = gc(env.dir.path(), &env, false);
+        assert!(!rerun.failed(), "{name}: {interrupted:?}\n{rerun:?}");
+        assert!(work.join(name).exists(), "{name}: {rerun:?}");
+        assert_eq!(
+            status_of(&rerun, &format!("work/{}/{name}", env.task)),
+            ["retained"],
+            "{name}: {rerun:?}"
+        );
+    }
+}
+
+/// The pass went on: anything skipped was skipped only because its own task stopped.
+fn no_pass_stop(report: &Report) {
+    let text = serde_json::to_string(report).unwrap();
+    assert!(!text.contains("pass stopped"), "{text}");
+    assert!(
+        report
+            .entries
+            .iter()
+            .filter(|e| e.status == "skipped")
+            .all(|e| e.reason.starts_with("task stopped after a failure")),
+        "{text}"
+    );
+}
+
+fn read_ticket_json(path: &Path) -> serde_json::Value {
+    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+}
+
+/// A move back that runs out of descriptors (injected at `Restoring`) is a retryable
+/// refusal: ticket and data stay, and the next pass moves the data back, never removes it.
+#[test]
+fn a_move_back_without_descriptors_is_retried_by_the_next_pass() {
+    let (env, _, _) = settled();
+    let (ticket, data) = staged_workspace(&env);
+    // The staged data no longer passes its checks: a later pass must move it back.
+    fs::hard_link(data.join("file"), data.join("linked")).unwrap();
+    let before = fs::read(&ticket).unwrap();
+    let report = gc_hook(env.dir.path(), &env, false, &|stage, _| {
+        if stage == CollectionStage::Restoring {
+            return Err(std::io::Error::from_raw_os_error(24));
+        }
+        Ok(())
+    });
+    let text = serde_json::to_string(&report).unwrap();
+    assert!(report.failed(), "{text}");
+    no_pass_stop(&report);
+    assert!(
+        !text.contains("pass stopped") && text.contains("retry"),
+        "{text}"
+    );
+    assert_eq!(
+        fs::read(&ticket).unwrap(),
+        before,
+        "the ticket is unchanged"
+    );
+    assert!(data.join("file").exists());
+    let again = gc(env.dir.path(), &env, false);
+    let ws = env
+        .dir
+        .path()
+        .join("work")
+        .join(env.task.as_str())
+        .join("ws");
+    assert!(
+        ws.join("file").exists() && ws.join("linked").exists(),
+        "{again:?}"
+    );
+    assert!(!ticket.exists() && !data.exists(), "{again:?}");
+}
+
+/// An entry swapped before staging whose move back runs out of descriptors keeps a ticket
+/// rewritten to name it with `restore`: the next pass moves it back, never removes it.
+#[test]
+fn a_swapped_entry_that_cannot_be_moved_back_is_marked_for_restore() {
+    let (env, _, _) = settled();
+    let work = env.dir.path().join("work").join(env.task.as_str());
+    let report = gc_hook(env.dir.path(), &env, false, &|stage, path| {
+        if stage == CollectionStage::TicketPublished && path.ends_with("ws") {
+            fs::rename(work.join("ws"), work.join("ws-validated"))?;
+            fs::create_dir(work.join("ws"))?;
+            fs::write(work.join("ws/foreign"), b"not validated")?;
+        }
+        if stage == CollectionStage::Restoring {
+            return Err(std::io::Error::from_raw_os_error(24));
+        }
+        Ok(())
+    });
+    let text = serde_json::to_string(&report).unwrap();
+    assert!(report.failed() && text.contains("retry"), "{text}");
+    let key = ticket_key(&format!("work/{}/ws", env.task));
+    let trash = env.dir.path().join("gc-trash");
+    let staged = trash.join(&key).join("data");
+    let ticket = read_ticket_json(&trash.join(format!("{key}.json")));
+    assert_eq!(ticket["restore"], true, "{ticket}");
+    assert_eq!(
+        ticket["inode"].as_u64().unwrap(),
+        std::os::unix::fs::MetadataExt::ino(&fs::symlink_metadata(&staged).unwrap())
+    );
+    assert!(staged.join("foreign").exists());
+    let again = gc(env.dir.path(), &env, false);
+    assert_eq!(
+        fs::read(work.join("ws/foreign")).unwrap(),
+        b"not validated",
+        "{again:?}"
+    );
+    assert!(!trash.join(format!("{key}.json")).exists(), "{again:?}");
+    assert!(work.join("ws-validated/file").exists());
+}
+
+/// The lock proves one home; a database or blob store of another home is refused.
+#[test]
+fn a_store_of_another_home_is_refused() {
+    for foreign in ["db", "blobs"] {
+        let (env, job, retention) = settled();
+        let other = Env::new(10);
+        let lock = File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(env.dir.path().join("driver.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        let held = HeldDriverLock::verify(env.dir.path(), &lock).unwrap();
+        let (db, blobs) = if foreign == "db" {
+            (&other.db, &env.blobs)
+        } else {
+            (&env.db, &other.blobs)
+        };
+        let report = agentos_engine::gc::collect(&held, db, blobs, Options::new(false)).unwrap();
+        assert!(report.failed(), "{foreign}: {report:?}");
+        assert!(
+            report.entries[0].reason.contains("not this home's"),
+            "{report:?}"
+        );
+        assert!(job.path.join("output.bin").exists() && retention.exists());
+    }
+}
+
+/// Staged data on another filesystem than the home is not what a ticket staged, even with
+/// the ticket's inode number.
+#[test]
+fn mount_gate_staged_data_on_another_device_is_refused() {
+    if !mount_gate() {
+        return;
+    }
+    let (env, job, _) = settled();
+    let relative = format!("work/{}/ws", env.task);
+    let key = ticket_key(&relative);
+    let trash = Mounted::tmpfs(&env.dir.path().join("gc-trash"));
+    fs::remove_file(trash.0.join("foreign")).unwrap();
+    let data = trash.0.join(&key).join("data");
+    fs::create_dir_all(&data).unwrap();
+    fs::write(data.join("elsewhere"), b"must remain").unwrap();
+    let mut ticket = ws_ticket(&relative, &env.task, "Workspace", 2);
+    ticket["inode"] = serde_json::json!(std::os::unix::fs::MetadataExt::ino(
+        &fs::metadata(&data).unwrap()
+    ));
+    fs::write(
+        trash.0.join(format!("{key}.json")),
+        serde_json::to_vec(&ticket).unwrap(),
+    )
+    .unwrap();
+    let report = gc(env.dir.path(), &env, false);
+    assert!(report.failed(), "{report:?}");
+    assert!(
+        report.entries[0].reason.contains("not the entry"),
+        "{report:?}"
+    );
+    assert_eq!(fs::read(data.join("elsewhere")).unwrap(), b"must remain");
+    assert!(job.path.join("output.bin").exists());
+}
+
+/// Staged data with the ticket's inode but another kind of file than the ticket's name
+/// implies (a directory staged as `ws.img`) is not what that ticket staged.
+#[test]
+fn staged_data_of_another_kind_than_its_ticket_names_is_refused() {
+    let (env, _, _) = settled();
+    let (ticket, data) = staged_workspace(&env);
+    let trash = env.dir.path().join("gc-trash");
+    let img = format!("work/{}/ws.img", env.task);
+    let key = ticket_key(&img);
+    // The real ws.img is collected aside first, so only the forged ticket names it.
+    fs::remove_file(env.dir.path().join(&img)).unwrap();
+    let mut forged = read_ticket_json(&ticket);
+    forged["relative"] = serde_json::json!(img);
+    fs::rename(data.parent().unwrap(), trash.join(&key)).unwrap();
+    fs::remove_file(&ticket).unwrap();
+    fs::write(
+        trash.join(format!("{key}.json")),
+        serde_json::to_vec(&forged).unwrap(),
+    )
+    .unwrap();
+    let report = gc(env.dir.path(), &env, false);
+    assert!(report.failed(), "{report:?}");
+    assert!(
+        report.entries[0].reason.contains("not the entry"),
+        "{report:?}"
+    );
+    assert!(trash.join(&key).join("data/file").exists());
 }

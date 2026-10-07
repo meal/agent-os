@@ -184,6 +184,8 @@ pub enum CollectionStage {
     Staged,
     /// The staged data and its directory are gone; the ticket remains.
     Removed,
+    /// Staged data is about to be moved back to its original place.
+    Restoring,
 }
 
 /// Why an entry or task is not collected.
@@ -214,8 +216,8 @@ impl From<io::Error> for Fail {
             Fail::Integrity(reason(&e))
         } else if transient(&e) {
             Fail::Transient(format!(
-                "{}: a resource shortage, not a problem with the data; retry with more free \
-                 descriptors or memory, or a lower --batch-size",
+                "{}: a resource shortage, not a problem with the data; retry with a higher \
+                 descriptor limit (ulimit -n) or more free memory",
                 reason(&e)
             ))
         } else {
@@ -515,6 +517,16 @@ impl Ticket {
                 && self.relative.file_name() == Some(OsStr::new("v.sock")),
             socket_child: None,
         }
+    }
+}
+
+/// The only kind of file an entry of `kind` named `name` may be: classification stages
+/// nothing else, and a later pass recognises staged data by it.
+fn expected_type(kind: Kind, name: &str) -> FileType {
+    match (kind, name) {
+        (Kind::JobFile, "v.sock") => FileType::Socket,
+        (Kind::JobFile, _) | (Kind::Workspace, "ws.img") => FileType::RegularFile,
+        (Kind::Workspace, _) | (Kind::Model, _) => FileType::Directory,
     }
 }
 
@@ -1060,11 +1072,8 @@ impl Pass<'_> {
                 continue;
             };
             let ft = confined::file_type(&st);
-            let fits = match file {
-                "output.bin" => ft == FileType::RegularFile,
-                "scratch.img" => ft == FileType::RegularFile,
-                _ => firecracker && ft == FileType::Socket,
-            };
+            let fits =
+                ft == expected_type(Kind::JobFile, file) && (file != "v.sock" || firecracker);
             if !fits {
                 return Err(Fail::Retain(format!("unexpected {file} in the job")));
             }
@@ -1153,8 +1162,21 @@ impl Pass<'_> {
         let Some(st) = confined::stat(&dir, OsStr::new(name))? else {
             return Ok(None);
         };
-        if confined::file_type(&st) == FileType::Symlink {
+        let ft = confined::file_type(&st);
+        if ft == FileType::Symlink {
             return Err(Fail::Integrity(format!("work/{task}/{name} is a symlink")));
+        }
+        // Workers write `ws`/`workspace` as directories and `ws.img` as a file; staging any
+        // other shape would leave data a later pass cannot recognise as its own.
+        if ft != expected_type(Kind::Workspace, name) {
+            return Err(Fail::Retain(format!(
+                "work/{task}/{name} is not a {}; kept",
+                if name == "ws.img" {
+                    "regular file"
+                } else {
+                    "directory"
+                }
+            )));
         }
         check_tree(&confined::path(&dir).join(name), Rules::default())?;
         Ok(Some(Delete {
@@ -1246,14 +1268,9 @@ impl Pass<'_> {
     /// compared across passes: it need not survive a reboot or remount.
     fn staged_by(&self, ticket: &Ticket, st: &rustix::fs::Stat) -> bool {
         let name = ticket.relative.file_name().and_then(OsStr::to_str);
-        let expected = match (ticket.kind, name) {
-            (Kind::JobFile, Some("v.sock")) => FileType::Socket,
-            (Kind::JobFile, _) | (Kind::Workspace, Some("ws.img")) => FileType::RegularFile,
-            (Kind::Workspace, _) | (Kind::Model, _) => FileType::Directory,
-        };
         st.st_ino == ticket.inode
             && st.st_dev == self.home_dev
-            && confined::file_type(st) == expected
+            && confined::file_type(st) == expected_type(ticket.kind, name.unwrap_or(""))
     }
 
     /// Classifies one task without deleting anything. `Err` is an integrity problem.
@@ -1446,23 +1463,41 @@ impl Pass<'_> {
         staged: &rustix::fs::Stat,
     ) -> Fail {
         let name = ticket.relative.file_name().expect("shape checked");
-        let moved = match parent {
-            Some(p) => confined::restore(stage, p, name),
-            None => confined::parent(&self.anchor, &ticket.relative)
-                .and_then(|p| confined::restore(stage, &p, name)),
+        let moved =
+            (self.hook)(CollectionStage::Restoring, &ticket.relative).and_then(|()| match parent {
+                Some(p) => confined::restore(stage, p, name),
+                None => confined::parent(&self.anchor, &ticket.relative)
+                    .and_then(|p| confined::restore(stage, &p, name)),
+            });
+        let moved = match moved {
+            Ok(()) => Ok(()),
+            Err(e) => Err(Fail::from(e)),
         };
-        match moved
-            .map_err(Fail::from)
-            .and_then(|()| self.retire(trash, key))
-        {
-            Ok(()) => match fail {
-                Fail::Integrity(why) => Fail::Integrity(format!("{why}; moved back and kept")),
-                other => Fail::Refuse(format!("{}; moved back and kept", other.text())),
-            },
+        match moved {
+            Ok(()) => {
+                let kept = match &fail {
+                    Fail::Integrity(why) => format!("{why}; moved back and kept"),
+                    other => format!("{}; moved back and kept", other.text()),
+                };
+                match self.retire(trash, key) {
+                    Ok(()) if matches!(fail, Fail::Integrity(_)) => Fail::Integrity(kept),
+                    Ok(()) => Fail::Refuse(kept),
+                    // The data is back; the leftover ticket names an entry that never moved
+                    // again, so the next pass drops it.
+                    Err(e) => Fail::Refuse(format!(
+                        "{kept}; dropping its ticket failed ({}), the next pass drops it",
+                        e.text()
+                    )),
+                }
+            }
             Err(Fail::Transient(why)) => {
                 // A ticket naming this very inode already leads the next pass to move it back
-                // (its checks fail again) or to finish it (they pass): no rewrite needed.
-                let named = (ticket.device, ticket.inode) == confined::identity_of(staged);
+                // (its checks fail again) or to finish it (they pass): no rewrite needed. A
+                // ticket from an earlier pass is matched as later passes match it.
+                let named = match parent {
+                    Some(_) => (ticket.device, ticket.inode) == confined::identity_of(staged),
+                    None => self.staged_by(ticket, staged),
+                };
                 let marked = named
                     || publish_ticket(
                         trash,
@@ -1612,10 +1647,9 @@ fn try_lock_briefly(lock: &File) -> bool {
     false
 }
 
-/// Publishes `ticket` durably; `replace` overwrites an existing ticket of the same key
-/// atomically (only to mark staged data for moving back).
 /// The database and blob store handed to `collect` are this home's (`agentos.db` and
-/// `blobs/objects` under the anchored directory, compared by device and inode).
+/// `blobs/objects` under the anchored directory, compared by device and inode). A symlinked
+/// `agentos.db` or `blobs` resolves elsewhere and is refused too.
 fn belongs_to_home(anchor: &File, db: &Db, blobs: &BlobStore) -> Result<(), String> {
     let same = |relative: &[&str], path: Option<&Path>| -> bool {
         let Some(path) = path else { return false };
@@ -1637,14 +1671,23 @@ fn belongs_to_home(anchor: &File, db: &Db, blobs: &BlobStore) -> Result<(), Stri
             if confined::identity_of(&st) == (meta.dev(), meta.ino()))
     };
     if !same(&["agentos.db"], db.path()) {
-        return Err("the database is not this home's agentos.db".into());
+        return Err(
+            "the database is not this home's agentos.db (an in-memory or symlinked database \
+             is refused)"
+                .into(),
+        );
     }
     if !same(&["blobs", "objects"], Some(blobs.objects_dir())) {
-        return Err("the blob store is not this home's blobs".into());
+        return Err(
+            "the blob store is not this home's blobs (a symlinked blobs directory is refused)"
+                .into(),
+        );
     }
     Ok(())
 }
 
+/// Publishes `ticket` durably; `replace` overwrites an existing ticket of the same key
+/// atomically (only to mark staged data for moving back).
 fn publish_ticket(trash: &File, key: &str, ticket: &Ticket, replace: bool) -> io::Result<()> {
     use std::io::Write;
     let mut tmp = tempfile::Builder::new()
