@@ -87,7 +87,10 @@ pub async fn dispatch(args: Args) -> Result<(), CliError> {
             revoke::revoke(&home, &task_id(&id)?, capability.as_deref())
         }
         Command::Export { id, dir } => export::export(&home, &task_id(&id)?, &dir),
-        Command::Gc { dry_run } => gc::gc(&home, dry_run),
+        Command::Gc {
+            dry_run,
+            batch_size,
+        } => gc::gc(&home, dry_run, batch_size as usize),
         Command::Supervise { .. } => unreachable!("handled before the runtime starts"),
     }
 }

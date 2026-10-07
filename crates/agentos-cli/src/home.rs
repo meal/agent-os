@@ -187,6 +187,11 @@ pub struct Store {
 pub struct DriverLock(File);
 
 impl DriverLock {
+    /// The locked `driver.lock` itself, for engine operations that demand proof of it.
+    pub fn file(&self) -> &File {
+        &self.0
+    }
+
     /// Records that the holder now drives `task`.
     pub fn driving(&self, task: &TaskId) -> std::io::Result<()> {
         let mut f = &self.0;
