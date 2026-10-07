@@ -554,3 +554,23 @@ impl Db {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    /// SQLite names in-memory and temporary databases with an empty string: no path.
+    #[test]
+    fn in_memory_and_temporary_databases_have_no_path() {
+        for conn in [
+            Connection::open_in_memory().unwrap(),
+            Connection::open("").unwrap(),
+        ] {
+            let db = Db {
+                conn,
+                clock: Box::new(now_ts),
+            };
+            assert_eq!(db.path(), None);
+        }
+    }
+}

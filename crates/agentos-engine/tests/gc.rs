@@ -1854,3 +1854,72 @@ fn staged_data_of_another_kind_than_its_ticket_names_is_refused() {
     );
     assert!(trash.join(&key).join("data/file").exists());
 }
+
+// ---- Round 4: restore tickets record what they staged ----
+
+/// An entry swapped (to a file, a symlink, or a directory where a file belongs) between
+/// validation and the move, whose move back runs out of descriptors, is moved back by the
+/// next pass: its restore ticket records what was staged, and the pass never stops.
+#[test]
+fn a_swapped_entry_of_another_shape_is_moved_back_by_the_next_pass() {
+    for (target, swap) in [("ws", "file"), ("ws", "symlink"), ("ws.img", "dir")] {
+        let (env, _, _) = settled();
+        let outside = tempfile::tempdir().unwrap();
+        let work = env.dir.path().join("work").join(env.task.as_str());
+        let aside = work.join(format!("{target}-validated"));
+        let report = gc_hook(env.dir.path(), &env, false, &|stage, path| {
+            if stage == CollectionStage::TicketPublished && path.ends_with(target) {
+                fs::rename(work.join(target), &aside)?;
+                match swap {
+                    "file" => fs::write(work.join(target), b"foreign file")?,
+                    "symlink" => std::os::unix::fs::symlink(outside.path(), work.join(target))?,
+                    _ => fs::create_dir(work.join(target))?,
+                }
+            }
+            if stage == CollectionStage::Restoring {
+                return Err(std::io::Error::from_raw_os_error(24));
+            }
+            Ok(())
+        });
+        let text = serde_json::to_string(&report).unwrap();
+        assert!(
+            report.failed() && text.contains("next pass moves it back"),
+            "{swap}: {text}"
+        );
+        let again = gc(env.dir.path(), &env, false);
+        let again_text = serde_json::to_string(&again).unwrap();
+        assert!(!again_text.contains("pass stopped"), "{swap}: {again_text}");
+        let back = fs::symlink_metadata(work.join(target)).unwrap();
+        match swap {
+            "file" => assert_eq!(fs::read(work.join(target)).unwrap(), b"foreign file"),
+            "symlink" => assert!(back.file_type().is_symlink()),
+            _ => assert!(back.is_dir()),
+        }
+        assert!(aside.exists(), "the validated original is untouched");
+        let key = ticket_key(&format!("work/{}/{target}", env.task));
+        let trash = env.dir.path().join("gc-trash");
+        assert!(
+            !trash.join(format!("{key}.json")).exists(),
+            "{swap}: {again_text}"
+        );
+        assert!(!trash.join(&key).exists(), "{swap}: {again_text}");
+    }
+}
+
+/// A recorded file type only widens what a restore ticket accepts: on a ticket that
+/// removes data, a recorded type other than the expected one is refused.
+#[test]
+fn a_removal_ticket_recording_another_file_type_is_refused() {
+    let (env, _, _) = settled();
+    let (ticket, data) = staged_workspace(&env);
+    let mut value = read_ticket_json(&ticket);
+    value["file_type"] = serde_json::json!("regular_file");
+    fs::write(&ticket, serde_json::to_vec(&value).unwrap()).unwrap();
+    let report = gc(env.dir.path(), &env, false);
+    assert!(report.failed(), "{report:?}");
+    assert!(
+        report.entries[0].reason.contains("not the entry"),
+        "{report:?}"
+    );
+    assert!(data.join("file").exists());
+}

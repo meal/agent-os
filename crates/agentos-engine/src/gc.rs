@@ -508,7 +508,87 @@ struct Ticket {
     /// moving it back failed: a later pass moves it back and never removes it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     restore: bool,
+    /// The kind of file that was staged, from the same stat that captured `inode`.
+    /// Absent in tickets of earlier builds (see `ticket_accepts`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_type: Option<StagedType>,
 }
+
+/// A kind of file as recorded in a ticket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum StagedType {
+    Directory,
+    RegularFile,
+    Socket,
+    Symlink,
+    Fifo,
+    CharDevice,
+    BlockDevice,
+    Unknown,
+}
+impl StagedType {
+    fn of(ft: FileType) -> StagedType {
+        match ft {
+            FileType::Directory => StagedType::Directory,
+            FileType::RegularFile => StagedType::RegularFile,
+            FileType::Socket => StagedType::Socket,
+            FileType::Symlink => StagedType::Symlink,
+            FileType::Fifo => StagedType::Fifo,
+            FileType::CharacterDevice => StagedType::CharDevice,
+            FileType::BlockDevice => StagedType::BlockDevice,
+            FileType::Unknown => StagedType::Unknown,
+        }
+    }
+}
+
+/// THE rule for which staged data a ticket describes (by kind of file; identity is
+/// compared separately). Every ticket writer goes through `removal_ticket` or
+/// `restore_ticket` and every reader through this function:
+/// - a removal ticket only ever describes the expected kind for its entry
+///   (`expected_type`), and a recorded type must be that kind too;
+/// - a restore ticket describes whatever was staged, as recorded: it only ever moves data
+///   back, so any recorded kind is safe; one without a record (earlier builds) keeps the
+///   expected-kind rule.
+fn ticket_accepts(ticket: &Ticket, staged: FileType) -> bool {
+    let name = ticket
+        .relative
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("");
+    let expected = StagedType::of(expected_type(ticket.kind, name));
+    let actual = StagedType::of(staged);
+    match (ticket.restore, ticket.file_type) {
+        (true, Some(recorded)) => actual == recorded,
+        (_, recorded) => actual == expected && recorded.is_none_or(|r| r == expected),
+    }
+}
+
+/// The ticket that stages `d` for removal, recording the kind of file validated.
+fn removal_ticket(d: &Delete) -> Ticket {
+    Ticket {
+        version: TICKET_VERSION,
+        relative: d.relative.clone(),
+        kind: d.kind,
+        proof: d.proof.clone(),
+        device: d.identity.0,
+        inode: d.identity.1,
+        restore: false,
+        file_type: Some(StagedType::of(d.file_type)),
+    }
+}
+
+/// `ticket` rewritten to name staged data (moved by this pass) for moving back only.
+fn restore_ticket(ticket: &Ticket, identity: (u64, u64), staged: FileType) -> Ticket {
+    Ticket {
+        device: identity.0,
+        inode: identity.1,
+        restore: true,
+        file_type: Some(StagedType::of(staged)),
+        ..ticket.clone()
+    }
+}
+
 impl Ticket {
     fn rules(&self) -> Rules {
         Rules {
@@ -585,6 +665,8 @@ struct Delete {
     proof: Proof,
     /// Device/inode of the entry, captured while it was validated.
     identity: (u64, u64),
+    /// Its kind of file, from the same stat.
+    file_type: FileType,
     /// Device/inode of its parent directory, captured while it was validated.
     parent: (u64, u64),
 }
@@ -1095,6 +1177,7 @@ impl Pass<'_> {
                     firecracker_socket: firecracker,
                 },
                 identity: confined::identity_of(&st),
+                file_type: ft,
                 parent: job_identity,
             });
         }
@@ -1144,6 +1227,7 @@ impl Pass<'_> {
                 firecracker_socket: false,
             },
             identity,
+            file_type: FileType::Directory,
             parent: confined::dir_identity(&root)?,
         }))
     }
@@ -1191,6 +1275,7 @@ impl Pass<'_> {
                 firecracker_socket: false,
             },
             identity: confined::identity_of(&st),
+            file_type: ft,
             parent: confined::dir_identity(&dir)?,
         }))
     }
@@ -1267,10 +1352,9 @@ impl Pass<'_> {
     /// and kind of file, on the home's current device. The recorded device number is not
     /// compared across passes: it need not survive a reboot or remount.
     fn staged_by(&self, ticket: &Ticket, st: &rustix::fs::Stat) -> bool {
-        let name = ticket.relative.file_name().and_then(OsStr::to_str);
         st.st_ino == ticket.inode
             && st.st_dev == self.home_dev
-            && confined::file_type(st) == expected_type(ticket.kind, name.unwrap_or(""))
+            && ticket_accepts(ticket, confined::file_type(st))
     }
 
     /// Classifies one task without deleting anything. `Err` is an integrity problem.
@@ -1498,19 +1582,15 @@ impl Pass<'_> {
                     Some(_) => (ticket.device, ticket.inode) == confined::identity_of(staged),
                     None => self.staged_by(ticket, staged),
                 };
+                // Only promise a later move back if the later reader accepts what is written.
+                let rewritten = restore_ticket(
+                    ticket,
+                    confined::identity_of(staged),
+                    confined::file_type(staged),
+                );
                 let marked = named
-                    || publish_ticket(
-                        trash,
-                        key,
-                        &Ticket {
-                            device: staged.st_dev,
-                            inode: staged.st_ino,
-                            restore: true,
-                            ..ticket.clone()
-                        },
-                        true,
-                    )
-                    .is_ok();
+                    || (ticket_accepts(&rewritten, confined::file_type(staged))
+                        && publish_ticket(trash, key, &rewritten, true).is_ok());
                 if marked {
                     Fail::Transient(format!(
                         "{}; moving it back failed ({why}); it stays staged and the next pass \
@@ -1555,15 +1635,13 @@ impl Pass<'_> {
                 "a deletion ticket for this path already exists".into(),
             ));
         }
-        let ticket = Ticket {
-            version: TICKET_VERSION,
-            relative: d.relative.clone(),
-            kind: d.kind,
-            proof: d.proof.clone(),
-            device: d.identity.0,
-            inode: d.identity.1,
-            restore: false,
-        };
+        let ticket = removal_ticket(d);
+        if !ticket_accepts(&ticket, d.file_type) {
+            // Classification stages only expected kinds; never write what no pass can read.
+            return Err(Fail::Refuse(
+                "unexpected kind of file for this entry; kept".into(),
+            ));
+        }
         publish_ticket(&trash, &key, &ticket, false)?;
         self.stage(CollectionStage::TicketPublished, &d.relative)?;
         let stage = confined::directory(&trash, OsStr::new(&key))?;
@@ -1913,4 +1991,129 @@ pub fn collect_with_hook(
         }
     }
     Ok(out.finish())
+}
+
+#[cfg(test)]
+mod ticket_tests {
+    use super::*;
+
+    const ALL: [FileType; 8] = [
+        FileType::Directory,
+        FileType::RegularFile,
+        FileType::Socket,
+        FileType::Symlink,
+        FileType::Fifo,
+        FileType::CharacterDevice,
+        FileType::BlockDevice,
+        FileType::Unknown,
+    ];
+
+    fn entries() -> Vec<(Kind, String, bool)> {
+        let effect = "e".repeat(64);
+        let attempt = "00000000-0000-0000-0000-000000000000";
+        let task = "11111111-1111-1111-1111-111111111111";
+        let mut out = Vec::new();
+        for name in WORKSPACES {
+            out.push((Kind::Workspace, format!("work/{task}/{name}"), false));
+        }
+        for name in JOB_FILES {
+            out.push((
+                Kind::JobFile,
+                format!("jobs/{effect}-{attempt}/{name}"),
+                true,
+            ));
+        }
+        out.push((Kind::Model, format!("model/{effect}-{attempt}"), false));
+        out
+    }
+
+    fn ticket(kind: Kind, relative: &str, firecracker: bool) -> Ticket {
+        let has_effect = kind != Kind::Workspace;
+        let ticket = Ticket {
+            version: TICKET_VERSION,
+            relative: relative.into(),
+            kind,
+            proof: Proof {
+                task: serde_json::from_value(serde_json::json!(
+                    "11111111-1111-1111-1111-111111111111"
+                ))
+                .unwrap(),
+                effect: has_effect
+                    .then(|| serde_json::from_value(serde_json::json!("e".repeat(64))).unwrap()),
+                attempt: has_effect.then(|| {
+                    serde_json::from_value(serde_json::json!(
+                        "00000000-0000-0000-0000-000000000000"
+                    ))
+                    .unwrap()
+                }),
+                result: has_effect.then(|| Digest::of(b"r")),
+                lease: 1,
+                firecracker_socket: firecracker,
+            },
+            device: 1,
+            inode: 2,
+            restore: false,
+            file_type: None,
+        };
+        assert_eq!(ticket_shape(&ticket), Ok(()), "{relative}");
+        ticket
+    }
+
+    /// Every ticket a writer can produce is accepted by the reader (write-set within
+    /// read-set), and a removal ticket never accepts another kind of file.
+    #[test]
+    fn every_written_ticket_is_read_back_and_removal_stays_strict() {
+        for (kind, relative, firecracker) in entries() {
+            let base = ticket(kind, &relative, firecracker);
+            let name = relative.rsplit('/').next().unwrap();
+            let expected = expected_type(kind, name);
+            for ft in ALL {
+                // Removal: classification stages only the expected kind (it checks
+                // `expected_type`); that ticket must be readable, any other must not be.
+                let delete = Delete {
+                    relative: relative.clone().into(),
+                    kind,
+                    proof: base.proof.clone(),
+                    identity: (1, 2),
+                    file_type: ft,
+                    parent: (1, 3),
+                };
+                let removal = removal_ticket(&delete);
+                assert_eq!(
+                    ticket_accepts(&removal, ft),
+                    ft == expected,
+                    "{relative} {ft:?}"
+                );
+                // Restore: whatever this pass staged, the rewritten ticket names it.
+                let restore = restore_ticket(&removal, (7, 9), ft);
+                assert!(ticket_accepts(&restore, ft), "restore {relative} {ft:?}");
+                for other in ALL.into_iter().filter(|o| *o != ft) {
+                    assert!(
+                        !ticket_accepts(&restore, other),
+                        "{relative} {ft:?}/{other:?}"
+                    );
+                }
+                // A removal ticket recording another kind is refused even for that kind.
+                if ft != expected {
+                    let lying = Ticket {
+                        file_type: Some(StagedType::of(ft)),
+                        ..base.clone()
+                    };
+                    assert!(!ticket_accepts(&lying, ft), "{relative} {ft:?}");
+                }
+                // Tickets of earlier builds (no record) keep the expected-kind rule.
+                for restore in [false, true] {
+                    let old = Ticket {
+                        restore,
+                        ..base.clone()
+                    };
+                    assert_eq!(
+                        ticket_accepts(&old, ft),
+                        ft == expected,
+                        "{relative} {ft:?}"
+                    );
+                }
+            }
+        }
+    }
 }
