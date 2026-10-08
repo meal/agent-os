@@ -60,6 +60,7 @@ dependencies = [
 name = "agentos-engine"
 version = "0.1.0"
 dependencies = [
+ "agentos-component",
  "agentos-core",
  "agentos-guest",
  "agentos-store",
