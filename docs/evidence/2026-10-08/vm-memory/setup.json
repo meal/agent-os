@@ -1,1 +1,1 @@
-{"schema_version":1,"tier":"kvm","commit":"f429da3088e246c12d71163de00e52e116e3718a","image":"python-stdlib-v1","test":"measure_jail_memory_under_heavy_writes","note":"run from a dirty tree: the measurement test itself was uncommitted"}
+{"schema_version":1,"tier":"kvm","commit":"7955b967472cc61e003f690ec1dde7e30ffc9fe8","image":"python-stdlib-v1","tests":["measure_jail_memory_under_heavy_writes","measure_jail_memory_with_concurrent_disk_fills"],"note":"run from a tree whose only change was the measurement tests themselves; samples every 20 ms"}

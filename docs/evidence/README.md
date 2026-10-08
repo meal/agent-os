@@ -29,10 +29,16 @@ the guest actually runs against the manifest for every image. The candidate is a
 not the default; the interpreter is copied from the pinned pyenv build, not rebuilt
 independently from source (see the recipe README).
 
-Task 9 memory measurements (`vm-memory/`): the hostile disk-fill check at 256 and 1024
-MiB of guest memory, with and without the 32 MiB/s minimum rate, alone and against a host
-writer. No case recorded an OOM kill; at 256 MiB the jail cgroup stayed at its 384 MiB limit
-by reclaiming page cache. The run used the measurement test before it was committed.
+Task 9 (contract-driven VM disks and I/O):
+
+| Run | Commit | Result |
+| --- | --- | --- |
+| `acceptance.sh kvm` | `b58087a` | **Failed**: one engine unit test raced a lock release against another test's process spawn (`kvm-task9-failed-attempt/`). Not a Task 9 change. |
+| `acceptance.sh kvm`, after the test fix | `7955b96` | Passed: both suites, 1018 passed and 0 failed in each (`kvm-task9-pass/`). |
+
+The memory measurements behind the jail's 128 MiB overhead are in `vm-memory/`: the
+hostile disk-fill check at 256 and 1024 MiB of guest memory, alone and four at once. The
+smallest headroom of memory reclaim cannot drop was 61 MiB, and no case recorded an OOM kill.
 
 Image `python-stdlib-v1`; Firecracker v1.17.0; kernel 6.18.51. The live runs predate the test
 fix, which changes only a test assertion. Recordings (schema version 2) are in
@@ -56,7 +62,7 @@ replay report, manifest, `patch.diff` (by BLAKE3), recording and setup commit mu
 The live harness also scans its recording and bundle for the exact key bytes before it
 writes a success report. The method of the first manual scan was not
 recorded; the decoded scan above finds nothing in these runs. Two-snapshot
-fresh-host evidence, VM resource measurements and the component ABI remain open.
+fresh-host evidence and the component ABI remain open.
 
 Run from a normal checkout on the provisioned Linux x86_64 Docker host:
 

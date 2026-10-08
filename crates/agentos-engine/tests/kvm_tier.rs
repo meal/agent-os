@@ -1896,6 +1896,13 @@ async fn measure_jail_memory_under_heavy_writes() {
                         .and_then(|e| keyed(e).get(k).copied())
                 };
                 let peak = max_of(&|s| num(s, "memory.peak").or_else(|| num(s, "memory.current")));
+                // What reclaim cannot drop at that instant: anonymous memory plus dirty and
+                // writeback page cache, summed within one sample.
+                let pinned = max_of(&|s| {
+                    Some(stat(s, "anon")? + stat(s, "file_dirty")? + stat(s, "file_writeback")?)
+                });
+                let limit =
+                    u64::from(memory + agentos_engine::jail::JAIL_MEMORY_OVERHEAD_MIB) << 20;
                 let row = serde_json::json!({
                     "guest_mib": memory,
                     "bandwidth_mib_s": bandwidth,
@@ -1903,6 +1910,8 @@ async fn measure_jail_memory_under_heavy_writes() {
                     "outcome": format!("{:?}", ran.out.receipt.outcome),
                     "peak_mib": peak >> 20,
                     "overhead_mib": (peak >> 20) as i64 - i64::from(memory),
+                    "unreclaimable_mib": pinned >> 20,
+                    "headroom_mib": (limit as i64 - pinned as i64) >> 20,
                     "anon_mib": max_of(&|s| stat(s, "anon")) >> 20,
                     "file_mib": max_of(&|s| stat(s, "file")) >> 20,
                     "file_dirty_mib": max_of(&|s| stat(s, "file_dirty")) >> 20,
@@ -1917,6 +1926,66 @@ async fn measure_jail_memory_under_heavy_writes() {
         }
     }
     fs::write(&out, serde_json::to_vec_pretty(&rows).unwrap()).unwrap();
+}
+
+/// The condition the disk-fill test once met an OOM in: several VMs filling their drives at
+/// once. Four 256 MiB guests run the hostile disk-fill check together; each row is one VM.
+/// Runs only with `AGENTOS_MEASURE_OUT=<file>` (written as `<file>.concurrent`).
+#[tokio::test(flavor = "multi_thread")]
+async fn measure_jail_memory_with_concurrent_disk_fills() {
+    let Some(kvm) = kvm::require() else { return };
+    let Some(out) = std::env::var_os("AGENTOS_MEASURE_OUT") else {
+        println!("SKIPPED: set AGENTOS_MEASURE_OUT=<file> to measure");
+        return;
+    };
+    let _alone = exclusive().await;
+    let fxs: Vec<Fx> = (0..4).map(|_| Fx::new(&kvm)).collect();
+    for fx in &fxs {
+        fx.snapshot().await;
+        fx.use_profile("hostile/disk-fill");
+    }
+    let every = Duration::from_millis(20);
+    let (a, b, c, d) = tokio::join!(
+        fxs[0].verify_watched(every, |w| w),
+        fxs[1].verify_watched(every, |w| w),
+        fxs[2].verify_watched(every, |w| w),
+        fxs[3].verify_watched(every, |w| w),
+    );
+    let runs = [a, b, c, d];
+    let mut rows = Vec::new();
+    for (ran, samples) in runs {
+        let stat = |s: &VmSample, k: &str| {
+            keyed(s.cgroup.get("memory.stat").map_or("", String::as_str))
+                .get(k)
+                .copied()
+        };
+        let max_of =
+            |f: &dyn Fn(&VmSample) -> Option<u64>| samples.iter().filter_map(f).max().unwrap_or(0);
+        let pinned = max_of(&|s| {
+            Some(stat(s, "anon")? + stat(s, "file_dirty")? + stat(s, "file_writeback")?)
+        });
+        let events = |s: &VmSample, k: &str| {
+            s.cgroup
+                .get("memory.events")
+                .and_then(|e| keyed(e).get(k).copied())
+        };
+        let limit = u64::from(256 + agentos_engine::jail::JAIL_MEMORY_OVERHEAD_MIB) << 20;
+        let row = serde_json::json!({
+            "guest_mib": 256,
+            "concurrent_vms": 4,
+            "outcome": format!("{:?}", ran.out.receipt.outcome),
+            "unreclaimable_mib": pinned >> 20,
+            "headroom_mib": (limit as i64 - pinned as i64) >> 20,
+            "events_max": max_of(&|s| events(s, "max")),
+            "oom_kill": max_of(&|s| events(s, "oom_kill")),
+            "samples": samples.len(),
+        });
+        println!("MEASURE {row}");
+        rows.push(row);
+    }
+    let mut path = out.clone();
+    path.push(".concurrent");
+    fs::write(path, serde_json::to_vec_pretty(&rows).unwrap()).unwrap();
 }
 
 /// A pinned profile whose source changed, a source changed while the check runs, and a

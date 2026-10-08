@@ -1,0 +1,42 @@
+[
+  {
+    "concurrent_vms": 4,
+    "events_max": 175,
+    "guest_mib": 256,
+    "headroom_mib": 67,
+    "oom_kill": 0,
+    "outcome": "Success",
+    "samples": 70,
+    "unreclaimable_mib": 316
+  },
+  {
+    "concurrent_vms": 4,
+    "events_max": 174,
+    "guest_mib": 256,
+    "headroom_mib": 81,
+    "oom_kill": 0,
+    "outcome": "Success",
+    "samples": 66,
+    "unreclaimable_mib": 302
+  },
+  {
+    "concurrent_vms": 4,
+    "events_max": 182,
+    "guest_mib": 256,
+    "headroom_mib": 65,
+    "oom_kill": 0,
+    "outcome": "Success",
+    "samples": 66,
+    "unreclaimable_mib": 318
+  },
+  {
+    "concurrent_vms": 4,
+    "events_max": 171,
+    "guest_mib": 256,
+    "headroom_mib": 61,
+    "oom_kill": 0,
+    "outcome": "Success",
+    "samples": 65,
+    "unreclaimable_mib": 322
+  }
+]
