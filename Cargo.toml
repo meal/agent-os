@@ -27,3 +27,5 @@ base64 = "0.23.1"
 vsock = "0.5.4"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
 httpdate = "1.0.3"
+# The analyzer runtime: default features off, only what a component host needs.
+wasmtime = { version = "49.0.2", default-features = false, features = ["std", "runtime", "cranelift", "component-model", "anyhow"] }

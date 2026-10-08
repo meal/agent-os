@@ -68,7 +68,7 @@ interface snapshot {
   /// The task's recorded snapshot, bound to one task and one capability.
   resource tree {
     /// Every regular file, sorted by path.
-    list: func() -> result<list<entry>, read-error>;
+    files: func() -> result<list<entry>, read-error>;
     /// At most `len` bytes of `path` from `offset`; `len` is at most 1 MiB.
     read: func(path: string, offset: u64, len: u32) -> result<list<u8>, read-error>;
   }
@@ -101,7 +101,8 @@ features off and only `component-model`, `cranelift` and `runtime` enabled (`wat
   call returns `budget-exhausted`.
 - **Guest bounds.** Fuel (deterministic) bounds execution; exhaustion or any trap is a
   definite failure. A `StoreLimits` limiter, set before instantiation, bounds linear memory
-  to 64 MiB, tables to 10000 elements and instances to 1. An epoch deadline of 60 s is a
+  to 64 MiB in one linear memory, tables to 10000 elements and core instances to 8 (a
+  wit-bindgen component is its module plus a few shims). An epoch deadline of 60 s is a
   backstop only; its trip is reported as an infrastructure failure because it is not
   deterministic.
 - **Report.** The returned string must be at most 64 KiB and parse as a JSON object;

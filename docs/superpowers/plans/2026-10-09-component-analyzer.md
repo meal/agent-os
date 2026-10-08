@@ -13,13 +13,13 @@ wasm-tools 1.261.0 (release binary, sha256
 - [x] **1. Contract and effect kind.** `snapshot.analyze` capability and the optional
   `analyzer` pin, each requiring the other; old contract digest unchanged.
   `EffectKind::AnalyzeSnapshot` (tag, capability, retry policy); `follow_up_event` is `None`.
-- [ ] **2. Runtime crate.** `agentos-component` with Wasmtime (default features off), the WIT
+- [x] **2. Runtime crate.** `agentos-component` with Wasmtime (default features off), the WIT
   world, the `tree` host resource behind an authority trait, read validation shared with
   `ShadowReader`, budgets, fuel, memory limits, epoch backstop and report checks. Red cases
   as WAT components: granted read, ungranted, revoked between reads, another task's tree,
   infinite loop, memory growth, oversize, malformed and `Err` reports, budgets, path
   validation, an extra import.
-- [ ] **3. Tooling and reference analyzer.** The image gains `wasm32-unknown-unknown` and the
+- [x] **3. Tooling and reference analyzer.** The image gains `wasm32-unknown-unknown` and the
   pinned wasm-tools. `components/repo-analyzer` builds with wit-bindgen; a script builds the
   component; the bytes are committed with a rebuild-and-compare test and an imports test.
 - [ ] **4. Registry.** `agentos component register|list`, refusing non-components, extra
