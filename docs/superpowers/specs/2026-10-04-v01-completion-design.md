@@ -68,7 +68,7 @@ Parameterize the current host-only live harness by recorded worker. Preserve hos
 
 ### Collection and failure durability
 
-Add `agentos gc --dry-run` and `agentos gc` under the driver lock. First collect only reconstructible transient data: settled model retention directories, settled dead job directories, scratch images, and terminal workspaces whose required results are already in blobs. Keep task inputs, journal, linked blobs, immutable registries, and all data needed by outstanding effects or pending cancellation.
+Add `agentos gc --dry-run` and `agentos gc` under the driver lock. First collect only reconstructible transient data: settled model retention directories, settled dead job directories, scratch images, and terminal workspaces whose required results are already in blobs. Keep task inputs, journal, linked blobs, immutable registries, and all data needed by outstanding effects or pending cancellation. (Revised 2026-10-07: job directories themselves are kept with their logs, status and receipts; only their redundant `output.bin`, `scratch.img` and `v.sock` are removed. See the [focused GC design](2026-10-04-conservative-gc-design.md).)
 
 Do not infer safety from terminal task state alone: terminal tasks can still have outstanding effects. Require no outstanding effects, no live job/inspection, and the workspace lock before removing task images. Plan deletion, revalidate locks/references, then remove only owned paths. Refuse symlink/traversal candidates. Repeated collection is idempotent and preserves export.
 

@@ -129,6 +129,17 @@ pub enum Command {
     },
     /// Write the export bundle of a finished task to DIR.
     Export { id: String, dir: PathBuf },
+    /// Collect proven redundant transient copies; preserve journal, inputs and artifacts.
+    Gc {
+        /// Report candidates and refusals without deleting task data.
+        #[arg(long)]
+        dry_run: bool,
+        /// Entries revalidated and deleted together (whole tasks per batch); bounds the
+        /// descriptors held at once.
+        #[arg(long, default_value_t = agentos_engine::gc::DEFAULT_BATCH_SIZE as u32,
+              value_parser = clap::value_parser!(u32).range(1..=4096))]
+        batch_size: u32,
+    },
     /// Internal: the per-job supervisor and its worker (`run|worker JOB_DIR`), and the fake
     /// guest of the test tier (`fake-guest UDS ROOT`, only with `AGENTOS_TEST_WORKERS=1`).
     #[command(hide = true)]

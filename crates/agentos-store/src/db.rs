@@ -347,6 +347,12 @@ pub(crate) fn store_task(tx: &Transaction, t: &Task) -> Result<()> {
 }
 
 impl Db {
+    /// The database file, as SQLite opened it; `None` for an in-memory or temporary
+    /// database (SQLite reports those with an empty name).
+    pub fn path(&self) -> Option<&Path> {
+        self.conn.path().filter(|p| !p.is_empty()).map(Path::new)
+    }
+
     pub fn open(path: &Path) -> Result<Db> {
         let conn = Connection::open(path)?;
         // busy_timeout first so the remaining setup also waits out concurrent openers.
@@ -546,5 +552,25 @@ impl Db {
             });
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    /// SQLite names in-memory and temporary databases with an empty string: no path.
+    #[test]
+    fn in_memory_and_temporary_databases_have_no_path() {
+        for conn in [
+            Connection::open_in_memory().unwrap(),
+            Connection::open("").unwrap(),
+        ] {
+            let db = Db {
+                conn,
+                clock: Box::new(now_ts),
+            };
+            assert_eq!(db.path(), None);
+        }
     }
 }

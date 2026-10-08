@@ -29,12 +29,17 @@ apply the reviewed patch to a clean copy.
 
 Current completion work is tracked in the [v0.1 plan](docs/superpowers/plans/2026-10-04-v01-completion.md).
 Model deadlines, bounded I/O, versioned retry/endpoint policy, the development runtime, and
-CI are implemented and tested offline. Real provider/KVM acceptance remains open; GC,
-contract-driven VM resources, the component analyzer, and fresh-host release validation
-remain planned work.
+CI, conservative transient GC (`agentos gc`) and host publication failure recovery are
+implemented and tested offline. Real provider/KVM
+acceptance remains open; contract-driven VM resources, the component analyzer, and
+fresh-host release validation remain planned work.
 
 Required offline gates are centralized in `sh scripts/check.sh`: formatting, strict Clippy,
-host tests and fake-jail tests, all through Docker Compose with the lockfile enforced.
+host tests, fake-jail tests and the GC mount gate, all through Docker Compose with the
+lockfile enforced. The mount gate (`sh scripts/check.sh mount`) runs the GC mount-root
+regressions in the `test-mount` service, which adds only `CAP_SYS_ADMIN` (and AppArmor
+unconfined) so they can mount a tmpfs inside real candidates; elsewhere those tests print
+`skipped: needs AGENTOS_GC_MOUNT_TESTS=1` and return.
 The PR/push workflow uses the same commands with separate Compose projects. Run
 `docker compose build test` after runtime changes. Development uses pyenv 2.8.6 and Python
 3.14.8 pinned by source checksums; `pyenv exec python` selects the project version.
@@ -955,8 +960,9 @@ The Firecracker worker:
   again when building the executor). A host change in between leaves the task READY and
   unapproved.
 - **Workspace and scratch image sizes are constants** (`ws.img` 1 GiB, `scratch.img` 512 MiB),
-  not contract limits, and the images are never garbage-collected (the jails are). A killed job
-  leaves its `scratch.img`.
+  not contract limits. `gc` removes the workspace images of eligible terminal tasks and, from
+  a job directory whose receipt is the settled published result, `scratch.img`; a killed
+  job's `scratch.img` stays while it has no such receipt or its effect is unsettled.
 - **One VM boot per effect** (about 0.65 s to `Ready` here) and one inspector boot per resume
   and per receipt-less patch; no VM reuse or snapshots.
 - **Executable bits are lost** in the guest: the protocol's `File{path, len}` carries no mode, so
@@ -976,7 +982,7 @@ The Firecracker worker:
   `Submitted` has no `guest_image` field (it would falsely name `fixture-executor-v0`); it has
   `guest_image_id` and `guest_image_digest`.
 - **The guest trusts the host's clock** (`kvm-clock`) and entropy, and the serial console
-  (`console.log`) is the only guest log.
+  (`console.log`) is the only guest log. `gc` never removes it.
 - **The image build needs network and root** in the build container (snapshot.debian.org, the
   Firecracker CI bucket); the kernel is a pinned download, not built from source.
 - **x86_64 only** (the image recipe pins the x86_64 kernel).
@@ -1022,12 +1028,13 @@ The model workflow (Phase 4):
 - **An exported `model/NNNN-response.json` can be the engine's failure record**, not an API
   response, for a model call that failed with an HTTP error (the manifest's `state` says
   `FAILED`).
-- **`<home>/model/` is never garbage-collected.** Retained responses accumulate for the life of
-  the home. `retained_outcome` lists `<home>/model` once per lookup and opens only that effect's
-  `<effect>-<attempt>` entries, so a lookup costs O(entries in `model/`); its one caller is
-  recovery's publish-retained step, at most twice per outstanding effect per pass. A read error
-  other than not-found and a corrupt `response.json` are logged and count as nothing retained
-  (so the effect is forfeited, never sent again on a guess).
+- **`<home>/model/` entries accumulate until `gc` collects them.** `gc` removes the retained
+  responses of terminal tasks only when they are proven redundant (see the `gc` section);
+  everything else stays. `retained_outcome` lists `<home>/model` once per lookup and opens only
+  that effect's `<effect>-<attempt>` entries, so a lookup costs O(entries in `model/`); its one
+  caller is recovery's publish-retained step, at most twice per outstanding effect per pass. A
+  read error other than not-found and a corrupt `response.json` are logged and count as nothing
+  retained (so the effect is forfeited, never sent again on a guess).
 - **Resuming a cancel-pending `anthropic:` task without a key exits 2.** `resume` needs the
   provider; use `agentos cancel`, which does not.
 - **Older demo transcripts predate the `model` field** of `status` (and `Submitted.model` as a
@@ -1059,7 +1066,9 @@ Carried from 3a:
   completion, and the next request is denied.
 - **`Denied` rows are forgeable.** They are audit rows any caller can append; only the
   `Capability*` rows are written by the broker itself.
-- **No job-directory garbage collection.** `<home>/jobs` grows with every attempt.
+- **Job collection is conservative.** `gc` requires terminal tasks, settled effects,
+  published receipts and free locks; unknown or unresolved copies remain, and job
+  directories themselves (logs, status, request, receipt, outcome) are never removed.
 - **Export bypasses the effect model.** It is authorized through the broker
   (`artifact.export`, journaled, revocable) but is not a journaled effect; it leaves an
   `Exported` audit row.
@@ -1079,7 +1088,8 @@ Carried from 3a:
 - Block-device rate limiting for the drives.
 - Contract-driven disk sizes (`worker_disk_mib`, an optional contract field) instead of the
   1 GiB / 512 MiB constants.
-- Garbage collection of workspace and scratch images together with the job directories.
+- Removing whole job directories (their logs and receipts included), e.g. after export or a
+  retention period; `gc` keeps them today and removes only their redundant copies.
 - Building the guest kernel from source (the build plan's Phase 6 "reproducible guest image
   build" finishes there).
 - Jailer extras that need a different supervision model or more privilege: `--new-pid-ns` (the
@@ -1093,3 +1103,101 @@ they require a usable `/dev/kvm`, and live also requires a regular nonsymlink ke
 at most 4096 bytes. Live runs mount that file read-only and produce host and actual jailed
 recordings, exports, and replay comparisons under `build/evidence/`.
 See [evidence collection](docs/evidence/README.md) for runner setup and pending gates.
+
+## Collecting transient data
+
+```sh
+agentos --home /path/to/home gc --dry-run
+agentos --home /path/to/home gc [--batch-size N]
+```
+
+`gc` needs an existing home (it never creates one: a mistyped `--home` exits 2) and takes the
+driver lock before it opens anything else, so no controller runs meanwhile. It never launches a model, worker or inspector
+and does not clean external cgroups or inspection directories.
+
+What it removes, only for terminal tasks with no unsettled effect (a cancellation still
+marked pending on a task that has already failed or finished no longer matters): the task's workspace (`work/<task>/ws`, `workspace` or `ws.img`; the parent and
+`ws.lock` stay), each settled model response copy (`model/<effect>-<attempt>`), and, in each
+job directory whose receipt is the effect's settled published result, `output.bin` (a copy
+of the published blob), `scratch.img` and a Firecracker job's `v.sock`. What it keeps: the
+journal, task inputs, registries, every blob, exported bundles, and every other file of a
+job directory: `console.log`, `stderr.log`, `firecracker.log`, `supervisor.log`,
+`status.json`, `request.json`, `receipt.json`, `outcome.json`/`outcome.bin`, `groups`,
+`vm.json`, `lock`. Attempts without such a receipt (killed, superseded, unresolved) are kept
+whole. A later pass reports a job directory it already reduced as `collected`.
+
+The JSON report has a `summary` with a count per status, `batches`, and up to 1000 `entries`
+(`truncated` says when more were counted; refusals are listed first), each with a relative
+`path`, a `status` and a bounded `reason` that never quotes file content:
+
+| status | meaning | exit code |
+| --- | --- | --- |
+| `candidate` | `--dry-run`: would be removed | 0 |
+| `deleted` | removed | 0 |
+| `collected` | a job directory whose redundant copies are already gone | 0 |
+| `retained` | kept on purpose, e.g. the task is unfinished, a lock is held, a tree has symlinks, special files, hard links, more than 10000 entries or 64 levels | 0 |
+| `refused` | an integrity problem or a failure (a resource shortage such as running out of descriptors says "retry"); data kept, or left staged under a ticket for the next pass | 1 |
+| `skipped` | not processed because the pass stopped | 1 |
+
+Any `refused` or `skipped` entry makes `gc` exit 1 after printing the report; a usage error
+exits 2. The decision is all-or-nothing per task: anything that may still be live (an
+unfinished task, a busy job or workspace lock, inspection or jail leftovers, a tree it will
+not walk) retains that task only, and other tasks are still collected. Execution is entry by
+entry: a failure in the middle of a task (or an interruption) leaves it partly collected, and
+the next pass finishes it. Integrity problems are an unknown name, a symlink or
+non-directory where an owned directory is expected (inside the home; the home path itself may
+be a symlink, it is resolved once), a mount root inside a candidate, an unowned or invalid
+`gc-trash` entry, staged data that is not what its ticket staged, or a corrupt registered
+blob. One found while classifying (the first phase, which reads everything) stops the pass
+before anything is deleted; one found later (a mount appearing after staging, a staged entry
+that changed, data that cannot be moved back) stops the remaining batches, after earlier
+batches, and earlier tasks of the same batch, were already collected. Fix or inspect the
+reported path, then rerun.
+
+Tasks are revalidated and deleted in batches of whole tasks: a batch closes at `--batch-size`
+entries (default 64, at most 4096; a larger task is one batch) or at 32 tasks, whichever
+comes first, and the task cap is lowered further when the soft descriptor limit is low
+(the report shows `tasks_per_batch`). Descriptors held at once: one workspace lock per task
+in the batch, one per directory level of the tree being removed (at most 64; names are
+listed before descending), plus about 32 for everything else, so a soft limit of 128 or more
+covers the worst case. Below that, deep trees can still run out; that is reported as a
+retryable refusal (raise `ulimit -n`; a lower `--batch-size` does not help a deep tree) and the
+staged data is finished, or moved back, by the next pass. If even the ticket that marks staged
+data for moving back cannot be written, the pass stops with an integrity refusal naming the
+`gc-trash` entry. A workspace of an unexpected shape (`ws` or `workspace` that is not a
+directory, `ws.img` that is not a regular file) is retained, never staged. Hundreds of tasks at
+`--batch-size 4096`, and a task with more than a thousand job directories, are collected
+under a 256-descriptor limit. A dry run creates nothing (not even missing `ws.lock` files)
+and removes nothing.
+
+Each removal is staged under `gc-trash` with a durable ownership ticket, moved there with
+descriptor-relative operations that never follow symlinks, checked against the device/inode
+captured while validating, and only then removed. After an interruption, rerun `gc`: it
+finishes a staged removal even after the original receipt files are gone (an entry staged by
+an earlier pass is recognised by its inode and kind on the home's current device, since a
+device number need not survive a reboot), drops tickets whose entry never moved, moves back
+staged data that no longer passes its checks, and cleans its own unpublished ticket
+temporary files. Mount-root detection requires a Linux kernel that reports
+`STATX_ATTR_MOUNT_ROOT` (5.8+); when it is unavailable, `gc` refuses and retains the data.
+
+Known limits of `gc`:
+- A staged entry whose original path has been reoccupied cannot be moved back
+  (`RENAME_NOREPLACE` never overwrites, so nothing is lost); the pass refuses and the
+  reported `gc-trash` entry needs manual cleanup.
+- Candidate trees are checked by walking paths below a pinned directory descriptor; this walk
+  only reads, and removal itself is descriptor-relative and re-checks mounts at each level.
+- Every pass re-reads every job directory remnant and reads every registered blob fully into
+  memory to check it: time grows with the home's history, memory with the largest blob.
+- Host-worker temporary directories under `work/<task>/` and `.output.bin.tmp`-style
+  leftovers of interrupted atomic writes are never reclaimed.
+- The `test-mount` gate builds a second image (Compose `extends` without `image:`).
+
+Not verified offline:
+- Real foreign bind-mount roots: mount-root refusal is tested only with tmpfs mounts made in a
+  container with `CAP_SYS_ADMIN` (the `test-mount` gate).
+- Firecracker/KVM and jailed job directories: a real `v.sock`, `ws.img` owned by uid 61000,
+  and `ws.img` with a link count above 1 while a jail chroot still links it (that keeps its
+  task retained until the link is gone).
+- Power-loss durability: only injected interruptions were tested.
+- Kernels older than 5.8: every pass refuses (no `STATX_ATTR_MOUNT_ROOT`).
+- Reclaiming host-worker temporary directories and atomic-write leftovers: never done.

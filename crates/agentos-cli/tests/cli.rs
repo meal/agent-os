@@ -4799,6 +4799,147 @@ fn resume_refuses_a_bad_base_url_but_cancel_still_works() {
 }
 
 #[test]
+fn gc_dry_run_collection_and_exports_preserve_verified_results() {
+    let cli = Cli::new();
+    let contract = cli.contract(&cli.repo_copy());
+    let submitted = cli.submit_yes(&contract, &fix_patch());
+    let id = submitted["task_id"].as_str().unwrap();
+    let work = cli.home().join("work").join(id);
+    let before = cli.path("before-gc");
+    cli.json(&["export", id, before.to_str().unwrap()]);
+    let dry = cli.json(&["gc", "--dry-run"]);
+    assert!(
+        dry["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["status"] == "candidate"),
+        "{dry}"
+    );
+    assert!(
+        work.join(if fake_mode() { "workspace" } else { "ws" })
+            .exists()
+            || real_mode()
+    );
+    let report = cli.json(&["gc"]);
+    assert!(
+        report["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["status"] == "deleted"),
+        "{report}"
+    );
+    let after = cli.path("after-gc");
+    cli.json(&["export", id, after.to_str().unwrap()]);
+    assert_eq!(
+        fs::read(before.join("patch.diff")).unwrap(),
+        fs::read(after.join("patch.diff")).unwrap()
+    );
+    for entry in fs::read_dir(before.join("evidence")).unwrap() {
+        let entry = entry.unwrap();
+        assert_eq!(
+            fs::read(entry.path()).unwrap(),
+            fs::read(after.join("evidence").join(entry.file_name())).unwrap()
+        );
+    }
+    // A second pass finds only collected job remnants (their logs and receipts stay).
+    let again = cli.json(&["gc"]);
+    assert_eq!(again["summary"]["deleted"], 0, "{again}");
+    assert_eq!(again["summary"]["candidate"], 0, "{again}");
+    assert_eq!(again["summary"]["refused"], 0, "{again}");
+    assert!(
+        again["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["status"] == "collected"),
+        "{again}"
+    );
+}
+
+/// A command that opens (and so creates) the home of a bare `Cli`, then fails on the task.
+fn create_home(cli: &Cli) {
+    cli.cmd(&["status", "00000000-0000-0000-0000-000000000000"])
+        .assert()
+        .code(1);
+    assert!(cli.home().join("agentos.db").is_file());
+}
+
+#[test]
+fn gc_never_creates_a_home() {
+    let cli = Cli::bare();
+    for args in [&["gc", "--dry-run"][..], &["gc"][..]] {
+        cli.cmd(args)
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("not an agentos home"));
+        assert!(!cli.home().exists());
+    }
+}
+
+#[test]
+fn gc_prints_its_report_and_exits_1_when_it_refuses() {
+    let cli = Cli::bare();
+    create_home(&cli);
+    let unknown = cli.home().join("model").join("unknown");
+    fs::create_dir_all(&unknown).unwrap();
+    let out = cli
+        .cmd(&["gc"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("gc refused 1"))
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(report["summary"]["refused"], 1, "{report}");
+    assert_eq!(report["entries"][0]["path"], "model/unknown", "{report}");
+    assert_eq!(report["entries"][0]["status"], "refused", "{report}");
+    assert!(unknown.is_dir());
+}
+
+#[test]
+fn gc_takes_the_driver_lock_before_opening_the_home() {
+    let cli = Cli::bare();
+    create_home(&cli);
+    let tasks = cli.home().join("tasks");
+    fs::remove_dir_all(&tasks).unwrap();
+    let lock = fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(cli.home().join("driver.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    cli.cmd(&["gc", "--dry-run"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("another agentos process"));
+    assert!(
+        !tasks.exists(),
+        "the home was opened before the lock was taken"
+    );
+}
+
+#[test]
+fn gc_refuses_while_another_driver_holds_the_lock() {
+    let cli = Cli::bare();
+    create_home(&cli);
+    let lock = fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(cli.home().join("driver.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    cli.cmd(&["gc"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("another agentos process"));
+}
+
+#[test]
 fn cancel_of_an_anthropic_task_needs_no_key_and_never_contacts_the_api() {
     let cli = Cli::new();
     let api = fake_api("parser-fix-direct.json");
