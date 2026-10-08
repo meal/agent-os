@@ -34,7 +34,10 @@ implemented and tested offline. Real provider/KVM acceptance passed on 2026-10-0
 ([evidence](docs/evidence/)). Contract-driven VM disks and I/O limits (optional
 `worker_disk_mib`, `worker_scratch_mib`, `worker_disk_bandwidth_mib_s` and
 `worker_disk_iops`, recorded at submission and exported) passed real KVM acceptance on
-2026-10-09. The component analyzer and fresh-host release validation remain planned work.
+2026-10-09. A contract can name a registered WebAssembly analyzer component, which runs
+once over the snapshot with broker-checked reads and no WASI, and whose report is exported
+but never counts as verification (KVM acceptance 2026-10-09). Fresh-host release
+validation remains planned work.
 
 Required offline gates are centralized in `sh scripts/check.sh`: formatting, strict Clippy,
 host tests, fake-jail tests, the GC mount gate and the analyzer component rebuild check, all through Docker Compose with the

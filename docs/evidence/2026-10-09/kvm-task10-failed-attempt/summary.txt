@@ -1,0 +1,6 @@
+Commit d33e82e, first attempt: the build died before any test ran: the host's root
+filesystem (Docker's storage) was full, and the linker failed with bus errors and
+'failed to create file'. Not a code failure. This project's rebuildable cargo target
+volumes were removed (about 120 GB) and the rerun at the same commit passed.
+An earlier attempt at e172000 was stopped before it finished: it would have been recorded
+as dirty, because Cargo.lock had not been committed (fixed in d33e82e).

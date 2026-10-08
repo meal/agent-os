@@ -30,7 +30,7 @@ wasm-tools 1.261.0 (release binary, sha256
 - [x] **6. CLI and export.** Approval shows the capability and the pin; `submit` copies the
   component into the task and records it; the manifest's optional `analysis` entry and
   `analysis/report.json`.
-- [ ] **7. End to end.** The fixture task with the reference analyzer on the fake and the real
+- [x] **7. End to end.** The fixture task with the reference analyzer on the fake and the real
   Firecracker worker; a report claiming `"passed": true` changes no verdict.
 
 **Gate:** granted-only access proven by red tests; analysis survives every crash point

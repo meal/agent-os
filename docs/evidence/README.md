@@ -40,6 +40,13 @@ The memory measurements behind the jail's 128 MiB overhead are in `vm-memory/`: 
 hostile disk-fill check at 256 and 1024 MiB of guest memory, alone and four at once. The
 smallest headroom of memory reclaim cannot drop was 61 MiB, and no case recorded an OOM kill.
 
+Task 10 (the component analyzer), `2026-10-09/`:
+
+| Run | Commit | Result |
+| --- | --- | --- |
+| `acceptance.sh kvm` | `d33e82e` | **Failed** before any test ran: the host's root disk was full (`kvm-task10-failed-attempt/`). |
+| `acceptance.sh kvm`, after freeing disk space | `d33e82e` | Passed: both suites, 1045 passed and 0 failed in each, including the analyzer end to end on the real jailed worker (`kvm-task10-pass/`). |
+
 Image `python-stdlib-v1`; Firecracker v1.17.0; kernel 6.18.51. The live runs predate the test
 fix, which changes only a test assertion. Recordings (schema version 2) are in
 `fixtures/transcripts/live/`; each worker's manifest, `patch.diff`, success report and replay
@@ -62,7 +69,7 @@ replay report, manifest, `patch.diff` (by BLAKE3), recording and setup commit mu
 The live harness also scans its recording and bundle for the exact key bytes before it
 writes a success report. The method of the first manual scan was not
 recorded; the decoded scan above finds nothing in these runs. Two-snapshot
-fresh-host evidence and the component ABI remain open.
+fresh-host evidence remains open.
 
 Run from a normal checkout on the provisioned Linux x86_64 Docker host:
 

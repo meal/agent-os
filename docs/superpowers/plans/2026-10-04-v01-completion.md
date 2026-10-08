@@ -12,9 +12,9 @@
 
 ## Execution status — 2026-10-08
 
-Packages 1–9 are complete. Package 7's live host and jailed runs and the real
+Packages 1–10 are complete. Package 7's live host and jailed runs and the real
 KVM suites passed on 2026-10-08 ([evidence](../../evidence/README.md)), and its evidence is
-checked automatically. Package 5's candidate guest passed real KVM acceptance at `f175de3`. Package 9 passed full KVM acceptance at `7955b96`. Packages 10–12 remain open; package 10 has a [focused design](../specs/2026-10-08-component-analyzer-design.md).
+checked automatically. Package 5's candidate guest passed real KVM acceptance at `f175de3`. Package 9 passed full KVM acceptance at `7955b96`, package 10 at `d33e82e`. Packages 11–12 remain open; package 11 has a [focused design](../specs/2026-10-09-kernel-and-installer-design.md).
 The 2026-10-04 status below is historical.
 
 ## Execution status — 2026-10-04
@@ -280,10 +280,12 @@ docker compose run --rm -e AGENTOS_TEST_WORKER=firecracker test-kvm cargo test -
 
 **Files:** new `wit/agentos-v1.wit`, `crates/agentos-component/{Cargo.toml,src/lib.rs,tests/analyzer.rs}`, analyzer fixture, core effect/capability types, engine routing/retention/export, store and recovery tests.
 
-- [ ] Write component spec and focused plan defining the exact WIT world, scoped resource handles, effect request/result serialization, and failure/recovery semantics before adding the crate.
-- [ ] Recheck/pin Wasmtime; current checked release is [49.0.2](https://docs.rs/crate/wasmtime/latest). Import no ambient filesystem/network WASI interfaces.
-- [ ] Add red cases: granted object read succeeds; ungranted/revoked/wrong-task handle fails; infinite loop interrupted; memory growth bounded; report oversize/malformed rejected; controller crash after output retention replays without reexecution.
-- [ ] Integrate through broker/effect lifecycle; reference analyzer emits an exported bounded report. Its result cannot produce `VerifyPassed`.
+- [x] Write component spec and focused plan defining the exact WIT world, scoped resource handles, effect request/result serialization, and failure/recovery semantics before adding the crate.
+- [x] Recheck/pin Wasmtime; current checked release is [49.0.2](https://docs.rs/crate/wasmtime/latest). Import no ambient filesystem/network WASI interfaces.
+- [x] Add red cases: granted object read succeeds; ungranted/revoked/wrong-task handle fails; infinite loop interrupted; memory growth bounded; report oversize/malformed rejected; controller crash after output retention replays without reexecution.
+- [x] Integrate through broker/effect lifecycle; reference analyzer emits an exported bounded report. Its result cannot produce `VerifyPassed`.
+
+**Task 10 result (2026-10-09).** Implemented per the [focused design](../specs/2026-10-08-component-analyzer-design.md) and [plan](2026-10-09-component-analyzer.md): Wasmtime 49.0.2 with no WASI, the `agentos:analyzer` world, a registry, one advisory analysis per task after the snapshot, broker checks on every read, retention and recovery at every crash point, GC of settled retention, and the report in the export. Full KVM acceptance passed at `d33e82e`.
 
 ```sh
 docker compose run --rm test cargo test -p agentos-component --locked
