@@ -530,7 +530,11 @@ struct Fx {
 
 impl Fx {
     fn new(kvm: &kvm::Kvm) -> Fx {
-        let dir = kvm.root();
+        Fx::new_in(kvm, kvm.root())
+    }
+
+    /// As `new`, with everything (work root, jobs, the image copy) under `dir`.
+    fn new_in(kvm: &kvm::Kvm, dir: TempDir) -> Fx {
         copy_dir(
             &fixtures().join("parser-repo"),
             &dir.path().join("snapshot"),
@@ -1541,6 +1545,294 @@ async fn the_minimum_rates_fit_a_near_limit_snapshot_within_the_deadlines() {
     println!(
         "near-limit snapshot at {bandwidth} MiB/s and {iops} ops/s: {snapshot:?}, inspection {:?}",
         started.elapsed()
+    );
+}
+
+/// A directory with a small tmpfs of its own mounted on it, so the host really runs out of
+/// space. Unmounted and removed on drop, which must come after the fixture inside it.
+struct SmallHostDisk {
+    dir: PathBuf,
+}
+
+impl SmallHostDisk {
+    fn new(kvm: &kvm::Kvm, mib: u64) -> (SmallHostDisk, TempDir) {
+        let root = kvm.root();
+        let status = std::process::Command::new("mount")
+            .args([
+                "-t",
+                "tmpfs",
+                "-o",
+                &format!("size={mib}m,mode=0755"),
+                "tmpfs",
+            ])
+            .arg(root.path())
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "mount a {mib} MiB tmpfs (the KVM tier has CAP_SYS_ADMIN)"
+        );
+        (
+            SmallHostDisk {
+                dir: root.path().to_path_buf(),
+            },
+            root,
+        )
+    }
+
+    fn free_mib(&self) -> u64 {
+        let st = rustix::fs::statvfs(&self.dir).unwrap();
+        (st.f_bavail * st.f_frsize) >> 20
+    }
+
+    /// Fills the disk up to `leave_mib` MiB free with a host file.
+    fn fill_leaving(&self, leave_mib: u64) {
+        fill_leaving(&self.dir, leave_mib);
+    }
+}
+
+fn fill_leaving(dir: &Path, leave_mib: u64) {
+    let st = rustix::fs::statvfs(dir).unwrap();
+    let fill = ((st.f_bavail * st.f_frsize) >> 20).saturating_sub(leave_mib);
+    let mut f = fs::File::options()
+        .create(true)
+        .append(true)
+        .open(dir.join("balloon"))
+        .unwrap();
+    let block = vec![0x5au8; 1 << 20];
+    for _ in 0..fill {
+        if std::io::Write::write_all(&mut f, &block).is_err() {
+            break;
+        }
+    }
+}
+
+impl Drop for SmallHostDisk {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("umount")
+            .arg("-l")
+            .arg(&self.dir)
+            .status();
+        let _ = fs::remove_dir(&self.dir);
+    }
+}
+
+/// Past the advisory free-space check, as if space disappeared right after it.
+fn past_the_space_check(w: FirecrackerWorker) -> FirecrackerWorker {
+    let mut env = test_env();
+    env.push(("AGENTOS_TEST_HOST_FREE_MIB".into(), "1000000".into()));
+    w.with_env(env)
+}
+
+fn io_errors_in(ran: &Ran) -> bool {
+    let console = ran.log("console.log");
+    for line in console.lines().filter(|l| l.contains("error")).take(6) {
+        println!("  console: {line}");
+    }
+    console.contains("I/O error")
+}
+
+/// A successful snapshot on a host whose free space the advisory check would refuse.
+async fn snapshot_past_the_space_check(fx: &Fx) -> Digest {
+    let req = fx.request(EffectKind::ReadSnapshot, b"");
+    let ran = fx
+        .run_with(&req, &fx.cfg.clone(), past_the_space_check)
+        .await;
+    assert_eq!(
+        ran.out.receipt.outcome,
+        Outcome::Success,
+        "{}",
+        out_text(&ran.out)
+    );
+    ran.out.new_workspace.unwrap()
+}
+
+/// A host ENOSPC while the guest writes its drives never yields a success that is not on
+/// the image: during a snapshot, a patch and a verification's scratch writes.
+#[tokio::test(flavor = "multi_thread")]
+async fn host_enospc_under_the_drives_never_yields_an_unbacked_success() {
+    let Some(kvm) = kvm::require() else { return };
+    let _alone = exclusive().await;
+
+    // 1. Snapshot: 150 MiB of incompressible data into a workspace on a nearly full host.
+    let (disk, root) = SmallHostDisk::new(&kvm, 200);
+    let mut fx = Fx::new_in(&kvm, root);
+    let outside = tempfile::tempdir().unwrap();
+    copy_dir(&fixtures().join("parser-repo"), outside.path());
+    let mut seed = 7u64;
+    for i in 0..3 {
+        // Under the 64 MiB per-file snapshot limit.
+        let noise: Vec<u8> = (0..50 << 20)
+            .map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (seed >> 56) as u8
+            })
+            .collect();
+        fs::write(outside.path().join(format!("noise-{i}.bin")), noise).unwrap();
+    }
+    fx.cfg.snapshot_dir = outside.path().to_path_buf();
+    println!("snapshot: {} MiB free before", disk.free_mib());
+    let req = fx.request(EffectKind::ReadSnapshot, b"");
+    let ran = fx
+        .run_with(&req, &fx.cfg.clone(), past_the_space_check)
+        .await;
+    println!(
+        "snapshot under ENOSPC: {:?} new_workspace {:?} unresolved {} console I/O errors {}",
+        ran.out.receipt.outcome,
+        ran.out.new_workspace,
+        ran.out.unresolved,
+        io_errors_in(&ran)
+    );
+    let why = failure(&ran.out);
+    assert!(
+        why.starts_with("host disk: the VM's drives returned I/O errors"),
+        "{why}"
+    );
+    assert_eq!(ran.out.new_workspace, None);
+    drop(fx);
+    drop(disk);
+
+    // 2. Patch: a snapshot first, then the host fills up before the fix is applied.
+    let (disk, root) = SmallHostDisk::new(&kvm, 200);
+    let fx = Fx::new_in(&kvm, root);
+    let base = snapshot_past_the_space_check(&fx).await;
+    // A patch adding a 3.6 MB file (under the 4 MiB patch limit), with less room than that
+    // left on the host once the VM has booted and formatted scratch.
+    let lines = 60_000;
+    let mut big = format!("--- /dev/null\n+++ b/src/big.txt\n@@ -0,0 +1,{lines} @@\n");
+    for i in 0..lines {
+        big.push_str(&format!("+{i:059}\n"));
+    }
+    let req = fx.request(
+        EffectKind::ApplyPatch {
+            expected_base: base,
+        },
+        big.as_bytes(),
+    );
+    // The host fills up once the VM has booted (about 0.6 s), while the patch is applied.
+    let dir = disk.dir.clone();
+    let balloon = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(700));
+        fill_leaving(&dir, 0);
+    });
+    let ran = fx
+        .run_with(&req, &fx.cfg.clone(), past_the_space_check)
+        .await;
+    balloon.join().unwrap();
+    println!(
+        "patch under ENOSPC: {:?} new_workspace {:?} unresolved {} console I/O errors {}",
+        ran.out.receipt.outcome,
+        ran.out.new_workspace,
+        ran.out.unresolved,
+        io_errors_in(&ran)
+    );
+    if io_errors_in(&ran) && ran.out.receipt.outcome != Outcome::Success {
+        let why = failure(&ran.out);
+        assert!(why.starts_with("host disk: "), "{why}");
+    }
+    let _ = fs::remove_file(disk.dir.join("balloon"));
+    let on_image = fx.digest();
+    match (&ran.out.receipt.outcome, ran.out.new_workspace) {
+        // A reported success is what the image holds.
+        (Outcome::Success, Some(reported)) => assert_eq!(on_image, reported),
+        // A failure leaves the base, or an image every later patch refuses as a conflict.
+        _ if on_image == base => println!("patch under ENOSPC: the image is still the base"),
+        _ => {
+            let again = fx
+                .run_with(
+                    &fx.request(
+                        EffectKind::ApplyPatch {
+                            expected_base: base,
+                        },
+                        fix_patch().as_bytes(),
+                    ),
+                    &fx.cfg.clone(),
+                    |w| w,
+                )
+                .await;
+            let why = failure(&again.out);
+            assert!(why.contains("version conflict"), "{why}");
+            println!("patch under ENOSPC: the image moved; the next patch is a version conflict");
+        }
+    }
+    drop(fx);
+    drop(disk);
+
+    // 3. Verification: the check writes and syncs 100 MiB to scratch on a nearly full host.
+    let (disk, root) = SmallHostDisk::new(&kvm, 200);
+    let fx = Fx::new_in(&kvm, root);
+    snapshot_past_the_space_check(&fx).await;
+    fx.use_script(
+        "import os, sys; \\
+         block = b'x' * (1 << 20); \\
+         fd = os.open('/scratch/check/fill', os.O_WRONLY | os.O_CREAT, 0o600); \\
+         [os.write(fd, block) for _ in range(100)]; \\
+         os.fsync(fd); \\
+         print('PASSED')",
+    );
+    disk.fill_leaving(30);
+    let req = fx.request(EffectKind::RunVerification, b"");
+    let ran = fx
+        .run_with(&req, &fx.cfg.clone(), past_the_space_check)
+        .await;
+    println!(
+        "verification under ENOSPC: {} console I/O errors {}",
+        out_text(&ran.out),
+        io_errors_in(&ran)
+    );
+    // Reported as the host's failure, not as a failing check the agent would try to fix.
+    let why = failure(&ran.out);
+    assert!(
+        why.starts_with("host disk: the VM's drives returned I/O errors")
+            && why.contains("is not evidence"),
+        "{why}"
+    );
+    drop(fx);
+    drop(disk);
+}
+
+/// The host reads guest block I/O errors from the serial console, so the check must not be
+/// able to write there (or into the kernel log) to disguise its own failure as the host's.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_check_cannot_write_the_console_or_the_kernel_log() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let fx = Fx::new(&kvm);
+    fx.snapshot().await;
+    let profile = fx.path("profile");
+    fs::remove_dir_all(&profile).unwrap();
+    fs::create_dir_all(&profile).unwrap();
+    fs::write(
+        profile.join("profile.json"),
+        r#"{"id":"console-probe","command":["python3","probe.py"],"protected":true}"#,
+    )
+    .unwrap();
+    fs::write(
+        profile.join("probe.py"),
+        r#"import errno, json
+found = {}
+for path in ["/dev/console", "/dev/ttyS0", "/dev/kmsg", "/dev/tty0"]:
+    try:
+        with open(path, "w") as f:
+            f.write("[    1.0] I/O error, dev vdc, sector 1\n")
+        found[path] = "written"
+    except OSError as e:
+        found[path] = errno.errorcode.get(e.errno, str(e))
+print(json.dumps(found))
+"#,
+    )
+    .unwrap();
+    let ran = fx.run(EffectKind::RunVerification).await;
+    let v = evidence(&ran.out);
+    let f = findings(&v);
+    println!("console probe: {f}");
+    for p in ["/dev/console", "/dev/ttyS0", "/dev/kmsg", "/dev/tty0"] {
+        assert_ne!(f[p], "written", "the check wrote {p}: {f}");
+    }
+    assert!(
+        !ran.log("console.log").contains("dev vdc, sector 1"),
+        "{}",
+        ran.log("console.log")
     );
 }
 

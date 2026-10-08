@@ -40,10 +40,11 @@ each commit; KVM steps run on an otherwise idle host; commits carry no co-author
 - [x] **9. Rate enforcement.** 160 MiB synced at 32 MiB/s takes at least 3.5 s (4.17 s
   measured). The first minimums did not boot; measured and raised to 32 MiB/s and 5000
   operations/s, with a near-limit snapshot test.
-- [ ] **9b. Host ENOSPC.** Work root on a small tmpfs: ENOSPC during snapshot, patch and a
-  verification scratch write fails visibly, never verifies, and leaves the journal's digest
-  equal to the inspected image or fails the task. Decide whether it can be reported as an
-  infrastructure failure. A jailed task with `worker_disk_mib` above 1024 runs (file-size limit).
+- [x] **9b. Host ENOSPC.** Work root on a 200 MiB tmpfs: ENOSPC during a snapshot, during
+  a patch's boot and during a check's scratch writes fails visibly, never verifies, and
+  leaves the image at the base. Guest kernel block I/O errors on the console are a reliable
+  signal, so these are reported as `host disk: …`; the check cannot write the console. A
+  jailed task with a 1536 MiB workspace runs (file-size limit).
 - [ ] **10. Recovery.** Kill after launch and resume a task with non-default resources; the
   recorded values are used and the bundle equals an uncrashed run's.
 - [ ] **11. Measurements and overhead.** Run the measurement matrix from the design, record it

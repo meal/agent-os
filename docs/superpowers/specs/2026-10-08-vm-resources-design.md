@@ -107,11 +107,18 @@ replacing the constants at the three use sites.
   - Every `ApplyPatch` first checks that the image's digest is the expected base, so a
     partly written image turns later patches into a visible version conflict instead of
     building on it.
-  - A full host disk during verification is likely to make the check report
-    `passed: false`, which the agent sees as a failing check. Whether a reliable signal
-    (guest I/O errors in the evidence or the Firecracker log) lets this be reported as an
-    infrastructure failure instead is decided by the real-KVM ENOSPC test below; until then
-    it is a known limitation.
+  - The guest kernel logs each failed block request on the serial console as
+    `[<time>] I/O error, dev vdX, …`. When it has, the worker reports a refusal, a failed
+    check or a failed boot as `host disk: the VM's drives returned I/O errors (see
+    console.log): …`, so the agent is not sent to fix code that is not broken. A check that
+    passes despite such errors keeps its evidence. The check cannot write the console or
+    the kernel log (`EACCES` on `/dev/console`, `/dev/ttyS0`, `/dev/tty0` and `/dev/kmsg`,
+    checked on KVM), so it cannot disguise its own failure as the host's.
+
+  Measured on KVM with the work root on a 200 MiB tmpfs: a snapshot of 150 MiB fails with
+  `syncfs /workspace: I/O error`; a host that fills while a patch's VM formats scratch fails
+  the boot; a check whose scratch writes hit the full host gets `EIO`. Each is reported as
+  `host disk: …`, and the image is unchanged after the failed patch.
 - **Rate limits.** When set, the workspace and scratch drives get Firecracker's
   `rate_limiter` (v1.17.0 API: `RateLimiter { bandwidth, ops }`, each a
   `TokenBucket { size, refill_time, one_time_burst? }`). Bandwidth uses

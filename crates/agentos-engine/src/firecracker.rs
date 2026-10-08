@@ -712,6 +712,48 @@ fn lock_ws(lock: &File) -> Result<(), TryLockError> {
     }
 }
 
+/// The guest kernel's line for a failed block request on one of the VM's drives (`vdb` the
+/// workspace, `vdc` scratch): the drive's host file could not be written, which with sparse
+/// images means the host disk is full. Only the kernel prints it with this `] ` prefix; the
+/// check cannot write the console (a KVM test checks that).
+const GUEST_BLOCK_IO_ERROR: &[u8] = b"] I/O error, dev vd";
+/// The most of `console.log` read when looking for it.
+const CONSOLE_SCAN_LIMIT: u64 = 4 << 20;
+
+/// Whether the VM's serial console logged a guest block I/O error.
+fn guest_block_io_errors(console_log: &Path) -> bool {
+    let Ok(mut file) = File::open(console_log) else {
+        return false;
+    };
+    let len = file.metadata().map_or(0, |m| m.len());
+    let mut tail = Vec::new();
+    let skip = len.saturating_sub(CONSOLE_SCAN_LIMIT);
+    if io::Seek::seek(&mut file, io::SeekFrom::Start(skip)).is_err()
+        || io::Read::read_to_end(
+            &mut io::Read::take(&mut file, CONSOLE_SCAN_LIMIT),
+            &mut tail,
+        )
+        .is_err()
+    {
+        return false;
+    }
+    tail.windows(GUEST_BLOCK_IO_ERROR.len())
+        .any(|w| w == GUEST_BLOCK_IO_ERROR)
+}
+
+/// The reason of an effect whose guest saw block I/O errors.
+const HOST_DISK_IO: &str = "host disk: the VM's drives returned I/O errors (see console.log)";
+
+/// `reason`, said to be the host disk's failure when the guest logged block I/O errors
+/// (formatting scratch at boot on a full host fails the boot).
+fn host_disk_hint(console_log: &Path, reason: String) -> String {
+    if guest_block_io_errors(console_log) {
+        format!("{HOST_DISK_IO}: {reason}")
+    } else {
+        reason
+    }
+}
+
 fn sparse(path: &Path, len: u64) -> io::Result<()> {
     File::create(path)?.set_len(len)
 }
@@ -1158,7 +1200,7 @@ impl FirecrackerWorker {
             Ok(link) => link,
             Err(e) => {
                 vm.kill();
-                return fail(not_up(&e));
+                return fail(host_disk_hint(&paths.console_log, not_up(&e)));
             }
         };
         let hello = Message::Hello {
@@ -1181,7 +1223,7 @@ impl FirecrackerWorker {
         if let Err(e) = ready {
             drop(link);
             vm.kill();
-            return fail(not_up(&e));
+            return fail(host_disk_hint(&paths.console_log, not_up(&e)));
         }
 
         // Serve: one request, one reply. From the first byte of the request on, a lost
@@ -1213,11 +1255,25 @@ impl FirecrackerWorker {
         drop(link);
         vm.wait_or_kill(SHUTDOWN_WAIT);
         drop(vm);
+        // With I/O errors from the drives, a refusal or a failed check says nothing about the
+        // workspace or the code: it is the host's failure, and the agent is told so.
+        let io_errors = guest_block_io_errors(&paths.console_log);
         let out = match reply {
+            Reply::Refused(reason) if io_errors => {
+                ExecOutcome::failure(req, ctx, format!("{HOST_DISK_IO}: {reason}"))
+            }
             Reply::Refused(reason) => ExecOutcome::failure(req, ctx, reason),
             Reply::Snapshot(files, digest) => outcomes::snapshot_manifest(req, ctx, files, digest),
             Reply::Patch(touched, digest) => outcomes::patch_applied(req, ctx, touched, digest),
             Reply::Verified(check) => match self.check_profile(&plan, &check) {
+                Ok(()) if io_errors && check.exit_code != Some(0) => ExecOutcome::failure(
+                    req,
+                    ctx,
+                    format!(
+                        "{HOST_DISK_IO}; the check's failure (exit code {:?}) is not evidence",
+                        check.exit_code
+                    ),
+                ),
                 Ok(()) => outcomes::evidence(req, ctx, &check),
                 Err(reason) => ExecOutcome::failure(req, ctx, reason),
             },
@@ -1861,6 +1917,30 @@ mod tests {
         let scratch = fs::metadata(&paths.scratch_img).unwrap();
         assert_eq!(scratch.len(), 768 << 20);
         assert!(scratch.blocks() * 512 < 1 << 20, "scratch.img stays sparse");
+    }
+
+    #[test]
+    fn only_the_kernel_block_error_line_counts_as_a_guest_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let console = dir.path().join("console.log");
+        let check = |text: &str| {
+            fs::write(&console, text).unwrap();
+            guest_block_io_errors(&console)
+        };
+        assert!(check(
+            "[    0.593152] I/O error, dev vdc, sector 278528 op 0x1:(WRITE) flags 0x4000\n"
+        ));
+        assert!(!check(
+            "agentos-guest: snapshot failed: syncfs /workspace: I/O error (os error 5)\n"
+        ));
+        assert!(!check(
+            "Buffer I/O error on device vdc, logical block 34816\n"
+        ));
+        assert!(!guest_block_io_errors(&dir.path().join("missing.log")));
+        // Only the last CONSOLE_SCAN_LIMIT bytes are read.
+        let mut long = "[ 1.0] I/O error, dev vdb, sector 1\n".to_string();
+        long.push_str(&"x".repeat(CONSOLE_SCAN_LIMIT as usize));
+        assert!(!check(&long));
     }
 
     /// A `request.json` written before resources were recorded still parses, as version 0.
