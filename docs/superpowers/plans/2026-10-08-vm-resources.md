@@ -18,7 +18,7 @@ each commit; KVM steps run on an otherwise idle host; commits carry no co-author
   optional `Limits` fields with `skip_serializing_if`, validation in `Contract::validate`.
 - [x] **3. Resolution.** Red: `VmResources::resolve` defaults (version 1); version-0 values for
   a journal without the record. Green: `agentos-core::resources`.
-- [ ] **4. Record and replay.** Red: `Submitted` carries `vm_resources` for Firecracker tasks
+- [x] **4. Record and replay.** Red: `Submitted` carries `vm_resources` for Firecracker tasks
   only; `resume` with a record that disagrees with the contract exits 1 and journals nothing.
   Green: CLI submit/resume plumbing into `FirecrackerConfig.resources`.
 - [ ] **5. Manifest.** Red: export includes `vm_resources`; a 2026-10-08 manifest still

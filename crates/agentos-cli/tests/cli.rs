@@ -5053,3 +5053,163 @@ fn cancel_of_an_anthropic_task_needs_no_key_and_never_contacts_the_api() {
     );
     assert_eq!(api.hits(), 0, "the crash came before the send");
 }
+
+/// The plain contract with `resources` merged into its `limits`.
+fn contract_with_resources(cli: &Cli, name: &str, resources: Value) -> String {
+    let mut contract: Value =
+        serde_json::from_str(&fs::read_to_string(cli.contract(&cli.repo_copy())).unwrap()).unwrap();
+    for (k, v) in resources.as_object().unwrap() {
+        contract["limits"][k] = v.clone();
+    }
+    cli.write(&format!("{name}.json"), &contract.to_string())
+}
+
+/// `submit --yes --crash-at` on the fake Firecracker worker: dies with 75; returns the task id.
+fn crash_fc(cli: &Cli, contract: &str) -> String {
+    let assert = cli
+        .cmd_as(
+            Mode::Fake,
+            &[
+                "submit",
+                contract,
+                "--yes",
+                "--fake-agent-patch",
+                fix_patch().to_str().unwrap(),
+                "--crash-at",
+                "during-execute:apply_patch",
+            ],
+        )
+        .assert()
+        .code(75);
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    stderr
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find_map(|v| v["task_id"].as_str().map(str::to_string))
+        .expect("the crash report names the task")
+}
+
+fn edit_submitted(cli: &Cli, id: &str, sql_expr: &str) {
+    rusqlite::Connection::open(cli.home().join("agentos.db"))
+        .unwrap()
+        .execute(
+            &format!("UPDATE events SET payload={sql_expr} WHERE task_id=?1 AND type='Submitted'"),
+            [id],
+        )
+        .unwrap();
+}
+
+#[test]
+fn submit_records_the_resolved_vm_resources_for_firecracker_tasks_only() {
+    let cli = Cli::bare();
+    cli.register_guest_image();
+    let plain = cli.submit_fc(&cli.contract(&cli.repo_copy()), &[]);
+    assert_eq!(plain["state"], "SUCCEEDED");
+    assert_eq!(
+        cli.submitted(plain["task_id"].as_str().unwrap())["vm_resources"],
+        json!({ "version": 1, "disk_mib": 1024, "scratch_mib": 512, "bandwidth_mib_s": null, "iops": null })
+    );
+    let sized = contract_with_resources(
+        &cli,
+        "sized",
+        json!({ "worker_disk_mib": 2048, "worker_scratch_mib": 768,
+                "worker_disk_bandwidth_mib_s": 64, "worker_disk_iops": 5000 }),
+    );
+    let out = cli.submit_fc(&sized, &[]);
+    assert_eq!(out["state"], "SUCCEEDED");
+    assert_eq!(
+        cli.submitted(out["task_id"].as_str().unwrap())["vm_resources"],
+        json!({ "version": 1, "disk_mib": 2048, "scratch_mib": 768, "bandwidth_mib_s": 64, "iops": 5000 })
+    );
+    let host = cli.json_as(
+        Mode::Plain,
+        &[
+            "submit",
+            &sized,
+            "--yes",
+            "--fake-agent-patch",
+            fix_patch().to_str().unwrap(),
+        ],
+    );
+    assert!(
+        cli.submitted(host["task_id"].as_str().unwrap())
+            .get("vm_resources")
+            .is_none(),
+        "the host worker has no drives"
+    );
+}
+
+#[test]
+fn resume_refuses_vm_resources_that_disagree_with_the_contract_and_journals_nothing() {
+    let cli = Cli::bare();
+    cli.register_guest_image();
+    let sized = contract_with_resources(&cli, "sized", json!({ "worker_disk_mib": 2048 }));
+
+    // A record that differs from what the stored contract resolves to.
+    let id = crash_fc(&cli, &sized);
+    edit_submitted(
+        &cli,
+        &id,
+        "json_set(payload, '$.vm_resources.disk_mib', 4096)",
+    );
+    let before = cli.events(&id);
+    cli.cmd_as(Mode::Fake, &["resume", &id])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("vm_resources"));
+    assert_eq!(cli.events(&id), before);
+
+    // No record (version 0) but a contract that asks for resources: also inconsistent.
+    let id = crash_fc(&cli, &sized);
+    edit_submitted(&cli, &id, "json_remove(payload, '$.vm_resources')");
+    let before = cli.events(&id);
+    cli.cmd_as(Mode::Fake, &["resume", &id])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("vm_resources"));
+    assert_eq!(cli.events(&id), before);
+}
+
+/// A task submitted before resources were recorded resumes with the version-0 values.
+#[test]
+fn a_task_without_recorded_vm_resources_resumes_with_version_zero() {
+    let cli = Cli::bare();
+    cli.register_guest_image();
+    let id = crash_fc(&cli, &cli.contract(&cli.repo_copy()));
+    edit_submitted(&cli, &id, "json_remove(payload, '$.vm_resources')");
+    let done = cli.json_as(Mode::Fake, &["resume", &id]);
+    assert_eq!(done["state"], "SUCCEEDED", "{done}");
+}
+
+#[test]
+fn the_approval_summary_shows_the_vm_disks_of_a_firecracker_task() {
+    let cli = Cli::bare();
+    cli.register_guest_image();
+    let summary = |contract: &str| {
+        let out = cli
+            .cmd_as(Mode::Fake, &["submit", contract])
+            .assert()
+            .success()
+            .get_output()
+            .stderr
+            .clone();
+        String::from_utf8(out).unwrap()
+    };
+    let plain = summary(&cli.contract(&cli.repo_copy()));
+    assert!(
+        plain.contains(
+            "  vm disks:             workspace 1024 MiB, scratch 512 MiB, no rate limit\n"
+        ),
+        "{plain}"
+    );
+    let limited = contract_with_resources(
+        &cli,
+        "limited",
+        json!({ "worker_disk_mib": 2048, "worker_disk_bandwidth_mib_s": 64, "worker_disk_iops": 5000 }),
+    );
+    let text = summary(&limited);
+    assert!(
+        text.contains("  vm disks:             workspace 2048 MiB, scratch 512 MiB, each writable drive at most 64 MiB/s and 5000 operations/s\n"),
+        "{text}"
+    );
+}

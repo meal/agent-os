@@ -22,6 +22,7 @@ use agentos_core::guest::{
     SNAPSHOT_FILES_LIMIT, WS_IMAGE_BYTES, mint_attempt_token, unb64,
 };
 use agentos_core::ids::{Digest, TaskId};
+use agentos_core::resources::VmResources;
 use agentos_core::workspace::{list_files, workspace_digest};
 use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 use serde::{Deserialize, Serialize};
@@ -87,6 +88,8 @@ pub struct FirecrackerConfig {
     pub launcher: GuestLauncher,
     /// Decided by the controller; the worker only executes it.
     pub jail: JailMode,
+    /// The task's drive sizes and rate limits, as recorded at submission.
+    pub resources: VmResources,
 }
 
 impl FirecrackerConfig {
@@ -1665,6 +1668,7 @@ mod tests {
 
     fn config() -> FirecrackerConfig {
         FirecrackerConfig {
+            resources: agentos_core::resources::VmResources::V0,
             firecracker_bin: "/home/x/bin/firecracker".into(),
             image_dir: "/home/x/registry/images/python-stdlib-v1@0545ba17".into(),
             image_digest: Digest::of(b"image"),

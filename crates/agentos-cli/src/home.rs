@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agentos_core::contract::Limits;
 use agentos_core::ids::{Digest, TaskId};
+use agentos_core::resources::VmResources;
 use agentos_engine::firecracker::{FirecrackerConfig, preflight};
 use agentos_engine::guestlink::GuestLauncher;
 use agentos_engine::jail::{self, JAIL_GID, JAIL_UID, JailConfig, JailDecision, JailMode};
@@ -140,6 +141,9 @@ pub struct RecordedWorker {
     pub image: Option<(String, Digest)>,
     /// `None` for host (and 3a) tasks.
     pub jailed: Option<bool>,
+    /// The recorded drive sizes and rate limits (version 0 when the record predates them);
+    /// `None` for host (and 3a) tasks.
+    pub resources: Option<VmResources>,
 }
 
 /// A Firecracker worker configuration that passed the preflight and the jail decision.
@@ -455,6 +459,7 @@ impl Home {
             kind: WorkerKind::Host,
             image: None,
             jailed: None,
+            resources: None,
         };
         let Some(submitted) = events.iter().find(|e| e.event_type == "Submitted") else {
             return Ok(host);
@@ -477,10 +482,13 @@ impl Home {
                     .and_then(|d| Digest::from_hex(d).ok())
                     .ok_or_else(|| broken("guest_image_digest"))?;
                 let jailed = p["jailed"].as_bool().ok_or_else(|| broken("jailed"))?;
+                let resources = VmResources::from_submitted(p)
+                    .map_err(|e| CliError::other(format!("task {task}: {e}")))?;
                 Ok(RecordedWorker {
                     kind: WorkerKind::Firecracker,
                     image: Some((id, digest)),
                     jailed: Some(jailed),
+                    resources: Some(resources),
                 })
             }
             Some(other) => Err(CliError::other(format!(
@@ -531,6 +539,7 @@ impl Home {
         task_dir: &Path,
         profile_digest: Option<Digest>,
         recorded_jailed: Option<bool>,
+        resources: VmResources,
     ) -> Result<PreparedFirecracker, CliError> {
         let root = std::path::absolute(&self.root)?;
         let image_digest = Digest::from_hex(&image.digest).map_err(|e| {
@@ -552,6 +561,7 @@ impl Home {
             attempt_token: String::new(),
             launcher,
             jail: JailMode::Unjailed,
+            resources,
         };
         // The registry entry itself is validated: manifest, files, and its digest now.
         preflight(&cfg)
@@ -846,6 +856,12 @@ impl Home {
                         ))
                     })?;
                 let limits = store.db.contract(task)?.limits;
+                // The values the task was submitted with, which its stored contract must
+                // still resolve to; nothing is journaled when it does not.
+                let resources = recorded.resources.unwrap_or(VmResources::V0);
+                resources
+                    .check_recorded(&limits)
+                    .map_err(|e| CliError::other(format!("task {task}: {e}")))?;
                 WorkerConfig::Firecracker(
                     self.prepare_firecracker(
                         &entry,
@@ -853,6 +869,7 @@ impl Home {
                         &task_dir,
                         profile_digest,
                         recorded.jailed,
+                        resources,
                     )?
                     .cfg,
                 )

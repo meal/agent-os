@@ -211,6 +211,7 @@ impl Kvm {
     pub fn jailed_config(&self, root: &Path) -> FirecrackerConfig {
         let image_dir = self.image_for(root);
         FirecrackerConfig {
+            resources: agentos_core::resources::VmResources::V0,
             firecracker_bin: self.firecracker_bin.clone(),
             image_digest: workspace_digest(&image_dir).expect("digest the guest image"),
             image_dir,

@@ -89,6 +89,7 @@ pub fn fake_image(root: &Path) -> PathBuf {
 pub fn fake_firecracker_config(root: &Path) -> FirecrackerConfig {
     let image_dir = fake_image(root);
     FirecrackerConfig {
+        resources: agentos_core::resources::VmResources::V0,
         firecracker_bin: root.join("bin/firecracker"),
         image_digest: workspace_digest(&image_dir).unwrap(),
         image_dir,

@@ -1020,6 +1020,7 @@ mod tests {
     #[test]
     fn chroot_view_is_the_golden_jailed_vm_json() {
         let cfg = FirecrackerConfig {
+            resources: agentos_core::resources::VmResources::V0,
             firecracker_bin: "/home/x/bin/firecracker".into(),
             image_dir: "/home/x/registry/images/python-stdlib-v1@0545ba17".into(),
             image_digest: Digest::of(b"image"),

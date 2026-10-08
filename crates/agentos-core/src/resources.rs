@@ -55,6 +55,40 @@ impl VmResources {
         }
     }
 
+    /// Whether this record is what `limits` resolves to under the record's own version. A
+    /// version-0 record (no record at all) is only consistent with a contract that asks for
+    /// none of the resource limits, which did not exist then.
+    pub fn check_recorded(&self, limits: &Limits) -> Result<(), String> {
+        let expected = match self.version {
+            0 => {
+                let asked = limits.worker_disk_mib.is_some()
+                    || limits.worker_scratch_mib.is_some()
+                    || limits.worker_disk_bandwidth_mib_s.is_some()
+                    || limits.worker_disk_iops.is_some();
+                if asked {
+                    return Err(
+                        "the contract sets VM resource limits but Submitted records no vm_resources"
+                            .into(),
+                    );
+                }
+                VmResources::V0
+            }
+            VM_RESOURCES_VERSION => VmResources::resolve(limits),
+            v => {
+                return Err(format!(
+                    "recorded vm_resources version {v} is newer than this build ({VM_RESOURCES_VERSION})"
+                ));
+            }
+        };
+        if *self == expected {
+            Ok(())
+        } else {
+            Err(format!(
+                "recorded vm_resources {self:?} differ from what the contract resolves to ({expected:?})"
+            ))
+        }
+    }
+
     /// `disk_mib` in bytes (a `u32` of MiB always fits a `u64` of bytes).
     pub fn disk_bytes(&self) -> u64 {
         u64::from(self.disk_mib) << 20
@@ -142,5 +176,34 @@ mod tests {
                 .unwrap_err()
                 .contains("malformed")
         );
+    }
+
+    #[test]
+    fn a_record_must_match_its_contract_under_its_own_version() {
+        let sized = limits(r#","worker_disk_mib":2048"#);
+        let recorded = VmResources::resolve(&sized);
+        assert_eq!(recorded.check_recorded(&sized), Ok(()));
+        let changed = VmResources {
+            disk_mib: 4096,
+            ..recorded
+        };
+        assert!(
+            changed
+                .check_recorded(&sized)
+                .unwrap_err()
+                .contains("vm_resources")
+        );
+        assert_eq!(VmResources::V0.check_recorded(&limits("")), Ok(()));
+        assert!(
+            VmResources::V0
+                .check_recorded(&sized)
+                .unwrap_err()
+                .contains("vm_resources")
+        );
+        let future = VmResources {
+            version: 2,
+            ..recorded
+        };
+        assert!(future.check_recorded(&sized).unwrap_err().contains("newer"));
     }
 }

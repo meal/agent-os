@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use agentos_core::contract::Contract;
 use agentos_core::guest::{GUEST_MIN_MEMORY_MIB, MAX_VCPUS};
 use agentos_core::ids::{Digest, TaskId};
+use agentos_core::resources::VmResources;
 use agentos_engine::firecracker::firecracker_version;
 use agentos_engine::guestlink::GuestLauncher;
 use agentos_engine::model::fake::Transcript;
@@ -52,6 +53,7 @@ struct FirecrackerRecord {
     image_digest: Digest,
     version: String,
     jailed: bool,
+    resources: VmResources,
 }
 
 /// The Firecracker worker's checks, in order: the contract's limits (exit 2), the guest image
@@ -80,7 +82,8 @@ fn check_firecracker(home: &Home, contract: &Contract) -> Result<FirecrackerReco
         })?;
     // The preflight reads only the launcher and the image: the task's own paths do not exist yet.
     let placeholder = std::path::absolute(home.tasks_dir())?;
-    let prepared = home.prepare_firecracker(&image, l, &placeholder, None, None)?;
+    let resources = VmResources::resolve(l);
+    let prepared = home.prepare_firecracker(&image, l, &placeholder, None, None, resources)?;
     let version = match &prepared.cfg.launcher {
         GuestLauncher::Fake { .. } => FAKE_FIRECRACKER_VERSION.to_string(),
         GuestLauncher::Real { .. } => {
@@ -96,6 +99,7 @@ fn check_firecracker(home: &Home, contract: &Contract) -> Result<FirecrackerReco
         image_digest: prepared.cfg.image_digest,
         version,
         jailed: prepared.jailed,
+        resources,
     })
 }
 
@@ -281,6 +285,21 @@ fn summarize(
             if fc.jailed { "jailed" } else { "unjailed" }
         ),
     }
+    if let Some(fc) = fc {
+        let r = &fc.resources;
+        let rates = match (r.bandwidth_mib_s, r.iops) {
+            (None, None) => "no rate limit".to_string(),
+            (Some(b), None) => format!("each writable drive at most {b} MiB/s"),
+            (None, Some(o)) => format!("each writable drive at most {o} operations/s"),
+            (Some(b), Some(o)) => {
+                format!("each writable drive at most {b} MiB/s and {o} operations/s")
+            }
+        };
+        eprintln!(
+            "  vm disks:             workspace {} MiB, scratch {} MiB, {rates}",
+            r.disk_mib, r.scratch_mib
+        );
+    }
 }
 
 pub async fn submit(
@@ -374,6 +393,7 @@ pub async fn submit(
             fields.insert("firecracker_version".into(), json!(fc.version));
             fields.insert("host_kernel".into(), json!(host_kernel()));
             fields.insert("jailed".into(), json!(fc.jailed));
+            fields.insert("vm_resources".into(), json!(fc.resources));
         }
     }
     store.db.append_audit(&task, "Submitted", &submitted)?;
