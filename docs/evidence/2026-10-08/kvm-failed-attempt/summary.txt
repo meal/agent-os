@@ -1,0 +1,5 @@
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test api_key_reaches_only_the_provider_and_never_the_journal_blobs_home_or_job_environments ... FAILED
+thread 'api_key_reaches_only_the_provider_and_never_the_journal_blobs_home_or_job_environments' (110) panicked at crates/agentos-cli/tests/cli.rs:4165:13:
+test result: FAILED. 114 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.35s

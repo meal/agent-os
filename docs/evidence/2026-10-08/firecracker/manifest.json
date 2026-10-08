@@ -1,0 +1,105 @@
+{
+  "task_id": "01a11c64-2316-70b1-ac31-85995ea2cb65",
+  "state": "SUCCEEDED",
+  "base_revision": "be77aa19c032f85329a9596adfd692252a0c87fd09d337b1873feb6003bdd3b8",
+  "base_workspace_digest": "be77aa19c032f85329a9596adfd692252a0c87fd09d337b1873feb6003bdd3b8",
+  "patch_digest": "ef779c73c1e7f13bea274b8893584ab90dca4f41b5480c5127321a8e9e4ca776",
+  "patches": [
+    {
+      "effect_id": "f6c399e48e8206526996c0deefc38ff0880fc1c94d8c43918d5a3fa733eede26",
+      "digest": "ef779c73c1e7f13bea274b8893584ab90dca4f41b5480c5127321a8e9e4ca776",
+      "file": "patches/0001-ef779c73c1e7f13bea274b8893584ab90dca4f41b5480c5127321a8e9e4ca776.patch"
+    }
+  ],
+  "final_workspace_digest": "5749086e441f674ce815f8928fa39edac450dc3b6773ab1114ea9f175c6794ae",
+  "verified_digest": "5749086e441f674ce815f8928fa39edac450dc3b6773ab1114ea9f175c6794ae",
+  "verification_profile_digest": "9ff584f31b7fef8ac5774ced5c8f1620c27f736b4bdc4d9e03e553df5d8ea12c",
+  "verification_results": [
+    {
+      "effect_id": "b3972664f97851d6079352c1ab82263cb559257c20d037c29d292229e6f22642",
+      "completed": true,
+      "passed": true,
+      "workspace_digest": "5749086e441f674ce815f8928fa39edac450dc3b6773ab1114ea9f175c6794ae",
+      "evidence_digest": "2480810e97c32cba90d5a1304e1fae56989c64155c66bf0be8b65df665b48d29",
+      "profile_digest": "9ff584f31b7fef8ac5774ced5c8f1620c27f736b4bdc4d9e03e553df5d8ea12c",
+      "exit_code": 0,
+      "accepted_for_final_workspace": true
+    }
+  ],
+  "model_calls": [
+    {
+      "effect_id": "c6bdf846ad13475468dde1447bb8d081c0b24e8d53b800905563cf4872bf60c0",
+      "request_digest": "fdbb346a20ffe3feba076da41d538e2340804cf949919b1a237bc7a6ef048449",
+      "response_digest": "071d1c00df03cf00fb0e26c2ae7ee38ba289774cb84d996b4dd2c0b37e4793e2",
+      "state": "COMPLETED",
+      "request_file": "model/0001-request.json",
+      "response_file": "model/0001-response.json"
+    },
+    {
+      "effect_id": "cf122b5ab9c0fd23221a7e1dccde7b02ccb181ad8ae42851f978ac03206dbce5",
+      "request_digest": "f520ec031baca5708228d55e0894beac9eec0894351c7b4df3a83c660c59d587",
+      "response_digest": "a9cec3ffd3a49f2b80fafad519056e19d23ec323c598988c068be325252809f7",
+      "state": "COMPLETED",
+      "request_file": "model/0002-request.json",
+      "response_file": "model/0002-response.json"
+    },
+    {
+      "effect_id": "3aefa981f479702ff4867afd638e24a68d03e041010f195a68ecc32bcd540597",
+      "request_digest": "ef73caea1e015328d37b30c228ef9cb85eea3528ce9272a63c0ee8fc0450ca69",
+      "response_digest": "53290f120b16f3c08793541a1ac21194e6072b4420f3be0de7915375d4511469",
+      "state": "COMPLETED",
+      "request_file": "model/0003-request.json",
+      "response_file": "model/0003-response.json"
+    },
+    {
+      "effect_id": "a92de7bdbca1d7037053ed4d8addb340f34b58b5596900243950bf404b54030f",
+      "request_digest": "5c1a9bf3b300050f0f1ab7215ba48839b93a0b2d4182dc52d90819238fef88db",
+      "response_digest": "98f609517a4b03cb727e45c1879c8e847e885aa64f2ca974b659a701af417fd3",
+      "state": "COMPLETED",
+      "request_file": "model/0004-request.json",
+      "response_file": "model/0004-response.json"
+    }
+  ],
+  "usage_summary": {
+    "reserved_model_requests": 0,
+    "settled_model_requests": 4,
+    "uncertain_model_requests": 0,
+    "reserved_tool_actions": 0,
+    "settled_tool_actions": 4,
+    "uncertain_tool_actions": 0
+  },
+  "contract_digest": "19fa1d6808e96ba70dfe6d2a45455b59ff3f6af5f9ac0d6906451a9e5106b70e",
+  "model": "anthropic:claude-opus-5-5",
+  "model_policy_version": 1,
+  "model_limits_version": 1,
+  "model_endpoint": "https://api.anthropic.com",
+  "generated_events": 79,
+  "capabilities": [
+    {
+      "operation": "snapshot.read",
+      "handle_prefix": "d6f3cfa5",
+      "revoked": false
+    },
+    {
+      "operation": "workspace.apply_patch",
+      "handle_prefix": "0d87c10f",
+      "revoked": false
+    },
+    {
+      "operation": "verification.run",
+      "handle_prefix": "a3bc0914",
+      "revoked": false
+    },
+    {
+      "operation": "artifact.export",
+      "handle_prefix": "ea6407ad",
+      "revoked": false
+    },
+    {
+      "operation": "model.request",
+      "handle_prefix": "1833b7bc",
+      "revoked": false
+    }
+  ],
+  "guest_image_digest": "384255af1b522625a02a5855c59ef3d21307dec6b459ca93c218bc5b97c5cac5"
+}

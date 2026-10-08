@@ -1,0 +1,45 @@
+{
+  "commit": "825d3600bd286270b3662a93373006024169515f-dirty",
+  "endpoint": "https://api.anthropic.com",
+  "kind": "live-acceptance",
+  "model": "claude-opus-5-5",
+  "run": {
+    "duration": {
+      "nanos": 461572194,
+      "secs": 16
+    },
+    "event_types": {
+      "ActionUsed": 4,
+      "AgentTurn": 10,
+      "ArtifactRegistered": 16,
+      "CapabilitiesIssued": 1,
+      "CapabilityGranted": 20,
+      "Denied": 1,
+      "EffectCompleted": 10,
+      "EffectDispatched": 10,
+      "EffectIntended": 10,
+      "Exported": 1,
+      "Started": 1,
+      "Submitted": 1,
+      "TaskCreated": 1,
+      "VerifyPassed": 1,
+      "VerifyStarted": 1,
+      "WorkspaceUpdated": 2
+    },
+    "model_calls": 5,
+    "patch": "e42168bb861dd8bd4f6dc882c06b754c14d8616b86d62acb5a7d8e8794336612",
+    "profile": "9ff584f31b7fef8ac5774ced5c8f1620c27f736b4bdc4d9e03e553df5d8ea12c",
+    "requests": [
+      "fdbb346a20ffe3feba076da41d538e2340804cf949919b1a237bc7a6ef048449",
+      "860cbb4981cc3edcdb908090dea8a407f76b563bd79ad5f0511a8010cec776e9",
+      "26fa5b740f90ae8dbabc78eedcc6864db85248aa307cb51d8e915d242561d9b7",
+      "62a039ffe274265f62a41aaaa5612675c812218a48596762543166c0b7e4d297",
+      "0e384e8adbcb7a7a5558d1e73da9960ceb5e9591136a0e5ea088047288468b39"
+    ],
+    "workspace": "19caa4fcf4e404c7820404402a7122b6619cfe7f95b6f2e76e07dbdd0e85b548"
+  },
+  "schema_version": 1,
+  "single_dispatch_verified": true,
+  "uncertain_model_requests": 0,
+  "worker": "host"
+}

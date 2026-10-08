@@ -4162,7 +4162,13 @@ fn api_key_reaches_only_the_provider_and_never_the_journal_blobs_home_or_job_env
                 continue;
             }
             dumps += 1;
-            assert!(stdout.contains("PATH="), "round {round}: {stdout}");
+            // In the real guest the parent is the guest's init: its environment is not
+            // readable, so the dump is empty. That is a stronger statement about the key (the
+            // guest never had it, see `api_key_never_reaches_the_guest`), but the dump is
+            // only a non-vacuous scan on the host-side workers.
+            if !real_mode() {
+                assert!(stdout.contains("PATH="), "round {round}: {stdout}");
+            }
             assert!(
                 !stdout.contains("ANTHROPIC_API_KEY") && !stdout.contains("SECRET"),
                 "round {round}: a job environment holds the key:\n{stdout}"
