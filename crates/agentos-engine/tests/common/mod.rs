@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+pub mod evidence;
 pub mod http;
 pub mod kvm;
 pub mod live;
