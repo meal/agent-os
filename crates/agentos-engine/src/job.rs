@@ -475,6 +475,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (job, lock) = JobDir::create(root.path(), &req()).unwrap();
         drop(lock);
+        // A process another test spawns in this window inherits the lock's descriptor until
+        // it execs, holding the flock that long: wait for the release instead of racing it.
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !job.is_dead() && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(job.is_dead());
         let unknown = || {
             probe_lock(
