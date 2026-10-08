@@ -12,9 +12,9 @@
 
 ## Execution status — 2026-10-08
 
-Packages 1–8 are complete. Package 7's live host and jailed runs and the real
+Packages 1–9 are complete. Package 7's live host and jailed runs and the real
 KVM suites passed on 2026-10-08 ([evidence](../../evidence/README.md)), and its evidence is
-checked automatically. Package 5's candidate guest passed real KVM acceptance at `f175de3`. Packages 9–12 remain open; package 9 has a [focused design](../specs/2026-10-08-vm-resources-design.md) and [plan](2026-10-08-vm-resources.md).
+checked automatically. Package 5's candidate guest passed real KVM acceptance at `f175de3`. Package 9 passed full KVM acceptance at `7955b96`. Packages 10–12 remain open; package 10 has a [focused design](../specs/2026-10-08-component-analyzer-design.md).
 The 2026-10-04 status below is historical.
 
 ## Execution status — 2026-10-04
@@ -260,10 +260,12 @@ docker compose run --rm test cargo test -p agentos-engine --locked --test export
 
 **Files:** `crates/agentos-core/src/contract.rs`, `crates/agentos-engine/src/{firecracker,jail}.rs`, CLI home/submit/export, contract/worker/KVM tests; profile registration validation.
 
-- [ ] Write focused resource-limit spec/plan: optional disk/scratch/bandwidth/IOPS fields, explicit ranges, old defaults, recorded provenance, and preflight capacity checks.
-- [ ] Test old-contract defaults (1024/512 MiB), minimum/maximum/overflow, full disk, actual I/O rate enforcement, and crash/resume with recorded limits.
-- [ ] Measure page-cache/cgroup pressure under heavy I/O; choose documented overhead from measurements and assert infrastructure OOM cannot accept verification.
-- [ ] Reject guest profiles that require unsupported executable mode transport; test interpreter-based commands continue to work. Keep a protocol-mode upgrade outside this package.
+- [x] Write focused resource-limit spec/plan: optional disk/scratch/bandwidth/IOPS fields, explicit ranges, old defaults, recorded provenance, and preflight capacity checks.
+- [x] Test old-contract defaults (1024/512 MiB), minimum/maximum/overflow, full disk, actual I/O rate enforcement, and crash/resume with recorded limits.
+- [x] Measure page-cache/cgroup pressure under heavy I/O; choose documented overhead from measurements and assert infrastructure OOM cannot accept verification.
+- [x] Reject guest profiles that require unsupported executable mode transport; test interpreter-based commands continue to work. Keep a protocol-mode upgrade outside this package.
+
+**Task 9 result (2026-10-09).** Implemented per the [focused design](../specs/2026-10-08-vm-resources-design.md) and [plan](2026-10-08-vm-resources.md). Two decisions changed from the first draft on measurements: images stay sparse (preallocation would reserve about all free space under the test container), and the rate minimums rose to 32 MiB/s and 5000 operations/s (the first ones could not boot). A full host disk is reported as `host disk: …`. Full KVM acceptance passed at `7955b96`.
 
 ```sh
 docker compose run --rm test cargo test -p agentos-core --locked

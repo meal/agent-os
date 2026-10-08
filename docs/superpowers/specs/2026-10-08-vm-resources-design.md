@@ -144,19 +144,22 @@ below it with margin and no run records an `oom_kill`; otherwise choose the smal
 the measurements support and record why. Reclaimable page cache is expected to be reclaimed
 under `memory.max` rather than kill Firecracker; the measurements decide.
 
-**Measured (2026-10-08, `docs/evidence/2026-10-08/vm-memory/`).** The hostile disk-fill
-check, alone and against a host writer, with and without the 32 MiB/s limit:
+**Measured (2026-10-08, `docs/evidence/2026-10-08/vm-memory/`).** Peak usage is the wrong
+measure under heavy writes: page cache fills whatever room exists, so at 256 MiB the peak sat
+at the 384 MiB limit in every case. What reclaim cannot drop is anonymous memory plus dirty
+and writeback page cache, summed within one sample (every 20 ms). The hostile disk-fill check:
 
-| Guest memory | Peak in the jail cgroup | Above guest memory | `memory.max` reached | OOM kills |
-| --- | --- | --- | --- | --- |
-| 256 MiB | 384 MiB in all four cases | 128 MiB (the limit) | 180–191 times | 0 |
-| 1024 MiB, no rate limit | 1103–1105 MiB | 79–81 MiB | 0 | 0 |
-| 1024 MiB, 32 MiB/s | 1050–1051 MiB | 26–27 MiB | 0 | 0 |
+| Case | Unreclaimable peak | Headroom to `memory.max` | OOM kills |
+| --- | --- | --- | --- |
+| 256 MiB guest, alone, with and without 32 MiB/s and a host writer | 284–312 MiB | 71–99 MiB | 0 |
+| 256 MiB guest, four VMs filling at once | 302–322 MiB | 61–81 MiB | 0 |
+| 1024 MiB guest, the same four single-VM cases | 682–767 MiB | 384–469 MiB | 0 |
 
-Anonymous memory stays within 2 MiB of the guest's; the rest is page cache, which the
-cgroup reclaims at its limit instead of killing Firecracker. **Decision: keep
-`JAIL_MEMORY_OVERHEAD_MIB` at 128 MiB.** The measurements give no reason to raise it, and
-lowering it would put the 1024 MiB case at its limit too.
+**Decision: keep `JAIL_MEMORY_OVERHEAD_MIB` at 128 MiB.** The tightest case keeps 61 MiB,
+about half the overhead, and four concurrent VMs did not reproduce the OOM the disk-fill
+test once met. A spike shorter than the 20 ms sampling could go unseen, so the disk-fill
+test still runs alone. Step 12 shows that an OOM, if it happens, is a visible failure and
+never accepted evidence.
 
 **Infrastructure OOM never verifies.** With the existing `with_jail_memory_max_mib` seam set
 low during a write-heavy verification, the VM is killed by the cgroup. The test asserts no
