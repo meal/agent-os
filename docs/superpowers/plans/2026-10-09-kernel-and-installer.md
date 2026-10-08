@@ -18,11 +18,11 @@ builds; no co-author trailer.
   byte-identical.
 - [ ] **3. Kernel on KVM.** The booted kernel's version and embedded config match the record;
   the full KVM suite passes on the new image.
-- [ ] **4. Release.** `scripts/release.sh VERSION` builds a static musl `agentos` and the
+- [x] **4. Release.** `scripts/release.sh VERSION` builds a static musl `agentos` and the
   release tree with `MANIFEST.json` and `SHA256SUMS`.
 - [x] **5. Installer.** `scripts/install.sh` with every refusal and `--self-test` covering
   each, plus idempotence and the same-version-different-content refusal.
-- [ ] **6. Smoke run.** `scripts/smoke-install.sh` in a fresh container on the KVM host:
+- [x] **6. Smoke run.** `scripts/smoke-install.sh` in a fresh container on the KVM host:
   install, register, jailed fixture with the analyzer, kill and resume, export, compare.
 
 **Gate:** reproducible, provenanced kernel and image; the release installs and works in a
