@@ -1004,13 +1004,6 @@ The model workflow (Phase 4):
   `AGENTOS_ANTHROPIC_BASE_URL` is refused before credentials or task writes. Legacy tasks
   lacking an endpoint may only resume with the official endpoint; re-submit custom tasks.
   HTTPS URLs can name any host, so select the provider when submitting.
-- **`cancel` and recovery of a terminal task build a live provider when a key is available.**
-  They build the provider leniently (`Home::recovery_executor`), so with a key an
-  `AnthropicProvider` is constructed although those paths never dispatch a model call (recovery
-  of a terminal or cancel-pending task never dispatches; it only abandons, forfeits or publishes
-  retained receipts). Without a key the provider is `None` and
-  a dispatch would fail with `no model provider configured`. The "never sends" guarantee rests on
-  recovery's behaviour, not on the type.
 - **Key files are bounded regular files.** Files over 4096 bytes and nonregular or symlink
   final components are refused. There is no mode warning; an unreadable key file's error echoes its path.
 - **Provider bodies are bounded.** Successful bodies over 4 MiB become unresolved calls
@@ -1035,8 +1028,13 @@ The model workflow (Phase 4):
 - **An exported `model/NNNN-response.json` can be the engine's failure record**, not an API
   response, for a model call that failed with an HTTP error (the manifest's `state` says
   `FAILED`).
-- **`retained_outcome` scans `<home>/model/`.** `gc` removes proven redundant terminal-task
-  response copies; uncollected entries still make each lookup scan the directory.
+- **`<home>/model/` entries accumulate until `gc` collects them.** `gc` removes the retained
+  responses of terminal tasks only when they are proven redundant (see the `gc` section);
+  everything else stays. `retained_outcome` lists `<home>/model` once per lookup and opens only
+  that effect's `<effect>-<attempt>` entries, so a lookup costs O(entries in `model/`); its one
+  caller is recovery's publish-retained step, at most twice per outstanding effect per pass. A
+  read error other than not-found and a corrupt `response.json` are logged and count as nothing
+  retained (so the effect is forfeited, never sent again on a guess).
 - **Resuming a cancel-pending `anthropic:` task without a key exits 2.** `resume` needs the
   provider; use `agentos cancel`, which does not.
 - **Older demo transcripts predate the `model` field** of `status` (and `Submitted.model` as a

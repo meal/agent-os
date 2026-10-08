@@ -421,3 +421,138 @@ async fn retention_creates_a_missing_root_and_round_trips() {
     let out = ex.run(&r, &ctx()).await;
     assert_eq!(ex.retained_outcome(&r.effect_id), Some(out));
 }
+
+/// A retained, resolved outcome for `req` written by hand under `attempt`.
+fn plant(ex: &ModelExecutor, req: &EffectRequest, attempt: &AttemptId, generation: u64) {
+    let mut out = ExecOutcome::success(
+        req,
+        &AttemptCtx {
+            attempt_id: attempt.clone(),
+            lease_generation: generation,
+            worker: "model".into(),
+        },
+        GOOD.to_vec(),
+    );
+    out.receipt.lease_generation = generation;
+    let dir = ex.retention_dir(&req.effect_id, attempt);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("response.json"), serde_json::to_vec(&out).unwrap()).unwrap();
+}
+
+fn effect_n(n: u32) -> EffectRequest {
+    let mut r = req(model_kind());
+    r.effect_id = EffectId::derive(&r.task_id, n, &r.kind, &Digest::of(&n.to_le_bytes()));
+    r
+}
+
+#[test]
+fn the_right_attempt_is_found_among_many_unrelated_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = ModelExecutor::new(dir.path().to_path_buf(), None, ExecCounts::default());
+    // Many unrelated retained effects, each with a corrupt file: reading any of them would log.
+    for n in 0..300 {
+        let other = effect_n(n);
+        let d = ex.retention_dir(&other.effect_id, &AttemptId::new());
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("response.json"), b"not json").unwrap();
+    }
+    let mine = effect_n(1000);
+    plant(&ex, &mine, &AttemptId::new(), 1);
+    plant(&ex, &mine, &AttemptId::new(), 3);
+    plant(&ex, &mine, &AttemptId::new(), 2);
+
+    let logs = capture_warnings(|| {
+        let found = ex.retained_outcome(&mine.effect_id).unwrap();
+        assert_eq!(found.receipt.lease_generation, 3, "the newest lease wins");
+        assert_eq!(ex.retained_outcome(&effect_n(2000).effect_id), None);
+    });
+
+    assert_eq!(logs, "", "only this effect's entries are opened");
+}
+
+#[tokio::test]
+async fn an_entry_planted_right_after_a_run_is_found_by_the_next_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ex, _) = exec(
+        dir.path(),
+        vec![ProviderResult::Response(GOOD.to_vec(), Usage::default())],
+        &ExecCounts::default(),
+    );
+    let late = effect_n(2);
+    assert_eq!(ex.retained_outcome(&late.effect_id), None);
+
+    let run = req(model_kind());
+    let kept = ex.run(&run, &ctx()).await;
+    assert_eq!(ex.retained_outcome(&run.effect_id), Some(kept));
+
+    // No pause: a lookup never depends on how much time has passed since the last one.
+    plant(&ex, &late, &AttemptId::new(), 1);
+    assert!(ex.retained_outcome(&late.effect_id).is_some());
+}
+
+#[test]
+fn a_corrupt_response_of_one_effect_does_not_affect_another() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = ModelExecutor::new(dir.path().to_path_buf(), None, ExecCounts::default());
+    let (bad, good) = (effect_n(1), effect_n(2));
+    let d = ex.retention_dir(&bad.effect_id, &AttemptId::new());
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("response.json"), b"{ truncated").unwrap();
+    plant(&ex, &good, &AttemptId::new(), 1);
+
+    let logs = capture_warnings(|| {
+        assert_eq!(ex.retained_outcome(&bad.effect_id), None);
+        assert!(ex.retained_outcome(&good.effect_id).is_some());
+    });
+
+    assert!(logs.contains("cannot parse"), "{logs}");
+    assert!(logs.contains(bad.effect_id.as_str()), "{logs}");
+    assert!(!logs.contains(good.effect_id.as_str()), "{logs}");
+}
+
+#[test]
+fn an_unreadable_response_is_logged_and_treated_as_nothing_retained() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = ModelExecutor::new(dir.path().to_path_buf(), None, ExecCounts::default());
+    let (unreadable, missing) = (effect_n(1), effect_n(2));
+    // `response.json` is a directory: reading it fails with an error that is not NotFound.
+    let d = ex.retention_dir(&unreadable.effect_id, &AttemptId::new());
+    std::fs::create_dir_all(d.join("response.json")).unwrap();
+    // A retention directory without a response is an ordinary crash leftover: silent.
+    std::fs::create_dir_all(ex.retention_dir(&missing.effect_id, &AttemptId::new())).unwrap();
+
+    let logs = capture_warnings(|| {
+        assert_eq!(ex.retained_outcome(&unreadable.effect_id), None);
+        assert_eq!(ex.retained_outcome(&missing.effect_id), None);
+    });
+
+    assert!(logs.contains("cannot read"), "{logs}");
+    assert!(logs.contains(unreadable.effect_id.as_str()), "{logs}");
+    assert!(!logs.contains(missing.effect_id.as_str()), "{logs}");
+}
+
+/// The warnings `f` logs, as text.
+fn capture_warnings(f: impl FnOnce()) -> String {
+    use std::sync::{Arc, Mutex};
+    #[derive(Clone)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let sink = Sink(Arc::default());
+    let writer = sink.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, f);
+    let bytes = sink.0.lock().unwrap().clone();
+    String::from_utf8(bytes).unwrap()
+}

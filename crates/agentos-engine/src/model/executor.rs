@@ -1,6 +1,7 @@
 //! Runs a `ModelCall` effect: sends the request exactly once and retains the answer
 //! before returning it, so recovery publishes the answer instead of sending again.
 
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -199,18 +200,45 @@ impl Executor for ModelExecutor {
         out
     }
 
+    /// The newest-lease resolved outcome retained for `effect`, if any. Anything this cannot
+    /// read or parse is logged (`warn`) and counts as not retained: the caller then treats
+    /// the effect as lost, which is the safe side (it is never sent again on a guess).
+    ///
+    /// Cost: one listing of the retention directory per call; only entries named
+    /// `<effect>-<attempt>` are opened.
     fn retained_outcome(&self, effect: &EffectId) -> Option<ExecOutcome> {
         let prefix = format!("{effect}-");
         let mut best: Option<ExecOutcome> = None;
-        for entry in std::fs::read_dir(&self.root).ok()?.flatten() {
+        let entries = match std::fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == ErrorKind::NotFound => return None,
+            Err(e) => {
+                tracing::warn!(root = %self.root.display(), error = %e,
+                    "cannot list the model retention directory; treating nothing as retained");
+                return None;
+            }
+        };
+        for entry in entries.flatten() {
             if !entry.file_name().to_string_lossy().starts_with(&prefix) {
                 continue;
             }
-            let Ok(bytes) = std::fs::read(entry.path().join("response.json")) else {
-                continue;
+            let file = entry.path().join("response.json");
+            let bytes = match std::fs::read(&file) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                Err(e) => {
+                    tracing::warn!(%effect, file = %file.display(), error = %e,
+                        "cannot read a retained model response; treating it as not retained");
+                    continue;
+                }
             };
-            let Ok(out) = serde_json::from_slice::<ExecOutcome>(&bytes) else {
-                continue;
+            let out = match serde_json::from_slice::<ExecOutcome>(&bytes) {
+                Ok(out) => out,
+                Err(e) => {
+                    tracing::warn!(%effect, file = %file.display(), error = %e,
+                        "cannot parse a retained model response; treating it as not retained");
+                    continue;
+                }
             };
             if out.receipt.effect_id != *effect || out.unresolved {
                 continue;
