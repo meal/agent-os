@@ -37,7 +37,7 @@ implemented and tested offline. Real provider/KVM acceptance passed on 2026-10-0
 2026-10-09. The component analyzer and fresh-host release validation remain planned work.
 
 Required offline gates are centralized in `sh scripts/check.sh`: formatting, strict Clippy,
-host tests, fake-jail tests and the GC mount gate, all through Docker Compose with the
+host tests, fake-jail tests, the GC mount gate and the analyzer component rebuild check, all through Docker Compose with the
 lockfile enforced. The mount gate (`sh scripts/check.sh mount`) runs the GC mount-root
 regressions in the `test-mount` service, which adds only `CAP_SYS_ADMIN` (and AppArmor
 unconfined) so they can mount a tmpfs inside real candidates; elsewhere those tests print

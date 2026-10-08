@@ -1,0 +1,20 @@
+# The analyzer components, built for wasm32-unknown-unknown by scripts/build-components.sh.
+# A workspace of its own: nothing here is part of the controller.
+[workspace]
+resolver = "3"
+members = ["repo-analyzer", "hostile-analyzer"]
+
+[workspace.package]
+edition = "2024"
+version = "1.0.0"
+
+[workspace.dependencies]
+wit-bindgen = { version = "0.62.0", default-features = false, features = ["macros", "realloc"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false

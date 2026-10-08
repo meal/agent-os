@@ -25,7 +25,8 @@ fi
 AGENTOS_CHECK_TEST_FAILURE=; export AGENTOS_CHECK_TEST_FAILURE
 : > "$scratch/commands"
 sh "$REPO/scripts/check.sh"
-[ "$(wc -l < "$scratch/commands")" -eq 5 ]
+[ "$(wc -l < "$scratch/commands")" -eq 6 ]
+grep -q 'test sh scripts/build-components.sh --check' "$scratch/commands"
 grep -q 'AGENTOS_TEST_JAIL=fake' "$scratch/commands"
 grep -q 'run --rm -e AGENTOS_GC_MOUNT_TESTS=1 test-mount cargo test -p agentos-engine --test gc --locked mount_gate_' "$scratch/commands"
 : > "$scratch/commands"

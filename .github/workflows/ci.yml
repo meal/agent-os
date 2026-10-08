@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        check: [fmt, clippy, host, fake, mount]
+        check: [fmt, clippy, host, fake, mount, components]
     env:
       COMPOSE_PROJECT_NAME: agentos-${{ github.run_id }}-${{ matrix.check }}
     steps:
