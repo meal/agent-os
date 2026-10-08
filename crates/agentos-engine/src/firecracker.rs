@@ -88,7 +88,9 @@ pub struct FirecrackerConfig {
     pub launcher: GuestLauncher,
     /// Decided by the controller; the worker only executes it.
     pub jail: JailMode,
-    /// The task's drive sizes and rate limits, as recorded at submission.
+    /// The task's drive sizes and rate limits, as recorded at submission. A `request.json`
+    /// written before they were recorded has none: version 0.
+    #[serde(default = "version_zero")]
     pub resources: VmResources,
 }
 
@@ -189,6 +191,10 @@ struct BootSource<'a> {
     boot_args: &'a str,
 }
 
+fn version_zero() -> VmResources {
+    VmResources::V0
+}
+
 #[derive(Serialize)]
 struct Drive<'a> {
     drive_id: &'a str,
@@ -196,6 +202,39 @@ struct Drive<'a> {
     is_read_only: bool,
     path_on_host: &'a str,
     cache_type: &'a str,
+    /// Absent without a contracted limit, so such a `vm.json` is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rate_limiter: Option<RateLimiter>,
+}
+
+/// Firecracker v1.17.0's `RateLimiter`: independent bytes/s and operations/s token buckets.
+#[derive(Serialize, Clone, Copy)]
+struct RateLimiter {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bandwidth: Option<TokenBucket>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ops: Option<TokenBucket>,
+}
+
+/// `size` tokens, refilled over `refill_time` milliseconds. No `one_time_burst`: the bucket
+/// starts full (one second's worth) and then refills at the contracted rate.
+#[derive(Serialize, Clone, Copy)]
+struct TokenBucket {
+    size: u64,
+    refill_time: u64,
+}
+
+/// The limiter of each writable drive, or `None` when the contract sets no rate.
+fn rate_limiter(r: &VmResources) -> Option<RateLimiter> {
+    let per_second = |size: u64| TokenBucket {
+        size,
+        refill_time: 1000,
+    };
+    let limiter = RateLimiter {
+        bandwidth: r.bandwidth_mib_s.map(|b| per_second(u64::from(b) << 20)),
+        ops: r.iops.map(|o| per_second(u64::from(o))),
+    };
+    (limiter.bandwidth.is_some() || limiter.ops.is_some()).then_some(limiter)
 }
 
 #[derive(Serialize)]
@@ -219,6 +258,7 @@ struct Logger<'a> {
 }
 
 fn vm_config<'a>(cfg: &FirecrackerConfig, view: &'a VmView) -> VmConfig<'a> {
+    let limiter = rate_limiter(&cfg.resources);
     VmConfig {
         boot_source: BootSource {
             kernel_image_path: &view.kernel,
@@ -231,6 +271,7 @@ fn vm_config<'a>(cfg: &FirecrackerConfig, view: &'a VmView) -> VmConfig<'a> {
                 is_read_only: true,
                 path_on_host: &view.rootfs,
                 cache_type: "Unsafe",
+                rate_limiter: None,
             },
             // Writeback: a guest fsync reaches ws.img before the guest reports success.
             Drive {
@@ -239,6 +280,7 @@ fn vm_config<'a>(cfg: &FirecrackerConfig, view: &'a VmView) -> VmConfig<'a> {
                 is_read_only: false,
                 path_on_host: &view.ws_img,
                 cache_type: "Writeback",
+                rate_limiter: limiter,
             },
             Drive {
                 drive_id: "scratch",
@@ -246,6 +288,7 @@ fn vm_config<'a>(cfg: &FirecrackerConfig, view: &'a VmView) -> VmConfig<'a> {
                 is_read_only: false,
                 path_on_host: &view.scratch_img,
                 cache_type: "Unsafe",
+                rate_limiter: limiter,
             },
         ],
         machine_config: MachineConfig {
@@ -1735,6 +1778,63 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&written).unwrap(),
             golden
+        );
+    }
+
+    /// A `request.json` written before resources were recorded still parses, as version 0.
+    #[test]
+    fn a_config_without_resources_parses_as_version_zero() {
+        let mut json = serde_json::to_value(config()).unwrap();
+        json.as_object_mut().unwrap().remove("resources").unwrap();
+        let cfg: FirecrackerConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.resources, VmResources::V0);
+    }
+
+    #[test]
+    fn rate_limits_go_on_the_writable_drives_only_and_are_absent_by_default() {
+        let task: TaskId = serde_json::from_str("\"task-1\"").unwrap();
+        let mut cfg = config();
+        let paths = VmPaths::new(Path::new("/home/x/jobs/e-a"), &cfg.work_root, &task);
+        let drives = |cfg: &FirecrackerConfig| {
+            render_vm_json(cfg, &paths.host_view(&cfg.image_dir))["drives"]
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+        assert!(
+            drives(&cfg).iter().all(|d| d.get("rate_limiter").is_none()),
+            "no limit, no key: the rendered file is unchanged"
+        );
+        cfg.resources = VmResources {
+            version: 1,
+            disk_mib: 2048,
+            scratch_mib: 768,
+            bandwidth_mib_s: Some(64),
+            iops: Some(5000),
+        };
+        let both = serde_json::json!({
+            "bandwidth": { "size": 64u64 << 20, "refill_time": 1000 },
+            "ops": { "size": 5000, "refill_time": 1000 }
+        });
+        let d = drives(&cfg);
+        assert!(
+            d[0].get("rate_limiter").is_none(),
+            "the read-only rootfs is never limited"
+        );
+        assert_eq!(d[1]["rate_limiter"], both);
+        assert_eq!(d[2]["rate_limiter"], both);
+
+        cfg.resources.iops = None;
+        let d = drives(&cfg);
+        assert_eq!(
+            d[1]["rate_limiter"],
+            serde_json::json!({ "bandwidth": { "size": 64u64 << 20, "refill_time": 1000 } })
+        );
+        cfg.resources.bandwidth_mib_s = None;
+        cfg.resources.iops = Some(10);
+        assert_eq!(
+            drives(&cfg)[2]["rate_limiter"],
+            serde_json::json!({ "ops": { "size": 10, "refill_time": 1000 } })
         );
     }
 

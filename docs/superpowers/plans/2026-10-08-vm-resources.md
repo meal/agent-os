@@ -23,7 +23,7 @@ each commit; KVM steps run on an otherwise idle host; commits carry no co-author
   Green: CLI submit/resume plumbing into `FirecrackerConfig.resources`.
 - [x] **5. Manifest.** Red: export includes `vm_resources`; a 2026-10-08 manifest still
   deserializes (already covered by the evidence test). Green: optional manifest field.
-- [ ] **6. Rendering.** Red: golden `vm.json` with and without rate limiters; the rootfs never
+- [x] **6. Rendering.** Red: golden `vm.json` with and without rate limiters; the rootfs never
   has one. Green: `Drive.rate_limiter: Option<RateLimiter>`.
 - [ ] **7. Sizes and preallocation.** Red: `ws.img` and `scratch.img` have the contracted
   lengths and allocated blocks (`st_blocks * 512 >= len`); an existing wrong-length `ws.img`
