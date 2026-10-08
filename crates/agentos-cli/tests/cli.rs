@@ -73,6 +73,19 @@ fn test_jail_fake() -> bool {
     }
 }
 
+/// The guest profile the test contracts name: the id of the image under test. Under the KVM
+/// tier (`AGENTOS_KVM_TESTS`) that is the configured image's, which need not be the default
+/// (`AGENTOS_ACCEPTANCE_IMAGE=python-stdlib-py314-v1`); the dummy image is registered under
+/// the same id, so every tier agrees.
+fn guest_profile() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        std::env::var_os("AGENTOS_KVM_TESTS")
+            .and_then(|_| kvm::configured_image_id())
+            .unwrap_or_else(|| "python-stdlib-v1".into())
+    })
+}
+
 fn fake_mode() -> bool {
     test_worker() == "firecracker-fake"
 }
@@ -149,9 +162,9 @@ impl Cli {
         }
     }
 
-    /// Registers the dummy `python-stdlib-v1` image (the contracts' `profile`); returns its digest.
+    /// Registers the dummy image under [`guest_profile`] (the contracts' `profile`); returns its digest.
     fn register_guest_image(&self) -> String {
-        let dir = fake_image_dir(self, "guest-image", "python-stdlib-v1", 0x68);
+        let dir = fake_image_dir(self, "guest-image", guest_profile(), 0x68);
         self.json_as(Mode::Plain, &["image", "register", dir.to_str().unwrap()])["digest"]
             .as_str()
             .unwrap()
@@ -289,7 +302,7 @@ impl Cli {
         let contract = json!({
             "goal": "fix the parser",
             "repository": { "source": source, "revision": revision },
-            "profile": "python-stdlib-v1",
+            "profile": guest_profile(),
             "editable_paths": ["src/**"],
             "verification_profile": "parser-checks-v1",
             "capabilities": ["snapshot.read", "workspace.apply_patch", "verification.run", "artifact.export"],
@@ -579,7 +592,7 @@ fn full_flow_submit_status_events_export_and_the_patch_reproduces_the_fix() {
         // The Firecracker worker records the registered image instead of the host's label.
         assert_eq!(
             submitted_event["payload"]["guest_image_id"],
-            "python-stdlib-v1"
+            guest_profile()
         );
         assert!(submitted_event["payload"].get("guest_image").is_none());
     } else {
@@ -2569,11 +2582,11 @@ impl Cli {
             .clone()
     }
 
-    /// `<home>/registry/images/python-stdlib-v1@<digest>/`.
+    /// `<home>/registry/images/<guest_profile>@<digest>/`.
     fn image_entry(&self, digest: &str) -> PathBuf {
         self.home()
             .join("registry/images")
-            .join(format!("python-stdlib-v1@{digest}"))
+            .join(format!("{}@{digest}", guest_profile()))
     }
 
     /// Changes one byte of the registered `rootfs.squashfs` (the registry is read-only: the
@@ -2635,7 +2648,7 @@ fn submit_with_worker_firecracker_records_the_worker_image_version_and_host_kern
     assert_eq!(out["state"], "SUCCEEDED");
     let s = cli.submitted(out["task_id"].as_str().unwrap());
     assert_eq!(s["worker"], "firecracker");
-    assert_eq!(s["guest_image_id"], "python-stdlib-v1");
+    assert_eq!(s["guest_image_id"], guest_profile());
     assert_eq!(s["guest_image_digest"], digest.as_str());
     assert_eq!(s["firecracker_version"], "fake");
     assert!(!s["host_kernel"].as_str().unwrap().is_empty(), "{s}");
@@ -3144,9 +3157,10 @@ fn submit_without_a_registered_image_exits_2() {
     cli.cmd_as(Mode::Fake, &["submit", &contract])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains(
-            "guest image python-stdlib-v1 not found in the registry",
-        ))
+        .stderr(predicate::str::contains(format!(
+            "guest image {} not found in the registry",
+            guest_profile()
+        )))
         .stderr(predicate::str::contains("build and register it first"));
     cli.assert_no_task();
 }
@@ -3183,7 +3197,7 @@ fn submit_with_a_pin_uses_exactly_that_image_even_if_a_newer_entry_exists() {
     let older = cli.register_guest_image();
     // Registration times are milliseconds: make sure the second entry is strictly newer.
     std::thread::sleep(std::time::Duration::from_millis(20));
-    let newer_dir = fake_image_dir(&cli, "guest-image-2", "python-stdlib-v1", 0x69);
+    let newer_dir = fake_image_dir(&cli, "guest-image-2", guest_profile(), 0x69);
     let newer = register_image(&cli, &newer_dir)["digest"]
         .as_str()
         .unwrap()
@@ -3323,7 +3337,8 @@ fn a_recorded_image_that_is_no_longer_registered_fails_before_the_task_is_touche
         .assert()
         .code(1)
         .stderr(predicate::str::contains(format!(
-            "recorded guest image python-stdlib-v1@{digest} is no longer registered"
+            "recorded guest image {}@{digest} is no longer registered",
+            guest_profile()
         )));
     assert_eq!(cli.events(&id), events);
 }
@@ -3341,7 +3356,7 @@ fn status_prints_worker_and_guest_image() {
     assert_eq!(status["worker"], "firecracker");
     assert_eq!(
         status["guest_image"],
-        json!({ "id": "python-stdlib-v1", "digest": digest })
+        json!({ "id": guest_profile(), "digest": digest })
     );
     assert_eq!(status["jailed"], false);
     let host = cli.json_as(Mode::Plain, &["submit", &contract])["task_id"]
@@ -3851,7 +3866,7 @@ impl Cli {
         let contract = json!({
             "goal": "fix the parser",
             "repository": { "source": repo, "revision": "recorded-at-submission" },
-            "profile": "python-stdlib-v1",
+            "profile": guest_profile(),
             "editable_paths": ["src/**"],
             "verification_profile": "parser-checks-v1",
             "capabilities": ["snapshot.read", "workspace.apply_patch", "verification.run", "artifact.export", "model.request"],

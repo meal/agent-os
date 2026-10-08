@@ -220,7 +220,7 @@ docker compose run --rm -e AGENTOS_TEST_WORKER=firecracker test-kvm cargo test -
 | 11. Kernel provenance and fresh-host installer | 3–5 days | Access to a fresh supported host |
 | 12. Alpha evidence and release candidate | 2–3 days | Every gate rerun at one frozen commit |
 
-Total remaining: 12.5–20 engineering days, against 15–24 originally estimated for the same packages after Task 8.
+Total remaining: 12.5–20 engineering days. The original estimate for Milestones B and C was 15–24 days, but it covered packages 8–12; package 8 is now done, and package 5's remaining gate belonged to Milestone A, so the two figures are not directly comparable.
 
 **Gate:** actual live success and offline replay, actual jailed worker isolation/recovery evidence. Missing setup keeps the gate open; no skipped test establishes acceptance.
 

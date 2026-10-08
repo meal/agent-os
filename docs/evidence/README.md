@@ -33,8 +33,8 @@ capability handles. Recordings store provider response bodies as byte arrays, so
 decodes them; a text search would not see them. Each promoted run's success report,
 replay report, manifest, `patch.diff` (by BLAKE3), recording and setup commit must agree.
 The live harness also scans its recording and bundle for the exact key bytes before it
-writes a success report. The first manual scan of these runs was a text search; the
-decoded scan above has since confirmed the same result. The candidate `python-stdlib-py314-v1` image, two-snapshot
+writes a success report. The method of the first manual scan was not
+recorded; the decoded scan above finds nothing in these runs. The candidate `python-stdlib-py314-v1` image, two-snapshot
 fresh-host evidence, VM resource measurements and the component ABI remain open.
 
 Run from a normal checkout on the provisioned Linux x86_64 Docker host:
