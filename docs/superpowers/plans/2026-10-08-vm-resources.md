@@ -13,10 +13,10 @@ each commit; KVM steps run on an otherwise idle host; commits carry no co-author
 - [x] **1. Executable-mode rejection.** Red: `profile register` accepts `["./check.sh"]` and
   `["check.sh"]` when `check.sh` is in the profile. Green: reject both with the interpreter
   hint; accept `["sh", "check.sh"]`, `["python3", "check.py"]` and `["/usr/bin/true"]`.
-- [ ] **2. Contract fields.** Red: pinned digest of the fixture contract; round-trip of the four
+- [x] **2. Contract fields.** Red: pinned digest of the fixture contract; round-trip of the four
   fields; each lower bound, upper bound and `u32::MAX` rejected with the field name. Green:
   optional `Limits` fields with `skip_serializing_if`, validation in `Contract::validate`.
-- [ ] **3. Resolution.** Red: `VmResources::resolve` defaults (version 1); version-0 values for
+- [x] **3. Resolution.** Red: `VmResources::resolve` defaults (version 1); version-0 values for
   a journal without the record. Green: `agentos-core::resources`.
 - [ ] **4. Record and replay.** Red: `Submitted` carries `vm_resources` for Firecracker tasks
   only; `resume` with a record that disagrees with the contract exits 1 and journals nothing.

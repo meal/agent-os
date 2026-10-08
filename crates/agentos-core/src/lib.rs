@@ -6,5 +6,6 @@ pub mod guest;
 pub mod ids;
 pub mod lease;
 pub mod patchrules;
+pub mod resources;
 pub mod state;
 pub mod workspace;
