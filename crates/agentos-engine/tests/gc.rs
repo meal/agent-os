@@ -1979,7 +1979,7 @@ fn a_settled_analysis_retention_is_collected() {
             root.join("analysis"),
             root.join("agentos.db"),
             env.snapshot_dir(),
-            common::component_wasm("repo-analyzer-v1"),
+            common::component_dir("repo-analyzer-v1"),
             counts.clone(),
         ),
     );

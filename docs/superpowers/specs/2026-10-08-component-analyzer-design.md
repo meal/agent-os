@@ -47,9 +47,12 @@ effect at the next read. The effect's intent and dispatch are authorized as usua
 "agentos:analyzer/analyzer@1.0.0"}`) and `component.wasm` into the read-only,
 content-addressed `<home>/registry/components/<id>@<digest>/`, reusing the profile and image
 registry code. Registration compiles the component and refuses one that imports anything
-outside the `agentos:analyzer` interface or does not export `analyze`. The contract always
-pins the digest. `submit` copies the entry into the task directory and records
-`analyzer_id` and `analyzer_digest` in `Submitted`; the bytes are re-digested before every run.
+outside the `agentos:analyzer` interface (type imports such as the world's `use` grant
+nothing and are allowed) or does not export `analyze`. The contract always pins the
+registry digest, which covers `component.json` and `component.wasm` as one tree, like a
+profile or image digest. `submit` copies the entry into `<task>/analyzer/`, checks its digest
+and records `analyzer_id` and `analyzer_digest` in `Submitted`; the executor re-digests that
+copy before every run.
 
 ## WIT world (`wit/agentos-analyzer-v1.wit`)
 
@@ -128,9 +131,12 @@ after a crash, so recovery publishes it without running the component again. GC 
 `AnalyzeSnapshot`. `follow_up_event` returns no task event for this kind, so a report can
 never produce `VerifyPassed` or change a workspace.
 
-The export manifest gains an optional `analysis` field (`{component_digest, report_digest,
-file}` with the report at `analysis/report.json`), omitted when there is none, so earlier
-manifests still parse.
+The export manifest gains an optional `analysis` field (`{effect_id, component_digest,
+state, report_digest, file}`, with a completed analysis's report at `analysis/report.json`),
+omitted when there is none, so earlier manifests still parse. A capability that is not usable
+when the analysis would start skips it, journaled as `AnalysisSkipped`. Recovery rebuilds the
+deterministic request (the analysis precedes every patch, so the workspace is still the
+snapshot) and uses it only when its digest is the journaled one.
 
 ## Reference analyzer
 

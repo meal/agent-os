@@ -5425,3 +5425,119 @@ fn component_register_refuses_what_is_not_an_analyzer() {
         .stderr(predicate::str::contains("plain name"));
     assert_eq!(cli.json(&["component", "list"]), json!([]));
 }
+
+/// The plain contract with the `snapshot.analyze` capability and an analyzer pin.
+fn contract_with_analyzer(cli: &Cli, id: &str, digest: &str) -> String {
+    let mut contract: Value =
+        serde_json::from_str(&fs::read_to_string(cli.contract(&cli.repo_copy())).unwrap()).unwrap();
+    contract["capabilities"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("snapshot.analyze"));
+    contract["analyzer"] = json!({ "id": id, "digest": digest });
+    cli.write(&format!("analyzer-{id}.json"), &contract.to_string())
+}
+
+#[test]
+fn a_task_with_an_analyzer_runs_it_once_and_exports_the_report() {
+    let cli = Cli::new();
+    let registered = cli.json(&[
+        "component",
+        "register",
+        component_fixture("repo-analyzer-v1").to_str().unwrap(),
+    ]);
+    let digest = registered["digest"].as_str().unwrap().to_string();
+    let contract = contract_with_analyzer(&cli, "repo-analyzer-v1", &digest);
+    let out = cli
+        .cmd(&[
+            "submit",
+            &contract,
+            "--yes",
+            "--fake-agent-patch",
+            fix_patch().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains(&format!(
+            "  analyzer:             repo-analyzer-v1@{digest}"
+        )),
+        "{stderr}"
+    );
+    assert!(stderr.contains("snapshot.analyze"), "{stderr}");
+    let done: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(done["state"], "SUCCEEDED", "{done}");
+    let id = done["task_id"].as_str().unwrap().to_string();
+    let submitted = cli.submitted(&id);
+    assert_eq!(
+        (
+            submitted["analyzer_id"].clone(),
+            submitted["analyzer_digest"].clone()
+        ),
+        (json!("repo-analyzer-v1"), json!(digest)),
+        "{submitted}"
+    );
+    assert!(
+        cli.home()
+            .join("tasks")
+            .join(&id)
+            .join("analyzer/component.wasm")
+            .is_file()
+    );
+    let analyses: Vec<Value> = cli
+        .events(&id)
+        .into_iter()
+        .filter(|e| e["type"] == "EffectIntended" && e["payload"]["kind"] == "AnalyzeSnapshot")
+        .collect();
+    assert_eq!(analyses.len(), 1);
+
+    let bundle = cli.path("analysis-bundle");
+    let manifest = cli.json(&["export", &id, bundle.to_str().unwrap()]);
+    assert_eq!(
+        manifest["analysis"]["component_digest"],
+        json!(digest),
+        "{manifest}"
+    );
+    assert_eq!(manifest["analysis"]["state"], "COMPLETED");
+    assert_eq!(manifest["analysis"]["file"], "analysis/report.json");
+    let report: Value =
+        serde_json::from_slice(&fs::read(bundle.join("analysis/report.json")).unwrap()).unwrap();
+    assert_eq!(report["analyzer"], "repo-analyzer-v1");
+    assert_eq!(
+        manifest["analysis"]["report_digest"],
+        json!(Digest::of(&fs::read(bundle.join("analysis/report.json")).unwrap()).to_string())
+    );
+}
+
+#[test]
+fn an_unregistered_analyzer_is_refused_at_submit() {
+    let cli = Cli::new();
+    let contract = contract_with_analyzer(&cli, "repo-analyzer-v1", &"a".repeat(64));
+    cli.cmd(&[
+        "submit",
+        &contract,
+        "--yes",
+        "--fake-agent-patch",
+        fix_patch().to_str().unwrap(),
+    ])
+    .assert()
+    .code(2)
+    .stderr(predicate::str::contains("not in the registry"));
+    cli.assert_no_task();
+}
+
+#[test]
+fn a_task_without_an_analyzer_exports_no_analysis() {
+    let cli = Cli::new();
+    let id = cli.submit_yes(&cli.contract(&cli.repo_copy()), &fix_patch())["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let bundle = cli.path("plain-bundle");
+    let manifest = cli.json(&["export", &id, bundle.to_str().unwrap()]);
+    assert!(manifest.get("analysis").is_none(), "{manifest}");
+    assert!(!bundle.join("analysis").exists());
+}

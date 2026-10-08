@@ -145,19 +145,20 @@ pub struct AnalysisExecutor {
     retention: Retention,
     db_path: PathBuf,
     snapshot_dir: PathBuf,
-    component: PathBuf,
+    analyzer_dir: PathBuf,
     counts: ExecCounts,
     crash: Option<CrashHook>,
 }
 
 impl AnalysisExecutor {
     /// Retains outcomes under `root` (`<home>/analysis`); reads the task's recorded snapshot
-    /// at `snapshot_dir` and its copy of the analyzer at `component`.
+    /// at `snapshot_dir` and runs its copy of the analyzer's registry entry at `analyzer_dir`
+    /// (`component.json` and `component.wasm`, digested as one tree like the registry).
     pub fn new(
         root: PathBuf,
         db_path: PathBuf,
         snapshot_dir: PathBuf,
-        component: PathBuf,
+        analyzer_dir: PathBuf,
         counts: ExecCounts,
     ) -> AnalysisExecutor {
         AnalysisExecutor {
@@ -168,7 +169,7 @@ impl AnalysisExecutor {
             },
             db_path,
             snapshot_dir,
-            component,
+            analyzer_dir,
             counts,
             crash: None,
         }
@@ -189,7 +190,7 @@ fn analyze(
     request: &AnalysisRequest,
     db_path: &Path,
     snapshot_dir: &Path,
-    component: &Path,
+    analyzer_dir: &Path,
     task: &TaskId,
 ) -> Result<Outcome, String> {
     if request.runtime != RUNTIME {
@@ -198,13 +199,16 @@ fn analyze(
             request.runtime
         ));
     }
-    let bytes = fs::read(component).map_err(|e| format!("cannot read the analyzer: {e}"))?;
-    if Digest::of(&bytes) != request.component_digest {
+    let analyzer =
+        workspace_digest(analyzer_dir).map_err(|e| format!("cannot digest the analyzer: {e}"))?;
+    if analyzer != request.component_digest {
         return Err(format!(
-            "the analyzer's bytes are not {}",
+            "the analyzer is {analyzer}, not {}",
             request.component_digest
         ));
     }
+    let bytes = fs::read(analyzer_dir.join("component.wasm"))
+        .map_err(|e| format!("cannot read the analyzer: {e}"))?;
     let snapshot =
         workspace_digest(snapshot_dir).map_err(|e| format!("cannot digest the snapshot: {e}"))?;
     if snapshot != request.snapshot_digest {
@@ -238,14 +242,14 @@ impl Executor for AnalysisExecutor {
                 return ExecOutcome::failure(req, ctx, format!("invalid analysis request: {e}"));
             }
         };
-        let (db_path, snapshot_dir, component, task) = (
+        let (db_path, snapshot_dir, analyzer_dir, task) = (
             self.db_path.clone(),
             self.snapshot_dir.clone(),
-            self.component.clone(),
+            self.analyzer_dir.clone(),
             req.task_id.clone(),
         );
         let ran = tokio::task::spawn_blocking(move || {
-            analyze(&request, &db_path, &snapshot_dir, &component, &task)
+            analyze(&request, &db_path, &snapshot_dir, &analyzer_dir, &task)
         })
         .await;
         let out = match ran {

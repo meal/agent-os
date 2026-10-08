@@ -27,7 +27,7 @@ wasm-tools 1.261.0 (release binary, sha256
 - [x] **5. Engine.** `ComponentExecutor` routed in the controller, retention under
   `analysis/`, the runner's one analysis after the snapshot, crash matrix for the new kind
   with an execution counter, GC rule.
-- [ ] **6. CLI and export.** Approval shows the capability and the pin; `submit` copies the
+- [x] **6. CLI and export.** Approval shows the capability and the pin; `submit` copies the
   component into the task and records it; the manifest's optional `analysis` entry and
   `analysis/report.json`.
 - [ ] **7. End to end.** The fixture task with the reference analyzer on the fake and the real

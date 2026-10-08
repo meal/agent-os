@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use agentos_core::contract::Limits;
 use agentos_core::ids::{Digest, TaskId};
 use agentos_core::resources::VmResources;
+use agentos_engine::analysis::AnalysisExecutor;
 use agentos_engine::firecracker::{FirecrackerConfig, preflight};
 use agentos_engine::guestlink::GuestLauncher;
 use agentos_engine::jail::{self, JAIL_GID, JAIL_UID, JailConfig, JailDecision, JailMode};
@@ -45,6 +46,9 @@ use crate::args::WorkerKind;
 use crate::commands::registry::{check_id, list_entries};
 use crate::commands::supervise::supervisor_cmd;
 use crate::error::CliError;
+
+/// Where a task keeps its copy of the analyzer's registry entry, under its task directory.
+pub const ANALYZER_DIR: &str = "analyzer";
 
 /// How long a verification check may run (the fixture executor's default).
 const VERIFY_TIMEOUT_SECS: u64 = 60;
@@ -326,6 +330,19 @@ impl Home {
         list_entries(&self.components_dir(), |dir| {
             dir.join("component.json").is_file() && dir.join("component.wasm").is_file()
         })
+    }
+
+    /// The registered analyzer `id` with exactly the digest `digest`.
+    pub fn resolve_component(&self, id: &str, digest: &str) -> Result<RegistryEntry, CliError> {
+        check_id("analyzer", id)?;
+        self.component_list()
+            .into_iter()
+            .find(|e| e.id == id && e.digest == digest)
+            .ok_or_else(|| {
+                CliError::usage(format!(
+                    "analyzer {id}@{digest} is not in the registry; `agentos component register` it first"
+                ))
+            })
     }
 
     /// Every registered guest image, unordered.
@@ -917,7 +934,18 @@ impl Home {
             task_dir.join("snapshot"),
             root.join("tasks"),
         );
-        Ok(RoutingExecutor::new(jobs, model, reads))
+        let exec = RoutingExecutor::new(jobs, model, reads);
+        // The task's copy of its analyzer's registry entry, recorded at submission.
+        Ok(match store.db.contract(task)?.analyzer {
+            Some(_) => exec.with_analysis(AnalysisExecutor::new(
+                root.join("analysis"),
+                root.join("agentos.db"),
+                task_dir.join("snapshot"),
+                task_dir.join(ANALYZER_DIR),
+                ExecCounts::default(),
+            )),
+            None => exec,
+        })
     }
 }
 

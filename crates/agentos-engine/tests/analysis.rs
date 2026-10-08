@@ -14,7 +14,7 @@ use agentos_engine::fixture::FixtureExecutor;
 use agentos_engine::routing::RoutingExecutor;
 use agentos_engine::runner::{EngineError, run_task_with};
 use agentos_engine::supervised::ExecCounts;
-use common::{Env, analyzer_contract, component_wasm, fix_patch, routing_over};
+use common::{Env, analyzer_contract, component_dir, fix_patch, routing_over};
 
 fn env(component: &str, mode: Option<&str>) -> Env {
     let env = Env::with_contract(analyzer_contract(10, component));
@@ -35,7 +35,7 @@ fn exec(
         root.join("analysis"),
         root.join("agentos.db"),
         env.snapshot_dir(),
-        component_wasm(component),
+        component_dir(component),
         counts.clone(),
     )
     .with_crash(hook.clone());

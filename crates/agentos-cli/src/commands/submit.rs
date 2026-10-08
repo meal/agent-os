@@ -20,7 +20,7 @@ use crate::args::WorkerKind;
 use crate::crash::CrashSpec;
 use crate::drive::{AGENT_PATCH, FAKE_AGENT, ModelSpec, TRANSCRIPT, agent_for, drive};
 use crate::error::CliError;
-use crate::home::Home;
+use crate::home::{ANALYZER_DIR, Home};
 
 /// A `repository.revision` asking submission to record the source's workspace digest.
 pub const RECORDED_AT_SUBMISSION: &str = "recorded-at-submission";
@@ -284,6 +284,12 @@ fn summarize(
         l.worker_vcpus,
         l.worker_memory_mib
     );
+    if let Some(a) = &contract.analyzer {
+        eprintln!(
+            "  analyzer:             {}@{}, reads the snapshot once before the first turn; its report is exported, never verified",
+            a.id, a.digest
+        );
+    }
     eprintln!("  agent:                {agent}");
     if let Some(endpoint) = endpoint {
         eprintln!("  model endpoint:       {endpoint}");
@@ -354,6 +360,19 @@ pub async fn submit(
             "verification profile changed while it was recorded: pinned {pin}, found {profile_digest}"
         )));
     }
+    // The analyzer's registry entry is copied like the profile and must still be the pinned one.
+    if let Some(a) = &contract.analyzer {
+        let entry = home.resolve_component(&a.id, &a.digest)?;
+        let staged = staging.path().join(ANALYZER_DIR);
+        copy_tree(&entry.dir, &staged)?;
+        let found = workspace_digest(&staged)?;
+        if found.to_string() != a.digest {
+            return Err(CliError::usage(format!(
+                "analyzer changed while it was recorded: pinned {}, found {found}",
+                a.digest
+            )));
+        }
+    }
     if expected_revision.is_some_and(|d| d != repo_digest) {
         return Err(CliError::usage(format!(
             "repository source changed while it was recorded (now {repo_digest})"
@@ -388,6 +407,11 @@ pub async fn submit(
         },
         "fake_agent_patch_digest": patch.as_ref().map(|p| Digest::of(p.as_bytes())),
     });
+    if let Some(a) = &contract.analyzer {
+        let fields = submitted.as_object_mut().expect("an object");
+        fields.insert("analyzer_id".into(), json!(a.id));
+        fields.insert("analyzer_digest".into(), json!(a.digest));
+    }
     let fields = submitted.as_object_mut().expect("an object");
     let transcript_digest = transcript.as_ref().map(|b| Digest::of(b));
     if let Some(d) = &transcript_digest {

@@ -776,12 +776,10 @@ pub async fn run_model<E: Executor>(env: &Env, exec: &E) -> TaskState {
         .unwrap()
 }
 
-/// `fixtures/components/<name>/component.wasm`.
-pub fn component_wasm(name: &str) -> PathBuf {
-    fixtures()
-        .join("components")
-        .join(name)
-        .join("component.wasm")
+/// `fixtures/components/<name>`: a registry-shaped analyzer (`component.json`,
+/// `component.wasm`).
+pub fn component_dir(name: &str) -> PathBuf {
+    fixtures().join("components").join(name)
 }
 
 /// `contract(tool_actions)` with the `snapshot.analyze` capability and an analyzer pin for the
@@ -793,7 +791,7 @@ pub fn analyzer_contract(tool_actions: u32, name: &str) -> (Contract, Digest) {
         .as_array_mut()
         .unwrap()
         .push("snapshot.analyze".into());
-    let digest = Digest::of(&std::fs::read(component_wasm(name)).unwrap());
+    let digest = workspace_digest(&component_dir(name)).unwrap();
     json["analyzer"] = serde_json::json!({ "id": name, "digest": digest.to_string() });
     let contract = Contract::parse(&json.to_string()).unwrap();
     let digest = Digest::of(&serde_json::to_vec(&contract).unwrap());
