@@ -1913,10 +1913,10 @@ mod tests {
             serde_json::json!({ "bandwidth": { "size": 64u64 << 20, "refill_time": 1000 } })
         );
         cfg.resources.bandwidth_mib_s = None;
-        cfg.resources.iops = Some(10);
+        cfg.resources.iops = Some(5000);
         assert_eq!(
             drives(&cfg)[2]["rate_limiter"],
-            serde_json::json!({ "ops": { "size": 10, "refill_time": 1000 } })
+            serde_json::json!({ "ops": { "size": 5000, "refill_time": 1000 } })
         );
     }
 

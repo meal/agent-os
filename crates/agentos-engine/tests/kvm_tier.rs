@@ -224,6 +224,7 @@ use agentos_core::contract::Contract;
 use agentos_core::effect::{AttemptId, EffectId, EffectKind, Outcome};
 use agentos_core::guest::{Message, Mode, SCRATCH_IMAGE_BYTES, WS_IMAGE_BYTES, mint_attempt_token};
 use agentos_core::ids::{Digest, TaskId};
+use agentos_core::resources::VmResources;
 use agentos_core::state::TaskState;
 use agentos_engine::agent::FakeAgent;
 use agentos_engine::crash::{CrashHook, CrashPoint, RunOptions};
@@ -550,6 +551,12 @@ impl Fx {
             counts: ExecCounts::default(),
             step: AtomicU32::new(0),
         }
+    }
+
+    /// The task's drive sizes and rate limits, as a recorded contract would set them.
+    fn with_resources(mut self, resources: VmResources) -> Fx {
+        self.cfg.resources = resources;
+        self
     }
 
     fn root(&self) -> &Path {
@@ -1373,6 +1380,167 @@ async fn disk_fill_is_bounded_by_the_images_and_the_root_stays_read_only() {
     assert!(
         max_scratch >= f["scratch_bytes"].as_u64().unwrap() / 2,
         "the fill reached the host file (sampled {max_scratch})"
+    );
+}
+
+fn resources(
+    disk_mib: u32,
+    scratch_mib: u32,
+    bandwidth: Option<u32>,
+    iops: Option<u32>,
+) -> VmResources {
+    VmResources {
+        version: 1,
+        disk_mib,
+        scratch_mib,
+        bandwidth_mib_s: bandwidth,
+        iops,
+    }
+}
+
+/// The guest's drives have the recorded sizes, both above the version-0 constants, so the
+/// jail's file-size limit must cover a workspace image over 1 GiB; and the check fills
+/// scratch up to its larger size before ENOSPC.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_guest_sees_and_fills_the_contracted_drive_sizes() {
+    let Some(kvm) = kvm::require() else { return };
+    let _alone = exclusive().await;
+    let fx = Fx::new(&kvm).with_resources(resources(1536, 768, None, None));
+    let ran = fx.snapshot().await;
+    assert_eq!(
+        ran.out.receipt.outcome,
+        Outcome::Success,
+        "{}",
+        out_text(&ran.out)
+    );
+    assert_eq!(fs::metadata(fx.ws_img()).unwrap().len(), 1536 << 20);
+    fx.use_script(
+        "import json; \
+         print(json.dumps({d: int(open(f'/sys/block/{d}/size').read()) * 512 for d in ('vdb', 'vdc')}))",
+    );
+    let v = evidence(&fx.run(EffectKind::RunVerification).await.out);
+    assert_eq!(v["passed"], true, "{v}");
+    let sizes = findings(&v);
+    assert_eq!(
+        (sizes["vdb"].as_u64(), sizes["vdc"].as_u64()),
+        (Some(1536 << 20), Some(768 << 20)),
+        "{sizes}"
+    );
+    fx.use_profile("hostile/disk-fill");
+    let v = evidence(&fx.run(EffectKind::RunVerification).await.out);
+    let f = findings(&v);
+    assert_eq!(f["scratch"], "ENOSPC", "{f}");
+    let wrote = f["scratch_bytes"].as_u64().unwrap();
+    assert!(
+        wrote > 512 << 20 && wrote < 768 << 20,
+        "filled {wrote} bytes of a 768 MiB scratch drive"
+    );
+}
+
+/// At the minimum contracted bandwidth, 32 MiB/s per writable drive, 160 MiB written and
+/// synced to scratch takes at least (160 - 32) / 32 = 4 s: the bucket starts full with one
+/// second's worth. Only a lower bound is asserted; an upper bound would depend on the host.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_bandwidth_limit_bites_on_synced_writes() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let fx = Fx::new(&kvm).with_resources(resources(1024, 512, Some(32), None));
+    fx.snapshot().await;
+    fx.use_script(
+        "import json, os, time; \\
+         block = b'x' * (1 << 20); \\
+         fd = os.open('/scratch/check/rate', os.O_WRONLY | os.O_CREAT, 0o600); \\
+         start = time.monotonic(); \\
+         [os.write(fd, block) for _ in range(160)]; \\
+         os.fsync(fd); \\
+         print(json.dumps({'seconds': time.monotonic() - start}))",
+    );
+    let v = evidence(&fx.run(EffectKind::RunVerification).await.out);
+    assert_eq!(v["passed"], true, "{v}");
+    let seconds = findings(&v)["seconds"].as_f64().unwrap();
+    println!("160 MiB synced at 32 MiB/s in {seconds:.2}s");
+    assert!(seconds >= 3.5, "the limit did not bite: {seconds:.2}s");
+}
+
+/// The lowest contracted rates still boot, format scratch, snapshot, verify and inspect the
+/// fixture within the timeouts.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_minimum_rates_still_run_the_fixture() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let (bandwidth, iops) = (
+        *agentos_core::contract::WORKER_DISK_BANDWIDTH_MIB_S.start(),
+        *agentos_core::contract::WORKER_DISK_IOPS.start(),
+    );
+    let fx = Fx::new(&kvm).with_resources(resources(1024, 512, Some(bandwidth), Some(iops)));
+    let started = Instant::now();
+    let ran = fx.snapshot().await;
+    assert_eq!(
+        ran.out.receipt.outcome,
+        Outcome::Success,
+        "{}",
+        out_text(&ran.out)
+    );
+    let snapshot = started.elapsed();
+    // The unfixed fixture: the check runs to the end and finds the bug.
+    let v = evidence(&fx.run(EffectKind::RunVerification).await.out);
+    assert_eq!(
+        (v["exit_code"].clone(), v["passed"].clone()),
+        (1.into(), false.into()),
+        "{v}"
+    );
+    let digest = fx.digest();
+    println!(
+        "at {bandwidth} MiB/s and {iops} ops/s: snapshot {snapshot:?}, all {:?}, digest {digest}",
+        started.elapsed()
+    );
+}
+
+/// The minimum rates were chosen so that a snapshot near the limits (65,000 files, 243 MiB)
+/// still fits the 120 s reply and the 60 s inspection deadlines; measured on the reference
+/// host at 45 s and 22 s (see the VM resources design).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_minimum_rates_fit_a_near_limit_snapshot_within_the_deadlines() {
+    let Some(kvm) = kvm::require() else { return };
+    let _alone = exclusive().await;
+    let (bandwidth, iops) = (
+        *agentos_core::contract::WORKER_DISK_BANDWIDTH_MIB_S.start(),
+        *agentos_core::contract::WORKER_DISK_IOPS.start(),
+    );
+    let fx = Fx::new(&kvm).with_resources(resources(1024, 512, Some(bandwidth), Some(iops)));
+    let big = fx.path("snapshot/big");
+    let mut seed = 1u64;
+    for i in 0..45 {
+        let block: Vec<u8> = (0..4 << 20)
+            .map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (seed >> 56) as u8
+            })
+            .collect();
+        fs::create_dir_all(&big).unwrap();
+        fs::write(big.join(format!("blob-{i}")), block).unwrap();
+    }
+    for d in 0..65 {
+        let dir = big.join(format!("d{d}"));
+        fs::create_dir_all(&dir).unwrap();
+        for f in 0..1000 {
+            fs::write(dir.join(format!("f{f}")), [b'a'; 1024]).unwrap();
+        }
+    }
+    let started = Instant::now();
+    let ran = fx.run(EffectKind::ReadSnapshot).await;
+    assert_eq!(
+        ran.out.receipt.outcome,
+        Outcome::Success,
+        "{}",
+        out_text(&ran.out)
+    );
+    let snapshot = started.elapsed();
+    let started = Instant::now();
+    assert_eq!(fx.digest(), ran.out.new_workspace.unwrap());
+    println!(
+        "near-limit snapshot at {bandwidth} MiB/s and {iops} ops/s: {snapshot:?}, inspection {:?}",
+        started.elapsed()
     );
 }
 

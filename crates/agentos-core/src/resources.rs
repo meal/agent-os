@@ -140,7 +140,7 @@ mod tests {
     #[test]
     fn present_fields_are_used_as_given() {
         let r = VmResources::resolve(&limits(
-            r#","worker_disk_mib":32768,"worker_scratch_mib":384,"worker_disk_bandwidth_mib_s":8,"worker_disk_iops":10"#,
+            r#","worker_disk_mib":32768,"worker_scratch_mib":384,"worker_disk_bandwidth_mib_s":32,"worker_disk_iops":5000"#,
         ));
         assert_eq!(
             r,
@@ -148,8 +148,8 @@ mod tests {
                 version: 1,
                 disk_mib: 32768,
                 scratch_mib: 384,
-                bandwidth_mib_s: Some(8),
-                iops: Some(10)
+                bandwidth_mib_s: Some(32),
+                iops: Some(5000)
             }
         );
         assert_eq!(r.disk_bytes(), 32768 * 1024 * 1024);

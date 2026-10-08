@@ -34,8 +34,11 @@ pub enum Capability {
 /// staged profile (64 MiB) and the reverse-check copy of the workspace content (256 MiB).
 pub const WORKER_DISK_MIB: std::ops::RangeInclusive<u32> = 512..=32768;
 pub const WORKER_SCRATCH_MIB: std::ops::RangeInclusive<u32> = 384..=32768;
-pub const WORKER_DISK_BANDWIDTH_MIB_S: std::ops::RangeInclusive<u32> = 1..=4096;
-pub const WORKER_DISK_IOPS: std::ops::RangeInclusive<u32> = 10..=1_000_000;
+/// The minimum rates keep boot (formatting scratch before the guest's 10 s watchdog), a
+/// near-limit snapshot (120 s reply deadline) and its inspection (60 s) within their
+/// deadlines; measured, see the VM resources design.
+pub const WORKER_DISK_BANDWIDTH_MIB_S: std::ops::RangeInclusive<u32> = 32..=4096;
+pub const WORKER_DISK_IOPS: std::ops::RangeInclusive<u32> = 5000..=1_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -277,8 +280,8 @@ mod tests {
         for (field, lo, hi) in [
             ("worker_disk_mib", 512u64, 32768u64),
             ("worker_scratch_mib", 384, 32768),
-            ("worker_disk_bandwidth_mib_s", 1, 4096),
-            ("worker_disk_iops", 10, 1_000_000),
+            ("worker_disk_bandwidth_mib_s", 32, 4096),
+            ("worker_disk_iops", 5000, 1_000_000),
         ] {
             for ok in [lo, hi] {
                 Contract::parse(&with_limits(&format!("\"{field}\":{ok}")))

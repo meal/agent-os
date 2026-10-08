@@ -33,8 +33,8 @@ its digest. A golden test pins the digest of an existing fixture contract.
 | --- | --- | --- | --- |
 | `worker_disk_mib` | 512..=32768 | 1024 | workspace drive size |
 | `worker_scratch_mib` | 384..=32768 | 512 | scratch drive size |
-| `worker_disk_bandwidth_mib_s` | 1..=4096 | no limit | workspace and scratch, each |
-| `worker_disk_iops` | 10..=1000000 | no limit | workspace and scratch, each |
+| `worker_disk_bandwidth_mib_s` | 32..=4096 | no limit | workspace and scratch, each |
+| `worker_disk_iops` | 5000..=1000000 | no limit | workspace and scratch, each |
 
 Minimums follow from what the drives must hold. The workspace receives a snapshot of up to
 `SNAPSHOT_BYTES_LIMIT` (256 MiB) plus ext4 metadata and patch growth. Scratch holds the staged
@@ -42,6 +42,25 @@ profile (`PROFILE_LIMIT`, 64 MiB), the patch workspace, the check's directory an
 reverse-check copy of the workspace content (up to 256 MiB). Maximums are conservative bounds
 for one local host, not a capacity promise; the capacity check below decides whether a task
 can run here.
+
+The rate minimums were raised from the first draft (1 MiB/s, 10 operations/s) after
+measuring on the KVM tier, because Firecracker's limiter throttles reads as well as writes,
+and the guest formats scratch through it before its 10 s watchdog. Measured on the
+reference host (NVMe, xfs), unlimited rows for comparison:
+
+| Snapshot | Limit | Snapshot time (deadline 120 s) | Inspection (deadline 60 s) |
+| --- | --- | --- | --- |
+| parser fixture | 500 operations/s | boot fails (watchdog) | n/a |
+| parser fixture | 1000 operations/s | 16.3 s | 5.5 s |
+| parser fixture | 4 MiB/s | 15.8 s | 5.4 s |
+| 249 MiB, 30,055 files | 16 MiB/s and 2000 operations/s | 71.1 s | 42.1 s |
+| 249 MiB, 30,055 files | 32 MiB/s and 5000 operations/s | 28.4 s | 15.7 s |
+| 243 MiB, 65,045 files | none | 7.0 s | 2.4 s |
+| 243 MiB, 65,045 files | 32 MiB/s and 5000 operations/s | 45.0 s | 21.9 s |
+
+At the minimums a snapshot near both limits keeps at least 2.6 times its deadlines; a KVM
+test pins that case. A slower host disk slows every row regardless of the limit, which only
+caps the rate.
 
 Byte sizes are computed as `u64::from(mib).checked_mul(1 << 20)`. Values outside the ranges
 are rejected by `Contract::validate` with the field name and range, before submission journals
@@ -148,11 +167,11 @@ version and is outside this package.
 | `profile register` rejects `./check.sh` and a bare profile file name, accepts interpreter commands and absolute paths | default |
 | Guest sees the contracted drive sizes (`/sys/block/vdb/size`, `vdc`) | real KVM |
 | Full workspace and full scratch at the contracted sizes fail visibly, never verify | real KVM |
-| Bandwidth limit bites: writing 5× the per-second rate takes at least 3.5 s; no upper bound is asserted | real KVM |
+| Bandwidth limit bites: 160 MiB synced at the 32 MiB/s minimum takes at least 3.5 s; no upper bound is asserted | real KVM |
 | Crash and resume of a task with non-default resources keeps the recorded sizes | real KVM |
 | Infrastructure OOM during write-heavy verification never verifies | real KVM |
 | Host ENOSPC (work root on a small tmpfs, images larger than it) during snapshot, patch and a scratch write in verification: visible failure, no `VerifyPassed`, and afterwards the inspected image digest equals the journal's or the task fails | real KVM |
-| The minimum rates (1 MiB/s, 10 operations/s) still boot, format scratch and take a 256 MiB snapshot within the timeouts; otherwise the bounds rise | real KVM |
+| The minimum rates run the fixture, and a near-limit snapshot (65,045 files, 243 MiB) within the deadlines | real KVM |
 
 ## Order of work
 

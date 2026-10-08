@@ -33,11 +33,13 @@ each commit; KVM steps run on an otherwise idle host; commits carry no co-author
 
 ## Real KVM
 
-- [ ] **8. Guest view and full drives.** The guest sees the contracted sizes; filling the
-  workspace or scratch fails visibly and never verifies.
-- [ ] **9. Rate enforcement.** With 8 MiB/s, a 40 MiB write with `fsync` inside the timed
-  region takes at least 3.5 s. The minimum rates still boot, format scratch and snapshot
-  within the timeouts, or the bounds rise.
+- [x] **8. Guest view and full drives.** The guest sees the contracted sizes (1536 and
+  768 MiB) and the check fills scratch to the larger size before ENOSPC. The agent cannot
+  fill the workspace drive: a snapshot is at most 256 MiB and the drive at least 512 MiB,
+  and patches are at most 4 MiB each; host ENOSPC is 9b.
+- [x] **9. Rate enforcement.** 160 MiB synced at 32 MiB/s takes at least 3.5 s (4.17 s
+  measured). The first minimums did not boot; measured and raised to 32 MiB/s and 5000
+  operations/s, with a near-limit snapshot test.
 - [ ] **9b. Host ENOSPC.** Work root on a small tmpfs: ENOSPC during snapshot, patch and a
   verification scratch write fails visibly, never verifies, and leaves the journal's digest
   equal to the inspected image or fails the task. Decide whether it can be reported as an
