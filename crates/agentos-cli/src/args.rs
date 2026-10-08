@@ -120,6 +120,11 @@ pub enum Command {
         #[command(subcommand)]
         command: ImageCommand,
     },
+    /// Manage the analyzer component registry.
+    Component {
+        #[command(subcommand)]
+        command: ComponentCommand,
+    },
     /// Revoke a task's capabilities (all, or one by its contract name, e.g. verification.run);
     /// running jobs that depend on a revoked capability are stopped.
     Revoke {
@@ -156,6 +161,15 @@ pub enum ProfileCommand {
     /// content-addressed registry; the same bytes twice change nothing.
     Register { dir: PathBuf },
     /// List registered profiles.
+    List,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ComponentCommand {
+    /// Copy an analyzer directory (component.json, component.wasm) into the read-only,
+    /// content-addressed registry after checking it is an analyzer component.
+    Register { dir: PathBuf },
+    /// List registered analyzer components.
     List,
 }
 

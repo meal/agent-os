@@ -1,3 +1,4 @@
+mod component;
 mod control;
 mod export;
 mod gc;
@@ -13,7 +14,7 @@ use agentos_core::ids::TaskId;
 use agentos_core::state::TaskState;
 use serde_json::{Value, json};
 
-use crate::args::{Args, Command, ImageCommand, ProfileCommand};
+use crate::args::{Args, Command, ComponentCommand, ImageCommand, ProfileCommand};
 use crate::error::CliError;
 use crate::home::Home;
 
@@ -83,6 +84,12 @@ pub async fn dispatch(args: Args) -> Result<(), CliError> {
         Command::Image {
             command: ImageCommand::List,
         } => image::list(&home),
+        Command::Component {
+            command: ComponentCommand::Register { dir },
+        } => component::register(&home, &dir),
+        Command::Component {
+            command: ComponentCommand::List,
+        } => component::list(&home),
         Command::Revoke { id, capability } => {
             revoke::revoke(&home, &task_id(&id)?, capability.as_deref())
         }

@@ -5335,3 +5335,93 @@ fn a_task_with_contracted_vm_resources_survives_a_kill_on_the_real_worker() {
         manifest["final_workspace_digest"]
     );
 }
+
+fn component_fixture(name: &str) -> PathBuf {
+    fixtures().join("components").join(name)
+}
+
+#[test]
+fn component_register_is_content_addressed_and_lists_entries() {
+    let cli = Cli::bare();
+    let first = cli.json(&[
+        "component",
+        "register",
+        component_fixture("repo-analyzer-v1").to_str().unwrap(),
+    ]);
+    assert_eq!(first["id"], "repo-analyzer-v1");
+    let digest = first["digest"].as_str().unwrap().to_string();
+    assert_eq!(digest.len(), 64);
+    let again = cli.json(&[
+        "component",
+        "register",
+        component_fixture("repo-analyzer-v1").to_str().unwrap(),
+    ]);
+    assert_eq!(again, first, "the same bytes twice change nothing");
+    let entry = cli
+        .home()
+        .join("registry/components")
+        .join(format!("repo-analyzer-v1@{digest}"));
+    assert!(entry.join("component.wasm").is_file() && entry.join("component.json").is_file());
+    let listed = cli.json(&["component", "list"]);
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(
+        (listed[0]["id"].clone(), listed[0]["digest"].clone()),
+        (json!("repo-analyzer-v1"), json!(digest))
+    );
+    // Not a profile: the profile registry does not list it.
+    assert_eq!(cli.json(&["profile", "list"]), json!([]));
+}
+
+#[test]
+fn component_register_refuses_what_is_not_an_analyzer() {
+    let cli = Cli::bare();
+    for (fixture, message) in [
+        ("wasi-import-v1", "imports wasi:cli/environment@0.2.0"),
+        ("no-export-v1", "does not export analyze"),
+    ] {
+        cli.cmd(&[
+            "component",
+            "register",
+            component_fixture(fixture).to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(message));
+    }
+    let bad = cli.path("bad-component");
+    fs::create_dir_all(&bad).unwrap();
+    fs::write(
+        bad.join("component.json"),
+        r#"{"id":"bad-v1","world":"agentos:analyzer/analyzer@1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(bad.join("component.wasm"), b"not wasm").unwrap();
+    cli.cmd(&["component", "register", bad.to_str().unwrap()])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("not a component"));
+    fs::write(
+        bad.join("component.json"),
+        r#"{"id":"bad-v1","world":"other:world/x@1.0.0"}"#,
+    )
+    .unwrap();
+    fs::copy(
+        component_fixture("repo-analyzer-v1").join("component.wasm"),
+        bad.join("component.wasm"),
+    )
+    .unwrap();
+    cli.cmd(&["component", "register", bad.to_str().unwrap()])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("agentos:analyzer/analyzer@1.0.0"));
+    fs::write(
+        bad.join("component.json"),
+        r#"{"id":"../x","world":"agentos:analyzer/analyzer@1.0.0"}"#,
+    )
+    .unwrap();
+    cli.cmd(&["component", "register", bad.to_str().unwrap()])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("plain name"));
+    assert_eq!(cli.json(&["component", "list"]), json!([]));
+}

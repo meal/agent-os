@@ -15,6 +15,7 @@ dependencies = [
 name = "agentos-cli"
 version = "0.1.0"
 dependencies = [
+ "agentos-component",
  "agentos-core",
  "agentos-engine",
  "agentos-store",

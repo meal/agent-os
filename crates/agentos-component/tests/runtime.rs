@@ -1,4 +1,4 @@
-//! The analyzer runtime against the committed components (`fixtures/components`, rebuilt by
+//! The analyzer runtime against the committed components (`fixtures/components/*/component.wasm`, rebuilt by
 //! `scripts/build-components.sh`): granted reads only, guest bounds, host budgets, reports.
 
 use std::collections::BTreeMap;
@@ -12,7 +12,7 @@ use agentos_component::{FileEntry, Limits, Outcome, Runtime, Snapshot, SnapshotE
 fn component(name: &str) -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/components")
-        .join(format!("{name}.wasm"));
+        .join(format!("{name}-v1/component.wasm"));
     std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 

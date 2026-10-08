@@ -317,6 +317,17 @@ impl Home {
         self.registry_dir().join("images")
     }
 
+    pub fn components_dir(&self) -> PathBuf {
+        self.registry_dir().join("components")
+    }
+
+    /// Every registered analyzer component, unordered.
+    pub fn component_list(&self) -> Vec<RegistryEntry> {
+        list_entries(&self.components_dir(), |dir| {
+            dir.join("component.json").is_file() && dir.join("component.wasm").is_file()
+        })
+    }
+
     /// Every registered guest image, unordered.
     pub fn image_list(&self) -> Vec<RegistryEntry> {
         list_entries(&self.images_dir(), |dir| dir.join("image.json").is_file())
