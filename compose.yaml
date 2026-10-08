@@ -41,4 +41,11 @@ services:
       - AGENTOS_GUEST_IMAGE=/work/build/guest-images/python-stdlib-v1
     # The built guest image (scripts/build-guest-image.sh) persists here between runs.
     volumes: ["guest-images:/work/build/guest-images"]
+  # The guest kernel builder (scripts/build-kernel.sh): a pinned Debian base with the build
+  # dependencies from the guest rootfs's snapshot.debian.org timestamp. Nothing else.
+  kernel-builder:
+    build: { context: ., dockerfile: Dockerfile.kernel }
+    volumes: [".:/work"]
+    init: true
+    command: sh scripts/build-kernel.sh build/kernels/out
 volumes: { cargo-cache: {}, target: {}, guest-images: {} }

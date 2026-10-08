@@ -8,7 +8,7 @@
 **Constraints:** red/green; `sh scripts/check.sh` after each commit; `df -h /` before long
 builds; no co-author trailer.
 
-- [ ] **1. Kernel builder.** A `kernel-builder` Compose service pinned by digest with build
+- [x] **1. Kernel builder.** A `kernel-builder` Compose service pinned by digest with build
   dependencies from the pinned Debian snapshot; `scripts/build-kernel.sh` fetches and checks
   the source, applies the committed Firecracker fragments, checks the resolved config
   against the committed one, builds `vmlinux` reproducibly, and `--verify` builds twice in

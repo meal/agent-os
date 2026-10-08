@@ -1,0 +1,14 @@
+# The guest kernel builder (scripts/build-kernel.sh): a pinned Debian base and the build
+# dependencies from the same snapshot.debian.org timestamp as the guest rootfs, so the
+# toolchain is the same on every build.
+FROM debian@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
+ARG SNAPSHOT=20260901T000000Z
+# Plain http: apt verifies the snapshot's signed InRelease with the image's archive keyring.
+# Plain http: apt verifies the snapshot's signed InRelease with the image's archive keyring.
+RUN printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/%s/ bookworm main\n' "$SNAPSHOT" > /etc/apt/sources.list && \
+    rm -f /etc/apt/sources.list.d/* && \
+    apt-get -o Acquire::Check-Valid-Until=false update && \
+    apt-get install -y --no-install-recommends gcc make bc flex bison libelf-dev libssl-dev dwarves \
+      xz-utils curl ca-certificates python3 && \
+    rm -rf /var/lib/apt/lists/*
+WORKDIR /work
