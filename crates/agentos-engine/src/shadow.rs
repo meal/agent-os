@@ -54,11 +54,11 @@ pub fn check_path(rel: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Reads at most `READ_LIMIT` bytes of the regular file `rel` under `shadow`:
-/// `(content, truncated)`. Refuses a bad path and any symlink on it before touching it.
-pub fn read_from(shadow: &Path, rel: &str) -> Result<(String, bool), String> {
+/// Opens the regular file `rel` under `root`, after refusing a bad path and any symlink on
+/// it before touching it. Shared by `ReadFile` and the analyzer's snapshot reads.
+pub fn open_file(root: &Path, rel: &str) -> Result<fs::File, String> {
     check_path(rel)?;
-    let crosses = symlink_on_path(shadow, rel).map_err(|e| {
+    let crosses = symlink_on_path(root, rel).map_err(|e| {
         format!(
             "cannot read {}: {}",
             guest_text(rel),
@@ -72,14 +72,21 @@ pub fn read_from(shadow: &Path, rel: &str) -> Result<(String, bool), String> {
             guest_text(&link)
         ));
     }
-    let path = shadow.join(rel);
+    let path = root.join(rel);
     match fs::metadata(&path) {
         Ok(m) if m.is_file() => {}
         _ => return Err(format!("file not in the workspace: {}", guest_text(rel))),
     }
+    fs::File::open(&path).map_err(|e| format!("cannot read {}: {e}", guest_text(rel)))
+}
+
+/// Reads at most `READ_LIMIT` bytes of the regular file `rel` under `shadow`:
+/// `(content, truncated)`. Refuses a bad path and any symlink on it before touching it.
+pub fn read_from(shadow: &Path, rel: &str) -> Result<(String, bool), String> {
+    let file = open_file(shadow, rel)?;
     let mut bytes = Vec::new();
-    fs::File::open(&path)
-        .and_then(|f| f.take(READ_LIMIT as u64 + 1).read_to_end(&mut bytes))
+    file.take(READ_LIMIT as u64 + 1)
+        .read_to_end(&mut bytes)
         .map_err(|e| format!("cannot read {}: {e}", guest_text(rel)))?;
     let truncated = bytes.len() > READ_LIMIT;
     let content = String::from_utf8_lossy(&bytes[..bytes.len().min(READ_LIMIT)]).into_owned();

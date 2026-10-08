@@ -24,7 +24,7 @@ wasm-tools 1.261.0 (release binary, sha256
   component; the bytes are committed with a rebuild-and-compare test and an imports test.
 - [x] **4. Registry.** `agentos component register|list`, refusing non-components, extra
   imports and a missing `analyze` export.
-- [ ] **5. Engine.** `ComponentExecutor` routed in the controller, retention under
+- [x] **5. Engine.** `ComponentExecutor` routed in the controller, retention under
   `analysis/`, the runner's one analysis after the snapshot, crash matrix for the new kind
   with an execution counter, GC rule.
 - [ ] **6. CLI and export.** Approval shows the capability and the pin; `submit` copies the

@@ -568,6 +568,11 @@ impl Env {
         Env::build(contract_with(tool_actions, caps), false)
     }
 
+    /// An approved task over `contract`.
+    pub fn with_contract(contract: (Contract, Digest)) -> Env {
+        Env::build(contract, true)
+    }
+
     fn build((contract, digest): (Contract, Digest), approve: bool) -> Env {
         let dir = tempfile::tempdir().unwrap();
         copy_dir(
@@ -769,4 +774,28 @@ pub async fn run_model<E: Executor>(env: &Env, exec: &E) -> TaskState {
     agentos_engine::runner::run_task(&env.db, &env.blobs, exec, &mut agent, &env.task)
         .await
         .unwrap()
+}
+
+/// `fixtures/components/<name>/component.wasm`.
+pub fn component_wasm(name: &str) -> PathBuf {
+    fixtures()
+        .join("components")
+        .join(name)
+        .join("component.wasm")
+}
+
+/// `contract(tool_actions)` with the `snapshot.analyze` capability and an analyzer pin for the
+/// committed component `name`.
+pub fn analyzer_contract(tool_actions: u32, name: &str) -> (Contract, Digest) {
+    let (contract, _) = contract(tool_actions);
+    let mut json = serde_json::to_value(&contract).unwrap();
+    json["capabilities"]
+        .as_array_mut()
+        .unwrap()
+        .push("snapshot.analyze".into());
+    let digest = Digest::of(&std::fs::read(component_wasm(name)).unwrap());
+    json["analyzer"] = serde_json::json!({ "id": name, "digest": digest.to_string() });
+    let contract = Contract::parse(&json.to_string()).unwrap();
+    let digest = Digest::of(&serde_json::to_vec(&contract).unwrap());
+    (contract, digest)
 }

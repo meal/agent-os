@@ -478,12 +478,45 @@ fn check_tree(root: &Path, rules: Rules) -> Result<(), Fail> {
     Ok(())
 }
 
+/// A directory of outcomes retained in the controller (`crate::retention`): where it is, the
+/// outcome's file, the ticket kind, and the effect kind it may hold.
+struct Retained {
+    dir: &'static str,
+    file: &'static str,
+    kind: Kind,
+    owns: fn(&EffectKind) -> bool,
+}
+
+const MODEL: Retained = Retained {
+    dir: "model",
+    file: "response.json",
+    kind: Kind::Model,
+    owns: |k| matches!(k, EffectKind::ModelCall { .. }),
+};
+
+const ANALYSIS: Retained = Retained {
+    dir: "analysis",
+    file: "outcome.json",
+    kind: Kind::Analysis,
+    owns: |k| matches!(k, EffectKind::AnalyzeSnapshot),
+};
+
+fn retained_family(kind: Kind) -> Option<&'static Retained> {
+    match kind {
+        Kind::Model => Some(&MODEL),
+        Kind::Analysis => Some(&ANALYSIS),
+        Kind::JobFile | Kind::Workspace => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum Kind {
     /// One redundant file of a job directory (`JOB_FILES`).
     JobFile,
     /// A whole `model/<effect>-<attempt>` response retention.
     Model,
+    /// A whole `analysis/<effect>-<attempt>` outcome retention.
+    Analysis,
     /// `work/<task>/{ws,workspace,ws.img}`.
     Workspace,
 }
@@ -606,7 +639,7 @@ fn expected_type(kind: Kind, name: &str) -> FileType {
     match (kind, name) {
         (Kind::JobFile, "v.sock") => FileType::Socket,
         (Kind::JobFile, _) | (Kind::Workspace, "ws.img") => FileType::RegularFile,
-        (Kind::Workspace, _) | (Kind::Model, _) => FileType::Directory,
+        (Kind::Workspace, _) | (Kind::Model, _) | (Kind::Analysis, _) => FileType::Directory,
     }
 }
 
@@ -642,9 +675,9 @@ fn ticket_shape(ticket: &Ticket) -> Result<(), String> {
                 && (parts[2] != "v.sock" || proof.firecracker_socket)
                 && proof.result.is_some()
         }
-        Kind::Model => {
+        Kind::Model | Kind::Analysis => {
             parts.len() == 2
-                && parts[0] == "model"
+                && parts[0] == retained_family(ticket.kind).map_or("", |f| f.dir)
                 && owned(&proof.effect, &proof.attempt).is_some_and(|o| parts[1] == o.as_str())
                 && proof.result.is_some()
         }
@@ -714,6 +747,7 @@ struct Items {
     pending: Vec<(String, Ticket)>,
     jobs: Vec<String>,
     models: Vec<String>,
+    analyses: Vec<String>,
     workspaces: Vec<&'static str>,
 }
 impl Items {
@@ -725,6 +759,7 @@ impl Items {
             .collect();
         paths.extend(self.jobs.iter().map(|j| format!("jobs/{j}")));
         paths.extend(self.models.iter().map(|m| format!("model/{m}")));
+        paths.extend(self.analyses.iter().map(|a| format!("analysis/{a}")));
         paths.extend(self.workspaces.iter().map(|w| format!("work/{task}/{w}")));
         paths
     }
@@ -895,7 +930,11 @@ impl Pass<'_> {
                 return Err(unowned());
             }
         }
-        for (sub, model) in [("jobs", false), ("model", true)] {
+        for (sub, family) in [
+            ("jobs", None),
+            ("model", Some(&MODEL)),
+            ("analysis", Some(&ANALYSIS)),
+        ] {
             let Some(root) = self.root_dir(sub).map_err(abort(sub))? else {
                 continue;
             };
@@ -916,17 +955,19 @@ impl Pass<'_> {
                     path: shown.clone(),
                     reason: format!("names an effect the journal does not know: {}", reason(e)),
                 })?;
-                if model && !matches!(rec.kind, EffectKind::ModelCall { .. }) {
+                if let Some(family) = family
+                    && !(family.owns)(&rec.kind)
+                {
                     return Err(Abort {
                         path: shown,
-                        reason: "model retention for an effect that is not a model call".into(),
+                        reason: format!("{} retention for an effect of another kind", family.dir),
                     });
                 }
                 let items = add(&mut scan.tasks, rec.task_id);
-                if model {
-                    items.models.push(name);
-                } else {
-                    items.jobs.push(name);
+                match family.map(|f| f.kind) {
+                    Some(Kind::Model) => items.models.push(name),
+                    Some(_) => items.analyses.push(name),
+                    None => items.jobs.push(name),
                 }
             }
         }
@@ -1188,14 +1229,19 @@ impl Pass<'_> {
         })
     }
 
-    fn classify_model(&self, task: &TaskId, name: &str) -> Result<Result<Delete, String>, Fail> {
+    fn classify_retained(
+        &self,
+        family: &Retained,
+        task: &TaskId,
+        name: &str,
+    ) -> Result<Result<Delete, String>, Fail> {
         let root = self
-            .root_dir("model")?
-            .ok_or_else(|| Fail::Refuse("model directory vanished".into()))?;
+            .root_dir(family.dir)?
+            .ok_or_else(|| Fail::Refuse(format!("{} directory vanished", family.dir)))?;
         let dir = owned_dir(&root, name)?;
         let identity = confined::dir_identity(&dir)?;
         check_tree(&pinned(&dir), Rules::default())?;
-        let out: ExecOutcome = match read_json_at(&dir, "response.json") {
+        let out: ExecOutcome = match read_json_at(&dir, family.file) {
             Ok(out) => out,
             Err(why) => return Ok(Err(why)),
         };
@@ -1204,7 +1250,7 @@ impl Pass<'_> {
         };
         if !settled(&rec, &out)
             || rec.task_id != *task
-            || !matches!(rec.kind, EffectKind::ModelCall { .. })
+            || !(family.owns)(&rec.kind)
             || name != format!("{}-{}", rec.effect_id, out.receipt.attempt_id)
             || rec.result_digest != Some(Digest::of(&out.output))
             || !rec
@@ -1216,8 +1262,8 @@ impl Pass<'_> {
             ));
         }
         Ok(Ok(Delete {
-            relative: Path::new("model").join(name),
-            kind: Kind::Model,
+            relative: Path::new(family.dir).join(name),
+            kind: family.kind,
             proof: Proof {
                 task: task.clone(),
                 effect: Some(rec.effect_id.clone()),
@@ -1297,7 +1343,7 @@ impl Pass<'_> {
             || rec.result_digest != result
             || rec.lease_generation != ticket.proof.lease
             || !result.is_some_and(|d| self.referenced.contains(&d))
-            || (ticket.kind == Kind::Model && !matches!(rec.kind, EffectKind::ModelCall { .. }))
+            || retained_family(ticket.kind).is_some_and(|f| !(f.owns)(&rec.kind))
         {
             return Err(Fail::Integrity(
                 "staged deletion is no longer proven by a settled published effect".into(),
@@ -1417,9 +1463,14 @@ impl Pass<'_> {
                 }
             }
         }
-        for name in &items.models {
-            let path = format!("model/{name}");
-            match self.classify_model(task, name) {
+        let retained = items
+            .models
+            .iter()
+            .map(|n| (&MODEL, n))
+            .chain(items.analyses.iter().map(|n| (&ANALYSIS, n)));
+        for (family, name) in retained {
+            let path = format!("{}/{name}", family.dir);
+            match self.classify_retained(family, task, name) {
                 Ok(Ok(delete)) => plan.actions.push(Action::Delete(delete)),
                 Ok(Err(why)) => plan.notes.push(Entry {
                     path,

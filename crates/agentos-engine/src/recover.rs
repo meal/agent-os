@@ -46,7 +46,7 @@ use agentos_core::effect::{
     AttemptId, EffectId, EffectKind, EffectRecord, EffectState, ReceiptVerdict, RetryPolicy,
     accept_receipt,
 };
-use agentos_core::ids::TaskId;
+use agentos_core::ids::{Digest, TaskId};
 use agentos_core::state::{TaskEvent, TaskState};
 use agentos_store::blob::BlobStore;
 use agentos_store::db::Db;
@@ -283,6 +283,13 @@ fn payload<E>(cx: &Cx<'_, E>, rec: &EffectRecord) -> Result<Option<Vec<u8>>> {
     match rec.kind {
         EffectKind::ApplyPatch { .. } => Ok(recovered_patch(cx, rec)?.map(String::into_bytes)),
         EffectKind::ModelCall { .. } => journal::model_request_body(cx.blobs, rec),
+        // Issued before the agent's first turn, so the workspace is still the snapshot; the
+        // rebuilt request counts only if it is the journaled one.
+        EffectKind::AnalyzeSnapshot => {
+            let snapshot = cx.db.task(&cx.task)?.workspace_digest;
+            Ok(crate::analysis::request_payload(&cx.contract, snapshot)
+                .filter(|p| Digest::of(p) == rec.request_digest))
+        }
         _ => Ok(Some(Vec::new())),
     }
 }

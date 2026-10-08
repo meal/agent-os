@@ -239,12 +239,20 @@ pub async fn drive(
     lock.driving(task)?;
     let hook = crash.map(CrashSpec::hook);
     // The crash hook reaches every executor the router owns.
-    let RoutingExecutor { jobs, model, reads } = exec;
-    let exec = RoutingExecutor::new(
+    let RoutingExecutor {
+        jobs,
+        model,
+        reads,
+        analysis,
+    } = exec;
+    let mut exec = RoutingExecutor::new(
         jobs.with_crash(hook.clone()),
         model.with_crash(hook.clone()),
         reads.with_crash(hook.clone()),
     );
+    if let Some(analysis) = analysis {
+        exec = exec.with_analysis(analysis.with_crash(hook.clone()));
+    }
     let opts = RunOptions { crash: hook };
     if let Some(state) = check_inputs(home, store, task)? {
         // The task is failed before anything runs on the changed inputs, but what the dead

@@ -65,7 +65,7 @@ pub const MAX_EFFECT_TIMEOUT_MS: i64 = 600_000;
 /// How many times each effect kind was really executed, shared across executor instances
 /// so it survives a simulated restart.
 #[derive(Debug, Clone, Default)]
-pub struct ExecCounts(Arc<[AtomicUsize; 7]>);
+pub struct ExecCounts(Arc<[AtomicUsize; 8]>);
 
 fn slot(tag: &str) -> usize {
     match tag {
@@ -75,6 +75,7 @@ fn slot(tag: &str) -> usize {
         "model_call" => 4,
         "list_files" => 5,
         "read_file" => 6,
+        "analyze_snapshot" => 7,
         _ => 3,
     }
 }

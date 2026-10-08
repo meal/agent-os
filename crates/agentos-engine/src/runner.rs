@@ -890,6 +890,58 @@ pub async fn run_task_with<E: Executor, A: Agent>(
     Ok(state)
 }
 
+/// Runs the contract's analyzer once over the snapshot, before the agent's first turn: a
+/// no-op without an analyzer, or once the journal holds the analysis. The report is advisory:
+/// a failed analysis, or a capability revoked before it, does not stop the task.
+async fn ensure_analysis<E: Executor>(cx: &Cx<'_, E>) -> Result<Option<TaskState>> {
+    let Some(analyzer) = &cx.contract.analyzer else {
+        return Ok(None);
+    };
+    let (db, task) = (cx.db, &cx.task);
+    if journal::intended(&db.events(task)?, "AnalyzeSnapshot", None)?.is_some() {
+        // Recovery has already settled it if it was in flight.
+        return Ok(None);
+    }
+    if let Some(state) = deadline_stop(cx).await? {
+        return Ok(Some(state));
+    }
+    if let Err(denial) = granted(db, task, Capability::SnapshotAnalyze, &Resource::Task)? {
+        tracing::info!(task_id = %task, denial, "analysis skipped: denied by the broker");
+        db.append_audit(
+            task,
+            "AnalysisSkipped",
+            &json!({ "reason": format!("capability {} not usable ({denial})",
+                capability_name(Capability::SnapshotAnalyze)) }),
+        )?;
+        return Ok(None);
+    }
+    let t = db.task(task)?;
+    let payload =
+        crate::analysis::request_payload(&cx.contract, t.workspace_digest).ok_or_else(|| {
+            EngineError::Protocol(format!(
+                "analyzer digest {:?} is not a digest",
+                analyzer.digest
+            ))
+        })?;
+    let rec = intend(
+        db,
+        task,
+        EffectKind::AnalyzeSnapshot,
+        Digest::of(&payload),
+        &t.workspace_digest,
+        &Resource::Task,
+    )?;
+    cx.crash(CrashPoint::AfterIntent, Some(rec.kind.tag()))?;
+    match run_attempt(cx, &rec, payload).await? {
+        Attempt::Published(ReceiptVerdict::Apply) | Attempt::Forfeited => Ok(None),
+        Attempt::Published(verdict) => Err(EngineError::ReceiptNotApplied {
+            effect: rec.effect_id,
+            verdict,
+        }),
+        Attempt::Ended(state) => Ok(Some(state)),
+    }
+}
+
 async fn drive<E: Executor, A: Agent>(cx: &Cx<'_, E>, agent: &mut A) -> Result<TaskState> {
     let (db, task) = (cx.db, &cx.task);
     // In-flight effects are reconciled before anything else, a pending cancel included,
@@ -912,6 +964,10 @@ async fn drive<E: Executor, A: Agent>(cx: &Cx<'_, E>, agent: &mut A) -> Result<T
     };
     if resumed && let Some(state) = workspace_lost(cx)? {
         return Ok(state);
+    }
+    match or_interrupted(db, task, ensure_analysis(cx).await)? {
+        Ok(Some(state)) | Err(state) => return Ok(state),
+        Ok(None) => {}
     }
 
     let turns = journal::session_turns(&db.events(task)?)?;
