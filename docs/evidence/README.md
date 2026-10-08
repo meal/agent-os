@@ -16,9 +16,25 @@ still do not establish provider or isolation acceptance.
 Image `python-stdlib-v1`; Firecracker v1.17.0; kernel 6.18.51. The live runs predate the test
 fix, which changes only a test assertion. Recordings (schema version 2) are in
 `fixtures/transcripts/live/`; each worker's manifest, `patch.diff`, success report and replay
-report are under `2026-10-08/host` and `2026-10-08/firecracker`. Every file was scanned for the
-key bytes, `sk-ant` and `x-api-key`: none found. The host run recorded one `Denied` event
-that has not been examined. The candidate `python-stdlib-py314-v1` image, two-snapshot
+report are under `2026-10-08/host` and `2026-10-08/firecracker`.
+
+The host run's one `Denied` event is the broker refusing the model's first patch as
+`InvalidPatch`: its hunk header counted 8 old and 9 new lines where the body had 7 and 8,
+so `git apply` reported a corrupt patch. The refusal created no effect and used no tool
+action (both runs show 4 `ActionUsed`; the host run has one more model call and one more
+`EffectIntended` than the jailed run, for the corrected patch). The model fixed the hunk
+on its next turn. `happy_path::a_miscounted_hunk_is_denied_before_any_effect_and_costs_no_action`
+replays that patch verbatim and reproduces the same request digest.
+
+Secret exclusion and consistency are now checked by `cargo test --test evidence` in the
+default tier. Every file under `docs/evidence/` (except prose) and `fixtures/transcripts/`
+is scanned for `sk-ant-`, `x-api-key`, `authorization`, `bearer ` and full 32-digit
+capability handles. Recordings store provider response bodies as byte arrays, so the scan
+decodes them; a text search would not see them. Each promoted run's success report,
+replay report, manifest, `patch.diff` (by BLAKE3), recording and setup commit must agree.
+The live harness also scans its recording and bundle for the exact key bytes before it
+writes a success report. The first manual scan of these runs was a text search; the
+decoded scan above has since confirmed the same result. The candidate `python-stdlib-py314-v1` image, two-snapshot
 fresh-host evidence, VM resource measurements and the component ABI remain open.
 
 Run from a normal checkout on the provisioned Linux x86_64 Docker host:

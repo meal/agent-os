@@ -10,6 +10,13 @@
 
 **Spec:** [v0.1 completion design](../specs/2026-10-04-v01-completion-design.md), [repository review](../../reviews/2026-10-04-repository-review.md), and the original [build plan](../../../Agent_OS_v1_Build_Plan.md).
 
+## Execution status — 2026-10-08
+
+Packages 1–4, 6, 7 and 8 are complete. Package 7's live host and jailed runs and the real
+KVM suites passed on 2026-10-08 ([evidence](../../evidence/README.md)), and its evidence is
+checked automatically. Package 5's candidate guest gate and packages 9–12 remain open.
+The 2026-10-04 status below is historical.
+
 ## Execution status — 2026-10-04
 
 Packages 1–4 are implemented and verified offline. Package 5 has scoped dependency
@@ -199,7 +206,21 @@ docker compose run --rm test-kvm cargo test --workspace --locked
 docker compose run --rm -e AGENTOS_TEST_WORKER=firecracker test-kvm cargo test --workspace --locked
 ```
 
-- [ ] Check evidence schema and secret exclusion; record failed attempts alongside successes. Re-estimate remaining delivery effort from results.
+- [x] Check evidence schema and secret exclusion; record failed attempts alongside successes. Re-estimate remaining delivery effort from results.
+
+**Task 7 result (2026-10-08).** `cargo test --test evidence` checks secret exclusion (decoding byte-encoded response bodies) and cross-file agreement of every promoted run in the default tier; the live harness scans its outputs for the exact key bytes before writing a success report. The one failed KVM attempt is kept beside the passing run. The host run's single `Denied` was an `InvalidPatch` refusal of a miscounted hunk, now pinned by a regression test.
+
+**Re-estimate from Task 7 results.** The provider, the jail and recovery behaved as designed on their first real runs; the only real-environment failure was a test assumption (an environment dump that is empty under guest init). Live runs took 4–5 model calls and about 16 seconds each. Remaining effort, replacing Milestones B and C above:
+
+| Package | Estimate | Main risk |
+| --- | --- | --- |
+| 5. Candidate guest reproducibility and conformance | 0.5–1 day | Image build nondeterminism under the new interpreter |
+| 9. Contract-driven VM disks and I/O | 3–5 days | Measuring page-cache and cgroup pressure reliably |
+| 10. Component analyzer | 4–6 days | WIT world scope and Wasmtime resource limits |
+| 11. Kernel provenance and fresh-host installer | 3–5 days | Access to a fresh supported host |
+| 12. Alpha evidence and release candidate | 2–3 days | Every gate rerun at one frozen commit |
+
+Total remaining: 12.5–20 engineering days, against 15–24 originally estimated for the same packages after Task 8.
 
 **Gate:** actual live success and offline replay, actual jailed worker isolation/recovery evidence. Missing setup keeps the gate open; no skipped test establishes acceptance.
 
