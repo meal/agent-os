@@ -209,6 +209,10 @@ mod tests {
             deadline_seconds: 60,
             worker_vcpus: 1,
             worker_memory_mib: 256,
+            worker_disk_mib: None,
+            worker_scratch_mib: None,
+            worker_disk_bandwidth_mib_s: None,
+            worker_disk_iops: None,
         }
     }
     fn d(s: &str) -> Digest {
