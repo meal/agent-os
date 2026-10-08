@@ -24,7 +24,7 @@ if [ "$mode" != offline ]; then
 fi
 export COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-agentos-acceptance}
 image=${AGENTOS_ACCEPTANCE_IMAGE:-python-stdlib-v1}
-case "$image" in python-stdlib-v1|python-stdlib-py314-v1) ;; *) echo 'unsupported acceptance image' >&2; exit 2;; esac
+case "$image" in python-stdlib-v1|python-stdlib-py314-v1|python-stdlib-py314-v2) ;; *) echo 'unsupported acceptance image' >&2; exit 2;; esac
 out=${AGENTOS_ACCEPTANCE_OUTPUT:-build/evidence/$(date -u +%Y%m%dT%H%M%SZ)-$$}
 mkdir -p "$(dirname "$out")"
 mkdir "$out" # Refuse existing destinations; preserve every attempt.
@@ -50,6 +50,11 @@ if [ "$mode" = offline ]; then
 fi
 run build docker compose build test test-kvm
 run firecracker docker compose run --rm test-kvm sh scripts/fetch-firecracker.sh
+if [ "$image" = python-stdlib-py314-v2 ]; then
+  # Its kernel is built here from pinned source, twice, before the image is built.
+  run kernel-builder docker compose build kernel-builder
+  run kernel docker compose run --rm kernel-builder sh scripts/build-kernel.sh build/kernels/out --verify
+fi
 run image docker compose run --rm test-kvm sh scripts/build-guest-image.sh "guest/$image" "build/guest-images/$image" --verify
 if [ "$mode" = kvm ]; then
   run kvm docker compose run --rm -e "AGENTOS_GUEST_IMAGE=/work/build/guest-images/$image" test-kvm cargo test --workspace --locked

@@ -174,7 +174,12 @@ for f in kernel.lock snapshot.lock packages.txt image.json.in hooks/customize.sh
 done
 
 json() { python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"; }
-KERNEL_URL=$(json "$RECIPE/kernel.lock" url)
+# An optional field: empty when absent.
+json_opt() { python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))' "$1" "$2"; }
+# A kernel is downloaded (`url`) or built here by scripts/build-kernel.sh (`built`: its output
+# directory, relative to the repository); either way `sha256` pins the vmlinux.
+KERNEL_URL=$(json_opt "$RECIPE/kernel.lock" url)
+KERNEL_BUILT=$(json_opt "$RECIPE/kernel.lock" built)
 KERNEL_SHA256=$(json "$RECIPE/kernel.lock" sha256)
 KERNEL_VERSION=$(json "$RECIPE/kernel.lock" version)
 SUITE=$(json "$RECIPE/snapshot.lock" suite)
@@ -214,9 +219,15 @@ own_under_build() {
   return 0
 }
 
-# 1. The kernel, cached in build/kernels/ and verified on every use.
+# 1. The kernel, cached in build/kernels/ (or built there) and verified on every use.
 KERNEL="$REPO/build/kernels/vmlinux-$KERNEL_VERSION"
+[ -z "$KERNEL_BUILT" ] || KERNEL="$REPO/$KERNEL_BUILT/vmlinux"
 kernel_ok() { [ -f "$KERNEL" ] && echo "$KERNEL_SHA256  $KERNEL" | sha256sum -c --status; }
+if [ -n "$KERNEL_BUILT" ] && ! kernel_ok; then
+  echo "build-guest-image.sh: $KERNEL is missing or not the pinned kernel ($KERNEL_SHA256); build it first:" >&2
+  echo "  docker compose run --rm kernel-builder sh scripts/build-kernel.sh $KERNEL_BUILT --verify" >&2
+  exit 1
+fi
 if ! kernel_ok; then
   mkdir -p "$REPO/build/kernels"
   echo "build-guest-image.sh: downloading $KERNEL_URL" >&2

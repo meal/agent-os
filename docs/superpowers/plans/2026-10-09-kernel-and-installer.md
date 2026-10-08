@@ -13,7 +13,7 @@ builds; no co-author trailer.
   the source, applies the committed Firecracker fragments, checks the resolved config
   against the committed one, builds `vmlinux` reproducibly, and `--verify` builds twice in
   fresh volumes and compares.
-- [ ] **2. Source-kernel recipe.** `guest/python-stdlib-py314-v2` takes its kernel from the
+- [x] **2. Source-kernel recipe.** `guest/python-stdlib-py314-v2` takes its kernel from the
   builder; `image.json` records the kernel provenance; `build-guest-image.sh --verify` stays
   byte-identical.
 - [ ] **3. Kernel on KVM.** The booted kernel's version and embedded config match the record;

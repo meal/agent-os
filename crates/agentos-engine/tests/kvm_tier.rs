@@ -1046,6 +1046,33 @@ async fn the_guest_interpreter_is_the_one_the_image_manifest_records() {
     }
 }
 
+/// The booted kernel is the one the image manifest records: for an image built with a
+/// source kernel (`kernel_build`), its version and the configuration it embeds
+/// (`/proc/config.gz`, `CONFIG_IKCONFIG_PROC`) match the record.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_booted_kernel_is_the_one_the_image_manifest_records() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let fx = Fx::new(&kvm);
+    fx.snapshot().await;
+    fx.use_script(
+        "import gzip, hashlib, json; \
+         config = gzip.open('/proc/config.gz').read(); \
+         print(json.dumps({'version': open('/proc/version').read().split()[2], \
+                           'config_sha256': hashlib.sha256(config).hexdigest()}))",
+    );
+    let v = evidence(&fx.run(EffectKind::RunVerification).await.out);
+    assert_eq!(v["passed"], true, "{v}");
+    let found = findings(&v);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(kvm.image_dir.join("image.json")).unwrap()).unwrap();
+    println!("image {}: booted kernel {found}", manifest["id"]);
+    if let Some(record) = manifest.get("kernel_build") {
+        assert_eq!(found["version"], record["version"], "{found}");
+        assert_eq!(found["config_sha256"], record["config_sha256"], "{found}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn net_probe_cannot_reach_anything_and_sees_only_lo() {
     let Some(kvm) = kvm::require() else { return };

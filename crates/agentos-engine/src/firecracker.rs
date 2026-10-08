@@ -340,6 +340,18 @@ pub struct InterpreterProvenance {
     pub pyenv_commit: String,
 }
 
+/// How an image's kernel was built here (`scripts/build-kernel.sh`): the source, the resolved
+/// configuration and the toolchain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KernelBuildProvenance {
+    pub version: String,
+    pub source_sha256: String,
+    pub config_sha256: String,
+    pub gcc: String,
+    pub binutils: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImageManifest {
@@ -352,6 +364,8 @@ pub struct ImageManifest {
     pub built_from: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interpreter: Option<InterpreterProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_build: Option<KernelBuildProvenance>,
 }
 
 /// Parses `<image_dir>/image.json` and checks that it speaks `GUEST_PROTOCOL` and names
@@ -361,23 +375,38 @@ pub fn read_image(image_dir: &Path) -> Result<ImageManifest, String> {
     let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let image: ImageManifest =
         serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-    if let Some(interpreter) = &image.interpreter {
-        let hex = |s: &str, n: usize| {
-            s.len() == n
-                && s.bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    let hex = |s: &str, n: usize| {
+        s.len() == n
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    if let Some(k) = &image.kernel_build {
+        let version = !k.version.is_empty()
+            && k.version.len() <= 32
+            && k.version.bytes().all(|b| b.is_ascii_digit() || b == b'.');
+        let text = |t: &str| {
+            !t.is_empty() && t.len() <= 128 && t.bytes().all(|b| (b' '..=b'~').contains(&b))
         };
-        if interpreter.version.is_empty()
+        if !version
+            || !hex(&k.source_sha256, 64)
+            || !hex(&k.config_sha256, 64)
+            || !text(&k.gcc)
+            || !text(&k.binutils)
+        {
+            return Err("invalid kernel build provenance".into());
+        }
+    }
+    if let Some(interpreter) = &image.interpreter
+        && (interpreter.version.is_empty()
             || interpreter.version.len() > 32
             || !interpreter
                 .version
                 .bytes()
                 .all(|b| b.is_ascii_digit() || b == b'.')
             || !hex(&interpreter.source_sha256, 64)
-            || !hex(&interpreter.pyenv_commit, 40)
-        {
-            return Err("invalid interpreter provenance".into());
-        }
+            || !hex(&interpreter.pyenv_commit, 40))
+    {
+        return Err("invalid interpreter provenance".into());
     }
     if image.protocol != GUEST_PROTOCOL {
         return Err(format!(
@@ -1942,6 +1971,45 @@ mod tests {
         let mut long = "[ 1.0] I/O error, dev vdb, sector 1\n".to_string();
         long.push_str(&"x".repeat(CONSOLE_SCAN_LIMIT as usize));
         assert!(!check(&long));
+    }
+
+    #[test]
+    fn a_kernel_build_record_is_parsed_and_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(KERNEL_FILE), b"k").unwrap();
+        fs::write(dir.path().join(ROOTFS_FILE), b"r").unwrap();
+        let sha = "a".repeat(64);
+        let manifest = |kernel_build: serde_json::Value| {
+            let m = serde_json::json!({
+                "id": "x-v1", "protocol": GUEST_PROTOCOL, "kernel": KERNEL_FILE,
+                "rootfs": ROOTFS_FILE, "agent_version": "0.1.0", "kernel_sha256": sha,
+                "built_from": "test", "kernel_build": kernel_build
+            });
+            fs::write(dir.path().join("image.json"), m.to_string()).unwrap();
+            read_image(dir.path())
+        };
+        let good = serde_json::json!({ "version": "6.18.51", "source_sha256": sha,
+            "config_sha256": sha, "gcc": "gcc (Debian 12.2.0-14+deb12u1) 12.2.0",
+            "binutils": "GNU ld (GNU Binutils for Debian) 2.40" });
+        let image = manifest(good.clone()).unwrap();
+        assert_eq!(image.kernel_build.unwrap().version, "6.18.51");
+        for (field, bad) in [
+            ("version", serde_json::json!("6.18.51-evil")),
+            ("config_sha256", serde_json::json!("short")),
+            ("gcc", serde_json::json!("gcc\nline")),
+            ("binutils", serde_json::json!("")),
+        ] {
+            let mut record = good.clone();
+            record[field] = bad;
+            assert_eq!(
+                manifest(record).unwrap_err(),
+                "invalid kernel build provenance",
+                "{field}"
+            );
+        }
+        let mut extra = good;
+        extra["extra"] = serde_json::json!(1);
+        assert!(manifest(extra).is_err(), "unknown fields are refused");
     }
 
     /// A `request.json` written before resources were recorded still parses, as version 0.
