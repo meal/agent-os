@@ -25,17 +25,23 @@ each commit; KVM steps run on an otherwise idle host; commits carry no co-author
   deserializes (already covered by the evidence test). Green: optional manifest field.
 - [x] **6. Rendering.** Red: golden `vm.json` with and without rate limiters; the rootfs never
   has one. Green: `Drive.rate_limiter: Option<RateLimiter>`.
-- [ ] **7. Sizes and preallocation.** Red: `ws.img` and `scratch.img` have the contracted
-  lengths and allocated blocks (`st_blocks * 512 >= len`); an existing wrong-length `ws.img`
-  fails the effect and is left untouched; a preallocation fault seam fails the job before
-  launch with the host-disk reason. Green: `fallocate` replacing `sparse`, the length check,
-  the `submit` capacity preflight.
+- [ ] **7. Sizes, free space and file-size limit.** Red: `ws.img` and `scratch.img` have the
+  contracted lengths; an existing wrong-length `ws.img` fails the effect and the inspection
+  and is left untouched; the free-space check refuses at `submit` and fails a job before
+  launch; the jail's `RLIMIT_FSIZE` is the larger image. Green: sizes from `resources`, the
+  length check, the `statvfs` check with a test seam, the jail limit.
 
 ## Real KVM
 
 - [ ] **8. Guest view and full drives.** The guest sees the contracted sizes; filling the
   workspace or scratch fails visibly and never verifies.
-- [ ] **9. Rate enforcement.** With 8 MiB/s, a 40 MiB write takes at least 3.5 s.
+- [ ] **9. Rate enforcement.** With 8 MiB/s, a 40 MiB write with `fsync` inside the timed
+  region takes at least 3.5 s. The minimum rates still boot, format scratch and snapshot
+  within the timeouts, or the bounds rise.
+- [ ] **9b. Host ENOSPC.** Work root on a small tmpfs: ENOSPC during snapshot, patch and a
+  verification scratch write fails visibly, never verifies, and leaves the journal's digest
+  equal to the inspected image or fails the task. Decide whether it can be reported as an
+  infrastructure failure. A jailed task with `worker_disk_mib` above 1024 runs (file-size limit).
 - [ ] **10. Recovery.** Kill after launch and resume a task with non-default resources; the
   recorded values are used and the bundle equals an uncrashed run's.
 - [ ] **11. Measurements and overhead.** Run the measurement matrix from the design, record it

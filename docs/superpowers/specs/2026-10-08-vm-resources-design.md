@@ -73,15 +73,26 @@ replacing the constants at the three use sites.
 - **Workspace image size is fixed once.** `ws.img` is created at the first snapshot with
   `disk_mib`. Every later effect and the inspector check that an existing `ws.img` has exactly
   that length and fail visibly otherwise. Nothing ever recreates or resizes it.
-- **Host capacity.** Both images are preallocated with `fallocate` instead of left sparse,
-  so a host ENOSPC can only happen before launch, never in the middle of a guest write.
-  A failed preallocation removes the partial file and fails the job before the VM starts.
-  The effect then fails as an infrastructure failure with the reason
-  `host disk: cannot preallocate <n> MiB for <file>: <error>`. `submit` additionally runs a
-  `statvfs` preflight on the work root for `disk_mib + scratch_mib` and refuses with exit 1
-  when free space is short; this is advisory, since space can disappear afterwards, and the
-  preallocation is the real guarantee. A filesystem without `fallocate` support is refused
-  by the same preflight.
+- **Host capacity.** Both images stay sparse. Preallocating them was considered and
+  rejected after measuring the cost: the test container's work root shares a filesystem with
+  48 GB free, and 32 parallel test tasks at 1.5 GiB each would reserve about all of it.
+  Instead, `submit` and every job launch run an advisory `statvfs` check on the work root:
+  free space must cover the unallocated part of `ws.img` plus `scratch_mib`. A shortfall
+  fails before launch with `host disk: <n> MiB free under <work root>, the VM may write <m> MiB`
+  (exit 1 at `submit`, an infrastructure failure for a job). Space can still run out after
+  the check. A host ENOSPC during a guest write reaches the guest as a block I/O error, and
+  its effect fails. That is safe for these reasons:
+  - The guest digests the mounted workspace at verification time, and `VerifyPassed`
+    requires that digest to equal the task's current digest, so a partly written image
+    cannot pass.
+  - Every `ApplyPatch` first checks that the image's digest is the expected base, so a
+    partly written image turns later patches into a visible version conflict instead of
+    building on it.
+  - A full host disk during verification is likely to make the check report
+    `passed: false`, which the agent sees as a failing check. Whether a reliable signal
+    (guest I/O errors in the evidence or the Firecracker log) lets this be reported as an
+    infrastructure failure instead is decided by the real-KVM ENOSPC test below; until then
+    it is a known limitation.
 - **Rate limits.** When set, the workspace and scratch drives get Firecracker's
   `rate_limiter` (v1.17.0 API: `RateLimiter { bandwidth, ops }`, each a
   `TokenBucket { size, refill_time, one_time_burst? }`). Bandwidth uses
@@ -130,8 +141,9 @@ version and is outside this package.
 | Resolution: absent fields give version 1 defaults; a journal without `vm_resources` gives version 0 | default |
 | `Submitted` records `vm_resources`; resume uses it; a record that disagrees with the contract refuses without journaling | default, fake jail |
 | Rendered `vm.json` with and without rate limits (golden) | default |
-| `ws.img` created at `disk_mib` and preallocated; a wrong-sized existing image fails visibly and is not replaced | default, fake guest |
-| Preallocation failure (fault seam) fails the job before launch with the host-disk reason | default |
+| `ws.img` created sparse at `disk_mib`, scratch at `scratch_mib`; a wrong-sized existing image fails visibly in the worker and the inspector and is not replaced | default, fake guest |
+| The free-space check refuses at `submit` and fails a job before launch (fault seam for the free-space figure) | default |
+| The jail's `RLIMIT_FSIZE` covers the larger image | default, fake jail; real KVM with `worker_disk_mib` above 1024 |
 | Manifest carries `vm_resources`; older manifests still deserialize | default |
 | `profile register` rejects `./check.sh` and a bare profile file name, accepts interpreter commands and absolute paths | default |
 | Guest sees the contracted drive sizes (`/sys/block/vdb/size`, `vdc`) | real KVM |
@@ -139,14 +151,16 @@ version and is outside this package.
 | Bandwidth limit bites: writing 5× the per-second rate takes at least 3.5 s; no upper bound is asserted | real KVM |
 | Crash and resume of a task with non-default resources keeps the recorded sizes | real KVM |
 | Infrastructure OOM during write-heavy verification never verifies | real KVM |
+| Host ENOSPC (work root on a small tmpfs, images larger than it) during snapshot, patch and a scratch write in verification: visible failure, no `VerifyPassed`, and afterwards the inspected image digest equals the journal's or the task fails | real KVM |
+| The minimum rates (1 MiB/s, 10 operations/s) still boot, format scratch and take a 256 MiB snapshot within the timeouts; otherwise the bounds rise | real KVM |
 
 ## Order of work
 
 Offline first: executable-mode rejection, contract fields and validation, resolution and
-recording, manifest, `vm.json` rendering, preallocation and size checks. Then the KVM tests
+recording, manifest, `vm.json` rendering, sizes, the free-space check and the jail's file-size limit. Then the KVM tests
 and the memory measurements on an idle host, then the overhead decision.
 
 ## Out of scope
 
-Mode transport, network, per-task host disk quotas beyond preallocation, read rate limits on
+Mode transport, network, per-task host disk quotas or preallocation, read rate limits on
 the rootfs, and changing the default sizes.
