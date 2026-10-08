@@ -190,9 +190,9 @@ docker compose run --rm -e AGENTOS_TEST_WORKER=firecracker-fake -e AGENTOS_TEST_
 **Files:** `crates/agentos-engine/tests/live_model.rs`, `crates/agentos-engine/tests/common/{live,kvm}.rs`; new `scripts/acceptance.sh`; sanitized evidence under `docs/evidence/`; versioned recordings under `fixtures/transcripts/`.
 
 - [x] Refactor live harness to accept recorded worker configuration; add host and jailed variants. Test both harness paths against the local fake API first.
-- [ ] Run a real host repair and jailed repair with bounded contract budgets and a mounted regular key file. Save recordings where they can be exported from the Compose target volume.
-- [ ] Replay the recordings without network and compare request digests, call count, workspace digest, protected profile evidence, and exported patch.
-- [ ] Run real KVM hostile profiles, conformance, and the full real-worker crash suite:
+- [x] Run a real host repair and jailed repair with bounded contract budgets and a mounted regular key file. Save recordings where they can be exported from the Compose target volume.
+- [x] Replay the recordings without network and compare request digests, call count, workspace digest, protected profile evidence, and exported patch.
+- [x] Run real KVM hostile profiles, conformance, and the full real-worker crash suite:
 
 ```sh
 docker compose run --rm test-kvm cargo test --workspace --locked

@@ -1,9 +1,25 @@
 # Acceptance evidence
 
-No real-provider or real-KVM acceptance evidence has been collected for the v0.1
-completion branch. Offline suites and local fake-provider recordings exercise the harness;
-skipped gated tests and fake-jail runs do not establish provider or isolation acceptance.
-The user deferred live/KVM setup on 2026-10-04.
+Real-provider and real-KVM acceptance evidence for the v0.1 completion branch was collected
+on 2026-10-08 (see [2026-10-08/](2026-10-08/)). Skipped gated tests and fake-jail runs
+still do not establish provider or isolation acceptance.
+
+## 2026-10-08: Task 7 results
+
+| Run | Commit | Result |
+| --- | --- | --- |
+| `acceptance.sh kvm`, first attempt | `825d360` | **Failed**: 114/115 in `agentos-cli` under the real worker. `api_key_reaches_only_the_provider…` asserted `PATH=` in an environment dump that is empty in a real guest (the parent is init). Not a key leak: `api_key_never_reaches_the_guest` passed. Kept in `kvm-failed-attempt/`. |
+| `acceptance.sh kvm`, after the test fix | `9de2618` | Passed: full workspace suite and the `AGENTOS_TEST_WORKER=firecracker` suite (`kvm-pass/`). |
+| `acceptance.sh live`, host worker | `825d360-dirty` (the dirty change is the test fix above) | `claude-opus-5-5`, `SUCCEEDED`, 5 model calls, final workspace digest equals verified digest; offline replay matched. |
+| `acceptance.sh live`, jailed Firecracker worker | `825d360-dirty` | Same model, `SUCCEEDED`, 4 model calls; offline replay matched. |
+
+Image `python-stdlib-v1`; Firecracker v1.17.0; kernel 6.18.51. The live runs predate the test
+fix, which changes only a test assertion. Recordings (schema version 2) are in
+`fixtures/transcripts/live/`; each worker's manifest, `patch.diff`, success report and replay
+report are under `2026-10-08/host` and `2026-10-08/firecracker`. Every file was scanned for the
+key bytes, `sk-ant` and `x-api-key`: none found. The host run recorded one `Denied` event
+that has not been examined. The candidate `python-stdlib-py314-v1` image, two-snapshot
+fresh-host evidence, VM resource measurements and the component ABI remain open.
 
 Run from a normal checkout on the provisioned Linux x86_64 Docker host:
 
