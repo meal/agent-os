@@ -20,7 +20,7 @@ builds; no co-author trailer.
   the full KVM suite passes on the new image.
 - [ ] **4. Release.** `scripts/release.sh VERSION` builds a static musl `agentos` and the
   release tree with `MANIFEST.json` and `SHA256SUMS`.
-- [ ] **5. Installer.** `scripts/install.sh` with every refusal and `--self-test` covering
+- [x] **5. Installer.** `scripts/install.sh` with every refusal and `--self-test` covering
   each, plus idempotence and the same-version-different-content refusal.
 - [ ] **6. Smoke run.** `scripts/smoke-install.sh` in a fresh container on the KVM host:
   install, register, jailed fixture with the analyzer, kill and resume, export, compare.

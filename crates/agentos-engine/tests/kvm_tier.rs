@@ -1583,7 +1583,14 @@ struct SmallHostDisk {
 }
 
 impl SmallHostDisk {
-    fn new(kvm: &kvm::Kvm, mib: u64) -> (SmallHostDisk, TempDir) {
+    /// A tmpfs with room for the copy of the guest image the fixture makes in it, plus
+    /// `headroom_mib` (which differs per image, so it is computed, not fixed).
+    fn new(kvm: &kvm::Kvm, headroom_mib: u64) -> (SmallHostDisk, TempDir) {
+        let image: u64 = kvm::IMAGE_FILES
+            .iter()
+            .map(|f| fs::metadata(kvm.image_dir.join(f)).unwrap().len())
+            .sum();
+        let mib = image.div_ceil(1 << 20) + headroom_mib;
         let root = kvm.root();
         let status = std::process::Command::new("mount")
             .args([
@@ -1683,7 +1690,7 @@ async fn host_enospc_under_the_drives_never_yields_an_unbacked_success() {
     let _alone = exclusive().await;
 
     // 1. Snapshot: 150 MiB of incompressible data into a workspace on a nearly full host.
-    let (disk, root) = SmallHostDisk::new(&kvm, 200);
+    let (disk, root) = SmallHostDisk::new(&kvm, 115);
     let mut fx = Fx::new_in(&kvm, root);
     let outside = tempfile::tempdir().unwrap();
     copy_dir(&fixtures().join("parser-repo"), outside.path());
@@ -1721,7 +1728,7 @@ async fn host_enospc_under_the_drives_never_yields_an_unbacked_success() {
     drop(disk);
 
     // 2. Patch: a snapshot first, then the host fills up before the fix is applied.
-    let (disk, root) = SmallHostDisk::new(&kvm, 200);
+    let (disk, root) = SmallHostDisk::new(&kvm, 115);
     let fx = Fx::new_in(&kvm, root);
     let base = snapshot_past_the_space_check(&fx).await;
     // A patch adding a 3.6 MB file (under the 4 MiB patch limit), with less room than that
@@ -1787,7 +1794,7 @@ async fn host_enospc_under_the_drives_never_yields_an_unbacked_success() {
     drop(disk);
 
     // 3. Verification: the check writes and syncs 100 MiB to scratch on a nearly full host.
-    let (disk, root) = SmallHostDisk::new(&kvm, 200);
+    let (disk, root) = SmallHostDisk::new(&kvm, 115);
     let fx = Fx::new_in(&kvm, root);
     snapshot_past_the_space_check(&fx).await;
     fx.use_script(
