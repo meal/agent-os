@@ -1,0 +1,13 @@
+Attempt 1 (commit 97d0f54): image built twice byte-identical; kvm suite FAILED 113/115 in agentos-cli.
+Both failures: 'guest image python-stdlib-v1 not found in the registry' - the CLI tests hard-coded
+the default image id as the contract profile. Fixed in 2ee9c45. The engine suites never ran.
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: FAILED. 113 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.54s
+
+Attempt 2 (commit 2ee9c45): every stage passed, but the result is INVALID for the candidate.
+The guest ran checks with PATH=/usr/bin:/bin while the recipe linked Python 3.14.8 only into
+/usr/local/bin, so every check ran Debian's Python 3.11.2. Found by the new KVM test
+the_guest_interpreter_is_the_one_the_image_manifest_records; fixed in f175de3.
+kvm: passed 985 failed 0
+real-worker: passed 985 failed 0

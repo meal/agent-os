@@ -12,9 +12,9 @@
 
 ## Execution status — 2026-10-08
 
-Packages 1–4, 6, 7 and 8 are complete. Package 7's live host and jailed runs and the real
+Packages 1–8 are complete. Package 7's live host and jailed runs and the real
 KVM suites passed on 2026-10-08 ([evidence](../../evidence/README.md)), and its evidence is
-checked automatically. Package 5's candidate guest gate and packages 9–12 remain open.
+checked automatically. Package 5's candidate guest passed real KVM acceptance at `f175de3`. Packages 9–12 remain open; package 9 has a [focused design](../specs/2026-10-08-vm-resources-design.md) and [plan](2026-10-08-vm-resources.md).
 The 2026-10-04 status below is historical.
 
 ## Execution status — 2026-10-04
@@ -156,7 +156,9 @@ docker compose run --rm test cargo test -p agentos-cli --test cli --locked
 - [x] Recheck official latest versions online. On 2026-10-04 the checked candidates are [Tokio 1.53.2](https://docs.rs/crate/tokio/latest), [UUID 1.27.0](https://docs.rs/crate/uuid/latest), and [Python 3.14.8](https://www.python.org/downloads/). Rust remains [1.98.1](https://doc.rust-lang.org/stable/releases.html).
 - [x] Update Tokio and UUID as scoped changes, remove unused `jsonschema` workspace declaration, and preserve reviewed locked dependencies otherwise.
 - [x] Pin pyenv itself by reviewed release/commit and Python source/version/checksum in the Docker development image; record `.python-version`. Add a new Python guest recipe rather than changing an existing registered digest.
-- [ ] Add fixture/profile compatibility cases for both interpreters. Verify two clean builds of the new guest image are byte-identical and interpreter provenance is correct.
+- [x] Add fixture/profile compatibility cases for both interpreters. Verify two clean builds of the new guest image are byte-identical and interpreter provenance is correct.
+
+**Task 5 result (2026-10-08).** At `f175de3` the candidate built twice byte-identically and passed both KVM suites. Interpreter provenance is checked inside the guest by `the_guest_interpreter_is_the_one_the_image_manifest_records`, which caught that an earlier passing run had executed Debian's 3.11.2. The candidate is accepted; it is not yet the default, and its interpreter is a copy of the pinned pyenv build rather than an independent source rebuild (package 11).
 
 ```sh
 docker compose run --rm test cargo update -p tokio --precise 1.53.2

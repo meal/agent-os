@@ -13,6 +13,22 @@ still do not establish provider or isolation acceptance.
 | `acceptance.sh live`, host worker | `825d360-dirty` (the dirty change is the test fix above) | `claude-opus-5-5`, `SUCCEEDED`, 5 model calls, final workspace digest equals verified digest; offline replay matched. |
 | `acceptance.sh live`, jailed Firecracker worker | `825d360-dirty` | Same model, `SUCCEEDED`, 4 model calls; offline replay matched. |
 
+Candidate image `python-stdlib-py314-v1` (Task 5), run with
+`AGENTOS_ACCEPTANCE_IMAGE=python-stdlib-py314-v1 sh scripts/acceptance.sh kvm`:
+
+| Run | Commit | Result |
+| --- | --- | --- |
+| First attempt | `97d0f54` | **Failed**: 113/115 in `agentos-cli`; the CLI tests hard-coded the default image id as the contract `profile`. The engine suites never ran. |
+| Second attempt | `2ee9c45` | Every stage passed, but **invalid**: checks ran Debian's Python 3.11.2, because the guest's check `PATH` is `/usr/bin:/bin` and the recipe linked 3.14.8 only into `/usr/local/bin`. |
+| After the recipe fix | `f175de3` | Passed: two byte-identical builds (digest `2ccceaa0…fefeb`), the full workspace suite and the `AGENTOS_TEST_WORKER=firecracker` suite, 986 passed and 0 failed in each. The guest reports Python 3.14.8, matching `image.json` and `runtime/python.lock`. |
+
+Both earlier attempts are in `kvm-py314-failed-attempts/`, the passing run with its
+`image.json` in `kvm-py314-pass/`. A new KVM test,
+`the_guest_interpreter_is_the_one_the_image_manifest_records`, now checks the interpreter
+the guest actually runs against the manifest for every image. The candidate is accepted but
+not the default; the interpreter is copied from the pinned pyenv build, not rebuilt
+independently from source (see the recipe README).
+
 Image `python-stdlib-v1`; Firecracker v1.17.0; kernel 6.18.51. The live runs predate the test
 fix, which changes only a test assertion. Recordings (schema version 2) are in
 `fixtures/transcripts/live/`; each worker's manifest, `patch.diff`, success report and replay
@@ -34,7 +50,7 @@ decodes them; a text search would not see them. Each promoted run's success repo
 replay report, manifest, `patch.diff` (by BLAKE3), recording and setup commit must agree.
 The live harness also scans its recording and bundle for the exact key bytes before it
 writes a success report. The method of the first manual scan was not
-recorded; the decoded scan above finds nothing in these runs. The candidate `python-stdlib-py314-v1` image, two-snapshot
+recorded; the decoded scan above finds nothing in these runs. Two-snapshot
 fresh-host evidence, VM resource measurements and the component ABI remain open.
 
 Run from a normal checkout on the provisioned Linux x86_64 Docker host:
