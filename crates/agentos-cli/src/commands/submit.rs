@@ -8,7 +8,7 @@ use agentos_core::contract::Contract;
 use agentos_core::guest::{GUEST_MIN_MEMORY_MIB, MAX_VCPUS};
 use agentos_core::ids::{Digest, TaskId};
 use agentos_core::resources::VmResources;
-use agentos_engine::firecracker::firecracker_version;
+use agentos_engine::firecracker::{check_host_space, firecracker_version};
 use agentos_engine::guestlink::GuestLauncher;
 use agentos_engine::model::fake::Transcript;
 use agentos_engine::model::provider::ApiKey;
@@ -84,6 +84,18 @@ fn check_firecracker(home: &Home, contract: &Contract) -> Result<FirecrackerReco
     let placeholder = std::path::absolute(home.tasks_dir())?;
     let resources = VmResources::resolve(l);
     let prepared = home.prepare_firecracker(&image, l, &placeholder, None, None, resources)?;
+    // Advisory: the images are sparse, so this is what the VMs may still write. The nearest
+    // existing directory stands in for a work root that does not exist yet.
+    let existing = placeholder
+        .ancestors()
+        .find(|p| p.is_dir())
+        .unwrap_or(&placeholder);
+    check_host_space(
+        existing,
+        resources.disk_bytes() + resources.scratch_bytes(),
+        &[],
+    )
+    .map_err(CliError::other)?;
     let version = match &prepared.cfg.launcher {
         GuestLauncher::Fake { .. } => FAKE_FIRECRACKER_VERSION.to_string(),
         GuestLauncher::Real { .. } => {

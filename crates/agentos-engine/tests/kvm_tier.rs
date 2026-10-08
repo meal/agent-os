@@ -881,6 +881,7 @@ async fn real_guest_boots_and_answers_ready_within_5s() {
                 &cfg.firecracker_bin,
                 cfg.vcpus,
                 cfg.memory_mib,
+                &cfg.resources,
             ))
             .env_clear()
             .current_dir(&dir)

@@ -17,6 +17,7 @@ use agentos_core::guest::{
     Frame, Message, Mode, RAW_FRAME_LIMIT, WS_IMAGE_BYTES, b64, read_frame, write_frame,
 };
 use agentos_core::ids::{Digest, TaskId};
+use agentos_core::resources::VmResources;
 use agentos_engine::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor};
 use agentos_engine::firecracker::{FirecrackerConfig, FirecrackerWorker, WorkerResult, preflight};
 use agentos_engine::fixture::FixtureExecutor;
@@ -101,10 +102,14 @@ impl Fx {
         self.task_dir().join("workspace")
     }
 
-    /// Makes `ws.img` exist without a snapshot (for requests that need one).
+    /// Makes `ws.img` exist without a snapshot (for requests that need one): sparse, at the
+    /// task's recorded size, as a snapshot leaves it.
     fn fake_ws_img(&self) {
         fs::create_dir_all(self.task_dir()).unwrap();
-        fs::write(self.task_dir().join("ws.img"), b"").unwrap();
+        fs::File::create(self.task_dir().join("ws.img"))
+            .unwrap()
+            .set_len(self.cfg.resources.disk_bytes())
+            .unwrap();
     }
 
     fn request(&self, kind: EffectKind, payload: &[u8]) -> EffectRequest {
@@ -460,6 +465,87 @@ async fn read_snapshot_creates_the_sparse_image_and_reports_the_host_bytes() {
     assert_eq!(out.new_workspace, expected.new_workspace);
     assert!(out.new_workspace.is_some());
     assert_eq!(out, expected);
+}
+
+fn sized(disk_mib: u32, scratch_mib: u32) -> VmResources {
+    VmResources {
+        version: 1,
+        disk_mib,
+        scratch_mib,
+        bandwidth_mib_s: None,
+        iops: None,
+    }
+}
+
+#[tokio::test]
+async fn read_snapshot_creates_the_workspace_image_at_the_contracted_size() {
+    let mut fx = Fx::new();
+    fx.cfg.resources = sized(2048, 768);
+    let (out, _job) = fx.run(EffectKind::ReadSnapshot, b"").await;
+    succeeded(&out);
+    let img = fs::metadata(fx.task_dir().join("ws.img")).unwrap();
+    assert_eq!(img.len(), 2048 << 20);
+    assert!(img.blocks() * 512 < 1 << 20, "ws.img stays sparse");
+}
+
+/// The image's size is fixed by the first snapshot: a later effect that expects another
+/// size fails before launching anything and leaves the image as it is.
+#[tokio::test]
+async fn an_existing_workspace_image_of_another_size_fails_and_is_left_as_is() {
+    let mut fx = Fx::new();
+    let (out, _job) = fx.run(EffectKind::ReadSnapshot, b"").await;
+    succeeded(&out);
+    let base = out.new_workspace.unwrap();
+    fx.cfg.resources = sized(2048, 512);
+    for (kind, payload) in [
+        (
+            EffectKind::ApplyPatch {
+                expected_base: base,
+            },
+            fix_patch().into_bytes(),
+        ),
+        (EffectKind::RunVerification, Vec::new()),
+    ] {
+        let (out, job) = fx.run(kind, &payload).await;
+        let why = reason(&out);
+        assert!(
+            why.contains("workspace image") && why.contains("recorded size"),
+            "{why}"
+        );
+        assert!(!out.unresolved, "nothing was sent: a definite failure");
+        assert!(!job.path.join("vm.json").exists(), "nothing was launched");
+    }
+    assert_eq!(
+        fs::metadata(fx.task_dir().join("ws.img")).unwrap().len(),
+        WS_IMAGE_BYTES
+    );
+}
+
+#[tokio::test]
+async fn too_little_host_disk_fails_before_launch() {
+    let fx = Fx::new();
+    let (out, job) = fx
+        .run_with(
+            &fx.request(EffectKind::ReadSnapshot, b""),
+            &ctx(),
+            env_with(&[("AGENTOS_TEST_HOST_FREE_MIB", "100")]),
+        )
+        .await;
+    let why = reason(&out);
+    assert!(why.starts_with("host disk: 100 MiB free under "), "{why}");
+    assert!(why.contains("the VM may write 1536 MiB"), "{why}");
+    assert!(!job.path.join("vm.json").exists());
+    assert!(!fx.task_dir().join("ws.img").exists());
+
+    // Enough room for what is not yet allocated: the job runs.
+    let (out, _job) = fx
+        .run_with(
+            &fx.request(EffectKind::ReadSnapshot, b""),
+            &ctx(),
+            env_with(&[("AGENTOS_TEST_HOST_FREE_MIB", "1536")]),
+        )
+        .await;
+    succeeded(&out);
 }
 
 /// Snapshot, fix patch and verification, with the same requests and attempt contexts.

@@ -755,6 +755,7 @@ async fn staged_ws_img_is_owned_by_the_jail_uid_and_still_inspectable() {
             &fx.cfg.firecracker_bin,
             fx.cfg.vcpus,
             fx.cfg.memory_mib,
+            &fx.cfg.resources,
         ))
         .env_clear()
         .envs(test_env())

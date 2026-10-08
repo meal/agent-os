@@ -8,7 +8,7 @@
 
 use std::fs::{self, File, TryLockError};
 use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 use agentos_core::effect::{AttemptId, EffectKind};
 use agentos_core::guest::{
     FILE_LIMIT, GUEST_CID, GUEST_MIN_MEMORY_MIB, GUEST_PROTOCOL, MAX_VCPUS, Message, Mode,
-    OUTPUT_LIMIT, PATCH_LIMIT, PROFILE_LIMIT, SCRATCH_IMAGE_BYTES, SNAPSHOT_BYTES_LIMIT,
-    SNAPSHOT_FILES_LIMIT, WS_IMAGE_BYTES, mint_attempt_token, unb64,
+    OUTPUT_LIMIT, PATCH_LIMIT, PROFILE_LIMIT, SNAPSHOT_BYTES_LIMIT, SNAPSHOT_FILES_LIMIT,
+    mint_attempt_token, unb64,
 };
 use agentos_core::ids::{Digest, TaskId};
 use agentos_core::resources::VmResources;
@@ -716,6 +716,61 @@ fn sparse(path: &Path, len: u64) -> io::Result<()> {
     File::create(path)?.set_len(len)
 }
 
+/// An existing `ws.img` must have the task's recorded size: the first snapshot fixed it, and
+/// nothing ever resizes or recreates it for a later effect.
+pub fn check_ws_img_len(ws_img: &Path, resources: &VmResources) -> Result<(), String> {
+    let len = fs::metadata(ws_img)
+        .map_err(|e| format!("workspace image {}: {e}", ws_img.display()))?
+        .len();
+    if len == resources.disk_bytes() {
+        return Ok(());
+    }
+    Err(format!(
+        "workspace image {} is {len} bytes, not the task's recorded size of {} MiB; it is left as is",
+        ws_img.display(),
+        resources.disk_mib
+    ))
+}
+
+/// The advisory host disk check: free space under `dir` must cover `need` bytes. Space can
+/// still run out afterwards. The test seam `AGENTOS_TEST_HOST_FREE_MIB` (honoured only with
+/// `AGENTOS_TEST_WORKERS=1`, from `extra` or the process) replaces the free figure.
+pub fn check_host_space(dir: &Path, need: u64, extra: &[(String, String)]) -> Result<(), String> {
+    let seam = env_value(extra, TEST_WORKERS_ENV).as_deref() == Some("1");
+    let free = match env_value(extra, "AGENTOS_TEST_HOST_FREE_MIB").filter(|_| seam) {
+        Some(mib) => {
+            mib.parse::<u64>()
+                .map_err(|e| format!("AGENTOS_TEST_HOST_FREE_MIB: {e}"))?
+                << 20
+        }
+        None => {
+            let st = rustix::fs::statvfs(dir)
+                .map_err(|e| format!("host disk: cannot stat {}: {e}", dir.display()))?;
+            st.f_bavail.saturating_mul(st.f_frsize)
+        }
+    };
+    if free >= need {
+        return Ok(());
+    }
+    Err(format!(
+        "host disk: {} MiB free under {}, the VM may write {} MiB",
+        free >> 20,
+        dir.display(),
+        need.div_ceil(1 << 20)
+    ))
+}
+
+/// What a VM may still allocate on the host: the unallocated part of `ws.img` (all of it
+/// when a snapshot recreates it) plus the scratch image.
+fn vm_host_bytes(resources: &VmResources, ws_img: &Path, fresh_ws: bool) -> u64 {
+    let allocated = if fresh_ws {
+        0
+    } else {
+        fs::metadata(ws_img).map_or(0, |m| m.blocks() * 512)
+    };
+    resources.disk_bytes().saturating_sub(allocated) + resources.scratch_bytes()
+}
+
 /// `name` from `extra` (a test seam's environment, last entry wins) or else the process's.
 fn env_value(extra: &[(String, String)], name: &str) -> Option<String> {
     extra
@@ -760,7 +815,7 @@ fn fake_gate(cfg: &FirecrackerConfig, extra: &[(String, String)]) -> Result<(), 
 /// `jail::stage` makes `firecracker.log` as a link to the chroot's, and the chroot's
 /// `vm.json`).
 fn prepare_vm_files(cfg: &FirecrackerConfig, paths: &VmPaths) -> io::Result<()> {
-    sparse(&paths.scratch_img, SCRATCH_IMAGE_BYTES)?;
+    sparse(&paths.scratch_img, cfg.resources.scratch_bytes())?;
     File::create(&paths.console_log)?;
     File::create(&paths.stderr_log)?;
     if matches!(cfg.jail, JailMode::Unjailed) {
@@ -829,6 +884,7 @@ fn launch(
                 &cfg.firecracker_bin,
                 cfg.vcpus,
                 cfg.memory_mib,
+                &cfg.resources,
                 overrides,
             ));
             (cmd, jail::host_uds(&plan))
@@ -1043,6 +1099,14 @@ impl FirecrackerWorker {
         if !snapshot && !paths.ws_img.is_file() {
             return fail(WORKSPACE_MISSING.into());
         }
+        if !snapshot && let Err(why) = check_ws_img_len(&paths.ws_img, &self.cfg.resources) {
+            return fail(why);
+        }
+        let need = vm_host_bytes(&self.cfg.resources, &paths.ws_img, snapshot);
+        let ws_dir = paths.ws_img.parent().unwrap_or(&paths.ws_img);
+        if let Err(why) = check_host_space(ws_dir, need, &self.env) {
+            return fail(why);
+        }
         let plan = match self.plan(req) {
             Ok(p) => p,
             Err(reason) => return fail(reason),
@@ -1055,7 +1119,7 @@ impl FirecrackerWorker {
         }
         // ws.img is created by ReadSnapshot only, from zero on every attempt, so a retry
         // starts clean.
-        if snapshot && let Err(e) = sparse(&paths.ws_img, WS_IMAGE_BYTES) {
+        if snapshot && let Err(e) = sparse(&paths.ws_img, self.cfg.resources.disk_bytes()) {
             return fail(format!(
                 "cannot prepare the VM: {}: {e}",
                 paths.ws_img.display()
@@ -1482,6 +1546,7 @@ impl Inspector {
         if !ws_img.is_file() {
             return Err(format!("workspace image {} is missing", ws_img.display()));
         }
+        check_ws_img_len(&ws_img, &self.cfg.resources).map_err(inspect_failed)?;
         let deadline = Instant::now() + self.inspect_timeout;
         fake_gate(&self.cfg, &self.env).map_err(inspect_failed)?;
         preflight(&self.cfg)
@@ -1779,6 +1844,23 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&written).unwrap(),
             golden
         );
+    }
+
+    #[test]
+    fn the_scratch_image_has_the_contracted_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config();
+        cfg.resources = VmResources {
+            version: 1,
+            scratch_mib: 768,
+            ..VmResources::V0
+        };
+        let task: TaskId = serde_json::from_str("\"task-1\"").unwrap();
+        let paths = VmPaths::new(dir.path(), &cfg.work_root, &task);
+        prepare_vm_files(&cfg, &paths).unwrap();
+        let scratch = fs::metadata(&paths.scratch_img).unwrap();
+        assert_eq!(scratch.len(), 768 << 20);
+        assert!(scratch.blocks() * 512 < 1 << 20, "scratch.img stays sparse");
     }
 
     /// A `request.json` written before resources were recorded still parses, as version 0.

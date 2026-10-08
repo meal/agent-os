@@ -25,7 +25,7 @@ each commit; KVM steps run on an otherwise idle host; commits carry no co-author
   deserializes (already covered by the evidence test). Green: optional manifest field.
 - [x] **6. Rendering.** Red: golden `vm.json` with and without rate limiters; the rootfs never
   has one. Green: `Drive.rate_limiter: Option<RateLimiter>`.
-- [ ] **7. Sizes, free space and file-size limit.** Red: `ws.img` and `scratch.img` have the
+- [x] **7. Sizes, free space and file-size limit.** Red: `ws.img` and `scratch.img` have the
   contracted lengths; an existing wrong-length `ws.img` fails the effect and the inspection
   and is left untouched; the free-space check refuses at `submit` and fails a job before
   launch; the jail's `RLIMIT_FSIZE` is the larger image. Green: sizes from `resources`, the

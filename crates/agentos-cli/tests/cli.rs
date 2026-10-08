@@ -5221,3 +5221,45 @@ fn the_approval_summary_shows_the_vm_disks_of_a_firecracker_task() {
         "{text}"
     );
 }
+
+#[test]
+fn submit_refuses_a_firecracker_task_the_host_disk_cannot_hold() {
+    let cli = Cli::bare();
+    cli.register_guest_image();
+    let contract = contract_with_resources(&cli, "big", json!({ "worker_disk_mib": 4096 }));
+    cli.cmd_as(
+        Mode::Fake,
+        &[
+            "submit",
+            &contract,
+            "--yes",
+            "--fake-agent-patch",
+            fix_patch().to_str().unwrap(),
+        ],
+    )
+    .env("AGENTOS_TEST_HOST_FREE_MIB", "4000")
+    .assert()
+    .code(1)
+    .stderr(predicate::str::contains("host disk: 4000 MiB free under "))
+    .stderr(predicate::str::contains("the VM may write 4608 MiB"));
+    cli.assert_no_task();
+    let out = cli
+        .cmd_as(
+            Mode::Fake,
+            &[
+                "submit",
+                &contract,
+                "--yes",
+                "--fake-agent-patch",
+                fix_patch().to_str().unwrap(),
+            ],
+        )
+        .env("AGENTOS_TEST_HOST_FREE_MIB", "4608")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let done: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(done["state"], "SUCCEEDED", "{done}");
+}

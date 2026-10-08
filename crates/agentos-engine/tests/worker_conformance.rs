@@ -1367,7 +1367,11 @@ async fn boot_timeout_failure_mapping() {
     for i in 0..3 {
         let fx = KFx::new();
         fs::create_dir_all(fx.task_dir()).unwrap();
-        fs::write(fx.task_dir().join("ws.img"), b"").unwrap();
+        // Sparse, at the recorded size, as a snapshot leaves it.
+        fs::File::create(fx.task_dir().join("ws.img"))
+            .unwrap()
+            .set_len(agentos_core::resources::VmResources::V0.disk_bytes())
+            .unwrap();
         let req = kinds(&fx)[i].clone();
         runs.push(tokio::spawn(async move {
             let exec = fx.executor(None, &[(NEVER_LISTEN, "1")]);
