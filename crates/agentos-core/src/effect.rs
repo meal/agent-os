@@ -24,12 +24,24 @@ pub enum RetryPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EffectKind {
     ReadSnapshot,
-    ApplyPatch { expected_base: Digest },
+    ApplyPatch {
+        expected_base: Digest,
+    },
     RunVerification,
     ExportBundle,
-    ModelCall { model: String, turn: u32 },
-    ListFiles { turn: u32 },
-    ReadFile { path: String, turn: u32 },
+    ModelCall {
+        model: String,
+        turn: u32,
+    },
+    ListFiles {
+        turn: u32,
+    },
+    ReadFile {
+        path: String,
+        turn: u32,
+    },
+    /// The contract's analyzer over the task's snapshot (payload: the request identity).
+    AnalyzeSnapshot,
 }
 
 impl EffectKind {
@@ -42,6 +54,7 @@ impl EffectKind {
             EffectKind::ApplyPatch { .. } => Capability::WorkspaceApplyPatch,
             EffectKind::RunVerification => Capability::VerificationRun,
             EffectKind::ExportBundle => Capability::ArtifactExport,
+            EffectKind::AnalyzeSnapshot => Capability::SnapshotAnalyze,
         }
     }
 
@@ -50,7 +63,9 @@ impl EffectKind {
             EffectKind::ReadSnapshot
             | EffectKind::RunVerification
             | EffectKind::ListFiles { .. }
-            | EffectKind::ReadFile { .. } => RetryPolicy::Retry,
+            | EffectKind::ReadFile { .. }
+            // Deterministic over an immutable input: running it again gives the same report.
+            | EffectKind::AnalyzeSnapshot => RetryPolicy::Retry,
             EffectKind::ModelCall { .. } => RetryPolicy::ForfeitThenRetry,
             // Safe to retry after reconciling because of the expected-version check.
             EffectKind::ApplyPatch { .. } | EffectKind::ExportBundle => {
@@ -69,6 +84,7 @@ impl EffectKind {
             EffectKind::ModelCall { .. } => "model_call",
             EffectKind::ListFiles { .. } => "list_files",
             EffectKind::ReadFile { .. } => "read_file",
+            EffectKind::AnalyzeSnapshot => "analyze_snapshot",
         }
     }
 }
@@ -617,5 +633,15 @@ mod tests {
         r.outcome = Outcome::Failure("boom".into());
         let json = serde_json::to_string(&r).unwrap();
         assert_eq!(serde_json::from_str::<Receipt>(&json).unwrap(), r);
+    }
+
+    #[test]
+    fn analyze_snapshot_is_a_retried_snapshot_analyze_effect() {
+        let kind = EffectKind::AnalyzeSnapshot;
+        assert_eq!(kind.tag(), "analyze_snapshot");
+        assert_eq!(kind.capability(), Capability::SnapshotAnalyze);
+        assert_eq!(kind.retry_policy(), RetryPolicy::Retry);
+        let json = serde_json::to_string(&kind).unwrap();
+        assert_eq!(serde_json::from_str::<EffectKind>(&json).unwrap(), kind);
     }
 }

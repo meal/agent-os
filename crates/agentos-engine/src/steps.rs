@@ -186,6 +186,7 @@ fn artifact_type(kind: &EffectKind, outcome: &Outcome) -> &'static str {
         (EffectKind::ModelCall { .. }, _) => "model-response",
         (EffectKind::ListFiles { .. }, _) => "file-list",
         (EffectKind::ReadFile { .. }, _) => "file-content",
+        (EffectKind::AnalyzeSnapshot, _) => "analysis-report",
     }
 }
 
@@ -352,7 +353,8 @@ pub(crate) fn finish_attempt<E>(
 ///   as rejected when a cancel is pending or the task is terminal, and errors otherwise.
 /// - RunVerification: `VerifyPassed` for the task's current digest only when the check ran,
 ///   passed, and its evidence is for exactly that digest; otherwise `VerifyFailed`.
-/// - ExportBundle, ModelCall, ListFiles, ReadFile: none.
+/// - ExportBundle, ModelCall, ListFiles, ReadFile, AnalyzeSnapshot: none (an analysis report
+///   claiming anything still never verifies).
 pub fn follow_up_event(kind: &EffectKind, out: &ExecOutcome, task: &Task) -> Option<TaskEvent> {
     match kind {
         EffectKind::ReadSnapshot | EffectKind::ApplyPatch { .. } => {
@@ -368,10 +370,12 @@ pub fn follow_up_event(kind: &EffectKind, out: &ExecOutcome, task: &Task) -> Opt
         } else {
             TaskEvent::VerifyFailed
         }),
+        // The analysis report is advisory: it never verifies and never moves the workspace.
         EffectKind::ExportBundle
         | EffectKind::ModelCall { .. }
         | EffectKind::ListFiles { .. }
-        | EffectKind::ReadFile { .. } => None,
+        | EffectKind::ReadFile { .. }
+        | EffectKind::AnalyzeSnapshot => None,
     }
 }
 
@@ -468,6 +472,24 @@ mod tests {
                 None
             );
         }
+    }
+
+    /// An analysis that claims a pass, carries a verification report and a new workspace
+    /// still produces no task event: it can never verify or move the workspace.
+    #[test]
+    fn an_analysis_never_produces_a_task_event_whatever_it_claims() {
+        let kind = EffectKind::AnalyzeSnapshot;
+        let now = task(TaskState::Verifying, d("w1"));
+        let mut out = outcome(&kind, true);
+        out.output = br#"{"passed":true,"workspace_digest":"w1"}"#.to_vec();
+        out.new_workspace = Some(d("w2"));
+        out.verification = Some(VerificationReport {
+            passed: true,
+            workspace: d("w1"),
+            summary: "s".into(),
+        });
+        assert_eq!(follow_up_event(&kind, &out, &now), None);
+        assert_eq!(follow_up_event(&kind, &outcome(&kind, false), &now), None);
     }
 
     #[test]

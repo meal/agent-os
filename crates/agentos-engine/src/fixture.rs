@@ -362,7 +362,8 @@ impl Executor for FixtureExecutor {
             }
             EffectKind::ModelCall { .. }
             | EffectKind::ListFiles { .. }
-            | EffectKind::ReadFile { .. } => {
+            | EffectKind::ReadFile { .. }
+            | EffectKind::AnalyzeSnapshot => {
                 ExecOutcome::failure(req, ctx, format!("not a worker effect: {}", req.kind.tag()))
             }
         }

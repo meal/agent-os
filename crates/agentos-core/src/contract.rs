@@ -27,6 +27,17 @@ pub enum Capability {
     ArtifactExport,
     #[serde(rename = "model.request")]
     ModelRequest,
+    #[serde(rename = "snapshot.analyze")]
+    SnapshotAnalyze,
+}
+
+/// The analyzer component a task runs once over its snapshot: a registered id and the digest
+/// it must have. Always pinned, so the run is reproducible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnalyzerRef {
+    pub id: String,
+    pub digest: String,
 }
 
 /// Bounds of the optional VM resource limits (see `resources::VmResources` for their
@@ -75,6 +86,9 @@ pub struct Contract {
     pub profile_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_image_digest: Option<String>,
+    /// Requires `snapshot.analyze`; absent, the task runs no analyzer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyzer: Option<AnalyzerRef>,
     pub verification_profile: String,
     pub capabilities: Vec<Capability>,
     pub limits: Limits,
@@ -165,6 +179,39 @@ impl Contract {
                 return Err(ContractError::Invalid(format!(
                     "profile_digest {d:?} must be 64 lowercase hex characters"
                 )));
+            }
+        }
+        let analyze = self.capabilities.contains(&Capability::SnapshotAnalyze);
+        match (&self.analyzer, analyze) {
+            (Some(a), true) => {
+                check_plain_name("analyzer.id", &a.id)?;
+                if a.id.contains('@') {
+                    return Err(ContractError::Invalid(format!(
+                        "analyzer.id {:?} must not contain '@'",
+                        a.id
+                    )));
+                }
+                let hex = a.digest.len() == 64
+                    && a.digest
+                        .bytes()
+                        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+                if !hex {
+                    return Err(ContractError::Invalid(format!(
+                        "analyzer.digest {:?} must be 64 lowercase hex characters",
+                        a.digest
+                    )));
+                }
+            }
+            (None, false) => {}
+            (Some(_), false) => {
+                return Err(ContractError::Invalid(
+                    "an analyzer needs the snapshot.analyze capability".into(),
+                ));
+            }
+            (None, true) => {
+                return Err(ContractError::Invalid(
+                    "the snapshot.analyze capability needs an analyzer".into(),
+                ));
             }
         }
         if let Some(d) = &self.guest_image_digest {
@@ -296,6 +343,71 @@ mod tests {
             }
             assert!(Contract::parse(&with_limits(&format!("\"{field}\":4294967296"))).is_err());
         }
+    }
+
+    const PIN_DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn with_analyzer(analyzer: &str, capability: bool) -> String {
+        let mut j = OK.replacen(
+            "\"verification_profile\"",
+            &format!("{analyzer}\"verification_profile\""),
+            1,
+        );
+        if capability {
+            j = j.replace(
+                "\"artifact.export\"]",
+                "\"artifact.export\",\"snapshot.analyze\"]",
+            );
+        }
+        j
+    }
+
+    #[test]
+    fn an_analyzer_needs_the_analyze_capability_and_the_reverse() {
+        let pin = format!(r#""analyzer":{{"id":"repo-analyzer-v1","digest":"{PIN_DIGEST}"}},"#);
+        let c = Contract::parse(&with_analyzer(&pin, true)).unwrap();
+        assert_eq!(
+            c.analyzer,
+            Some(AnalyzerRef {
+                id: "repo-analyzer-v1".into(),
+                digest: PIN_DIGEST.into()
+            })
+        );
+        assert!(c.capabilities.contains(&Capability::SnapshotAnalyze));
+        let out = serde_json::to_string(&c).unwrap();
+        assert_eq!(Contract::parse(&out).unwrap(), c);
+        let without_cap = Contract::parse(&with_analyzer(&pin, false))
+            .unwrap_err()
+            .to_string();
+        assert!(without_cap.contains("snapshot.analyze"), "{without_cap}");
+        let without_pin = Contract::parse(&with_analyzer("", true))
+            .unwrap_err()
+            .to_string();
+        assert!(without_pin.contains("analyzer"), "{without_pin}");
+        assert!(
+            !serde_json::to_string(&Contract::parse(OK).unwrap())
+                .unwrap()
+                .contains("analyzer")
+        );
+    }
+
+    #[test]
+    fn an_analyzer_pin_is_a_plain_id_and_a_full_digest() {
+        for (id, digest) in [
+            ("a/b", PIN_DIGEST),
+            ("x@y", PIN_DIGEST),
+            ("..", PIN_DIGEST),
+            ("ok-v1", "short"),
+            ("ok-v1", &PIN_DIGEST.to_uppercase()),
+        ] {
+            let pin = format!(r#""analyzer":{{"id":"{id}","digest":"{digest}"}},"#);
+            assert!(
+                Contract::parse(&with_analyzer(&pin, true)).is_err(),
+                "{id} {digest}"
+            );
+        }
+        let extra = format!(r#""analyzer":{{"id":"ok-v1","digest":"{PIN_DIGEST}","x":1}},"#);
+        assert!(Contract::parse(&with_analyzer(&extra, true)).is_err());
     }
 
     #[test]
