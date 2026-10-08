@@ -1003,6 +1003,36 @@ async fn snapshot_digest_from_the_real_guest_equals_the_host_digest() {
 // ---------------------------------------------------------------------------------------
 // The threat model: one hostile profile per row of the spec's table.
 
+/// The guest's `python3` is the interpreter its image manifest records (an image with an
+/// `interpreter` entry, such as `python-stdlib-py314-v1`); the manifest's claim alone proves
+/// nothing about what was copied into the rootfs.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_guest_interpreter_is_the_one_the_image_manifest_records() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let fx = Fx::new(&kvm);
+    fx.snapshot().await;
+    fx.use_script(
+        "import json, platform, sys; \
+         print(json.dumps({'version': platform.python_version(), 'executable': sys.executable}))",
+    );
+    let v = evidence(&fx.run(EffectKind::RunVerification).await.out);
+    assert_eq!(v["passed"], true, "{v}");
+    let found = findings(&v);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(kvm.image_dir.join("image.json")).unwrap()).unwrap();
+    println!("image {}: guest python {found}", manifest["id"]);
+    match manifest["interpreter"]["version"].as_str() {
+        Some(version) => assert_eq!(found["version"], version, "{found}"),
+        None => assert!(
+            found["version"]
+                .as_str()
+                .is_some_and(|v| v.starts_with("3.")),
+            "{found}"
+        ),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn net_probe_cannot_reach_anything_and_sees_only_lo() {
     let Some(kvm) = kvm::require() else { return };
