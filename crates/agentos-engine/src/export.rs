@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 
 use agentos_core::effect::{EffectId, EffectKind, EffectRecord, EffectState};
 use agentos_core::ids::{Digest, TaskId};
+use agentos_core::resources::VmResources;
 use agentos_core::state::TaskState;
 use agentos_store::blob::BlobStore;
 use agentos_store::db::{Db, DbError, StoredEvent};
@@ -147,6 +148,10 @@ pub struct Manifest {
     /// host tasks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_image_digest: Option<Digest>,
+    /// The drive sizes and rate limits a Firecracker task ran with (`Submitted.vm_resources`,
+    /// version 0 for a task submitted before they were recorded); absent for host tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm_resources: Option<VmResources>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -257,6 +262,12 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
         .iter()
         .find(|e| e.event_type == "Submitted")
         .map(|e| &e.payload);
+    let vm_resources = match submitted {
+        Some(s) if s.get("worker").and_then(serde_json::Value::as_str) == Some("firecracker") => {
+            Some(VmResources::from_submitted(s).map_err(inconsistent)?)
+        }
+        _ => None,
+    };
     let (submitted_repo, submitted_profile, guest_image_digest) = match submitted {
         Some(s) => {
             // Submission digests the stored contract serialization, so it can be re-checked.
@@ -481,6 +492,7 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
             })
             .collect(),
         guest_image_digest,
+        vm_resources,
     };
     Ok(Contents {
         manifest,
@@ -654,6 +666,7 @@ mod tests {
             generated_events: 1,
             capabilities: Vec::new(),
             guest_image_digest: None,
+            vm_resources: None,
         };
         let evidence = [b"{\"a\":1}".to_vec(), b"{\"b\":2}".to_vec()]
             .into_iter()

@@ -21,7 +21,7 @@ each commit; KVM steps run on an otherwise idle host; commits carry no co-author
 - [x] **4. Record and replay.** Red: `Submitted` carries `vm_resources` for Firecracker tasks
   only; `resume` with a record that disagrees with the contract exits 1 and journals nothing.
   Green: CLI submit/resume plumbing into `FirecrackerConfig.resources`.
-- [ ] **5. Manifest.** Red: export includes `vm_resources`; a 2026-10-08 manifest still
+- [x] **5. Manifest.** Red: export includes `vm_resources`; a 2026-10-08 manifest still
   deserializes (already covered by the evidence test). Green: optional manifest field.
 - [ ] **6. Rendering.** Red: golden `vm.json` with and without rate limiters; the rootfs never
   has one. Green: `Drive.rate_limiter: Option<RateLimiter>`.

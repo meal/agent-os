@@ -3434,6 +3434,10 @@ fn manifest_names_the_guest_image_for_firecracker_tasks_and_omits_it_for_host_ta
     let dir = cli.path("fc-bundle");
     let manifest = cli.json_as(Mode::Plain, &["export", &fc, dir.to_str().unwrap()]);
     assert_eq!(manifest["guest_image_digest"], digest.as_str());
+    assert_eq!(
+        manifest["vm_resources"],
+        json!({ "version": 1, "disk_mib": 1024, "scratch_mib": 512, "bandwidth_mib_s": null, "iops": null })
+    );
     let host = cli.json_as(
         Mode::Plain,
         &[
@@ -3450,11 +3454,9 @@ fn manifest_names_the_guest_image_for_firecracker_tasks_and_omits_it_for_host_ta
     let dir = cli.path("host-bundle");
     let manifest = cli.json_as(Mode::Plain, &["export", &host, dir.to_str().unwrap()]);
     assert!(manifest.get("guest_image_digest").is_none(), "{manifest}");
-    assert!(
-        !fs::read_to_string(dir.join("manifest.json"))
-            .unwrap()
-            .contains("guest_image_digest")
-    );
+    assert!(manifest.get("vm_resources").is_none(), "{manifest}");
+    let written = fs::read_to_string(dir.join("manifest.json")).unwrap();
+    assert!(!written.contains("guest_image_digest") && !written.contains("vm_resources"));
 }
 
 #[test]
@@ -5179,6 +5181,12 @@ fn a_task_without_recorded_vm_resources_resumes_with_version_zero() {
     edit_submitted(&cli, &id, "json_remove(payload, '$.vm_resources')");
     let done = cli.json_as(Mode::Fake, &["resume", &id]);
     assert_eq!(done["state"], "SUCCEEDED", "{done}");
+    let dir = cli.path("legacy-bundle");
+    let manifest = cli.json_as(Mode::Plain, &["export", &id, dir.to_str().unwrap()]);
+    assert_eq!(
+        manifest["vm_resources"],
+        json!({ "version": 0, "disk_mib": 1024, "scratch_mib": 512, "bandwidth_mib_s": null, "iops": null })
+    );
 }
 
 #[test]
