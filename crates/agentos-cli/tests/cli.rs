@@ -1993,6 +1993,57 @@ fn ids_with_at_sign_or_traversal_are_rejected_at_register() {
         .stderr(predicate::str::contains("command"));
 }
 
+/// The guest protocol carries file contents without modes, so a command that runs a file from
+/// the profile directory directly could never execute in a VM: registration refuses it and
+/// names the interpreter form. Interpreter commands and absolute guest paths are accepted.
+#[test]
+fn commands_that_need_an_executable_bit_are_rejected_at_register() {
+    let cli = Cli::new();
+    let profile = |name: &str, command: Value| {
+        let dir = cli.path(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("check.sh"), "exit 0\n").unwrap();
+        fs::write(
+            dir.join("profile.json"),
+            json!({ "id": name, "command": command }).to_string(),
+        )
+        .unwrap();
+        dir
+    };
+    for (name, command) in [
+        ("dot-slash-v1", json!(["./check.sh"])),
+        ("nested-v1", json!(["bin/check.sh", "--fast"])),
+        ("bare-file-v1", json!(["check.sh"])),
+    ] {
+        cli.cmd(&[
+            "profile",
+            "register",
+            profile(name, command).to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("file modes"))
+        .stderr(predicate::str::contains("[\"sh\", \"check.sh\"]"));
+    }
+    assert_eq!(profile_registry_entries(&cli), Vec::<String>::new());
+    for (name, command) in [
+        ("sh-v1", json!(["sh", "check.sh"])),
+        ("python-v1", json!(["python3", "check.py"])),
+        ("absolute-v1", json!(["/usr/bin/true"])),
+    ] {
+        assert_eq!(register(&cli, &profile(name, command))["id"], name);
+    }
+    let mut ids: Vec<String> = cli
+        .json(&["profile", "list"])
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, ["absolute-v1", "python-v1", "sh-v1"]);
+}
+
 #[test]
 fn registered_profile_runs_end_to_end() {
     let cli = Cli::new();

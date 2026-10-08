@@ -10,7 +10,7 @@ each commit; KVM steps run on an otherwise idle host; commits carry no co-author
 
 ## Offline
 
-- [ ] **1. Executable-mode rejection.** Red: `profile register` accepts `["./check.sh"]` and
+- [x] **1. Executable-mode rejection.** Red: `profile register` accepts `["./check.sh"]` and
   `["check.sh"]` when `check.sh` is in the profile. Green: reject both with the interpreter
   hint; accept `["sh", "check.sh"]`, `["python3", "check.py"]` and `["/usr/bin/true"]`.
 - [ ] **2. Contract fields.** Red: pinned digest of the fixture contract; round-trip of the four
