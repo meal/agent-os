@@ -5263,3 +5263,75 @@ fn submit_refuses_a_firecracker_task_the_host_disk_cannot_hold() {
     let done: Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(done["state"], "SUCCEEDED", "{done}");
 }
+
+/// Kill and resume on the real, jailed worker with non-default resources: the recorded
+/// sizes and rates are used before and after the crash, and the export carries them.
+#[test]
+fn a_task_with_contracted_vm_resources_survives_a_kill_on_the_real_worker() {
+    let Some(kvm) = kvm::require() else { return };
+    let cli = Cli::bare();
+    cli.json_as(
+        Mode::Plain,
+        &["image", "register", kvm.image_dir.to_str().unwrap()],
+    );
+    let contract = contract_with_resources(
+        &cli,
+        "resources",
+        json!({ "worker_disk_mib": 1536, "worker_scratch_mib": 768,
+                "worker_disk_bandwidth_mib_s": 64, "worker_disk_iops": 10000 }),
+    );
+    let real = |args: &[&str]| cli.cmd_as(Mode::Real, args);
+    let crashed = real(&[
+        "submit",
+        &contract,
+        "--yes",
+        "--fake-agent-patch",
+        fix_patch().to_str().unwrap(),
+        "--crash-at",
+        "during-execute:apply_patch",
+    ])
+    .assert()
+    .code(75)
+    .get_output()
+    .stderr
+    .clone();
+    let id = String::from_utf8_lossy(&crashed)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find_map(|v| v["task_id"].as_str().map(str::to_string))
+        .unwrap();
+    let recorded = json!({ "version": 1, "disk_mib": 1536, "scratch_mib": 768,
+                           "bandwidth_mib_s": 64, "iops": 10000 });
+    assert_eq!(cli.submitted(&id)["vm_resources"], recorded);
+    let resumed: Value = serde_json::from_slice(
+        &real(&["resume", &id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert_eq!(resumed, json!({ "task_id": id, "state": "SUCCEEDED" }));
+    assert_eq!(
+        fs::metadata(cli.home().join("work").join(&id).join("ws.img"))
+            .unwrap()
+            .len(),
+        1536 << 20
+    );
+    let bundle = cli.path("resources-bundle");
+    let manifest: Value = serde_json::from_slice(
+        &real(&["export", &id, bundle.to_str().unwrap()])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert_eq!(manifest["vm_resources"], recorded);
+    assert_eq!(
+        manifest["verified_digest"],
+        manifest["final_workspace_digest"]
+    );
+}

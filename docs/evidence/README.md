@@ -29,6 +29,11 @@ the guest actually runs against the manifest for every image. The candidate is a
 not the default; the interpreter is copied from the pinned pyenv build, not rebuilt
 independently from source (see the recipe README).
 
+Task 9 memory measurements (`vm-memory/`): the hostile disk-fill check at 256 and 1024
+MiB of guest memory, with and without the 32 MiB/s minimum rate, alone and against a host
+writer. No case recorded an OOM kill; at 256 MiB the jail cgroup stayed at its 384 MiB limit
+by reclaiming page cache. The run used the measurement test before it was committed.
+
 Image `python-stdlib-v1`; Firecracker v1.17.0; kernel 6.18.51. The live runs predate the test
 fix, which changes only a test assertion. Recordings (schema version 2) are in
 `fixtures/transcripts/live/`; each worker's manifest, `patch.diff`, success report and replay

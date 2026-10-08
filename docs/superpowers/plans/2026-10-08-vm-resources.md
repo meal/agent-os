@@ -45,12 +45,15 @@ each commit; KVM steps run on an otherwise idle host; commits carry no co-author
   leaves the image at the base. Guest kernel block I/O errors on the console are a reliable
   signal, so these are reported as `host disk: …`; the check cannot write the console. A
   jailed task with a 1536 MiB workspace runs (file-size limit).
-- [ ] **10. Recovery.** Kill after launch and resume a task with non-default resources; the
-  recorded values are used and the bundle equals an uncrashed run's.
-- [ ] **11. Measurements and overhead.** Run the measurement matrix from the design, record it
-  under `docs/evidence/`, and set `JAIL_MEMORY_OVERHEAD_MIB` from it.
-- [ ] **12. Infrastructure OOM.** Low `memory.max` during a write-heavy verification: no
-  `VerifyPassed`, a visible failure reason, `oom_kill > 0`.
+- [x] **10. Recovery.** A task with 1536/768 MiB, 64 MiB/s and 10000 operations/s is killed
+  during the patch on the real jailed worker, resumed to SUCCEEDED, keeps a 1536 MiB
+  `ws.img`, and exports its recorded resources.
+- [x] **11. Measurements and overhead.** Eight cases recorded under
+  `docs/evidence/2026-10-08/vm-memory/`; no OOM kill; 128 MiB kept (see the design).
+- [x] **12. Infrastructure OOM.** With `memory.max` at 200 MiB for a 256 MiB guest, the
+  check's scratch writes get Firecracker OOM-killed after the request: the effect fails
+  with "guest exited before reporting", carries no check result, and the VM's cgroup
+  records the kill.
 
 ```sh
 sh scripts/check.sh

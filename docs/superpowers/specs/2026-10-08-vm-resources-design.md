@@ -144,6 +144,20 @@ below it with margin and no run records an `oom_kill`; otherwise choose the smal
 the measurements support and record why. Reclaimable page cache is expected to be reclaimed
 under `memory.max` rather than kill Firecracker; the measurements decide.
 
+**Measured (2026-10-08, `docs/evidence/2026-10-08/vm-memory/`).** The hostile disk-fill
+check, alone and against a host writer, with and without the 32 MiB/s limit:
+
+| Guest memory | Peak in the jail cgroup | Above guest memory | `memory.max` reached | OOM kills |
+| --- | --- | --- | --- | --- |
+| 256 MiB | 384 MiB in all four cases | 128 MiB (the limit) | 180–191 times | 0 |
+| 1024 MiB, no rate limit | 1103–1105 MiB | 79–81 MiB | 0 | 0 |
+| 1024 MiB, 32 MiB/s | 1050–1051 MiB | 26–27 MiB | 0 | 0 |
+
+Anonymous memory stays within 2 MiB of the guest's; the rest is page cache, which the
+cgroup reclaims at its limit instead of killing Firecracker. **Decision: keep
+`JAIL_MEMORY_OVERHEAD_MIB` at 128 MiB.** The measurements give no reason to raise it, and
+lowering it would put the 1024 MiB case at its limit too.
+
 **Infrastructure OOM never verifies.** With the existing `with_jail_memory_max_mib` seam set
 low during a write-heavy verification, the VM is killed by the cgroup. The test asserts no
 `VerifyPassed`, an effect failure whose reason names the VM's exit, and an `oom_kill` count

@@ -1,0 +1,1 @@
+{"schema_version":1,"tier":"kvm","commit":"f429da3088e246c12d71163de00e52e116e3718a","image":"python-stdlib-v1","test":"measure_jail_memory_under_heavy_writes","note":"run from a dirty tree: the measurement test itself was uncommitted"}

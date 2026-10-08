@@ -401,7 +401,7 @@ struct VmSample {
     cgroup: BTreeMap<&'static str, String>,
 }
 
-const CGROUP_FILES: [&str; 10] = [
+const CGROUP_FILES: [&str; 11] = [
     "cpu.max",
     "memory.max",
     "memory.swap.max",
@@ -410,6 +410,7 @@ const CGROUP_FILES: [&str; 10] = [
     "memory.events",
     "memory.stat",
     "memory.current",
+    "memory.peak",
     "cpu.stat",
     "cgroup.procs",
 ];
@@ -1836,6 +1837,88 @@ print(json.dumps(found))
     );
 }
 
+/// The memory measurements behind `JAIL_MEMORY_OVERHEAD_MIB` (see the VM resources design):
+/// the hostile disk-fill check at 256 and 1024 MiB of guest memory, with and without the
+/// minimum bandwidth limit, alone and against a host writer outside the jail. Runs only with
+/// `AGENTOS_MEASURE_OUT=<file>`, where it writes one JSON object per case.
+#[tokio::test(flavor = "multi_thread")]
+async fn measure_jail_memory_under_heavy_writes() {
+    let Some(kvm) = kvm::require() else { return };
+    let Some(out) = std::env::var_os("AGENTOS_MEASURE_OUT") else {
+        println!("SKIPPED: set AGENTOS_MEASURE_OUT=<file> to measure");
+        return;
+    };
+    let _alone = exclusive().await;
+    let mut rows = Vec::new();
+    for memory in [256u32, 1024] {
+        for bandwidth in [None, Some(32u32)] {
+            for contention in [false, true] {
+                let mut fx = Fx::new(&kvm).with_resources(resources(1024, 512, bandwidth, None));
+                fx.cfg.memory_mib = memory;
+                fx.snapshot().await;
+                fx.use_profile("hostile/disk-fill");
+                let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let writer = contention.then(|| {
+                    let (stop, file) = (stop.clone(), fx.path("host-writer.bin"));
+                    std::thread::spawn(move || {
+                        let block = vec![0xa5u8; 1 << 20];
+                        while !stop.load(Ordering::Relaxed) {
+                            let mut f = fs::File::create(&file).unwrap();
+                            for _ in 0..256 {
+                                if std::io::Write::write_all(&mut f, &block).is_err() {
+                                    break;
+                                }
+                            }
+                            let _ = f.sync_all();
+                        }
+                        let _ = fs::remove_file(&file);
+                    })
+                });
+                let (ran, samples) = fx.verify_watched(Duration::from_millis(20), |w| w).await;
+                stop.store(true, Ordering::Relaxed);
+                if let Some(w) = writer {
+                    w.join().unwrap();
+                }
+                let max_of = |f: &dyn Fn(&VmSample) -> Option<u64>| {
+                    samples.iter().filter_map(f).max().unwrap_or(0)
+                };
+                let stat = |s: &VmSample, k: &str| {
+                    keyed(s.cgroup.get("memory.stat").map_or("", String::as_str))
+                        .get(k)
+                        .copied()
+                };
+                let num = |s: &VmSample, f: &str| {
+                    s.cgroup.get(f).and_then(|v| v.trim().parse::<u64>().ok())
+                };
+                let events = |s: &VmSample, k: &str| {
+                    s.cgroup
+                        .get("memory.events")
+                        .and_then(|e| keyed(e).get(k).copied())
+                };
+                let peak = max_of(&|s| num(s, "memory.peak").or_else(|| num(s, "memory.current")));
+                let row = serde_json::json!({
+                    "guest_mib": memory,
+                    "bandwidth_mib_s": bandwidth,
+                    "host_writer": contention,
+                    "outcome": format!("{:?}", ran.out.receipt.outcome),
+                    "peak_mib": peak >> 20,
+                    "overhead_mib": (peak >> 20) as i64 - i64::from(memory),
+                    "anon_mib": max_of(&|s| stat(s, "anon")) >> 20,
+                    "file_mib": max_of(&|s| stat(s, "file")) >> 20,
+                    "file_dirty_mib": max_of(&|s| stat(s, "file_dirty")) >> 20,
+                    "file_writeback_mib": max_of(&|s| stat(s, "file_writeback")) >> 20,
+                    "events_max": max_of(&|s| events(s, "max")),
+                    "oom_kill": max_of(&|s| events(s, "oom_kill")),
+                    "samples": samples.len(),
+                });
+                println!("MEASURE {row}");
+                rows.push(row);
+            }
+        }
+    }
+    fs::write(&out, serde_json::to_vec_pretty(&rows).unwrap()).unwrap();
+}
+
 /// A pinned profile whose source changed, a source changed while the check runs, and a
 /// check that rewrites its own staged copy: none of them ever yields passing evidence.
 #[tokio::test(flavor = "multi_thread")]
@@ -2597,6 +2680,63 @@ async fn memory_hog_firecracker_is_oom_killed_by_the_cgroup_when_the_bound_is_lo
         evidence(&next.out)["exit_code"],
         1,
         "the unpatched fixture fails its check, in a VM that came up"
+    );
+}
+
+/// An infrastructure OOM in the middle of a write-heavy check never verifies: with the jail's
+/// `memory.max` below the guest's memory, the VM boots, then the check's scratch writes fill
+/// guest RAM and the cgroup kills Firecracker before any result exists.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oom_kill_during_a_write_heavy_check_is_a_visible_failure_not_evidence() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let fx = Fx::new(&kvm);
+    fx.snapshot().await;
+    fx.use_script(
+        "import os; \\
+         block = b'x' * (1 << 20); \\
+         fd = os.open('/scratch/check/fill', os.O_WRONLY | os.O_CREAT, 0o600); \\
+         [os.write(fd, block) for _ in range(400)]; \\
+         os.fsync(fd); \\
+         print('PASSED')",
+    );
+    let req = fx.request(EffectKind::RunVerification, b"");
+    let c = ctx(2);
+    let job = JobDir::create(&fx.path("jobs"), &fx.job_request(&req, &c, &fx.cfg, None))
+        .unwrap()
+        .0;
+    let worker = FirecrackerWorker::new(&fx.cfg, &job)
+        .with_env(test_env())
+        .with_jail_memory_max_mib(200);
+    let events = fx.cgroup_of(&c).join("memory.events");
+    let own = sample(Duration::from_micros(200), move |_| {
+        fs::read_to_string(&events)
+            .ok()
+            .and_then(|e| keyed(&e).get("oom_kill").copied())
+    });
+    let out = worker.run(&req, &c).await;
+    let own = own.stop();
+    let ran = Ran {
+        out,
+        job,
+        ctx: c,
+        took: Duration::ZERO,
+    };
+    let why = failure(&ran.out);
+    println!("write-heavy check under a lowered memory.max: {why}");
+    assert_eq!(
+        why,
+        "guest exited before reporting: firecracker killed by signal 9"
+    );
+    let output: serde_json::Value = serde_json::from_slice(&ran.out.output).unwrap_or_default();
+    assert!(
+        output.get("passed").is_none() && output.get("workspace_digest").is_none(),
+        "the failure carries no check result: {output}"
+    );
+    assert!(
+        own.iter().copied().max().unwrap_or(0) >= 1,
+        "the VM's own cgroup recorded the OOM kill ({} reads)",
+        own.len()
     );
 }
 
