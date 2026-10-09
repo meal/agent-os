@@ -7,7 +7,8 @@
 the v0.1 guarantees intact, as designed in
 [External agent CLI inside the guest](../specs/2026-10-09-guest-agent-runner-design.md).
 
-**Constraints:** red/green per step; `sh scripts/check.sh` after each commit; **no Co-Authored-By
+**Constraints:** red/green per step (state it in every subagent brief; show the failing output);
+the controller reads each diff against the brief before ticking a task; `sh scripts/check.sh` after each commit; **no Co-Authored-By
 trailer on any commit** (user CLAUDE.md overrides the harness attribution; say so in every
 subagent prompt); check library and CLI versions online when they are first pinned, never from
 memory; run `df -h /` before any compose/cargo work and delete only our `*_target` volumes; do
@@ -53,8 +54,22 @@ print `~/.anthropic-key`; do not tag or publish a release.
 5. **Only the body crosses.** Guest headers are dropped; the host adds the key. The placeholder
    key the CLI holds is meaningless. The proxy forwards only `POST /v1/messages`; every other
    path is answered locally (statuses taken from Task 1) and never hangs the CLI.
-6. **Budgets (Q5).** One `model_requests` unit per forwarded call, the deadline bounds the
-   session, the lease is the deadline plus grace (existing rules).
+6. **Budgets and lease (Q5).** One `model_requests` unit per forwarded call. A session job has
+   its own lease class: `EffectTimeouts` gains `session` (default = the remaining task deadline,
+   never above a new `MAX_SESSION_TIMEOUT_MS`), and `supervised.rs`'s `MAX_EFFECT_TIMEOUT_MS`
+   (600 s, which would kill any session over 10 minutes) applies to every other kind only.
+   Tests update with it (Task 6). The mailbox loop runs all of `drive()`'s per-turn guards for
+   every request (`interrupted`, `deadline_stop`, `model_failure_policy`, `turn_limit`,
+   `check_request_size`, `pending_model_retry`), serves `.req` files strictly in `n` order, one
+   at a time, and the guest `Bridge` serializes concurrent proxy connections.
+6a. **Journal shape.** In-session model calls are journaled as `SessionModelCall` events, which
+   `session_turns` skips (it only reads `AgentTurn`); only `RunSession`, `ApplyPatch`, `Verify`
+   are ordinary agent turns. So a crash after the session ended resumes at the journaled
+   `ApplyPatch`/`Verify` with no replay divergence and no second send (test in Task 8).
+6b. **Model.** The host rewrites `model` in every forwarded body to the model the controller is
+   configured with (the CLI asks for its own default, `claude-opus-5-5` at 128k), so the budget
+   bounds cost and not only request count. Done in `normalize_request`'s caller (Task 7) and
+   tested; the original requested name is recorded in the audit event.
 7. **Large bodies.** Bodies travel in raw frames (16 MiB limit), checked with
    `check_request_size` (8 MiB) on the host; the 1 MiB JSON frame limit is never used for them.
 8. **Tiers.** Tasks 2-8 are testable on the fake guest (`spawn_fake` plus a scripted fake CLI),
@@ -118,20 +133,41 @@ Each line has its test in the named task.
   timeout 30 s. Tests with real sockets: plain call, streaming call, count_tokens, unknown
   path, oversized body (413), slow client (timeout), upstream error status passed through.
 
+- [ ] **4b. Scripted-model run of the real CLI (blocks Task 5; no key, no KVM).** Extend
+  `scripts/cli-traffic-stub.py` (or a sibling) to answer `POST /v1/messages` with canned SSE
+  produced by the real `sse_from_message` (fixture dumped by a core unit test): turn 1 a
+  `tool_use` that edits/creates a file in the work directory, turn 2 an `end_turn` text. Run
+  `claude -p` as a non-root user with the headless-edit flags (take them from `claude --help`,
+  not memory). Record in the traffic findings: SSE accepted (also with a `thinking` block); the
+  flags that let edits happen without prompts; exit code after `end_turn`; whether a side call
+  goes to a second model; the actual values of `thinking`, `output_config`,
+  `context_management`. If `thinking` is `{type:"enabled", budget_tokens:N}` with N at or above
+  the clamped `max_tokens`, `normalize_request` must lower N below it or drop `thinking`; add
+  that test to `messages.rs` first.
+
 - [ ] **5. Guest session handler.** First: `lo` stays down at boot (verification relies on every connect failing, and `ip` is not in the image). Bring it up only when `RunAgent` is handled, never at boot: enable rustix `net` + `ioctl` features (check the latest rustix online), SIOCSIFFLAGS with IFF_UP on `lo`; it needs CAP_NET_ADMIN so it is verified on the KVM tier (Task 9) with `net-probe` still failing for every non-loopback address and for loopback outside a session. Then: `handlers::run_agent`: copy the workspace to
   `<scratch>/agent/work` (fresh each time, `fresh_scratch`), `git init` + baseline commit there
-  as the diff base, start the proxy, run `argv` in a new process group as the unprivileged
+  as the diff base (set `PYTHONDONTWRITEBYTECODE=1`, `HOME` and caches under scratch), start the proxy, run `argv` in a new process group as the unprivileged
   uid/gid the verification already uses (`run_in_group`), `HOME` and temp under scratch, env
   from the message (allow-list: `ANTHROPIC_BASE_URL` forced to the proxy, `ANTHROPIC_API_KEY`
   forced to the literal `placeholder`, anything else the message names), no inherited env.
-  On exit or timeout kill the group, `git diff --binary HEAD` is the patch (bounded by
-  `PATCH_LIMIT`; over it => `Refused`), digest the scratch tree. `Session::serve` dispatches
+  On exit or timeout kill the group, then `git add -A` and `git diff --cached HEAD` (no
+  `--binary`: `patchrules` refuses binary patches, so a binary change makes the reply `Refused`
+  with that reason) is the patch, so new files are included. Paths the host would reject are
+  excluded before staging (`__pycache__`, `*.pyc`, `.pytest_cache`, `.claude`, `.git`: share the
+  one component list from `agentos-core::patchrules`, the same one `has_excluded_component`
+  uses). Bounded by `PATCH_LIMIT`; over it => `Refused`. Digest the scratch tree. The guest
+  `Bridge` serializes concurrent proxy connections (one `ModelRequest` in flight). `Session::serve` dispatches
   `RunAgent` and relays `ModelRequest`s while the child runs. Fake-guest test
   (`tests/fake_session.rs`): a scripted shell "CLI" that curls the proxy twice and edits a file
-  yields two `ModelRequest`s and a patch naming that file; a CLI that sleeps forever is killed
+  yields two `ModelRequest`s and a patch naming that file; a CLI that edits one file, creates a new one and writes a `.pyc`
+  yields a patch with both source changes, no `.pyc`, and it applies through the existing
+  `apply_patch`; a CLI that sleeps forever is killed
   at `timeout_secs` and the reply says so; `/proc` shows no leftover process.
 
-- [ ] **6. Host link and worker.** `GuestLink` gains `recv_request(until)` handling the
+- [ ] **6. Host link and worker.** Session lease class first (Decision 6): `EffectTimeouts.session`,
+  `MAX_SESSION_TIMEOUT_MS`, and the supervised lease/fence tests for a session longer than
+  600 s. Then: `GuestLink` gains `recv_request(until)` handling the
   guest-initiated frames. `FirecrackerWorker::run_vm` branches on `EffectKind::RunAgentSession`:
   `RunAgent`, then loop: `ModelRequest` -> write `session/<n>.req` atomically (temp + rename) ->
   poll for `<n>.resp` (50 ms, bounded by lease and cancel marker) -> `ModelReply`; `AgentDone`
@@ -140,7 +176,8 @@ Each line has its test in the named task.
   (`agent.session`, required by the contract's capability list) in `agentos-core`, with the
   contract-digest-unchanged test the analyzer capability had.
 
-- [ ] **7. Runner session driver.** `AgentAction::RunSession` + `Observation::SessionEnded {
+- [ ] **7. Runner session driver.** Journal inner calls as `SessionModelCall` (Decision 6a);
+  rewrite `model` per Decision 6b. `AgentAction::RunSession` + `Observation::SessionEnded {
   exit_code, patch: Option<String> }`; `act()` handles it: broker check for `agent.session`,
   start the job (`SupervisedExecutor::start`, new non-waiting entry beside `run`), then loop
   `serve_mailbox`: for each `.req` -> `normalize_request` with the contract cap -> journal a
@@ -153,7 +190,9 @@ Each line has its test in the named task.
   fails the task and sends nothing; clamp is visible in the journaled request; a patch on a
   non-editable and on a `.git` path is `Denied`, workspace unchanged; deadline kills the CLI.
 
-- [ ] **8. Recovery and crash matrix.** In `recover.rs`/`drive`: an open `RunSession` turn does
+- [ ] **8. Recovery and crash matrix.** Red test first: the session completes, then the
+  controller crashes at AfterIntent of the `ApplyPatch`; resume applies the journaled patch and
+  verifies with no divergence and no resend. In `recover.rs`/`drive`: an open `RunSession` turn does
   not replay; reconcile outstanding `ModelCall`s, kill the job, fail `agent session lost`
   (distinct from `agent replay diverged`). Extend `crash_matrix.rs` with the session kinds at
   every crash point, with the execution counter proving a retained response is never sent
