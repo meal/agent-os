@@ -49,7 +49,8 @@ log "installing $release"
 sh /scripts/install.sh "$release" --sha256 "$sha" --prefix /opt/agentos --home /root/.agentos
 bin=/opt/agentos/current/bin
 manifest=/opt/agentos/current/MANIFEST.json
-field() { sed -n "s/.*\"$1\":{\"digest\":\"\([0-9a-f]*\)\",\"id\":\"\([^\"]*\)\"}.*/\\$2/p" "$manifest"; }
+# MANIFEST.json is compact with sorted keys: each entry starts with its digest and id.
+field() { sed -n "s/.*\"$1\":{\"digest\":\"\([0-9a-f]*\)\",\"id\":\"\([^\"]*\)\".*/\\$2/p" "$manifest"; }
 image_id=$(field image 2); image_digest=$(field image 1)
 component_id=$(field component 2); component_digest=$(field component 1)
 profile_digest=$(field profile 1)

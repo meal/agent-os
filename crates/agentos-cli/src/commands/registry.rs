@@ -40,7 +40,16 @@ pub fn check_id(kind: &str, id: &str) -> Result<(), CliError> {
 }
 
 /// Makes `dir` and everything under it read-only (files 0444, directories 0555).
+/// Removes the write bits of everything under `dir` and of `dir` itself.
 fn make_read_only(dir: &Path) -> Result<(), CliError> {
+    make_contents_read_only(dir)?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o555))?;
+    Ok(())
+}
+
+/// Removes the write bits of everything under `dir`, but not of `dir`: a directory moved to
+/// another parent needs its own write bit (its `..` changes), which only root does without.
+fn make_contents_read_only(dir: &Path) -> Result<(), CliError> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -50,7 +59,6 @@ fn make_read_only(dir: &Path) -> Result<(), CliError> {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o444))?;
         }
     }
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o555))?;
     Ok(())
 }
 
@@ -69,8 +77,9 @@ pub fn register_tree(registry: &Path, id: &str, source: &Path) -> Result<Registe
     let name = format!("{id}@{digest}");
     let entry = registry.join(&name);
     if !entry.exists() {
-        make_read_only(&staged)?;
+        make_contents_read_only(&staged)?;
         fs::rename(&staged, &entry)?;
+        fs::set_permissions(&entry, fs::Permissions::from_mode(0o555))?;
         let registered_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)

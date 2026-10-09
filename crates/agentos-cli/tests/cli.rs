@@ -5596,3 +5596,57 @@ fn host_check_reports_each_requirement_and_fails_on_a_required_one() {
     assert_eq!(unjailed["jail"], "needs root");
     assert_eq!(check(&[], "ok")["jail"], "ok");
 }
+
+/// Registration works for an unprivileged owner: a directory moved to another parent needs
+/// its own write bit, which root bypasses (the test tier runs as root, so it drops to nobody).
+#[test]
+fn an_unprivileged_owner_can_register() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+    let cli = Cli::bare();
+    let source = cli.path("unprivileged-profile");
+    copy_tree(&fixtures().join("profiles/parser-checks-v1"), &source).unwrap();
+    let home = cli.path("unprivileged-home");
+    fs::create_dir_all(&home).unwrap();
+    let root = rustix::process::geteuid().is_root();
+    if root {
+        for p in [cli.path(""), source.clone(), home.clone()] {
+            std::os::unix::fs::chown(&p, Some(65534), Some(65534)).unwrap();
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        for f in fs::read_dir(&source).unwrap() {
+            std::os::unix::fs::chown(f.unwrap().path(), Some(65534), Some(65534)).unwrap();
+        }
+    }
+    let mut cmd = StdCommand::new(env!("CARGO_BIN_EXE_agentos"));
+    cmd.args([
+        "--home",
+        home.to_str().unwrap(),
+        "profile",
+        "register",
+        source.to_str().unwrap(),
+    ]);
+    if root {
+        cmd.uid(65534).gid(65534);
+    }
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let entry = fs::read_dir(home.join("registry"))
+        .unwrap()
+        .flatten()
+        .find(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("parser-checks-v1@")
+                && e.path().is_dir()
+        })
+        .expect("the entry");
+    assert_eq!(
+        fs::metadata(entry.path()).unwrap().permissions().mode() & 0o777,
+        0o555
+    );
+}
