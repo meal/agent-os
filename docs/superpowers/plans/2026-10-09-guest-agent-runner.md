@@ -222,7 +222,7 @@ Each line has its test in the named task.
   prove no key and no NIC; `scripts/acceptance.sh` gains the case. Check disk first; image
   builds use the acceptance compose project.
 
-- [ ] **10. Live run, docs, evidence.** A `live_agent_session.rs` test gated exactly like
+- [ ] **10. Live run, docs, evidence.** (harness and offline proof done: 90c0d0e..4f2cfa0, 9105e7e. **Attempt 1** by the owner on 2026-10-09: HTTP 400 `messages.1.output_config: Extra inputs are not permitted`, one send; fixed host-side by merging `system`-role messages into user messages and keeping only `role`/`content`; see docs/evidence/2026-10-09/live-agent-attempt-1.md. **Attempt 2 pending**, owner runs it.)  A `live_agent_session.rs` test gated exactly like
   `live_model.rs` (key from the environment, billed once, `-- --ignored`); recorded transcript
   under `docs/evidence/`; README/`docs/testing.md` sections; roadmap status updated; the two
   open caveats written down (no session resume; subscription logins unsupported). Leave
