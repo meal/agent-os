@@ -78,7 +78,7 @@ decodes them; a text search would not see them. Each promoted run's success repo
 replay report, manifest, `patch.diff` (by BLAKE3), recording and setup commit must agree.
 The live harness also scans its recording and bundle for the exact key bytes before it
 writes a success report. The method of the first manual scan was not
-recorded; the decoded scan above finds nothing in these runs. Release evidence across two snapshots at one frozen commit remains open.
+recorded; the decoded scan above finds nothing in these runs. Release candidate v0.1.0-rc5: every gate at commit `b8a456a`, under `2026-10-09/rc5/` (see `docs/releases/v0.1.0-rc5.md`).
 
 Run from a normal checkout on the provisioned Linux x86_64 Docker host:
 

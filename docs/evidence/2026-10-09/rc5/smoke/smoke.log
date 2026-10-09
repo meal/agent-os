@@ -1,0 +1,10 @@
+smoke: refused as expected: install.sh: git is required (agentos parses patches with it); install git
+smoke: refused as expected: agentos: host check failed
+smoke: delegating cgroups as a host init would
+smoke: installing /release/agentos-0.1.0-rc5-x86_64-linux.tar.gz
+smoke: release image python-stdlib-py314-v2@4fcc30c901feae478894b6818e503d51a235a28fb2407569e69a0bd196740251, analyzer repo-analyzer-v1@d3725d10f95890d2704c3fdcabf31c6da3f96d8500e50fd86fc1c1f2c51e32d0
+smoke: submitting with a crash during the patch
+smoke: task 01a11e2c-cc6d-715c-809f-d56d99bd0d19 crashed as asked; resuming
+smoke: root: install, jailed run, kill and resume, export passed
+smoke: unprivileged: install with --allow-unjailed, unjailed run passed
+smoke: install, jailed run, kill and resume, export, unprivileged unjailed run: all checks passed

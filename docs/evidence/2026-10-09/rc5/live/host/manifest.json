@@ -1,0 +1,112 @@
+{
+  "task_id": "01a11e2b-9e0d-7558-a11c-cdf51d743e5b",
+  "state": "SUCCEEDED",
+  "base_revision": "be77aa19c032f85329a9596adfd692252a0c87fd09d337b1873feb6003bdd3b8",
+  "base_workspace_digest": "be77aa19c032f85329a9596adfd692252a0c87fd09d337b1873feb6003bdd3b8",
+  "patch_digest": "e42168bb861dd8bd4f6dc882c06b754c14d8616b86d62acb5a7d8e8794336612",
+  "patches": [
+    {
+      "effect_id": "ff89488567297f9857beed897fda031afe6460e3b9ae7eee8d08a772b79dfb02",
+      "digest": "e42168bb861dd8bd4f6dc882c06b754c14d8616b86d62acb5a7d8e8794336612",
+      "file": "patches/0001-e42168bb861dd8bd4f6dc882c06b754c14d8616b86d62acb5a7d8e8794336612.patch"
+    }
+  ],
+  "final_workspace_digest": "19caa4fcf4e404c7820404402a7122b6619cfe7f95b6f2e76e07dbdd0e85b548",
+  "verified_digest": "19caa4fcf4e404c7820404402a7122b6619cfe7f95b6f2e76e07dbdd0e85b548",
+  "verification_profile_digest": "9ff584f31b7fef8ac5774ced5c8f1620c27f736b4bdc4d9e03e553df5d8ea12c",
+  "verification_results": [
+    {
+      "effect_id": "c013f3841126779d3a7b2734863726544d9b52636e2424dc9a8d083fedc94cf9",
+      "completed": true,
+      "passed": true,
+      "workspace_digest": "19caa4fcf4e404c7820404402a7122b6619cfe7f95b6f2e76e07dbdd0e85b548",
+      "evidence_digest": "140431d341571d2478761383c6e3ff1898ff12c0550cfd5e9d36793f96b30853",
+      "profile_digest": "9ff584f31b7fef8ac5774ced5c8f1620c27f736b4bdc4d9e03e553df5d8ea12c",
+      "exit_code": 0,
+      "accepted_for_final_workspace": true
+    }
+  ],
+  "model_calls": [
+    {
+      "effect_id": "0dca327685d00dc00f3251232f713bf3b2bf39469f3cf39ce17effe8f3eeeb3e",
+      "request_digest": "fdbb346a20ffe3feba076da41d538e2340804cf949919b1a237bc7a6ef048449",
+      "response_digest": "9d33cb256f94b1dbc79ced4f3fc0a1563432d54afaf72ae406b1a00ac776983e",
+      "state": "COMPLETED",
+      "request_file": "model/0001-request.json",
+      "response_file": "model/0001-response.json"
+    },
+    {
+      "effect_id": "1cbca9ba845196fe8834142b80ca6eefb3972e875a49e9c0f8175d7732a97c3e",
+      "request_digest": "e0639f699d98efe68bb2c374e290dcbc64bd26225880fa006455241353a97b83",
+      "response_digest": "71b1a5cdf2da903fecc17929cbcf98e898f1f4aba2563437248afa09e29bf3c6",
+      "state": "COMPLETED",
+      "request_file": "model/0002-request.json",
+      "response_file": "model/0002-response.json"
+    },
+    {
+      "effect_id": "9623b1d4226d5b448dbb0bae9d34ddbd20c016ab1414c0fd9f3127b11308d075",
+      "request_digest": "7aa54a047c35285b9cfbc0c2872ed4d7bd868f9f8d1474446e04081db8b7ba84",
+      "response_digest": "db5650bde666b43e756361c6193b0cb8d69ab22e9db1c3f9bbb35b6ff7477f14",
+      "state": "COMPLETED",
+      "request_file": "model/0003-request.json",
+      "response_file": "model/0003-response.json"
+    },
+    {
+      "effect_id": "16f9c78c1a028cd3e6a5bfb81987993c1399b3b5a093477edd88962973f2276b",
+      "request_digest": "63b15d53cdf2bec804f76d157c9505cc00641513b85b3dde0eda79fc8f7a7474",
+      "response_digest": "212626b5f2e34d0531dde6d83cedf7000b99df10cb9fd4f9314ec1d2f198024f",
+      "state": "COMPLETED",
+      "request_file": "model/0004-request.json",
+      "response_file": "model/0004-response.json"
+    },
+    {
+      "effect_id": "9b9e8d36a09511052adb4f3ffbe330d80ea5800ce28c8640f98bc75efc64ff24",
+      "request_digest": "03f28f8d554fc116df599060df3f6ed658ffa12444d3be204530961ad6af599d",
+      "response_digest": "2f6a9d0a8333a1b94853af0f6e4693ff9724e11a7cc073eeaa8214c31ca85f0b",
+      "state": "COMPLETED",
+      "request_file": "model/0005-request.json",
+      "response_file": "model/0005-response.json"
+    }
+  ],
+  "usage_summary": {
+    "reserved_model_requests": 0,
+    "settled_model_requests": 5,
+    "uncertain_model_requests": 0,
+    "reserved_tool_actions": 0,
+    "settled_tool_actions": 4,
+    "uncertain_tool_actions": 0
+  },
+  "contract_digest": "19fa1d6808e96ba70dfe6d2a45455b59ff3f6af5f9ac0d6906451a9e5106b70e",
+  "model": "anthropic:claude-opus-5-5",
+  "model_policy_version": 1,
+  "model_limits_version": 1,
+  "model_endpoint": "https://api.anthropic.com",
+  "generated_events": 89,
+  "capabilities": [
+    {
+      "operation": "snapshot.read",
+      "handle_prefix": "3f7f6e02",
+      "revoked": false
+    },
+    {
+      "operation": "workspace.apply_patch",
+      "handle_prefix": "a08251dd",
+      "revoked": false
+    },
+    {
+      "operation": "verification.run",
+      "handle_prefix": "0d3cf947",
+      "revoked": false
+    },
+    {
+      "operation": "artifact.export",
+      "handle_prefix": "931d29ec",
+      "revoked": false
+    },
+    {
+      "operation": "model.request",
+      "handle_prefix": "f56446a4",
+      "revoked": false
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+--- a/src/parser.py
++++ b/src/parser.py
+@@ -2,8 +2,9 @@
+     """Parse 'key = value' lines into a dict, skipping blanks and '#' comments."""
+     result = {}
+     for line in text.splitlines():
+-        if not line.strip() or line.startswith("#"):
++        stripped = line.strip()
++        if not stripped or stripped.startswith("#"):
+             continue
+-        key, _, value = line.partition("=")
+-        result[key] = value
++        key, _, value = stripped.partition("=")
++        result[key.strip()] = value.strip()
+     return result

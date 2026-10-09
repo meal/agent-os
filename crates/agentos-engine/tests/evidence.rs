@@ -17,27 +17,25 @@ fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// Every `docs/evidence/<date>/<worker>/<stem>.evidence.json`, as (worker dir, stem).
+/// Every `<worker>/<stem>.evidence.json` anywhere under `docs/evidence`, as (worker dir, stem);
+/// the run's `live-setup.json` is in the worker directory's parent.
 fn promoted_runs() -> Vec<(PathBuf, String)> {
-    let mut runs = Vec::new();
-    for date in std::fs::read_dir(repo().join("docs/evidence")).unwrap() {
-        let date = date.unwrap().path();
-        if !date.is_dir() {
-            continue;
-        }
-        for worker in std::fs::read_dir(&date).unwrap() {
-            let worker = worker.unwrap().path();
-            if !worker.is_dir() {
-                continue;
-            }
-            for file in std::fs::read_dir(&worker).unwrap() {
-                let name = file.unwrap().file_name().into_string().unwrap();
-                if let Some(stem) = name.strip_suffix(".evidence.json") {
-                    runs.push((worker.clone(), stem.to_string()));
-                }
+    fn walk(dir: &Path, runs: &mut Vec<(PathBuf, String)>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, runs);
+            } else if let Some(stem) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(".evidence.json"))
+            {
+                runs.push((dir.to_path_buf(), stem.to_string()));
             }
         }
     }
+    let mut runs = Vec::new();
+    walk(&repo().join("docs/evidence"), &mut runs);
     runs.sort();
     runs
 }

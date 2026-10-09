@@ -12,9 +12,9 @@
 
 ## Execution status — 2026-10-08
 
-Packages 1–11 are complete. Package 7's live host and jailed runs and the real
+Packages 1–12 are complete; v0.1 is a release candidate. Package 7's live host and jailed runs and the real
 KVM suites passed on 2026-10-08 ([evidence](../../evidence/README.md)), and its evidence is
-checked automatically. Package 5's candidate guest passed real KVM acceptance at `f175de3`. Package 9 passed full KVM acceptance at `7955b96`, package 10 at `d33e82e`, package 11 at `a127005` with its smoke install at `2a50d59`. Package 12 remains open.
+checked automatically. Package 5's candidate guest passed real KVM acceptance at `f175de3`. Package 9 passed full KVM acceptance at `7955b96`, package 10 at `d33e82e`, package 11 at `a127005`. Package 12 produced release candidate v0.1.0-rc5 at `b8a456a` with every gate passing there.
 The 2026-10-04 status below is historical.
 
 ## Execution status — 2026-10-04
@@ -323,11 +323,13 @@ The image command uses the existing recipe to establish the baseline; the new so
 
 **Files:** new second repository/profile/task fixture; `scripts/acceptance.sh`; `docs/evidence/`, supported-host/runbook docs, release workflow and checksums; README/build-plan status.
 
-- [ ] Freeze a release commit and exact image/profile/component/model/policy versions.
-- [ ] Run the four offline CI gates, real KVM full suite, both live worker variants/replays, component tests, image reproducibility, and fresh-host smoke at that commit.
-- [ ] Demonstrate tasks across two distinct registered snapshots; publish successes, failures, settled/uncertain requests, limits, versions, durations, and exported patch/evidence digests.
-- [ ] Verify evidence/recordings contain no key, full capability handle, or unintended secret file. Verify checksums from a clean download.
-- [ ] Produce release candidate and release notes. Mark v0.1 complete only when every gate above has actual evidence; otherwise identify the remaining gate and keep its checkbox open.
+- [x] Freeze a release commit and exact image/profile/component/model/policy versions.
+- [x] Run the four offline CI gates, real KVM full suite, both live worker variants/replays, component tests, image reproducibility, and fresh-host smoke at that commit.
+- [x] Demonstrate tasks across two distinct registered snapshots; publish successes, failures, settled/uncertain requests, limits, versions, durations, and exported patch/evidence digests.
+- [x] Verify evidence/recordings contain no key, full capability handle, or unintended secret file. Verify checksums from a clean download.
+- [x] Produce release candidate and release notes. Mark v0.1 complete only when every gate above has actual evidence; otherwise identify the remaining gate and keep its checkbox open.
+
+**Task 12 result (2026-10-09).** [Release candidate v0.1.0-rc5](../../releases/v0.1.0-rc5.md), frozen at `b8a456a`: every gate above passed at that commit, with evidence under `docs/evidence/2026-10-09/rc5/`. The "clean download" check is a rebuild from a fresh clone, which reproduced the tarball; nothing was published. The fresh-host gate used a fresh container on the only KVM host. v0.1 is complete as a release candidate; tagging, publishing and a run on a separate machine are the owner's to decide.
 
 **Gate:** a third party can reproduce the supported fresh-host workflow and inspect final-workspace evidence. Publishing a release is a separate action from creating this plan.
 

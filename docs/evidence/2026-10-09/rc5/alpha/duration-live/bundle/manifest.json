@@ -1,0 +1,124 @@
+{
+  "task_id": "01a11e2d-679c-7034-939b-8dd510ae35d8",
+  "state": "SUCCEEDED",
+  "base_revision": "5a76834068f805463b492c9b832fe210c3870407e714650f996325b06d9ed87d",
+  "base_workspace_digest": "5a76834068f805463b492c9b832fe210c3870407e714650f996325b06d9ed87d",
+  "patch_digest": "2fda17625d97e3e99eda6423debb288fa411c5d07125650175514dee0ea97f36",
+  "patches": [
+    {
+      "effect_id": "bff754f293623e09fba873235ffe2ef30e3a66ca044a72749f54fa79dd7f60f2",
+      "digest": "2fda17625d97e3e99eda6423debb288fa411c5d07125650175514dee0ea97f36",
+      "file": "patches/0001-2fda17625d97e3e99eda6423debb288fa411c5d07125650175514dee0ea97f36.patch"
+    }
+  ],
+  "final_workspace_digest": "ce26f7c604d2583fde4b0a43349cc8d490ed6a7197d246c6671679d56a26ca07",
+  "verified_digest": "ce26f7c604d2583fde4b0a43349cc8d490ed6a7197d246c6671679d56a26ca07",
+  "verification_profile_digest": "965e3d1f0ae89f2b5c1735905142887b0e118f80a20288247eca734222fe275e",
+  "verification_results": [
+    {
+      "effect_id": "189d11257247ba17a32a467d85c89cd5e88e73c6033db723c5eda895cc2b7611",
+      "completed": true,
+      "passed": true,
+      "workspace_digest": "ce26f7c604d2583fde4b0a43349cc8d490ed6a7197d246c6671679d56a26ca07",
+      "evidence_digest": "6bf18aa6144e2f59f34e4cf3d0a4b6097e03691428109214cd0f80a62891c11c",
+      "profile_digest": "965e3d1f0ae89f2b5c1735905142887b0e118f80a20288247eca734222fe275e",
+      "exit_code": 0,
+      "accepted_for_final_workspace": true
+    }
+  ],
+  "model_calls": [
+    {
+      "effect_id": "f49267405345b216cc643b7b7ef68627ff2476e86ee2bd9952181ad65e2a041e",
+      "request_digest": "2b4488a73c27c2a5a15e1041b389ac0cc13d6736c936eb20d5c0ca96b4d28b92",
+      "response_digest": "a2e305e16029daa7196c2ff02865564535b60aa35da8a92e05a84a1c0ad20537",
+      "state": "COMPLETED",
+      "request_file": "model/0001-request.json",
+      "response_file": "model/0001-response.json"
+    },
+    {
+      "effect_id": "a468897bf1af815eafe0c73f887e16587ada9dfb8803df3c878d357c0290cc7c",
+      "request_digest": "e74ae434733c9ee6cfb30ba2125daed4adadef706599b03820047969551ded13",
+      "response_digest": "e7862fc635c9cfe60400c57c492d6a48afd498cba46e8ac0a8ec1861e37b3a38",
+      "state": "COMPLETED",
+      "request_file": "model/0002-request.json",
+      "response_file": "model/0002-response.json"
+    },
+    {
+      "effect_id": "f91a8b529b5d107a1155fe3ed892320de8e78bbb6acffa526c9551fcf79f947b",
+      "request_digest": "918a4552729692c1c02e9b4628d798d4774f5af6a4ac4870e8f5d676c289b22d",
+      "response_digest": "e55c1fc3a3c4c7fbffe3cae950b7a808be7b43d3b018b4aa78669aabe5222618",
+      "state": "COMPLETED",
+      "request_file": "model/0003-request.json",
+      "response_file": "model/0003-response.json"
+    },
+    {
+      "effect_id": "20ee462900fc140ee1d457ac21fcd73841f3986b9bef524cc1d2afb124244306",
+      "request_digest": "a93d4065e8915e36ffe68428f9e9b4045a370f8df1c82db9cb5e35efc6ef2ca5",
+      "response_digest": "8e3694c08c76d08b66c0cbde4b19c0057eb6eab37831d0af0c8d47c082ccf35c",
+      "state": "COMPLETED",
+      "request_file": "model/0004-request.json",
+      "response_file": "model/0004-response.json"
+    }
+  ],
+  "usage_summary": {
+    "reserved_model_requests": 0,
+    "settled_model_requests": 4,
+    "uncertain_model_requests": 0,
+    "reserved_tool_actions": 0,
+    "settled_tool_actions": 4,
+    "uncertain_tool_actions": 0
+  },
+  "contract_digest": "4e1f97bbfc9ad22550708121aa75c5e847f5ed27ef045651fd966f763f0945bf",
+  "model": "anthropic:claude-opus-5-5",
+  "model_policy_version": 1,
+  "model_limits_version": 1,
+  "model_endpoint": "https://api.anthropic.com",
+  "generated_events": 86,
+  "capabilities": [
+    {
+      "operation": "snapshot.read",
+      "handle_prefix": "59e33de0",
+      "revoked": false
+    },
+    {
+      "operation": "workspace.apply_patch",
+      "handle_prefix": "9be77031",
+      "revoked": false
+    },
+    {
+      "operation": "verification.run",
+      "handle_prefix": "aac2bb20",
+      "revoked": false
+    },
+    {
+      "operation": "artifact.export",
+      "handle_prefix": "84708bcc",
+      "revoked": false
+    },
+    {
+      "operation": "snapshot.analyze",
+      "handle_prefix": "16dfcd74",
+      "revoked": false
+    },
+    {
+      "operation": "model.request",
+      "handle_prefix": "8b101ff8",
+      "revoked": false
+    }
+  ],
+  "guest_image_digest": "4fcc30c901feae478894b6818e503d51a235a28fb2407569e69a0bd196740251",
+  "vm_resources": {
+    "version": 1,
+    "disk_mib": 1024,
+    "scratch_mib": 512,
+    "bandwidth_mib_s": null,
+    "iops": null
+  },
+  "analysis": {
+    "effect_id": "5a68aa3ed2ac306c9bf1713f7ba991794496e9238e753c4fda704547d10c4c41",
+    "component_digest": "d3725d10f95890d2704c3fdcabf31c6da3f96d8500e50fd86fc1c1f2c51e32d0",
+    "state": "COMPLETED",
+    "report_digest": "028037bfa55f37c34af9130ec5a2ec7609bd88e59ca3033b44aad7b390cf8994",
+    "file": "analysis/report.json"
+  }
+}

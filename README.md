@@ -37,8 +37,8 @@ implemented and tested offline. Real provider/KVM acceptance passed on 2026-10-0
 2026-10-09. A contract can name a registered WebAssembly analyzer component, which runs
 once over the snapshot with broker-checked reads and no WASI, and whose report is exported
 but never counts as verification (KVM acceptance 2026-10-09). Fresh-host release
-validation was smoke-tested in a fresh container (see below); release evidence across two
-snapshots remains planned work.
+validation was smoke-tested in a fresh container (see below). Release candidate
+[v0.1.0-rc5](docs/releases/v0.1.0-rc5.md) passed every v0.1 gate at commit `b8a456a`.
 
 ## Installing a release
 

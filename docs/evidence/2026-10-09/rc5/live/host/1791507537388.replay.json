@@ -1,0 +1,41 @@
+{
+  "kind": "offline-replay",
+  "request_patch_workspace_profile_match": true,
+  "run": {
+    "duration": {
+      "nanos": 477908175,
+      "secs": 0
+    },
+    "event_types": {
+      "ActionUsed": 4,
+      "AgentTurn": 10,
+      "ArtifactRegistered": 16,
+      "CapabilitiesIssued": 1,
+      "CapabilityGranted": 20,
+      "Denied": 1,
+      "EffectCompleted": 10,
+      "EffectDispatched": 10,
+      "EffectIntended": 10,
+      "Exported": 1,
+      "Started": 1,
+      "Submitted": 1,
+      "TaskCreated": 1,
+      "VerifyPassed": 1,
+      "VerifyStarted": 1,
+      "WorkspaceUpdated": 2
+    },
+    "model_calls": 5,
+    "patch": "e42168bb861dd8bd4f6dc882c06b754c14d8616b86d62acb5a7d8e8794336612",
+    "profile": "9ff584f31b7fef8ac5774ced5c8f1620c27f736b4bdc4d9e03e553df5d8ea12c",
+    "requests": [
+      "fdbb346a20ffe3feba076da41d538e2340804cf949919b1a237bc7a6ef048449",
+      "e0639f699d98efe68bb2c374e290dcbc64bd26225880fa006455241353a97b83",
+      "7aa54a047c35285b9cfbc0c2872ed4d7bd868f9f8d1474446e04081db8b7ba84",
+      "63b15d53cdf2bec804f76d157c9505cc00641513b85b3dde0eda79fc8f7a7474",
+      "03f28f8d554fc116df599060df3f6ed658ffa12444d3be204530961ad6af599d"
+    ],
+    "workspace": "19caa4fcf4e404c7820404402a7122b6619cfe7f95b6f2e76e07dbdd0e85b548"
+  },
+  "schema_version": 1,
+  "worker": "host"
+}

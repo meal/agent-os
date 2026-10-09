@@ -1,0 +1,39 @@
+--- a/src/duration.py
++++ b/src/duration.py
+@@ -1,14 +1,32 @@
+-UNITS = {"s": 1, "m": 60, "h": 3600}
++UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+ 
+ 
+ def parse_duration(text: str) -> int:
+     """Parse durations like '90s', '5m', '1h30m' or '2d 4h' into seconds."""
++    if not isinstance(text, str):
++        raise TypeError("duration must be a string")
+     total = 0
+     number = ""
+-    for ch in text:
++    seen_component = False
++    for ch in text.strip().lower():
+         if ch.isdigit():
+             number += ch
++        elif ch.isspace():
++            if number:
++                raise ValueError(f"missing unit in duration: {text!r}")
++            continue
++        elif ch in UNITS:
++            if not number:
++                raise ValueError(f"missing number in duration: {text!r}")
++            total += int(number) * UNITS[ch]
++            number = ""
++            seen_component = True
+         else:
+-            total += int(number) * UNITS[ch]
+-            number = ""
++            raise ValueError(f"unknown unit {ch!r} in duration: {text!r}")
++    if number:
++        if seen_component:
++            raise ValueError(f"missing unit in duration: {text!r}")
++        return int(number)
++    if not seen_component:
++        raise ValueError(f"empty duration: {text!r}")
+     return total
