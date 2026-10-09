@@ -241,8 +241,8 @@ use agentos_engine::supervised::{ExecCounts, SupervisedExecutor};
 use agentos_engine::worker::Worker;
 use agentos_engine::workspace::workspace_digest;
 use common::{
-    Env, FcProc, SUPERVISOR_BIN, TEST_WORKERS_ENV, contract, copy_dir, firecracker_processes,
-    fix_patch, fixtures, home_firecrackers, processes_naming, supervised,
+    Env, FcProc, HomeGuard, SUPERVISOR_BIN, TEST_WORKERS_ENV, contract, copy_dir,
+    firecracker_processes, fix_patch, fixtures, home_firecrackers, processes_naming, supervised,
 };
 use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 use tempfile::TempDir;
@@ -439,80 +439,6 @@ fn watch_vm(id: String, cgroup_root: PathBuf, every: Duration) -> Sampler<VmSamp
             cgroup: files,
         })
     })
-}
-
-/// Cleans a test's home up however the test ends, a failed assertion included, so no VM
-/// or `agentos/<id>` cgroup leaks into later tests: SIGKILLs every Firecracker of the home
-/// (by `--id`: `home_vm_ids`, plus the ids registered with `watch`), waits for them to be
-/// gone, then collects the jail of every job and inspect directory (and the watched ones).
-/// Declare it after the home's `TempDir` (or first in a struct), so it runs before the
-/// directory is removed.
-struct HomeGuard {
-    root: PathBuf,
-    cgroup_root: PathBuf,
-    watched: std::sync::Mutex<Vec<(String, PathBuf)>>,
-}
-
-impl HomeGuard {
-    fn new(root: &Path, cgroup_root: &Path) -> HomeGuard {
-        HomeGuard {
-            root: root.to_path_buf(),
-            cgroup_root: cgroup_root.to_path_buf(),
-            watched: Default::default(),
-        }
-    }
-
-    /// Also covers the VM `id` run from `dir` (a VM launched by hand, outside `jobs/`).
-    fn watch(&self, id: &str, dir: &Path) {
-        self.watched
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push((id.to_string(), dir.to_path_buf()));
-    }
-}
-
-impl Drop for HomeGuard {
-    fn drop(&mut self) {
-        let watched = std::mem::take(&mut *self.watched.lock().unwrap_or_else(|p| p.into_inner()));
-        let mut ids = common::home_vm_ids(&self.root);
-        ids.extend(watched.iter().map(|(id, _)| id.clone()));
-        let ours = || -> Vec<i32> {
-            firecracker_processes()
-                .into_iter()
-                .filter(|p| p.id().is_some_and(|id| ids.iter().any(|i| i == id)))
-                .map(|p| p.pid)
-                .collect()
-        };
-        for pid in ours() {
-            if let Some(pid) = Pid::from_raw(pid) {
-                let _ = kill_process(pid, Signal::KILL);
-            }
-        }
-        let until = Instant::now() + Duration::from_secs(5);
-        while !ours().is_empty() && Instant::now() < until {
-            thread::sleep(Duration::from_millis(10));
-        }
-        let listed = |dir: PathBuf| -> Vec<PathBuf> {
-            fs::read_dir(dir)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .map(|e| e.path())
-                .collect()
-        };
-        let mut dirs = listed(self.root.join("jobs"));
-        for task in listed(self.root.join("inspect")) {
-            dirs.extend(listed(task));
-        }
-        dirs.extend(watched.into_iter().map(|(_, dir)| dir));
-        for dir in dirs {
-            // A killed VM's cgroup may need a moment to empty.
-            let until = Instant::now() + Duration::from_secs(2);
-            while jail::collect(&dir, &self.cgroup_root).is_err() && Instant::now() < until {
-                thread::sleep(Duration::from_millis(10));
-            }
-        }
-    }
 }
 
 /// A task of the real, jailed worker whose files live in a scratch root on the guest image's

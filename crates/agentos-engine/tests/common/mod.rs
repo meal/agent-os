@@ -7,6 +7,10 @@ pub mod live;
 pub mod procs;
 
 use std::fs;
+use std::thread;
+
+use agentos_engine::jail;
+use rustix::process::{Pid, Signal, kill_process};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -944,4 +948,78 @@ pub fn two_calls_and_a_fix() -> String {
         call_script(1, first),
         call_script(2, again)
     )
+}
+
+/// Cleans a test's home up however the test ends, a failed assertion included, so no VM
+/// or `agentos/<id>` cgroup leaks into later tests: SIGKILLs every Firecracker of the home
+/// (by `--id`: `home_vm_ids`, plus the ids registered with `watch`), waits for them to be
+/// gone, then collects the jail of every job and inspect directory (and the watched ones).
+/// Declare it after the home's `TempDir` (or first in a struct), so it runs before the
+/// directory is removed.
+pub struct HomeGuard {
+    root: PathBuf,
+    cgroup_root: PathBuf,
+    watched: std::sync::Mutex<Vec<(String, PathBuf)>>,
+}
+
+impl HomeGuard {
+    pub fn new(root: &Path, cgroup_root: &Path) -> HomeGuard {
+        HomeGuard {
+            root: root.to_path_buf(),
+            cgroup_root: cgroup_root.to_path_buf(),
+            watched: Default::default(),
+        }
+    }
+
+    /// Also covers the VM `id` run from `dir` (a VM launched by hand, outside `jobs/`).
+    pub fn watch(&self, id: &str, dir: &Path) {
+        self.watched
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((id.to_string(), dir.to_path_buf()));
+    }
+}
+
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        let watched = std::mem::take(&mut *self.watched.lock().unwrap_or_else(|p| p.into_inner()));
+        let mut ids = home_vm_ids(&self.root);
+        ids.extend(watched.iter().map(|(id, _)| id.clone()));
+        let ours = || -> Vec<i32> {
+            firecracker_processes()
+                .into_iter()
+                .filter(|p| p.id().is_some_and(|id| ids.iter().any(|i| i == id)))
+                .map(|p| p.pid)
+                .collect()
+        };
+        for pid in ours() {
+            if let Some(pid) = Pid::from_raw(pid) {
+                let _ = kill_process(pid, Signal::KILL);
+            }
+        }
+        let until = Instant::now() + Duration::from_secs(5);
+        while !ours().is_empty() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let listed = |dir: PathBuf| -> Vec<PathBuf> {
+            fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .collect()
+        };
+        let mut dirs = listed(self.root.join("jobs"));
+        for task in listed(self.root.join("inspect")) {
+            dirs.extend(listed(task));
+        }
+        dirs.extend(watched.into_iter().map(|(_, dir)| dir));
+        for dir in dirs {
+            // A killed VM's cgroup may need a moment to empty.
+            let until = Instant::now() + Duration::from_secs(2);
+            while jail::collect(&dir, &self.cgroup_root).is_err() && Instant::now() < until {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
 }
