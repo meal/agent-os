@@ -173,7 +173,7 @@ fn fake_guest_answers_connect_with_ok_and_hello_with_ready() {
     };
     assert_eq!(
         (protocol, agent_version.as_str(), mode),
-        (2, "0.1.0", Mode::Job)
+        (2, "0.2.0", Mode::Job)
     );
     assert!(vcpus >= 1 && memory_mib > 0, "{vcpus} {memory_mib}");
 }

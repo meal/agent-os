@@ -7,14 +7,15 @@
 #   docker compose run --rm test-kvm sh scripts/release.sh VERSION [IMAGE]
 #
 # Runs in test-kvm, which mounts the built guest images (scripts/build-guest-image.sh) and the
-# fetched Firecracker (scripts/fetch-firecracker.sh). IMAGE defaults to python-stdlib-py314-v2,
-# the image with a source-built, provenanced kernel.
+# fetched Firecracker (scripts/fetch-firecracker.sh). IMAGE defaults to agent-cli-py314-v1: guest
+# protocol 2, a source-built, provenanced kernel and the pinned agent CLI binary. The older
+# recipes speak protocol 1 and are refused by this release's controller.
 set -eu
 REPO=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 cd "$REPO"
 [ "$#" -ge 1 ] && [ "$#" -le 2 ] || { echo 'usage: scripts/release.sh VERSION [IMAGE]' >&2; exit 2; }
 version=$1
-image=${2:-python-stdlib-py314-v2}
+image=${2:-agent-cli-py314-v1}
 case "$version" in *[!0-9A-Za-z.+-]* | '' | -*) echo "invalid version $version" >&2; exit 2;; esac
 case "$image" in *[!0-9A-Za-z.-]* | '' | -*) echo "invalid image $image" >&2; exit 2;; esac
 fc="$REPO/build/firecracker/v1.17.0"
