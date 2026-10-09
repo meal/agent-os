@@ -207,7 +207,7 @@ Each line has its test in the named task.
   again) and its sha256 in a lock file; download in the build container, verify the hash, fail
   closed. `scripts/acceptance.sh` allows the new image and defaults to it; the reproducibility
   `--verify` build must pass.
-- [ ] **9b. KVM tier.** Fix what the VM tier shows for Task 5's untested paths (loopback ioctl,
+- [x] **9b. KVM tier** (aba71fc, fff1c23, ee778c9; final image digest d5fac431023288f24639194fee32ad5d95a36724eb51f4487ef58f37602d8d3b; evidence in docs/evidence/2026-10-09/agent-session-kvm.md; all workspace KVM suites green with both worker modes).  Fix what the VM tier shows for Task 5's untested paths (loopback ioctl,
   chown handover, trampoline exec as uid 1001, git under split uids, process limit for the
   binary, guest memory). Tests in a new `crates/agentos-engine/tests/kvm_agent.rs`: (1) a
   scripted sh "CLI" session proves no NIC and no key (connect to a non-loopback address fails,
