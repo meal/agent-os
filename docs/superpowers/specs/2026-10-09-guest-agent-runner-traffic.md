@@ -33,3 +33,26 @@ needs no key).
   `x-stainless-retry-count` rising. Each retry reaches the controller as its own call and
   consumes one `model_requests` unit; the budget, not the CLI, ends such a storm.
 - Headers the proxy drops: all of them (`x-api-key` is the placeholder).
+
+## Scripted-model run (plan Task 4b)
+
+`scripts/cli-scripted-stub.py` served two canned answers built by the real
+`agentos_core::messages::sse_from_message` (`cargo run -p agentos-core --example dump_sse`):
+a `text` + `Write` tool_use, then an `end_turn` text. Run as an unprivileged user with
+`claude -p "create hello.txt" --permission-mode bypassPermissions --output-format json
+< /dev/null`.
+
+- **The SDK accepted the codec's SSE.** The tool ran (`hello.txt` was created with the scripted
+  content), the CLI made exactly **two** `/v1/messages` calls and exited **0** with
+  `stop_reason: end_turn`. No side call to a second model, no other path.
+- Headless edit flag: `--permission-mode bypassPermissions` (from `claude --help`).
+- Body values: `thinking: {"type":"adaptive","display":"omitted"}` (no `budget_tokens`, so the
+  `max_tokens` clamp cannot violate a thinking budget; `normalize_request` needs no change),
+  `output_config: {"effort":"medium"}`, `context_management: {"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}`.
+  `normalize_request` strips the last two (no beta header is sent); whether the live API then
+  accepts the rest remains Task 10's question.
+- The CLI offers ~20 tools, including `WebFetch`, `WebSearch`, `Agent`, `Workflow`,
+  `ScheduleWakeup`. In the guest the network ones fail (no NIC); the session handler passes
+  `--disallowedTools` for them so the model is not offered tools that cannot work.
+- Not yet shown: a `thinking` content block in a response (the CLI sent `display: omitted`, so
+  the model is not expected to return one); a streamed `thinking` block is left to the live run.

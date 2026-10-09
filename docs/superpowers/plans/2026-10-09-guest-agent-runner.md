@@ -133,13 +133,13 @@ Each line has its test in the named task.
   timeout 30 s. Tests with real sockets: plain call, streaming call, count_tokens, unknown
   path, oversized body (413), slow client (timeout), upstream error status passed through.
 
-- [ ] **4b. Scripted-model run of the real CLI (blocks Task 5; no key, no KVM).** Extend
+- [x] **4b. Scripted-model run of the real CLI (blocks Task 5; no key, no KVM).** Extend
   `scripts/cli-traffic-stub.py` (or a sibling) to answer `POST /v1/messages` with canned SSE
   produced by the real `sse_from_message` (fixture dumped by a core unit test): turn 1 a
   `tool_use` that edits/creates a file in the work directory, turn 2 an `end_turn` text. Run
   `claude -p` as a non-root user with the headless-edit flags (take them from `claude --help`,
   not memory). Record in the traffic findings: SSE accepted (also with a `thinking` block); the
-  flags that let edits happen without prompts; exit code after `end_turn`; whether a side call
+  flags that let edits happen without prompts (found: `--permission-mode bypassPermissions`, `--disallowedTools WebFetch WebSearch ...` for tools that cannot work offline; findings in the traffic file); exit code after `end_turn`; whether a side call
   goes to a second model; the actual values of `thinking`, `output_config`,
   `context_management`. If `thinking` is `{type:"enabled", budget_tokens:N}` with N at or above
   the clamped `max_tokens`, `normalize_request` must lower N below it or drop `thinking`; add
