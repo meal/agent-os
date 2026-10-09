@@ -796,6 +796,7 @@ impl Home {
                 Some(key) => key,
                 None => self.api_key()?,
             };
+            crate::commands::submit_tls_ready()?;
             let provider = AnthropicProvider::new(key);
             let provider = match base {
                 Some(url) => provider.with_base_url(url),

@@ -143,3 +143,8 @@ fn print(v: &Value) {
 fn print_state(task: &TaskId, state: TaskState) {
     print(&json!({ "task_id": task, "state": state.label() }));
 }
+
+/// See [`submit::tls_ready`].
+pub(crate) fn submit_tls_ready() -> Result<(), crate::error::CliError> {
+    submit::tls_ready()
+}

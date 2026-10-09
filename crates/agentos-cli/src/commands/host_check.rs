@@ -63,17 +63,19 @@ pub fn host_check(home: &Home) -> Result<(), CliError> {
         Ok(out) => Err(format!("git --version exited with {}", out.status)),
         Err(e) => Err(format!("git: {e}")),
     };
+    let tls = agentos_engine::model::anthropic::check_http_client();
     let jail = home.probe_jail()?;
     let jail_required = !home.allow_unjailed;
     let (kvm_ok, kvm) = reason(kvm);
     let (fc_ok, firecracker) = reason(firecracker);
     let (git_ok, git) = reason(git);
     let (jail_ok, jail) = reason(jail);
+    let (tls_ok, tls) = reason(tls);
     print(&json!({
-        "kvm": kvm, "firecracker": firecracker, "git": git,
+        "kvm": kvm, "firecracker": firecracker, "git": git, "tls": tls,
         "jail": jail, "jail_required": jail_required,
     }));
-    if kvm_ok && fc_ok && git_ok && (jail_ok || !jail_required) {
+    if kvm_ok && fc_ok && git_ok && tls_ok && (jail_ok || !jail_required) {
         Ok(())
     } else {
         Err(CliError::other("host check failed"))

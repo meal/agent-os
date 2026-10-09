@@ -207,6 +207,7 @@ fn validate(
                 // with the task untouched.
                 ModelSpec::Anthropic(_) => {
                     home.checked_base_url()?;
+                    tls_ready()?;
                     if yes {
                         api_key = Some(home.api_key()?);
                     }
@@ -468,4 +469,14 @@ pub async fn submit(
         })),
     }
     Ok(())
+}
+
+/// Refuses a model task on a host whose CA certificates cannot be loaded, before anything is
+/// written.
+pub fn tls_ready() -> Result<(), CliError> {
+    agentos_engine::model::anthropic::check_http_client().map_err(|e| {
+        CliError::other(format!(
+            "{e}; install the system CA certificates (the ca-certificates package)"
+        ))
+    })
 }

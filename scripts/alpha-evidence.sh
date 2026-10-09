@@ -33,7 +33,7 @@ log() { echo "alpha: $*"; }
 printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20260901T000000Z/ bookworm main\n' > /etc/apt/sources.list
 rm -f /etc/apt/sources.list.d/*
 apt-get -qq -o Acquire::Check-Valid-Until=false update
-apt-get -qq install -y --no-install-recommends git > /dev/null
+apt-get -qq install -y --no-install-recommends git ca-certificates > /dev/null
 sh /scripts/kvm-entrypoint.sh true
 sh /scripts/install.sh "$release" --sha256 "$sha" --prefix /opt/agentos --home /root/.agentos > /out/install.log
 bin=/opt/agentos/current/bin

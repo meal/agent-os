@@ -54,14 +54,32 @@ pub struct AnthropicProvider {
     key: ApiKey,
 }
 
-fn build_client(timeout: Duration) -> reqwest::Client {
+fn client_builder(timeout: Duration) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .timeout(timeout)
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
+}
+
+fn build_client(timeout: Duration) -> reqwest::Client {
+    client_builder(timeout)
         .build()
         .expect("build the HTTP client")
+}
+
+/// Whether the provider's HTTP client can be built here: it verifies the server with the
+/// system's CA certificates, which a minimal host may lack. Call before
+/// [`AnthropicProvider::new`], which cannot fail.
+pub fn check_http_client() -> Result<(), String> {
+    client_builder(MODEL_TIMEOUT)
+        .build()
+        .map(drop)
+        .map_err(|e| {
+            let cause =
+                std::error::Error::source(&e).map_or_else(|| e.to_string(), ToString::to_string);
+            format!("cannot build a TLS client for the model provider: {cause}")
+        })
 }
 
 impl AnthropicProvider {

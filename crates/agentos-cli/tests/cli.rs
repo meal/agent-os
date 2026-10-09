@@ -5650,3 +5650,45 @@ fn an_unprivileged_owner_can_register() {
         0o555
     );
 }
+
+/// Without system CA certificates the model provider cannot be reached securely: submit
+/// refuses before anything is written (it used to panic after creating the task), and the
+/// host check reports it.
+#[test]
+fn a_host_without_ca_certificates_is_refused_before_a_model_task_exists() {
+    let cli = Cli::new();
+    let key = cli.write("key", "sk-ant-FAKE-no-certs");
+    let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
+    cli.cmd(&[
+        "--api-key-file",
+        &key,
+        "submit",
+        &contract,
+        "--yes",
+        "--model",
+        "anthropic:claude-opus-5-5",
+    ])
+    .env("SSL_CERT_FILE", "/nonexistent/certs.pem")
+    .env("SSL_CERT_DIR", "/nonexistent/certs")
+    .assert()
+    .code(1)
+    .stderr(predicate::str::contains("CA certificates"));
+    cli.assert_no_task();
+    let out = cli
+        .cmd_as(Mode::Plain, &["host-check"])
+        .env("SSL_CERT_FILE", "/nonexistent/certs.pem")
+        .env("SSL_CERT_DIR", "/nonexistent/certs")
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    assert!(
+        report["tls"].as_str().unwrap().contains("CA certificates"),
+        "{report}"
+    );
+    let ok = cli.cmd_as(Mode::Plain, &["host-check"]).output().unwrap();
+    let report: Value = serde_json::from_slice(&ok.stdout).unwrap();
+    assert_eq!(report["tls"], "ok", "{report}");
+}

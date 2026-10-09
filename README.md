@@ -44,7 +44,8 @@ snapshots remains planned work.
 
 A release is `agentos-VERSION-x86_64-linux.tar.gz` with its `.sha256`, built by
 `docker compose run --rm test-kvm sh scripts/release.sh VERSION` from a clean committed tree.
-Supported hosts: x86_64 Linux with usable `/dev/kvm`, git, and, for the jailed worker, root
+Supported hosts: x86_64 Linux with usable `/dev/kvm`, git, the system CA certificates (for
+the model provider), and, for the jailed worker, root
 with a writable cgroup v2 tree that can delegate `cpu`, `memory` and `pids` (systemd hosts
 normally can). Install with:
 

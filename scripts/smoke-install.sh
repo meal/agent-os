@@ -37,11 +37,12 @@ refused() { # refused MESSAGE: the root install must refuse with MESSAGE and lea
   log "refused as expected: $(tail -n1 /out/refused.out)"
 }
 refused 'git is required'
-# git for the host-side patch parser, from the guest rootfs's Debian snapshot.
+# git (the host-side patch parser) and the CA certificates (TLS to the model provider),
+# from the guest rootfs's Debian snapshot.
 printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20260901T000000Z/ bookworm main\n' > /etc/apt/sources.list
 rm -f /etc/apt/sources.list.d/*
 apt-get -qq -o Acquire::Check-Valid-Until=false update
-apt-get -qq install -y --no-install-recommends git > /dev/null
+apt-get -qq install -y --no-install-recommends git ca-certificates > /dev/null
 refused 'host check failed'
 log 'delegating cgroups as a host init would'
 sh /scripts/kvm-entrypoint.sh true
