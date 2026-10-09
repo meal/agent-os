@@ -31,7 +31,7 @@ use agentos_core::patchrules::{check_summary, parse_numstat};
 use agentos_core::workspace::{copy_tree, purge_excluded, workspace_digest};
 use rustix::process::Pid;
 
-use crate::backend::Backend;
+use crate::backend::{Backend, CHECK_PATH};
 use crate::handlers::{WORKSPACE_MISSING, capture, fresh_scratch, kill_group, reap_group};
 use crate::proxy::{Bridge, Proxy};
 
@@ -41,7 +41,8 @@ use crate::proxy::{Bridge, Proxy};
 const SESSION_EXCLUDED: [&str; 2] = [".pytest_cache", ".claude"];
 
 /// Variables the session sets itself: a message cannot override them.
-const SESSION_ENV: [&str; 8] = [
+const SESSION_ENV: [&str; 9] = [
+    "PATH",
     "HOME",
     "TMPDIR",
     "PYTHONDONTWRITEBYTECODE",
@@ -300,6 +301,7 @@ fn env_for_cli(
     requested: &[(String, String)],
 ) -> Vec<(String, String)> {
     let mut env = vec![
+        ("PATH".to_string(), CHECK_PATH.to_string()),
         ("HOME".to_string(), tree.home.display().to_string()),
         ("TMPDIR".to_string(), tree.tmp.display().to_string()),
         ("PYTHONDONTWRITEBYTECODE".to_string(), "1".to_string()),
@@ -598,4 +600,38 @@ pub fn run_agent<S: Read + Write>(
         },
         patch,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tree() -> Tree {
+        Tree {
+            work: "/scratch/agent/work".into(),
+            gitdir: "/scratch/agent/git".into(),
+            home: "/scratch/agent/home".into(),
+            tmp: "/scratch/agent/tmp".into(),
+        }
+    }
+
+    fn value<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        env.iter()
+            .rev()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn the_cli_gets_the_guest_path_and_a_message_cannot_replace_it() {
+        let proxy: SocketAddr = "127.0.0.1:4000".parse().unwrap();
+        let requested = vec![
+            ("PATH".to_string(), "/tmp/evil".to_string()),
+            ("EXTRA".to_string(), "kept".to_string()),
+        ];
+        let env = env_for_cli(&tree(), proxy, &requested);
+        assert_eq!(value(&env, "PATH"), Some("/usr/bin:/bin"));
+        assert_eq!(env.iter().filter(|(k, _)| k == "PATH").count(), 1);
+        assert_eq!(value(&env, "EXTRA"), Some("kept"));
+    }
 }
