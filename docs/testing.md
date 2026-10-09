@@ -238,7 +238,7 @@ What it costs, in principle: every request carries the CLI's system prompt and t
 which are most of its input tokens, plus the conversation so far. Output is capped at
 4096 tokens per request. The contract allows 12 model requests in total, and retries
 count: a rejected request (400) ends the task at once; a 429 or 5xx makes the host wait
-(2, 2, 4, 8, 16, 32, then 60 seconds) before the CLI sends again, and each send counts. The
+(2, 4, 8, 16, 32, then 60 seconds) before the CLI sends again, and each send counts. The
 request after the 12th ends the task with "budget exhausted" without being sent. The deadline is 15 minutes. Nothing caps input
 tokens directly, so the 12 requests are the bound on spend. The first run also decides whether
 the API accepts the forwarded bodies without the beta headers the CLI sends.
