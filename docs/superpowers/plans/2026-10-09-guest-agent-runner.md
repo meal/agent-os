@@ -109,9 +109,8 @@ Each line has its test in the named task.
   usable only with a v1 controller. Red test: a v1 `Hello` is `Refused` with the existing
   "unsupported protocol" text.
 
-- [ ] **4. Guest loopback proxy (`agentos-guest/src/proxy.rs`).** Blocking `std::net`, no new
-  dependency, bound to `127.0.0.1:0` inside the VM (`lo` is brought up by `init.rs`; add it
-  there with a test). `trait Bridge { fn forward(&self, body: Vec<u8>) -> Result<(u16, Vec<u8>),
+- [x] **4. Guest loopback proxy** (91deba6; `lo` bring-up deferred to Task 5, see there) (`agentos-guest/src/proxy.rs`).** Blocking `std::net`, no new
+  dependency, bound to `127.0.0.1:0` inside the VM (`lo` is down today: `init.rs` documents that it configures nothing; see Task 5). `trait Bridge { fn forward(&self, body: Vec<u8>) -> Result<(u16, Vec<u8>),
   String>; }` (the guest session implements it with `ModelRequest`/`ModelReply`; tests use a
   fake). Handler: `POST /v1/messages` -> `Bridge`; if the request body had `stream:true`, wrap
   the reply with `sse_from_message` and `text/event-stream`; local answers for everything else
@@ -119,7 +118,7 @@ Each line has its test in the named task.
   timeout 30 s. Tests with real sockets: plain call, streaming call, count_tokens, unknown
   path, oversized body (413), slow client (timeout), upstream error status passed through.
 
-- [ ] **5. Guest session handler.** `handlers::run_agent`: copy the workspace to
+- [ ] **5. Guest session handler.** First: `lo` stays down at boot (verification relies on every connect failing, and `ip` is not in the image). Bring it up only when `RunAgent` is handled, never at boot: enable rustix `net` + `ioctl` features (check the latest rustix online), SIOCSIFFLAGS with IFF_UP on `lo`; it needs CAP_NET_ADMIN so it is verified on the KVM tier (Task 9) with `net-probe` still failing for every non-loopback address and for loopback outside a session. Then: `handlers::run_agent`: copy the workspace to
   `<scratch>/agent/work` (fresh each time, `fresh_scratch`), `git init` + baseline commit there
   as the diff base, start the proxy, run `argv` in a new process group as the unprivileged
   uid/gid the verification already uses (`run_in_group`), `HOME` and temp under scratch, env
