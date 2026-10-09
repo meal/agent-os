@@ -37,7 +37,26 @@ implemented and tested offline. Real provider/KVM acceptance passed on 2026-10-0
 2026-10-09. A contract can name a registered WebAssembly analyzer component, which runs
 once over the snapshot with broker-checked reads and no WASI, and whose report is exported
 but never counts as verification (KVM acceptance 2026-10-09). Fresh-host release
-validation remains planned work.
+validation was smoke-tested in a fresh container (see below); release evidence across two
+snapshots remains planned work.
+
+## Installing a release
+
+A release is `agentos-VERSION-x86_64-linux.tar.gz` with its `.sha256`, built by
+`docker compose run --rm test-kvm sh scripts/release.sh VERSION` from a clean committed tree.
+Supported hosts: x86_64 Linux with usable `/dev/kvm`, git, and, for the jailed worker, root
+with a writable cgroup v2 tree that can delegate `cpu`, `memory` and `pids` (systemd hosts
+normally can). Install with:
+
+```sh
+sh scripts/install.sh agentos-VERSION-x86_64-linux.tar.gz --sha256 "$(cat agentos-VERSION-x86_64-linux.tar.gz.sha256)"
+```
+
+It verifies every file, runs the release's own `agentos host-check`, stages and activates the
+version atomically under `~/.local/share/agentos`, never replaces an existing home
+(`~/.agentos`), and registers the release's image, profile and analyzer. Without root or
+delegable cgroups, pass `--allow-unjailed` and submit with `--allow-unjailed` too.
+`agentos host-check` and `agentos version` can be run at any time.
 
 Required offline gates are centralized in `sh scripts/check.sh`: formatting, strict Clippy,
 host tests, fake-jail tests, the GC mount gate and the analyzer component rebuild check, all through Docker Compose with the

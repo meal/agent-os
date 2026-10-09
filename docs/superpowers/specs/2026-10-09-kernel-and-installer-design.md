@@ -72,14 +72,18 @@ exiting 2 with a reason and leaving nothing behind:
 2. **Checksum.** The tarball's sha256 must be `--sha256`; after extraction into a staging
    directory, every file must match `SHA256SUMS`, and `SHA256SUMS` must list every file.
 3. **KVM.** `/dev/kvm` must exist and be readable and writable by the user.
-4. **cgroups.** A cgroup v2 hierarchy with `cpu`, `memory` and `pids` delegable, unless
-   `--allow-unjailed`, which is recorded and warned about, as the CLI does.
-5. **Staging.** Extraction goes to `PREFIX/.staging-VERSION-<pid>`; any older staging
+4. **cgroups and git.** A cgroup v2 hierarchy listing `cpu`, `memory` and `pids` (a quick
+   early refusal), and git, which host-side patch parsing needs.
+5. **The release's own host check.** Before activation the installer runs the staged
+   `agentos host-check`: KVM, Firecracker, git and, unless `--allow-unjailed`, the jail probe
+   `submit` runs (root, a writable and delegable cgroup tree, the home's filesystem). So
+   cgroups that are present but not delegable are refused by the CLI's own rules.
+6. **Staging.** Extraction goes to `PREFIX/.staging-VERSION-<pid>`; any older staging
    directory from an interrupted run is removed first. The staged tree is moved into place
    with one `rename` to `PREFIX/VERSION`, and `PREFIX/current` is switched with a symlink
    rename. Same version with identical checksums: a no-op. Same version with different
    content: refused.
-6. **Home.** Created only when absent; an existing home is never modified except by
+7. **Home.** Created only when absent; an existing home is never modified except by
    registering the release's image, profile and component, which is idempotent and
    content-addressed.
 
@@ -88,12 +92,13 @@ the installer itself runs directly on the host.
 
 ## Smoke run (`scripts/smoke-install.sh`)
 
-Builds a release (or takes one), starts a fresh `debian:bookworm-slim` container (pinned by
-digest) with `/dev/kvm` and the same capabilities as `test-kvm`, installs the release as an
-unprivileged user and as root (jailed), registers the image, profile and component, submits
-the parser fixture with the analyzer on the jailed worker with a crash during the patch,
-resumes it, exports it, and compares the exported patch with `fixtures/parser-repo.fix.patch`
-applied to the recorded snapshot and the evidence profile digest with the registered one.
+Takes a release, starts a fresh `debian:bookworm-slim` container (pinned by digest) with
+`/dev/kvm` and the same capabilities as `test-kvm`. Like an unprepared host it has no git and
+a read-only cgroup tree: the installer must refuse both. It then gets git from the pinned
+snapshot and the cgroup delegation a host's init provides, installs as root, submits the
+parser fixture with the analyzer on the jailed worker with a crash during the patch, resumes,
+exports, and compares the export with the release manifest and the fixture patch. Last, an
+unprivileged user installs with `--allow-unjailed` and runs the fixture unjailed.
 Only one KVM host is available, so a fresh container on it stands in for a fresh host; the
 evidence says so.
 

@@ -47,6 +47,16 @@ Task 10 (the component analyzer), `2026-10-09/`:
 | `acceptance.sh kvm` | `d33e82e` | **Failed** before any test ran: the host's root disk was full (`kvm-task10-failed-attempt/`). |
 | `acceptance.sh kvm`, after freeing disk space | `d33e82e` | Passed: both suites, 1045 passed and 0 failed in each, including the analyzer end to end on the real jailed worker (`kvm-task10-pass/`). |
 
+Task 11 (source kernel and installer), `2026-10-09/`:
+
+| Run | Commit | Result |
+| --- | --- | --- |
+| `acceptance.sh kvm` on `python-stdlib-py314-v2` | `22a5e7b` | **Failed**: kernel and image reproducible, one KVM test sized its tmpfs for the smaller image (`kvm-py314-v2-failed-attempt/`). |
+| the same, after the test fix | `a127005` | Passed: two identical kernel builds, two identical image builds, both suites with 1047 passed and 0 failed (`kvm-py314-v2-pass/`). |
+| `smoke-install.sh` on release `0.1.0-rc3` | `2a50d59` | Passed (`smoke-install/`): in a fresh pinned Debian container the installer refused a missing git and an undelegated cgroup tree, then installed as root and ran the fixture jailed with the analyzer through a kill and resume, and an unprivileged user installed with `--allow-unjailed` and ran it unjailed. rc1 and rc2 were dry runs: rc1 shipped the image without kernel provenance, and rc2 exposed a registration bug for non-root users, fixed in `2a50d59`. |
+
+Only one KVM host was available: a fresh container on it stands in for a fresh host.
+
 Image `python-stdlib-v1`; Firecracker v1.17.0; kernel 6.18.51. The live runs predate the test
 fix, which changes only a test assertion. Recordings (schema version 2) are in
 `fixtures/transcripts/live/`; each worker's manifest, `patch.diff`, success report and replay
@@ -68,8 +78,7 @@ decodes them; a text search would not see them. Each promoted run's success repo
 replay report, manifest, `patch.diff` (by BLAKE3), recording and setup commit must agree.
 The live harness also scans its recording and bundle for the exact key bytes before it
 writes a success report. The method of the first manual scan was not
-recorded; the decoded scan above finds nothing in these runs. Two-snapshot
-fresh-host evidence remains open.
+recorded; the decoded scan above finds nothing in these runs. Release evidence across two snapshots at one frozen commit remains open.
 
 Run from a normal checkout on the provisioned Linux x86_64 Docker host:
 

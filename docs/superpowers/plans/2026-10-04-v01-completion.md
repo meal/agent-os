@@ -12,9 +12,9 @@
 
 ## Execution status — 2026-10-08
 
-Packages 1–10 are complete. Package 7's live host and jailed runs and the real
+Packages 1–11 are complete. Package 7's live host and jailed runs and the real
 KVM suites passed on 2026-10-08 ([evidence](../../evidence/README.md)), and its evidence is
-checked automatically. Package 5's candidate guest passed real KVM acceptance at `f175de3`. Package 9 passed full KVM acceptance at `7955b96`, package 10 at `d33e82e`. Packages 11–12 remain open; package 11 has a [focused design](../specs/2026-10-09-kernel-and-installer-design.md).
+checked automatically. Package 5's candidate guest passed real KVM acceptance at `f175de3`. Package 9 passed full KVM acceptance at `7955b96`, package 10 at `d33e82e`, package 11 at `a127005` with its smoke install at `2a50d59`. Package 12 remains open.
 The 2026-10-04 status below is historical.
 
 ## Execution status — 2026-10-04
@@ -300,10 +300,12 @@ docker compose run --rm test cargo test --workspace --locked
 
 **Files:** new pinned guest kernel source/config/toolchain recipe; `scripts/build-guest-image.sh`; new `scripts/{install,smoke-install}.sh`; release artifact manifest; Docker/Compose packaging; supported-host documentation.
 
-- [ ] Pin kernel source/checksum/config and build toolchain; build twice in independent directories and compare guest artifacts. Record provenance with interpreter and agent versions.
-- [ ] Specify a Docker-based installer with atomic staging, checksum verification, no overwrite of existing homes, idempotent version installation, and actionable KVM/cgroup refusal.
-- [ ] Add red installer cases: corrupted checksum, existing home, interrupted staging, unsupported architecture, missing KVM, nondelegated cgroups. Test no partial install after refusal.
-- [ ] On a fresh supported host, install, register images/profile, run jailed fixture, kill/resume, and export; compare exported patch/evidence against recorded inputs.
+- [x] Pin kernel source/checksum/config and build toolchain; build twice in independent directories and compare guest artifacts. Record provenance with interpreter and agent versions.
+- [x] Specify a Docker-based installer with atomic staging, checksum verification, no overwrite of existing homes, idempotent version installation, and actionable KVM/cgroup refusal.
+- [x] Add red installer cases: corrupted checksum, existing home, interrupted staging, unsupported architecture, missing KVM, nondelegated cgroups. Test no partial install after refusal.
+- [x] On a fresh supported host, install, register images/profile, run jailed fixture, kill/resume, and export; compare exported patch/evidence against recorded inputs.
+
+**Task 11 result (2026-10-09).** Per the [focused design](../specs/2026-10-09-kernel-and-installer-design.md) and [plan](2026-10-09-kernel-and-installer.md): linux 6.18.51 from pinned kernel.org source with Firecracker v1.17.0's config fragments, built reproducibly (three identical builds) in a digest-pinned builder; `python-stdlib-py314-v2` boots it and records its provenance, and passed full KVM acceptance at `a127005`. `scripts/release.sh` builds a reproducible release; `scripts/install.sh` refuses each unsuitable case (self-tested) and runs the release's own `host-check`; the smoke run passed on `0.1.0-rc3` at `2a50d59`. One KVM host was available, so a fresh container on it stands in for a fresh host.
 
 ```sh
 docker compose run --rm test-kvm sh scripts/build-guest-image.sh guest/python-stdlib-v1 build/guest-images/python-stdlib-v1 --verify

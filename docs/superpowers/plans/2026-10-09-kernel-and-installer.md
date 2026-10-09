@@ -16,7 +16,7 @@ builds; no co-author trailer.
 - [x] **2. Source-kernel recipe.** `guest/python-stdlib-py314-v2` takes its kernel from the
   builder; `image.json` records the kernel provenance; `build-guest-image.sh --verify` stays
   byte-identical.
-- [ ] **3. Kernel on KVM.** The booted kernel's version and embedded config match the record;
+- [x] **3. Kernel on KVM.** The booted kernel's version and embedded config match the record;
   the full KVM suite passes on the new image.
 - [x] **4. Release.** `scripts/release.sh VERSION` builds a static musl `agentos` and the
   release tree with `MANIFEST.json` and `SHA256SUMS`.

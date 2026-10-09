@@ -484,7 +484,7 @@ printf 'Task, evidence and review copy: %s\n' "$practice"</pre>
     <div class="done"><span class="pill live">TESTED OFFLINE</span><b>Reliability and CI</b>Bounded model I/O, Python pins, formatting, lint and Compose test gates.</div>
     <div class="done"><span class="pill live">DONE</span><b>Resource lifecycle</b>Safe collection, publication failure tests, and contract-driven VM disks and I/O with measured limits.</div>
     <div class="done"><span class="pill live">DONE</span><b>5 Wasm ABI</b>A capability-checked analyzer component on Wasmtime, without WASI; its report is exported, never verification.</div>
-    <div><span class="pill warn">LATER</span><b>6 Release</b>Source-built kernel, fresh-host installer and evidence across two snapshots.</div>
+    <div><span class="pill idle">BUILT</span><b>6 Release</b>Source-built reproducible kernel, release tarball and checked installer, smoke-tested in a fresh container; evidence across two snapshots pending.</div>
   </div>
   <p>All required offline gates pass: formatting, strict Clippy, the host suite, the fake-jail suite and the mount gate. Offline and skipped gated tests do not establish real provider or KVM acceptance; that evidence is recorded separately. The Python 3.14 guest passed real KVM acceptance; the legacy image remains the default.</p>
   <p class="note"><a href="https://github.com/meal/agent-os/blob/main/docs/superpowers/plans/2026-10-04-v01-completion.md">Completion plan</a> · <a href="https://github.com/meal/agent-os/blob/main/docs/reviews/2026-10-04-offline-milestone-review.md">Verification and review decisions</a></p>
