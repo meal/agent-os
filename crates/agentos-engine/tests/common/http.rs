@@ -20,6 +20,9 @@ pub enum Reply {
     Redirect(u16, String),
     /// Closes the connection without writing anything.
     CloseAtOnce,
+    /// The nth request (from 0) is answered with the nth status and body; past the end, a 400
+    /// with an Anthropic-shaped error body.
+    Sequence(Vec<(u16, Vec<u8>)>),
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +145,16 @@ fn handle(
         Reply::Status(status, text) => respond(&mut stream, *status, text.as_bytes()),
         Reply::Hang(d) => thread::sleep(*d),
         Reply::CloseAtOnce => {}
+        Reply::Sequence(answers) => {
+            let (status, body) = answers.get(attempt).cloned().unwrap_or_else(|| {
+                (
+                    400,
+                    br#"{"type":"error","error":{"type":"invalid_request_error","message":"the offline script is exhausted"}}"#
+                        .to_vec(),
+                )
+            });
+            respond(&mut stream, status, &body);
+        }
         Reply::Redirect(status, location) => {
             let head = format!(
                 "HTTP/1.1 {status} Redirect\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
