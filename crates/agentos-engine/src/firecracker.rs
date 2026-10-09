@@ -13,11 +13,11 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use agentos_core::effect::{AttemptId, EffectKind};
+use agentos_core::effect::{AgentSessionSpec, AttemptId, EffectKind};
 use agentos_core::guest::{
-    FILE_LIMIT, GUEST_CID, GUEST_MIN_MEMORY_MIB, GUEST_PROTOCOL, MAX_VCPUS, Message, Mode,
+    FILE_LIMIT, Frame, GUEST_CID, GUEST_MIN_MEMORY_MIB, GUEST_PROTOCOL, MAX_VCPUS, Message, Mode,
     OUTPUT_LIMIT, PATCH_LIMIT, PROFILE_LIMIT, SNAPSHOT_BYTES_LIMIT, SNAPSHOT_FILES_LIMIT,
     mint_attempt_token, unb64,
 };
@@ -30,8 +30,8 @@ use serde::{Deserialize, Serialize};
 use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Reconciliation};
 use crate::guestlink::{GuestLauncher, GuestLink, LinkError, fake_command, guest_text, type_name};
 use crate::jail::{self, CgroupOverrides, JailMode, StageSources};
-use crate::job::JobDir;
-use crate::outcomes::{self, Check};
+use crate::job::{JobDir, Mailbox};
+use crate::outcomes::{self, AgentEnd, Check};
 use crate::worker::{TEST_WORKERS_ENV, Worker};
 
 pub use agentos_guest::handlers::PatchStateIs;
@@ -60,6 +60,12 @@ const VERIFY_REPLY_MARGIN: Duration = Duration::from_secs(60);
 /// Bounds each single write to the guest (a peer that stops reading).
 const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 const EXIT_POLL: Duration = Duration::from_millis(10);
+/// How often a session's model mailbox, cancel marker and lease are looked at while the guest
+/// or the controller is quiet.
+const SESSION_POLL: Duration = Duration::from_millis(50);
+/// The guest's own limit on the CLI stops this long before the lease, so the CLI's end is
+/// reported before the host kills the VM.
+const SESSION_MARGIN_SECS: i64 = 10;
 /// How long `firecracker --version` may take.
 const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 const WS_BUSY: &str = "workspace image is attached to another VM";
@@ -566,6 +572,11 @@ pub struct FirecrackerWorker {
 
 /// The request to send, prepared (and limit-checked) before anything is launched.
 enum Plan {
+    Session {
+        spec: AgentSessionSpec,
+        expected_base: Digest,
+        lease_expiry_ms: i64,
+    },
     Snapshot {
         files: u64,
         bytes: u64,
@@ -583,6 +594,7 @@ enum Plan {
 
 /// The reply that decides the outcome, held until the VM is down.
 enum Reply {
+    Session(AgentEnd),
     Refused(String),
     Snapshot(Vec<String>, Digest),
     Patch(Vec<String>, Digest),
@@ -593,6 +605,8 @@ enum Reply {
 enum Served {
     Lost,
     Violation(String),
+    /// The host ended the session on purpose (its lease, or the cancel marker).
+    Interrupted(String),
 }
 
 /// Removes `scratch.img` however the job ends inside this process.
@@ -1090,12 +1104,26 @@ impl FirecrackerWorker {
                     source,
                 })
             }
+            EffectKind::RunAgentSession { expected_base } => {
+                let spec = AgentSessionSpec::from_payload(&req.payload)
+                    .map_err(|e| format!("invalid agent session: {e}"))?;
+                let lease_expiry_ms = JobDir {
+                    path: self.job_dir.clone(),
+                }
+                .request()
+                .map_err(|e| format!("cannot read the job's lease: {e}"))?
+                .lease_expiry_ms;
+                Ok(Plan::Session {
+                    spec,
+                    expected_base: *expected_base,
+                    lease_expiry_ms,
+                })
+            }
             EffectKind::ExportBundle => Err("not implemented in this milestone".into()),
             EffectKind::ModelCall { .. }
             | EffectKind::ListFiles { .. }
             | EffectKind::ReadFile { .. }
-            | EffectKind::AnalyzeSnapshot
-            | EffectKind::RunAgentSession { .. } => {
+            | EffectKind::AnalyzeSnapshot => {
                 Err(format!("not a worker effect: {}", req.kind.tag()))
             }
         }
@@ -1259,7 +1287,14 @@ impl FirecrackerWorker {
 
         // Serve: one request, one reply. From the first byte of the request on, a lost
         // connection or a violation leaves the effect unknown for a patch.
-        let served = self.serve(&mut link, &plan, req, &mut vm);
+        let served = match &plan {
+            Plan::Session {
+                spec,
+                expected_base,
+                lease_expiry_ms,
+            } => self.serve_session(&mut link, &mut vm, spec, *expected_base, *lease_expiry_ms),
+            _ => self.serve(&mut link, &plan, req, &mut vm),
+        };
         let reply = match served {
             Ok(reply) => reply,
             Err(served) => {
@@ -1269,7 +1304,7 @@ impl FirecrackerWorker {
                     Served::Lost => {
                         format!("guest exited before reporting: {}", exit_code_text(&status))
                     }
-                    Served::Violation(why) => why,
+                    Served::Violation(why) | Served::Interrupted(why) => why,
                 };
                 return if is_patch {
                     WorkerResult::NoOutcome(reason)
@@ -1294,6 +1329,7 @@ impl FirecrackerWorker {
                 ExecOutcome::failure(req, ctx, format!("{HOST_DISK_IO}: {reason}"))
             }
             Reply::Refused(reason) => ExecOutcome::failure(req, ctx, reason),
+            Reply::Session(end) => outcomes::agent_session(req, ctx, end),
             Reply::Snapshot(files, digest) => outcomes::snapshot_manifest(req, ctx, files, digest),
             Reply::Patch(touched, digest) => outcomes::patch_applied(req, ctx, touched, digest),
             Reply::Verified(check) => match self.check_profile(&plan, &check) {
@@ -1350,6 +1386,11 @@ impl FirecrackerWorker {
             _ => Served::Lost,
         };
         let reply_until = match plan {
+            Plan::Session { .. } => {
+                return Err(Served::Interrupted(
+                    "an agent session is served by serve_session".into(),
+                ));
+            }
             Plan::Snapshot { files, bytes } => {
                 link.send(&Message::ReadSnapshot {
                     file_count: *files,
@@ -1391,6 +1432,7 @@ impl FirecrackerWorker {
         };
         let violation = |why: String| Served::Violation(LinkError::Protocol(why).to_string());
         let expected = match plan {
+            Plan::Session { .. } => "AgentDone",
             Plan::Snapshot { .. } => "SnapshotDone",
             Plan::Patch { .. } => "PatchApplied",
             Plan::Verify { .. } => "Verified",
@@ -1449,6 +1491,141 @@ impl FirecrackerWorker {
             ))),
         }
     }
+}
+
+impl FirecrackerWorker {
+    /// `RunAgent`, then the CLI's model calls through the job's session mailbox until the
+    /// guest reports how the CLI ended (`AgentDone`) or refuses (`Refused`). The guest numbers
+    /// its requests 1, 2, ...; any other number is a violation. A call waits on the controller;
+    /// the session ends at its lease or on the cancel marker, whichever comes first.
+    fn serve_session(
+        &self,
+        link: &mut GuestLink,
+        vm: &mut Vm,
+        spec: &AgentSessionSpec,
+        expected_base: Digest,
+        lease_expiry_ms: i64,
+    ) -> Result<Reply, Served> {
+        let link_err = |e: LinkError| match e {
+            LinkError::Protocol(_) => Served::Violation(e.to_string()),
+            _ => Served::Lost,
+        };
+        let violation = |why: String| Served::Violation(LinkError::Protocol(why).to_string());
+        let job = JobDir {
+            path: self.job_dir.clone(),
+        };
+        let mailbox = Mailbox::new(job.session_dir());
+        link.send(&Message::RunAgent {
+            argv: spec.argv.clone(),
+            env: spec.env.clone(),
+            timeout_secs: session_timeout_secs(lease_expiry_ms, unix_ms()),
+            expected_base,
+        })
+        .map_err(link_err)?;
+        let mut next_id = 1;
+        loop {
+            let frame = loop {
+                if let Some(why) = session_stop(&job, lease_expiry_ms) {
+                    vm.kill();
+                    return Err(Served::Interrupted(why));
+                }
+                let polled = link.poll_frame(SESSION_POLL, Instant::now() + REPLY_TIMEOUT);
+                if let Some(frame) = polled.map_err(link_err)? {
+                    break frame;
+                }
+            };
+            match frame {
+                Frame::Json(Message::ModelRequest { id }) => {
+                    if id != next_id {
+                        return Err(violation(format!(
+                            "model request {id} arrived, expected {next_id}"
+                        )));
+                    }
+                    let body = link
+                        .recv_body(Instant::now() + REPLY_TIMEOUT)
+                        .map_err(link_err)?;
+                    if let Err(e) = mailbox.worker_post_request(id, &body) {
+                        vm.kill();
+                        return Err(Served::Interrupted(format!(
+                            "cannot post model request {id}: {}",
+                            guest_text(&e.to_string())
+                        )));
+                    }
+                    let (status, reply) = loop {
+                        match mailbox.worker_poll_reply(id) {
+                            Ok(Some(answer)) => break answer,
+                            Ok(None) => {}
+                            Err(e) => {
+                                vm.kill();
+                                return Err(Served::Interrupted(format!(
+                                    "the answer to model request {id} is invalid: {}",
+                                    guest_text(&e.to_string())
+                                )));
+                            }
+                        }
+                        if let Some(why) = session_stop(&job, lease_expiry_ms) {
+                            vm.kill();
+                            return Err(Served::Interrupted(why));
+                        }
+                        thread::sleep(SESSION_POLL);
+                    };
+                    link.send(&Message::ModelReply { id, status })
+                        .map_err(link_err)?;
+                    link.send_body(&reply).map_err(link_err)?;
+                    next_id += 1;
+                }
+                Frame::Json(Message::AgentDone {
+                    exit_code,
+                    signal,
+                    timed_out,
+                    workspace_digest,
+                }) => {
+                    let patch = link
+                        .recv_body(Instant::now() + REPLY_TIMEOUT)
+                        .map_err(link_err)?;
+                    return Ok(Reply::Session(AgentEnd {
+                        exit_code,
+                        signal,
+                        timed_out,
+                        workspace_digest,
+                        patch,
+                    }));
+                }
+                Frame::Json(Message::Refused { reason }) => {
+                    return Ok(Reply::Refused(guest_text(&reason)));
+                }
+                Frame::Json(other) => {
+                    return Err(violation(format!(
+                        "expected ModelRequest or AgentDone, got {}",
+                        type_name(&other)
+                    )));
+                }
+                Frame::Raw(_) => {
+                    return Err(violation("raw frame where a message was expected".into()));
+                }
+            }
+        }
+    }
+}
+
+/// Why a running session must end now: the controller cancelled its job, or its lease ran out.
+fn session_stop(job: &JobDir, lease_expiry_ms: i64) -> Option<String> {
+    if job.cancel_requested() {
+        return Some("agent session cancelled".into());
+    }
+    (unix_ms() >= lease_expiry_ms).then(|| "agent session timed out at its lease".into())
+}
+
+/// The CLI's own limit: the seconds left on the lease less a margin, at least one.
+fn session_timeout_secs(lease_expiry_ms: i64, now_ms: i64) -> u64 {
+    (lease_expiry_ms.saturating_sub(now_ms) / 1000 - SESSION_MARGIN_SECS).max(1) as u64
+}
+
+fn unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// What an inspection boot asks the guest (inspect mode).
@@ -2352,5 +2529,14 @@ mod tests {
         value["interpreter"]["source_sha256"] = serde_json::json!("invalid");
         write(&value);
         assert!(read_image(dir.path()).is_err());
+    }
+
+    #[test]
+    fn a_session_gets_its_lease_less_a_margin_and_at_least_one_second() {
+        let now = 1_000_000;
+        assert_eq!(session_timeout_secs(now + 1_800_000, now), 1790);
+        assert_eq!(session_timeout_secs(now + 5_000, now), 1);
+        assert_eq!(session_timeout_secs(now - 1, now), 1);
+        assert_eq!(session_timeout_secs(i64::MIN, now), 1);
     }
 }

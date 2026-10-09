@@ -300,6 +300,18 @@ impl GuestLink {
         write_frame(&mut self.stream, &Frame::Raw(bytes.to_vec())).map_err(lost)
     }
 
+    /// Sends `bytes` as exactly one raw frame, empty included, at most `RAW_FRAME_LIMIT` bytes:
+    /// the body of a `ModelReply`, which the guest reads as one frame.
+    pub fn send_body(&mut self, bytes: &[u8]) -> Result<(), LinkError> {
+        if bytes.len() > RAW_FRAME_LIMIT {
+            return Err(LinkError::Protocol(format!(
+                "body of {} bytes, over the {RAW_FRAME_LIMIT} limit",
+                bytes.len()
+            )));
+        }
+        write_frame(&mut self.stream, &Frame::Raw(bytes.to_vec())).map_err(lost)
+    }
+
     /// Bounds every single write on the connection (a peer that stops reading).
     pub fn set_write_timeout(&self, timeout: Option<Duration>) -> Result<(), LinkError> {
         self.stream.set_write_timeout(timeout).map_err(lost)
@@ -321,6 +333,60 @@ impl GuestLink {
             Frame::Raw(_) => Err(LinkError::Protocol(
                 "raw frame where a message was expected".into(),
             )),
+        }
+    }
+
+    /// The next frame of any kind, once it has started: `Ok(None)` when nothing starts within
+    /// `wait`, so a caller can poll other conditions between frames. Once the first byte is
+    /// in, the frame is read whole, within `until`.
+    pub fn poll_frame(
+        &mut self,
+        wait: Duration,
+        until: Instant,
+    ) -> Result<Option<Frame>, LinkError> {
+        self.stream
+            .set_read_timeout(Some(wait.max(Duration::from_millis(1))))
+            .map_err(lost)?;
+        let mut first = [0u8; 1];
+        loop {
+            match self.stream.read(&mut first) {
+                Ok(0) => return Err(lost(io::ErrorKind::UnexpectedEof.into())),
+                Ok(_) => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if is_timeout(&e) => return Ok(None),
+                Err(e) => return Err(lost(e)),
+            }
+        }
+        let mut rest = (&first[..]).chain(DeadlineReader {
+            stream: &self.stream,
+            until,
+        });
+        read_frame(&mut rest, RAW_FRAME_LIMIT)
+            .map(Some)
+            .map_err(frame_error)
+    }
+
+    /// The next frame, of any kind, waiting at most until `until`.
+    pub fn recv_frame(&mut self, until: Instant) -> Result<Frame, LinkError> {
+        read_frame(
+            &mut DeadlineReader {
+                stream: &self.stream,
+                until,
+            },
+            RAW_FRAME_LIMIT,
+        )
+        .map_err(frame_error)
+    }
+
+    /// The raw frame that must come next (the body after a `ModelRequest`, the patch after
+    /// `AgentDone`): a message there is a protocol violation.
+    pub fn recv_body(&mut self, until: Instant) -> Result<Vec<u8>, LinkError> {
+        match self.recv_frame(until)? {
+            Frame::Raw(bytes) => Ok(bytes),
+            Frame::Json(m) => Err(LinkError::Protocol(format!(
+                "{} where a raw frame was expected",
+                type_name(&m)
+            ))),
         }
     }
 

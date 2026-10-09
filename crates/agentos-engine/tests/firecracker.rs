@@ -8,13 +8,15 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agentos_core::contract::Contract;
-use agentos_core::effect::{AttemptId, EffectId, EffectKind, Outcome};
+use agentos_core::effect::{AgentSessionSpec, AttemptId, EffectId, EffectKind, Outcome};
 use agentos_core::guest::{
-    Frame, Message, Mode, RAW_FRAME_LIMIT, WS_IMAGE_BYTES, b64, read_frame, write_frame,
+    Frame, Message, Mode, RAW_FRAME_LIMIT, WS_IMAGE_BYTES, b64, read_frame, unb64, write_frame,
 };
 use agentos_core::ids::{Digest, TaskId};
 use agentos_core::resources::VmResources;
@@ -22,7 +24,7 @@ use agentos_engine::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor}
 use agentos_engine::firecracker::{FirecrackerConfig, FirecrackerWorker, WorkerResult, preflight};
 use agentos_engine::fixture::FixtureExecutor;
 use agentos_engine::guestlink::{GuestLauncher, socket_path};
-use agentos_engine::job::{JobDir, JobRequest, WorkerConfig};
+use agentos_engine::job::{JobDir, JobRequest, Mailbox, WorkerConfig};
 use agentos_engine::worker::Worker;
 use agentos_engine::workspace::workspace_digest;
 use agentos_store::db::Db;
@@ -1332,4 +1334,261 @@ fn a_no_outcome_worker_cannot_forge_supervisor_log_lines() {
         "{log:?}"
     );
     assert_clean(lines[0]);
+}
+
+// ---------------------------------------------------------------------------------------
+// Agent sessions: the model mailbox, the cancel marker and the lease.
+
+/// The guest's `curl` of the scripted CLI: one model call, body from `$IN`, reply to `$OUT`.
+const CURL: &str = "/usr/bin/curl -fsS -o \"$HOME/$OUT\" -X POST \"$ANTHROPIC_BASE_URL/v1/messages\" -H 'content-type: application/json' --data-binary @\"$HOME/$IN\"";
+
+/// Writes a scripted CLI outside the workspace; its path is what `argv` names.
+fn write_cli(fx: &Fx, script: &str) -> String {
+    let path = fx.path("cli.sh");
+    fs::write(&path, script).unwrap();
+    path.display().to_string()
+}
+
+/// A `RunAgentSession` request over `base`, running `/bin/sh <cli>`.
+fn session_request(fx: &Fx, base: Digest, cli: &str) -> EffectRequest {
+    let payload = AgentSessionSpec {
+        argv: vec!["/bin/sh".into(), cli.into()],
+        env: vec![],
+    }
+    .to_payload();
+    fx.request(
+        EffectKind::RunAgentSession {
+            expected_base: base,
+        },
+        &payload,
+    )
+}
+
+/// Plays the controller side of the job's session mailbox on its own thread until `done`:
+/// each request is answered by `answer` (`None` leaves it unanswered). Returns the requests
+/// it saw, in the order it saw them.
+fn controller(
+    job: &JobDir,
+    done: Arc<AtomicBool>,
+    answer: impl Fn(u64, &[u8]) -> Option<(u16, Vec<u8>)> + Send + 'static,
+) -> thread::JoinHandle<Vec<(u64, Vec<u8>)>> {
+    let mailbox = Mailbox::new(job.session_dir());
+    thread::spawn(move || {
+        let mut seen = Vec::new();
+        let mut after = 0;
+        while !done.load(Ordering::SeqCst) {
+            if let Some((id, body)) = mailbox.controller_next_request(after).unwrap() {
+                if seen.last().is_none_or(|(last, _)| *last != id) {
+                    seen.push((id, body.clone()));
+                }
+                if let Some((status, reply)) = answer(id, &body) {
+                    mailbox.controller_post_reply(id, status, &reply).unwrap();
+                    after = id;
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        seen
+    })
+}
+
+/// The scripted CLI of the happy path: two model calls, an edit in between.
+fn two_call_cli(fx: &Fx) -> String {
+    write_cli(
+        fx,
+        &format!(
+            "set -eu\n\
+             printf '%s' '{{\"model\":\"m\",\"max_tokens\":8,\"stream\":false,\"messages\":[]}}' > \"$HOME/req1.json\"\n\
+             IN=req1.json\nOUT=reply1.json\n{CURL}\n\
+             printf '\\n# edited by the agent\\n' >> src/parser.py\n\
+             printf '%s' '{{\"model\":\"m\",\"max_tokens\":8,\"stream\":false,\"messages\":[{{\"role\":\"user\",\"content\":\"again\"}}]}}' > \"$HOME/req2.json\"\n\
+             IN=req2.json\nOUT=reply2.json\n{CURL}\n"
+        ),
+    )
+}
+
+#[tokio::test]
+async fn a_session_relays_two_model_calls_in_order_and_returns_the_patch() {
+    let fx = Fx::new();
+    let base = fx.snapshot().await;
+    let cli = two_call_cli(&fx);
+    let (req, c) = (session_request(&fx, base, &cli), ctx());
+    let job = fx.job(&req, &c);
+    let done = Arc::new(AtomicBool::new(false));
+    let mailbox = controller(&job, done.clone(), |id, _| {
+        Some((200, format!("{{\"reply\":{id}}}").into_bytes()))
+    });
+    let res = fx.worker(&job, test_env()).run_job(&req, &c).await;
+    done.store(true, Ordering::SeqCst);
+    let seen = mailbox.join().unwrap();
+    let WorkerResult::Outcome(out) = res else {
+        panic!("expected an outcome, got {res:?}")
+    };
+    succeeded(&out);
+    let ids: Vec<u64> = seen.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids, vec![1, 2], "requests in order, each once");
+    assert!(String::from_utf8_lossy(&seen[1].1).contains("again"));
+    let v = json(&out);
+    assert_eq!(v["exit_code"], 0, "{v}");
+    assert_eq!(v["timed_out"], false, "{v}");
+    let patch = String::from_utf8(unb64(v["patch_b64"].as_str().unwrap()).unwrap()).unwrap();
+    assert!(
+        patch.contains("src/parser.py") && patch.contains("+# edited by the agent"),
+        "{patch}"
+    );
+    // The session never touched the workspace image's files: the patch is for ApplyPatch.
+    assert!(guests_of(&job).is_empty());
+}
+
+#[tokio::test]
+async fn a_controller_that_never_answers_is_ended_by_the_cancel_marker_and_the_vm_reaped() {
+    let fx = Fx::new();
+    let base = fx.snapshot().await;
+    // One call, never answered, then the CLI waits for ever.
+    let cli = write_cli(
+        &fx,
+        &format!(
+            "set -eu\nprintf '{{}}' > \"$HOME/req1.json\"\nIN=req1.json\nOUT=reply1.json\n{CURL}\nsleep 600\n"
+        ),
+    );
+    let (req, c) = (session_request(&fx, base, &cli), ctx());
+    let job = fx.job(&req, &c);
+    let done = Arc::new(AtomicBool::new(false));
+    let mailbox = controller(&job, done.clone(), |_, _| None);
+    let cancel = job.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(2));
+        cancel.drop_cancel().unwrap();
+    });
+    let started = Instant::now();
+    let res = fx.worker(&job, test_env()).run_job(&req, &c).await;
+    done.store(true, Ordering::SeqCst);
+    let seen = mailbox.join().unwrap();
+    let WorkerResult::Outcome(out) = res else {
+        panic!("expected an outcome, got {res:?}")
+    };
+    assert!(started.elapsed() < Duration::from_secs(60));
+    assert_eq!(seen.len(), 1, "the one request is seen, never answered");
+    let why = reason(&out);
+    assert!(why.contains("cancelled"), "{why}");
+    assert!(
+        matches!(out.receipt.outcome, Outcome::Failure(_)),
+        "a lost session is a failure, never unresolved"
+    );
+    assert!(guests_of(&job).is_empty(), "the VM is reaped");
+    assert!(pids_with(&cli).is_empty(), "no CLI survives the job");
+    assert!(
+        pids_with("sleep 600").is_empty(),
+        "no sleep survives the job"
+    );
+}
+
+#[tokio::test]
+async fn a_session_past_its_lease_is_ended_with_the_vm_reaped() {
+    let fx = Fx::new();
+    let base = fx.snapshot().await;
+    let cli = write_cli(
+        &fx,
+        &format!(
+            "set -eu\nprintf '{{}}' > \"$HOME/req1.json\"\nIN=req1.json\nOUT=reply1.json\n{CURL}\nsleep 600\n"
+        ),
+    );
+    let (req, c) = (session_request(&fx, base, &cli), ctx());
+    // A lease two seconds from now, with the job written for it.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let job = JobDir::create(
+        &fx.path("jobs"),
+        &JobRequest {
+            effect_id: req.effect_id.clone(),
+            task_id: req.task_id.clone(),
+            kind: req.kind.clone(),
+            payload: req.payload.clone(),
+            contract: req.contract.clone(),
+            attempt_id: c.attempt_id.clone(),
+            lease_generation: c.lease_generation,
+            lease_expiry_ms: now + 2_000,
+            task_deadline_ms: i64::MAX,
+            worker: WorkerConfig::Firecracker(fx.cfg.clone()),
+        },
+    )
+    .unwrap()
+    .0;
+    let done = Arc::new(AtomicBool::new(false));
+    let mailbox = controller(&job, done.clone(), |_, _| None);
+    let started = Instant::now();
+    let res = fx.worker(&job, test_env()).run_job(&req, &c).await;
+    done.store(true, Ordering::SeqCst);
+    mailbox.join().unwrap();
+    let WorkerResult::Outcome(out) = res else {
+        panic!("expected an outcome, got {res:?}")
+    };
+    assert!(started.elapsed() < Duration::from_secs(60));
+    let why = reason(&out);
+    assert!(why.contains("lease"), "{why}");
+    assert!(guests_of(&job).is_empty(), "the VM is reaped");
+    assert!(
+        pids_with("sleep 600").is_empty(),
+        "no sleep survives the job"
+    );
+}
+
+#[tokio::test]
+async fn a_session_over_another_base_is_refused_and_nothing_runs() {
+    let fx = Fx::new();
+    let _ = fx.snapshot().await;
+    let cli = write_cli(&fx, "printf ran > \"$HOME/ran\"\n");
+    let (req, c) = (
+        session_request(&fx, Digest::of(b"not the base"), &cli),
+        ctx(),
+    );
+    let job = fx.job(&req, &c);
+    let done = Arc::new(AtomicBool::new(false));
+    let mailbox = controller(&job, done.clone(), |_, _| None);
+    let res = fx.worker(&job, test_env()).run_job(&req, &c).await;
+    done.store(true, Ordering::SeqCst);
+    let seen = mailbox.join().unwrap();
+    let WorkerResult::Outcome(out) = res else {
+        panic!("expected an outcome, got {res:?}")
+    };
+    assert!(seen.is_empty(), "a refused session sends nothing");
+    assert!(matches!(out.receipt.outcome, Outcome::Failure(_)));
+    assert!(
+        reason(&out).starts_with("version conflict: expected "),
+        "{}",
+        reason(&out)
+    );
+}
+
+#[tokio::test]
+async fn a_model_request_out_of_order_from_the_guest_is_a_failure() {
+    let fx = Fx::with_peer();
+    // The workspace image must exist for a job VM (a snapshot would need the peer's protocol).
+    fs::create_dir_all(fx.task_dir()).unwrap();
+    fs::File::create(fx.task_dir().join("ws.img"))
+        .unwrap()
+        .set_len(fx.cfg.resources.disk_bytes())
+        .unwrap();
+    let (req, c) = (
+        session_request(&fx, Digest::of(b"base"), "/bin/true"),
+        ctx(),
+    );
+    let job = fx.job(&req, &c);
+    let guest = peer(&job, |s, request| {
+        assert!(matches!(request, Message::RunAgent { .. }), "{request:?}");
+        // The first request of a session is 1; a peer that skips to 2 is a violation.
+        send(s, Message::ModelRequest { id: 2 });
+        write_frame(s, &Frame::Raw(b"{}".to_vec())).unwrap();
+        bye(s);
+    });
+    let res = fx.worker(&job, test_env()).run_job(&req, &c).await;
+    guest.join().unwrap();
+    let WorkerResult::Outcome(out) = res else {
+        panic!("expected an outcome, got {res:?}")
+    };
+    let why = reason(&out);
+    assert!(why.contains("model request 2"), "{why}");
+    assert!(matches!(out.receipt.outcome, Outcome::Failure(_)));
 }
