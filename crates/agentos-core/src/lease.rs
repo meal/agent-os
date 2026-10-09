@@ -1,10 +1,17 @@
 use std::time::Duration;
 
+/// The longest lease an agent session may have (four hours). A session lease is also never
+/// longer than the task's remaining deadline; every other kind keeps the shorter cap.
+pub const MAX_SESSION_TIMEOUT_MS: i64 = 14_400_000;
+
 /// Per-effect wall-clock timeouts used to size leases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EffectTimeouts {
     pub verification: Duration,
     pub other: Duration,
+    /// An agent session's timeout before the task deadline clips it (at most
+    /// [`MAX_SESSION_TIMEOUT_MS`]).
+    pub session: Duration,
 }
 
 impl Default for EffectTimeouts {
@@ -12,6 +19,7 @@ impl Default for EffectTimeouts {
         EffectTimeouts {
             verification: Duration::from_secs(70),
             other: Duration::from_secs(30),
+            session: Duration::from_millis(MAX_SESSION_TIMEOUT_MS as u64),
         }
     }
 }
@@ -72,5 +80,17 @@ mod tests {
         let t = EffectTimeouts::default();
         assert_eq!(t.verification, std::time::Duration::from_secs(70));
         assert_eq!(t.other, std::time::Duration::from_secs(30));
+        assert_eq!(t.session, std::time::Duration::from_secs(4 * 3600));
+    }
+
+    #[test]
+    fn session_lease_without_a_deadline_is_its_timeout_and_a_deadline_clips_it() {
+        let now = 1_000_000;
+        let session = MAX_SESSION_TIMEOUT_MS;
+        assert_eq!(lease_expiry_ms(now, session, 0), now + session);
+        // Half an hour left of a two-hour deadline: the lease is the remaining time.
+        let deadline = now + 7_200_000;
+        assert_eq!(lease_expiry_ms(now, 1_800_000, deadline), now + 1_800_000);
+        assert_eq!(lease_expiry_ms(now, session, deadline), deadline);
     }
 }

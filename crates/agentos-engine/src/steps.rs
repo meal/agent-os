@@ -186,6 +186,8 @@ fn artifact_type(kind: &EffectKind, outcome: &Outcome) -> &'static str {
         (EffectKind::ModelCall { .. }, _) => "model-response",
         (EffectKind::ListFiles { .. }, _) => "file-list",
         (EffectKind::ReadFile { .. }, _) => "file-content",
+        (EffectKind::AnalyzeSnapshot, _) => "analysis-report",
+        (EffectKind::RunAgentSession { .. }, _) => "agent-session",
     }
 }
 
@@ -302,7 +304,8 @@ fn reason_of(out: &ExecOutcome) -> String {
 
 /// The end of an effect nobody can decide: a DISPATCHED one becomes UNKNOWN (its reservation
 /// `Uncertain`, since it may have run), and a task that is not terminal yet fails with
-/// "unreconcilable effect <id>". Returns the task's state afterwards.
+/// "unreconcilable effect <id>", or "agent session lost" for a session (which is never run
+/// again). Returns the task's state afterwards.
 pub(crate) fn mark_unreconcilable(db: &Db, rec: &EffectRecord) -> Result<TaskState> {
     if rec.state == EffectState::Dispatched {
         db.mark_unknown(&rec.effect_id)?;
@@ -311,11 +314,11 @@ pub(crate) fn mark_unreconcilable(db: &Db, rec: &EffectRecord) -> Result<TaskSta
     if t.state.is_terminal() {
         return Ok(t.state);
     }
-    fail(
-        db,
-        &rec.task_id,
-        &format!("unreconcilable effect {}", rec.effect_id),
-    )
+    let reason = match rec.kind {
+        EffectKind::RunAgentSession { .. } => "agent session lost".to_string(),
+        _ => format!("unreconcilable effect {}", rec.effect_id),
+    };
+    fail(db, &rec.task_id, &reason)
 }
 
 /// Steps 4-6 for an outcome in hand, whether just executed, retained by the executor
@@ -352,7 +355,8 @@ pub(crate) fn finish_attempt<E>(
 ///   as rejected when a cancel is pending or the task is terminal, and errors otherwise.
 /// - RunVerification: `VerifyPassed` for the task's current digest only when the check ran,
 ///   passed, and its evidence is for exactly that digest; otherwise `VerifyFailed`.
-/// - ExportBundle, ModelCall, ListFiles, ReadFile: none.
+/// - ExportBundle, ModelCall, ListFiles, ReadFile, AnalyzeSnapshot: none (an analysis report
+///   claiming anything still never verifies).
 pub fn follow_up_event(kind: &EffectKind, out: &ExecOutcome, task: &Task) -> Option<TaskEvent> {
     match kind {
         EffectKind::ReadSnapshot | EffectKind::ApplyPatch { .. } => {
@@ -368,10 +372,13 @@ pub fn follow_up_event(kind: &EffectKind, out: &ExecOutcome, task: &Task) -> Opt
         } else {
             TaskEvent::VerifyFailed
         }),
+        // The analysis report is advisory: it never verifies and never moves the workspace.
         EffectKind::ExportBundle
         | EffectKind::ModelCall { .. }
         | EffectKind::ListFiles { .. }
-        | EffectKind::ReadFile { .. } => None,
+        | EffectKind::ReadFile { .. }
+        | EffectKind::AnalyzeSnapshot
+        | EffectKind::RunAgentSession { .. } => None,
     }
 }
 
@@ -468,6 +475,24 @@ mod tests {
                 None
             );
         }
+    }
+
+    /// An analysis that claims a pass, carries a verification report and a new workspace
+    /// still produces no task event: it can never verify or move the workspace.
+    #[test]
+    fn an_analysis_never_produces_a_task_event_whatever_it_claims() {
+        let kind = EffectKind::AnalyzeSnapshot;
+        let now = task(TaskState::Verifying, d("w1"));
+        let mut out = outcome(&kind, true);
+        out.output = br#"{"passed":true,"workspace_digest":"w1"}"#.to_vec();
+        out.new_workspace = Some(d("w2"));
+        out.verification = Some(VerificationReport {
+            passed: true,
+            workspace: d("w1"),
+            summary: "s".into(),
+        });
+        assert_eq!(follow_up_event(&kind, &out, &now), None);
+        assert_eq!(follow_up_event(&kind, &outcome(&kind, false), &now), None);
     }
 
     #[test]

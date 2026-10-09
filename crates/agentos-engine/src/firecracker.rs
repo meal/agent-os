@@ -8,20 +8,21 @@
 
 use std::fs::{self, File, TryLockError};
 use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use agentos_core::effect::{AttemptId, EffectKind};
+use agentos_core::effect::{AgentSessionSpec, AttemptId, EffectKind};
 use agentos_core::guest::{
-    FILE_LIMIT, GUEST_CID, GUEST_MIN_MEMORY_MIB, GUEST_PROTOCOL, MAX_VCPUS, Message, Mode,
-    OUTPUT_LIMIT, PATCH_LIMIT, PROFILE_LIMIT, SCRATCH_IMAGE_BYTES, SNAPSHOT_BYTES_LIMIT,
-    SNAPSHOT_FILES_LIMIT, WS_IMAGE_BYTES, mint_attempt_token, unb64,
+    FILE_LIMIT, Frame, GUEST_CID, GUEST_MIN_MEMORY_MIB, GUEST_PROTOCOL, MAX_VCPUS, Message, Mode,
+    OUTPUT_LIMIT, PATCH_LIMIT, PROFILE_LIMIT, SNAPSHOT_BYTES_LIMIT, SNAPSHOT_FILES_LIMIT,
+    mint_attempt_token, unb64,
 };
 use agentos_core::ids::{Digest, TaskId};
+use agentos_core::resources::VmResources;
 use agentos_core::workspace::{list_files, workspace_digest};
 use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 use serde::{Deserialize, Serialize};
@@ -29,8 +30,8 @@ use serde::{Deserialize, Serialize};
 use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Reconciliation};
 use crate::guestlink::{GuestLauncher, GuestLink, LinkError, fake_command, guest_text, type_name};
 use crate::jail::{self, CgroupOverrides, JailMode, StageSources};
-use crate::job::JobDir;
-use crate::outcomes::{self, Check};
+use crate::job::{JobDir, Mailbox};
+use crate::outcomes::{self, AgentEnd, Check};
 use crate::worker::{TEST_WORKERS_ENV, Worker};
 
 pub use agentos_guest::handlers::PatchStateIs;
@@ -59,6 +60,12 @@ const VERIFY_REPLY_MARGIN: Duration = Duration::from_secs(60);
 /// Bounds each single write to the guest (a peer that stops reading).
 const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 const EXIT_POLL: Duration = Duration::from_millis(10);
+/// How often a session's model mailbox, cancel marker and lease are looked at while the guest
+/// or the controller is quiet.
+const SESSION_POLL: Duration = Duration::from_millis(50);
+/// The guest's own limit on the CLI stops this long before the lease, so the CLI's end is
+/// reported before the host kills the VM.
+const SESSION_MARGIN_SECS: i64 = 10;
 /// How long `firecracker --version` may take.
 const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 const WS_BUSY: &str = "workspace image is attached to another VM";
@@ -87,6 +94,10 @@ pub struct FirecrackerConfig {
     pub launcher: GuestLauncher,
     /// Decided by the controller; the worker only executes it.
     pub jail: JailMode,
+    /// The task's drive sizes and rate limits, as recorded at submission. A `request.json`
+    /// written before they were recorded has none: version 0.
+    #[serde(default = "version_zero")]
+    pub resources: VmResources,
 }
 
 impl FirecrackerConfig {
@@ -186,6 +197,10 @@ struct BootSource<'a> {
     boot_args: &'a str,
 }
 
+fn version_zero() -> VmResources {
+    VmResources::V0
+}
+
 #[derive(Serialize)]
 struct Drive<'a> {
     drive_id: &'a str,
@@ -193,6 +208,39 @@ struct Drive<'a> {
     is_read_only: bool,
     path_on_host: &'a str,
     cache_type: &'a str,
+    /// Absent without a contracted limit, so such a `vm.json` is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rate_limiter: Option<RateLimiter>,
+}
+
+/// Firecracker v1.17.0's `RateLimiter`: independent bytes/s and operations/s token buckets.
+#[derive(Serialize, Clone, Copy)]
+struct RateLimiter {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bandwidth: Option<TokenBucket>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ops: Option<TokenBucket>,
+}
+
+/// `size` tokens, refilled over `refill_time` milliseconds. No `one_time_burst`: the bucket
+/// starts full (one second's worth) and then refills at the contracted rate.
+#[derive(Serialize, Clone, Copy)]
+struct TokenBucket {
+    size: u64,
+    refill_time: u64,
+}
+
+/// The limiter of each writable drive, or `None` when the contract sets no rate.
+fn rate_limiter(r: &VmResources) -> Option<RateLimiter> {
+    let per_second = |size: u64| TokenBucket {
+        size,
+        refill_time: 1000,
+    };
+    let limiter = RateLimiter {
+        bandwidth: r.bandwidth_mib_s.map(|b| per_second(u64::from(b) << 20)),
+        ops: r.iops.map(|o| per_second(u64::from(o))),
+    };
+    (limiter.bandwidth.is_some() || limiter.ops.is_some()).then_some(limiter)
 }
 
 #[derive(Serialize)]
@@ -216,6 +264,7 @@ struct Logger<'a> {
 }
 
 fn vm_config<'a>(cfg: &FirecrackerConfig, view: &'a VmView) -> VmConfig<'a> {
+    let limiter = rate_limiter(&cfg.resources);
     VmConfig {
         boot_source: BootSource {
             kernel_image_path: &view.kernel,
@@ -228,6 +277,7 @@ fn vm_config<'a>(cfg: &FirecrackerConfig, view: &'a VmView) -> VmConfig<'a> {
                 is_read_only: true,
                 path_on_host: &view.rootfs,
                 cache_type: "Unsafe",
+                rate_limiter: None,
             },
             // Writeback: a guest fsync reaches ws.img before the guest reports success.
             Drive {
@@ -236,6 +286,7 @@ fn vm_config<'a>(cfg: &FirecrackerConfig, view: &'a VmView) -> VmConfig<'a> {
                 is_read_only: false,
                 path_on_host: &view.ws_img,
                 cache_type: "Writeback",
+                rate_limiter: limiter,
             },
             Drive {
                 drive_id: "scratch",
@@ -243,6 +294,7 @@ fn vm_config<'a>(cfg: &FirecrackerConfig, view: &'a VmView) -> VmConfig<'a> {
                 is_read_only: false,
                 path_on_host: &view.scratch_img,
                 cache_type: "Unsafe",
+                rate_limiter: limiter,
             },
         ],
         machine_config: MachineConfig {
@@ -294,6 +346,18 @@ pub struct InterpreterProvenance {
     pub pyenv_commit: String,
 }
 
+/// How an image's kernel was built here (`scripts/build-kernel.sh`): the source, the resolved
+/// configuration and the toolchain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KernelBuildProvenance {
+    pub version: String,
+    pub source_sha256: String,
+    pub config_sha256: String,
+    pub gcc: String,
+    pub binutils: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImageManifest {
@@ -306,6 +370,8 @@ pub struct ImageManifest {
     pub built_from: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interpreter: Option<InterpreterProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_build: Option<KernelBuildProvenance>,
 }
 
 /// Parses `<image_dir>/image.json` and checks that it speaks `GUEST_PROTOCOL` and names
@@ -315,23 +381,38 @@ pub fn read_image(image_dir: &Path) -> Result<ImageManifest, String> {
     let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let image: ImageManifest =
         serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-    if let Some(interpreter) = &image.interpreter {
-        let hex = |s: &str, n: usize| {
-            s.len() == n
-                && s.bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    let hex = |s: &str, n: usize| {
+        s.len() == n
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    if let Some(k) = &image.kernel_build {
+        let version = !k.version.is_empty()
+            && k.version.len() <= 32
+            && k.version.bytes().all(|b| b.is_ascii_digit() || b == b'.');
+        let text = |t: &str| {
+            !t.is_empty() && t.len() <= 128 && t.bytes().all(|b| (b' '..=b'~').contains(&b))
         };
-        if interpreter.version.is_empty()
+        if !version
+            || !hex(&k.source_sha256, 64)
+            || !hex(&k.config_sha256, 64)
+            || !text(&k.gcc)
+            || !text(&k.binutils)
+        {
+            return Err("invalid kernel build provenance".into());
+        }
+    }
+    if let Some(interpreter) = &image.interpreter
+        && (interpreter.version.is_empty()
             || interpreter.version.len() > 32
             || !interpreter
                 .version
                 .bytes()
                 .all(|b| b.is_ascii_digit() || b == b'.')
             || !hex(&interpreter.source_sha256, 64)
-            || !hex(&interpreter.pyenv_commit, 40)
-        {
-            return Err("invalid interpreter provenance".into());
-        }
+            || !hex(&interpreter.pyenv_commit, 40))
+    {
+        return Err("invalid interpreter provenance".into());
     }
     if image.protocol != GUEST_PROTOCOL {
         return Err(format!(
@@ -491,6 +572,11 @@ pub struct FirecrackerWorker {
 
 /// The request to send, prepared (and limit-checked) before anything is launched.
 enum Plan {
+    Session {
+        spec: AgentSessionSpec,
+        expected_base: Digest,
+        lease_expiry_ms: i64,
+    },
     Snapshot {
         files: u64,
         bytes: u64,
@@ -508,6 +594,7 @@ enum Plan {
 
 /// The reply that decides the outcome, held until the VM is down.
 enum Reply {
+    Session(AgentEnd),
     Refused(String),
     Snapshot(Vec<String>, Digest),
     Patch(Vec<String>, Digest),
@@ -518,6 +605,8 @@ enum Reply {
 enum Served {
     Lost,
     Violation(String),
+    /// The host ended the session on purpose (its lease, or the cancel marker).
+    Interrupted(String),
 }
 
 /// Removes `scratch.img` however the job ends inside this process.
@@ -666,8 +755,105 @@ fn lock_ws(lock: &File) -> Result<(), TryLockError> {
     }
 }
 
+/// The guest kernel's line for a failed block request on one of the VM's drives (`vdb` the
+/// workspace, `vdc` scratch): the drive's host file could not be written, which with sparse
+/// images means the host disk is full. Only the kernel prints it with this `] ` prefix; the
+/// check cannot write the console (a KVM test checks that).
+const GUEST_BLOCK_IO_ERROR: &[u8] = b"] I/O error, dev vd";
+/// The most of `console.log` read when looking for it.
+const CONSOLE_SCAN_LIMIT: u64 = 4 << 20;
+
+/// Whether the VM's serial console logged a guest block I/O error.
+fn guest_block_io_errors(console_log: &Path) -> bool {
+    let Ok(mut file) = File::open(console_log) else {
+        return false;
+    };
+    let len = file.metadata().map_or(0, |m| m.len());
+    let mut tail = Vec::new();
+    let skip = len.saturating_sub(CONSOLE_SCAN_LIMIT);
+    if io::Seek::seek(&mut file, io::SeekFrom::Start(skip)).is_err()
+        || io::Read::read_to_end(
+            &mut io::Read::take(&mut file, CONSOLE_SCAN_LIMIT),
+            &mut tail,
+        )
+        .is_err()
+    {
+        return false;
+    }
+    tail.windows(GUEST_BLOCK_IO_ERROR.len())
+        .any(|w| w == GUEST_BLOCK_IO_ERROR)
+}
+
+/// The reason of an effect whose guest saw block I/O errors.
+const HOST_DISK_IO: &str = "host disk: the VM's drives returned I/O errors (see console.log)";
+
+/// `reason`, said to be the host disk's failure when the guest logged block I/O errors
+/// (formatting scratch at boot on a full host fails the boot).
+fn host_disk_hint(console_log: &Path, reason: String) -> String {
+    if guest_block_io_errors(console_log) {
+        format!("{HOST_DISK_IO}: {reason}")
+    } else {
+        reason
+    }
+}
+
 fn sparse(path: &Path, len: u64) -> io::Result<()> {
     File::create(path)?.set_len(len)
+}
+
+/// An existing `ws.img` must have the task's recorded size: the first snapshot fixed it, and
+/// nothing ever resizes or recreates it for a later effect.
+pub fn check_ws_img_len(ws_img: &Path, resources: &VmResources) -> Result<(), String> {
+    let len = fs::metadata(ws_img)
+        .map_err(|e| format!("workspace image {}: {e}", ws_img.display()))?
+        .len();
+    if len == resources.disk_bytes() {
+        return Ok(());
+    }
+    Err(format!(
+        "workspace image {} is {len} bytes, not the task's recorded size of {} MiB; it is left as is",
+        ws_img.display(),
+        resources.disk_mib
+    ))
+}
+
+/// The advisory host disk check: free space under `dir` must cover `need` bytes. Space can
+/// still run out afterwards. The test seam `AGENTOS_TEST_HOST_FREE_MIB` (honoured only with
+/// `AGENTOS_TEST_WORKERS=1`, from `extra` or the process) replaces the free figure.
+pub fn check_host_space(dir: &Path, need: u64, extra: &[(String, String)]) -> Result<(), String> {
+    let seam = env_value(extra, TEST_WORKERS_ENV).as_deref() == Some("1");
+    let free = match env_value(extra, "AGENTOS_TEST_HOST_FREE_MIB").filter(|_| seam) {
+        Some(mib) => {
+            mib.parse::<u64>()
+                .map_err(|e| format!("AGENTOS_TEST_HOST_FREE_MIB: {e}"))?
+                << 20
+        }
+        None => {
+            let st = rustix::fs::statvfs(dir)
+                .map_err(|e| format!("host disk: cannot stat {}: {e}", dir.display()))?;
+            st.f_bavail.saturating_mul(st.f_frsize)
+        }
+    };
+    if free >= need {
+        return Ok(());
+    }
+    Err(format!(
+        "host disk: {} MiB free under {}, the VM may write {} MiB",
+        free >> 20,
+        dir.display(),
+        need.div_ceil(1 << 20)
+    ))
+}
+
+/// What a VM may still allocate on the host: the unallocated part of `ws.img` (all of it
+/// when a snapshot recreates it) plus the scratch image.
+fn vm_host_bytes(resources: &VmResources, ws_img: &Path, fresh_ws: bool) -> u64 {
+    let allocated = if fresh_ws {
+        0
+    } else {
+        fs::metadata(ws_img).map_or(0, |m| m.blocks() * 512)
+    };
+    resources.disk_bytes().saturating_sub(allocated) + resources.scratch_bytes()
 }
 
 /// `name` from `extra` (a test seam's environment, last entry wins) or else the process's.
@@ -714,7 +900,7 @@ fn fake_gate(cfg: &FirecrackerConfig, extra: &[(String, String)]) -> Result<(), 
 /// `jail::stage` makes `firecracker.log` as a link to the chroot's, and the chroot's
 /// `vm.json`).
 fn prepare_vm_files(cfg: &FirecrackerConfig, paths: &VmPaths) -> io::Result<()> {
-    sparse(&paths.scratch_img, SCRATCH_IMAGE_BYTES)?;
+    sparse(&paths.scratch_img, cfg.resources.scratch_bytes())?;
     File::create(&paths.console_log)?;
     File::create(&paths.stderr_log)?;
     if matches!(cfg.jail, JailMode::Unjailed) {
@@ -783,6 +969,7 @@ fn launch(
                 &cfg.firecracker_bin,
                 cfg.vcpus,
                 cfg.memory_mib,
+                &cfg.resources,
                 overrides,
             ));
             (cmd, jail::host_uds(&plan))
@@ -917,10 +1104,26 @@ impl FirecrackerWorker {
                     source,
                 })
             }
+            EffectKind::RunAgentSession { expected_base } => {
+                let spec = AgentSessionSpec::from_payload(&req.payload)
+                    .map_err(|e| format!("invalid agent session: {e}"))?;
+                let lease_expiry_ms = JobDir {
+                    path: self.job_dir.clone(),
+                }
+                .request()
+                .map_err(|e| format!("cannot read the job's lease: {e}"))?
+                .lease_expiry_ms;
+                Ok(Plan::Session {
+                    spec,
+                    expected_base: *expected_base,
+                    lease_expiry_ms,
+                })
+            }
             EffectKind::ExportBundle => Err("not implemented in this milestone".into()),
             EffectKind::ModelCall { .. }
             | EffectKind::ListFiles { .. }
-            | EffectKind::ReadFile { .. } => {
+            | EffectKind::ReadFile { .. }
+            | EffectKind::AnalyzeSnapshot => {
                 Err(format!("not a worker effect: {}", req.kind.tag()))
             }
         }
@@ -997,6 +1200,14 @@ impl FirecrackerWorker {
         if !snapshot && !paths.ws_img.is_file() {
             return fail(WORKSPACE_MISSING.into());
         }
+        if !snapshot && let Err(why) = check_ws_img_len(&paths.ws_img, &self.cfg.resources) {
+            return fail(why);
+        }
+        let need = vm_host_bytes(&self.cfg.resources, &paths.ws_img, snapshot);
+        let ws_dir = paths.ws_img.parent().unwrap_or(&paths.ws_img);
+        if let Err(why) = check_host_space(ws_dir, need, &self.env) {
+            return fail(why);
+        }
         let plan = match self.plan(req) {
             Ok(p) => p,
             Err(reason) => return fail(reason),
@@ -1009,7 +1220,7 @@ impl FirecrackerWorker {
         }
         // ws.img is created by ReadSnapshot only, from zero on every attempt, so a retry
         // starts clean.
-        if snapshot && let Err(e) = sparse(&paths.ws_img, WS_IMAGE_BYTES) {
+        if snapshot && let Err(e) = sparse(&paths.ws_img, self.cfg.resources.disk_bytes()) {
             return fail(format!(
                 "cannot prepare the VM: {}: {e}",
                 paths.ws_img.display()
@@ -1048,7 +1259,7 @@ impl FirecrackerWorker {
             Ok(link) => link,
             Err(e) => {
                 vm.kill();
-                return fail(not_up(&e));
+                return fail(host_disk_hint(&paths.console_log, not_up(&e)));
             }
         };
         let hello = Message::Hello {
@@ -1071,12 +1282,19 @@ impl FirecrackerWorker {
         if let Err(e) = ready {
             drop(link);
             vm.kill();
-            return fail(not_up(&e));
+            return fail(host_disk_hint(&paths.console_log, not_up(&e)));
         }
 
         // Serve: one request, one reply. From the first byte of the request on, a lost
         // connection or a violation leaves the effect unknown for a patch.
-        let served = self.serve(&mut link, &plan, req, &mut vm);
+        let served = match &plan {
+            Plan::Session {
+                spec,
+                expected_base,
+                lease_expiry_ms,
+            } => self.serve_session(&mut link, &mut vm, spec, *expected_base, *lease_expiry_ms),
+            _ => self.serve(&mut link, &plan, req, &mut vm),
+        };
         let reply = match served {
             Ok(reply) => reply,
             Err(served) => {
@@ -1086,7 +1304,7 @@ impl FirecrackerWorker {
                     Served::Lost => {
                         format!("guest exited before reporting: {}", exit_code_text(&status))
                     }
-                    Served::Violation(why) => why,
+                    Served::Violation(why) | Served::Interrupted(why) => why,
                 };
                 return if is_patch {
                     WorkerResult::NoOutcome(reason)
@@ -1103,11 +1321,26 @@ impl FirecrackerWorker {
         drop(link);
         vm.wait_or_kill(SHUTDOWN_WAIT);
         drop(vm);
+        // With I/O errors from the drives, a refusal or a failed check says nothing about the
+        // workspace or the code: it is the host's failure, and the agent is told so.
+        let io_errors = guest_block_io_errors(&paths.console_log);
         let out = match reply {
+            Reply::Refused(reason) if io_errors => {
+                ExecOutcome::failure(req, ctx, format!("{HOST_DISK_IO}: {reason}"))
+            }
             Reply::Refused(reason) => ExecOutcome::failure(req, ctx, reason),
+            Reply::Session(end) => outcomes::agent_session(req, ctx, end),
             Reply::Snapshot(files, digest) => outcomes::snapshot_manifest(req, ctx, files, digest),
             Reply::Patch(touched, digest) => outcomes::patch_applied(req, ctx, touched, digest),
             Reply::Verified(check) => match self.check_profile(&plan, &check) {
+                Ok(()) if io_errors && check.exit_code != Some(0) => ExecOutcome::failure(
+                    req,
+                    ctx,
+                    format!(
+                        "{HOST_DISK_IO}; the check's failure (exit code {:?}) is not evidence",
+                        check.exit_code
+                    ),
+                ),
                 Ok(()) => outcomes::evidence(req, ctx, &check),
                 Err(reason) => ExecOutcome::failure(req, ctx, reason),
             },
@@ -1153,6 +1386,11 @@ impl FirecrackerWorker {
             _ => Served::Lost,
         };
         let reply_until = match plan {
+            Plan::Session { .. } => {
+                return Err(Served::Interrupted(
+                    "an agent session is served by serve_session".into(),
+                ));
+            }
             Plan::Snapshot { files, bytes } => {
                 link.send(&Message::ReadSnapshot {
                     file_count: *files,
@@ -1194,6 +1432,7 @@ impl FirecrackerWorker {
         };
         let violation = |why: String| Served::Violation(LinkError::Protocol(why).to_string());
         let expected = match plan {
+            Plan::Session { .. } => "AgentDone",
             Plan::Snapshot { .. } => "SnapshotDone",
             Plan::Patch { .. } => "PatchApplied",
             Plan::Verify { .. } => "Verified",
@@ -1252,6 +1491,141 @@ impl FirecrackerWorker {
             ))),
         }
     }
+}
+
+impl FirecrackerWorker {
+    /// `RunAgent`, then the CLI's model calls through the job's session mailbox until the
+    /// guest reports how the CLI ended (`AgentDone`) or refuses (`Refused`). The guest numbers
+    /// its requests 1, 2, ...; any other number is a violation. A call waits on the controller;
+    /// the session ends at its lease or on the cancel marker, whichever comes first.
+    fn serve_session(
+        &self,
+        link: &mut GuestLink,
+        vm: &mut Vm,
+        spec: &AgentSessionSpec,
+        expected_base: Digest,
+        lease_expiry_ms: i64,
+    ) -> Result<Reply, Served> {
+        let link_err = |e: LinkError| match e {
+            LinkError::Protocol(_) => Served::Violation(e.to_string()),
+            _ => Served::Lost,
+        };
+        let violation = |why: String| Served::Violation(LinkError::Protocol(why).to_string());
+        let job = JobDir {
+            path: self.job_dir.clone(),
+        };
+        let mailbox = Mailbox::new(job.session_dir());
+        link.send(&Message::RunAgent {
+            argv: spec.argv.clone(),
+            env: spec.env.clone(),
+            timeout_secs: session_timeout_secs(lease_expiry_ms, unix_ms()),
+            expected_base,
+        })
+        .map_err(link_err)?;
+        let mut next_id = 1;
+        loop {
+            let frame = loop {
+                if let Some(why) = session_stop(&job, lease_expiry_ms) {
+                    vm.kill();
+                    return Err(Served::Interrupted(why));
+                }
+                let polled = link.poll_frame(SESSION_POLL, Instant::now() + REPLY_TIMEOUT);
+                if let Some(frame) = polled.map_err(link_err)? {
+                    break frame;
+                }
+            };
+            match frame {
+                Frame::Json(Message::ModelRequest { id }) => {
+                    if id != next_id {
+                        return Err(violation(format!(
+                            "model request {id} arrived, expected {next_id}"
+                        )));
+                    }
+                    let body = link
+                        .recv_body(Instant::now() + REPLY_TIMEOUT)
+                        .map_err(link_err)?;
+                    if let Err(e) = mailbox.worker_post_request(id, &body) {
+                        vm.kill();
+                        return Err(Served::Interrupted(format!(
+                            "cannot post model request {id}: {}",
+                            guest_text(&e.to_string())
+                        )));
+                    }
+                    let (status, reply) = loop {
+                        match mailbox.worker_poll_reply(id) {
+                            Ok(Some(answer)) => break answer,
+                            Ok(None) => {}
+                            Err(e) => {
+                                vm.kill();
+                                return Err(Served::Interrupted(format!(
+                                    "the answer to model request {id} is invalid: {}",
+                                    guest_text(&e.to_string())
+                                )));
+                            }
+                        }
+                        if let Some(why) = session_stop(&job, lease_expiry_ms) {
+                            vm.kill();
+                            return Err(Served::Interrupted(why));
+                        }
+                        thread::sleep(SESSION_POLL);
+                    };
+                    link.send(&Message::ModelReply { id, status })
+                        .map_err(link_err)?;
+                    link.send_body(&reply).map_err(link_err)?;
+                    next_id += 1;
+                }
+                Frame::Json(Message::AgentDone {
+                    exit_code,
+                    signal,
+                    timed_out,
+                    workspace_digest,
+                }) => {
+                    let patch = link
+                        .recv_body(Instant::now() + REPLY_TIMEOUT)
+                        .map_err(link_err)?;
+                    return Ok(Reply::Session(AgentEnd {
+                        exit_code,
+                        signal,
+                        timed_out,
+                        workspace_digest,
+                        patch,
+                    }));
+                }
+                Frame::Json(Message::Refused { reason }) => {
+                    return Ok(Reply::Refused(guest_text(&reason)));
+                }
+                Frame::Json(other) => {
+                    return Err(violation(format!(
+                        "expected ModelRequest or AgentDone, got {}",
+                        type_name(&other)
+                    )));
+                }
+                Frame::Raw(_) => {
+                    return Err(violation("raw frame where a message was expected".into()));
+                }
+            }
+        }
+    }
+}
+
+/// Why a running session must end now: the controller cancelled its job, or its lease ran out.
+fn session_stop(job: &JobDir, lease_expiry_ms: i64) -> Option<String> {
+    if job.cancel_requested() {
+        return Some("agent session cancelled".into());
+    }
+    (unix_ms() >= lease_expiry_ms).then(|| "agent session timed out at its lease".into())
+}
+
+/// The CLI's own limit: the seconds left on the lease less a margin, at least one.
+fn session_timeout_secs(lease_expiry_ms: i64, now_ms: i64) -> u64 {
+    (lease_expiry_ms.saturating_sub(now_ms) / 1000 - SESSION_MARGIN_SECS).max(1) as u64
+}
+
+fn unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// What an inspection boot asks the guest (inspect mode).
@@ -1436,6 +1810,7 @@ impl Inspector {
         if !ws_img.is_file() {
             return Err(format!("workspace image {} is missing", ws_img.display()));
         }
+        check_ws_img_len(&ws_img, &self.cfg.resources).map_err(inspect_failed)?;
         let deadline = Instant::now() + self.inspect_timeout;
         fake_gate(&self.cfg, &self.env).map_err(inspect_failed)?;
         preflight(&self.cfg)
@@ -1665,6 +2040,7 @@ mod tests {
 
     fn config() -> FirecrackerConfig {
         FirecrackerConfig {
+            resources: agentos_core::resources::VmResources::V0,
             firecracker_bin: "/home/x/bin/firecracker".into(),
             image_dir: "/home/x/registry/images/python-stdlib-v1@0545ba17".into(),
             image_digest: Digest::of(b"image"),
@@ -1731,6 +2107,143 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&written).unwrap(),
             golden
+        );
+    }
+
+    #[test]
+    fn the_scratch_image_has_the_contracted_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config();
+        cfg.resources = VmResources {
+            version: 1,
+            scratch_mib: 768,
+            ..VmResources::V0
+        };
+        let task: TaskId = serde_json::from_str("\"task-1\"").unwrap();
+        let paths = VmPaths::new(dir.path(), &cfg.work_root, &task);
+        prepare_vm_files(&cfg, &paths).unwrap();
+        let scratch = fs::metadata(&paths.scratch_img).unwrap();
+        assert_eq!(scratch.len(), 768 << 20);
+        assert!(scratch.blocks() * 512 < 1 << 20, "scratch.img stays sparse");
+    }
+
+    #[test]
+    fn only_the_kernel_block_error_line_counts_as_a_guest_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let console = dir.path().join("console.log");
+        let check = |text: &str| {
+            fs::write(&console, text).unwrap();
+            guest_block_io_errors(&console)
+        };
+        assert!(check(
+            "[    0.593152] I/O error, dev vdc, sector 278528 op 0x1:(WRITE) flags 0x4000\n"
+        ));
+        assert!(!check(
+            "agentos-guest: snapshot failed: syncfs /workspace: I/O error (os error 5)\n"
+        ));
+        assert!(!check(
+            "Buffer I/O error on device vdc, logical block 34816\n"
+        ));
+        assert!(!guest_block_io_errors(&dir.path().join("missing.log")));
+        // Only the last CONSOLE_SCAN_LIMIT bytes are read.
+        let mut long = "[ 1.0] I/O error, dev vdb, sector 1\n".to_string();
+        long.push_str(&"x".repeat(CONSOLE_SCAN_LIMIT as usize));
+        assert!(!check(&long));
+    }
+
+    #[test]
+    fn a_kernel_build_record_is_parsed_and_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(KERNEL_FILE), b"k").unwrap();
+        fs::write(dir.path().join(ROOTFS_FILE), b"r").unwrap();
+        let sha = "a".repeat(64);
+        let manifest = |kernel_build: serde_json::Value| {
+            let m = serde_json::json!({
+                "id": "x-v1", "protocol": GUEST_PROTOCOL, "kernel": KERNEL_FILE,
+                "rootfs": ROOTFS_FILE, "agent_version": "0.1.0", "kernel_sha256": sha,
+                "built_from": "test", "kernel_build": kernel_build
+            });
+            fs::write(dir.path().join("image.json"), m.to_string()).unwrap();
+            read_image(dir.path())
+        };
+        let good = serde_json::json!({ "version": "6.18.51", "source_sha256": sha,
+            "config_sha256": sha, "gcc": "gcc (Debian 12.2.0-14+deb12u1) 12.2.0",
+            "binutils": "GNU ld (GNU Binutils for Debian) 2.40" });
+        let image = manifest(good.clone()).unwrap();
+        assert_eq!(image.kernel_build.unwrap().version, "6.18.51");
+        for (field, bad) in [
+            ("version", serde_json::json!("6.18.51-evil")),
+            ("config_sha256", serde_json::json!("short")),
+            ("gcc", serde_json::json!("gcc\nline")),
+            ("binutils", serde_json::json!("")),
+        ] {
+            let mut record = good.clone();
+            record[field] = bad;
+            assert_eq!(
+                manifest(record).unwrap_err(),
+                "invalid kernel build provenance",
+                "{field}"
+            );
+        }
+        let mut extra = good;
+        extra["extra"] = serde_json::json!(1);
+        assert!(manifest(extra).is_err(), "unknown fields are refused");
+    }
+
+    /// A `request.json` written before resources were recorded still parses, as version 0.
+    #[test]
+    fn a_config_without_resources_parses_as_version_zero() {
+        let mut json = serde_json::to_value(config()).unwrap();
+        json.as_object_mut().unwrap().remove("resources").unwrap();
+        let cfg: FirecrackerConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.resources, VmResources::V0);
+    }
+
+    #[test]
+    fn rate_limits_go_on_the_writable_drives_only_and_are_absent_by_default() {
+        let task: TaskId = serde_json::from_str("\"task-1\"").unwrap();
+        let mut cfg = config();
+        let paths = VmPaths::new(Path::new("/home/x/jobs/e-a"), &cfg.work_root, &task);
+        let drives = |cfg: &FirecrackerConfig| {
+            render_vm_json(cfg, &paths.host_view(&cfg.image_dir))["drives"]
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+        assert!(
+            drives(&cfg).iter().all(|d| d.get("rate_limiter").is_none()),
+            "no limit, no key: the rendered file is unchanged"
+        );
+        cfg.resources = VmResources {
+            version: 1,
+            disk_mib: 2048,
+            scratch_mib: 768,
+            bandwidth_mib_s: Some(64),
+            iops: Some(5000),
+        };
+        let both = serde_json::json!({
+            "bandwidth": { "size": 64u64 << 20, "refill_time": 1000 },
+            "ops": { "size": 5000, "refill_time": 1000 }
+        });
+        let d = drives(&cfg);
+        assert!(
+            d[0].get("rate_limiter").is_none(),
+            "the read-only rootfs is never limited"
+        );
+        assert_eq!(d[1]["rate_limiter"], both);
+        assert_eq!(d[2]["rate_limiter"], both);
+
+        cfg.resources.iops = None;
+        let d = drives(&cfg);
+        assert_eq!(
+            d[1]["rate_limiter"],
+            serde_json::json!({ "bandwidth": { "size": 64u64 << 20, "refill_time": 1000 } })
+        );
+        cfg.resources.bandwidth_mib_s = None;
+        cfg.resources.iops = Some(5000);
+        assert_eq!(
+            drives(&cfg)[2]["rate_limiter"],
+            serde_json::json!({ "ops": { "size": 5000, "refill_time": 1000 } })
         );
     }
 
@@ -1956,7 +2469,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join(KERNEL_FILE), b"k").unwrap();
         fs::write(dir.path().join(ROOTFS_FILE), b"r").unwrap();
-        let good = r#"{"id":"python-stdlib-v1","protocol":1,"kernel":"vmlinux","rootfs":"rootfs.squashfs","agent_version":"0.1.0","kernel_sha256":"0545ba1781fc06cfa1d7699069057f4538103fd1644100cf0da434899a1ed447","built_from":"test"}"#;
+        let good = r#"{"id":"python-stdlib-v1","protocol":2,"kernel":"vmlinux","rootfs":"rootfs.squashfs","agent_version":"0.1.0","kernel_sha256":"0545ba1781fc06cfa1d7699069057f4538103fd1644100cf0da434899a1ed447","built_from":"test"}"#;
         let write = |s: &str| fs::write(dir.path().join("image.json"), s).unwrap();
         write(good);
         assert_eq!(read_image(dir.path()).unwrap().id, "python-stdlib-v1");
@@ -1967,11 +2480,11 @@ mod tests {
                 .unwrap_err()
                 .contains("unknown field `extra`")
         );
-        write(&good.replace(r#""protocol":1"#, r#""protocol":2"#));
+        write(&good.replace(r#""protocol":2"#, r#""protocol":1"#));
         assert!(
             read_image(dir.path())
                 .unwrap_err()
-                .contains("protocol 2, expected 1")
+                .contains("protocol 1, expected 2")
         );
         write(&good.replace(r#""kernel":"vmlinux""#, r#""kernel":"../../etc/vmlinux""#));
         assert!(
@@ -1984,13 +2497,113 @@ mod tests {
         assert!(read_image(dir.path()).unwrap_err().contains("is missing"));
     }
 
+    /// The shipped recipes' manifests, rendered the way `build-guest-image.sh` renders them. The
+    /// agent CLI recipe speaks protocol 2; the three recipes frozen for the rc5 evidence still
+    /// say protocol 1, and a controller at `GUEST_PROTOCOL` refuses them.
+    #[test]
+    fn shipped_recipe_manifests_speak_the_protocol_they_declare() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let kernel_sha = "0545ba1781fc06cfa1d7699069057f4538103fd1644100cf0da434899a1ed447";
+        for recipe in [
+            "agent-cli-py314-v1",
+            "python-stdlib-v1",
+            "python-stdlib-py314-v1",
+            "python-stdlib-py314-v2",
+        ] {
+            let template =
+                fs::read_to_string(repo.join("guest").join(recipe).join("image.json.in"))
+                    .unwrap_or_else(|e| panic!("{recipe}: {e}"));
+            let rendered = template
+                .replace("@AGENT_VERSION@", "0.1.0")
+                .replace("@KERNEL_SHA256@", kernel_sha)
+                .replace("@GIT_SHA@", "test");
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("image.json"), rendered).unwrap();
+            fs::write(dir.path().join(KERNEL_FILE), b"k").unwrap();
+            fs::write(dir.path().join(ROOTFS_FILE), b"r").unwrap();
+            let result = read_image(dir.path());
+            if recipe == "agent-cli-py314-v1" {
+                let manifest = result.unwrap_or_else(|e| panic!("{recipe}: {e}"));
+                assert_eq!(manifest.id, recipe);
+            } else {
+                let err = result.expect_err(recipe);
+                assert!(err.contains("protocol 1, expected 2"), "{recipe}: {err}");
+            }
+        }
+    }
+
+    /// `agent-cli.lock` is sourced by the image hook: plain `KEY=VALUE` lines, the npm tarball
+    /// the pin names, and hashes of the right shape. Malformed or missing fields fail here.
+    #[test]
+    fn agent_cli_lock_is_well_formed_and_names_the_npm_tarball() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let text = fs::read_to_string(repo.join("guest/agent-cli-py314-v1/agent-cli.lock"))
+            .expect("guest/agent-cli-py314-v1/agent-cli.lock");
+        let mut fields = std::collections::BTreeMap::new();
+        for line in text
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        {
+            let (key, value) = line.split_once('=').expect("KEY=VALUE");
+            let plain = |s: &str| {
+                !s.is_empty()
+                    && s.bytes()
+                        .all(|b| b.is_ascii_graphic() && !b"\"'$`\\".contains(&b))
+            };
+            assert!(
+                key.bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'),
+                "key {key:?}"
+            );
+            assert!(plain(value), "value of {key} is not a plain token");
+            assert!(
+                fields.insert(key.to_string(), value.to_string()).is_none(),
+                "{key} twice"
+            );
+        }
+        let get = |k: &str| {
+            fields
+                .get(k)
+                .unwrap_or_else(|| panic!("{k} missing"))
+                .clone()
+        };
+        let version = get("AGENTOS_CLAUDE_CODE_VERSION");
+        assert!(
+            version.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+                && version.matches('.').count() == 2
+        );
+        assert_eq!(
+            get("AGENTOS_CLAUDE_CODE_PACKAGE"),
+            "@anthropic-ai/claude-code-linux-x64"
+        );
+        assert_eq!(
+            get("AGENTOS_CLAUDE_CODE_URL"),
+            format!(
+                "https://registry.npmjs.org/@anthropic-ai/claude-code-linux-x64/-/claude-code-linux-x64-{version}.tgz"
+            )
+        );
+        let hex64 = |s: String| {
+            s.len() == 64
+                && s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        assert!(hex64(get("AGENTOS_CLAUDE_CODE_TARBALL_SHA256")));
+        assert!(hex64(get("AGENTOS_CLAUDE_CODE_BINARY_SHA256")));
+        let integrity = get("AGENTOS_CLAUDE_CODE_INTEGRITY");
+        assert!(
+            integrity.starts_with("sha512-") && integrity.len() == "sha512-".len() + 88,
+            "{integrity}"
+        );
+        assert_eq!(fields.len(), 6, "unexpected fields: {:?}", fields.keys());
+    }
+
     #[test]
     fn image_manifest_records_optional_interpreter_provenance() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join(KERNEL_FILE), b"k").unwrap();
         fs::write(dir.path().join(ROOTFS_FILE), b"r").unwrap();
         let mut value = serde_json::json!({
-            "id": "python-stdlib-py314-v1", "protocol": 1, "kernel": "vmlinux",
+            "id": "python-stdlib-py314-v1", "protocol": 2, "kernel": "vmlinux",
             "rootfs": "rootfs.squashfs", "agent_version": "0.1.0",
             "kernel_sha256": "0545ba1781fc06cfa1d7699069057f4538103fd1644100cf0da434899a1ed447",
             "built_from": "test",
@@ -2016,5 +2629,14 @@ mod tests {
         value["interpreter"]["source_sha256"] = serde_json::json!("invalid");
         write(&value);
         assert!(read_image(dir.path()).is_err());
+    }
+
+    #[test]
+    fn a_session_gets_its_lease_less_a_margin_and_at_least_one_second() {
+        let now = 1_000_000;
+        assert_eq!(session_timeout_secs(now + 1_800_000, now), 1790);
+        assert_eq!(session_timeout_secs(now + 5_000, now), 1);
+        assert_eq!(session_timeout_secs(now - 1, now), 1);
+        assert_eq!(session_timeout_secs(i64::MIN, now), 1);
     }
 }

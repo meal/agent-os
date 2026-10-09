@@ -73,6 +73,19 @@ fn test_jail_fake() -> bool {
     }
 }
 
+/// The guest profile the test contracts name: the id of the image under test. Under the KVM
+/// tier (`AGENTOS_KVM_TESTS`) that is the configured image's, which need not be the default
+/// (`AGENTOS_ACCEPTANCE_IMAGE=python-stdlib-py314-v1`); the dummy image is registered under
+/// the same id, so every tier agrees.
+fn guest_profile() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        std::env::var_os("AGENTOS_KVM_TESTS")
+            .and_then(|_| kvm::configured_image_id())
+            .unwrap_or_else(|| "python-stdlib-v1".into())
+    })
+}
+
 fn fake_mode() -> bool {
     test_worker() == "firecracker-fake"
 }
@@ -149,9 +162,9 @@ impl Cli {
         }
     }
 
-    /// Registers the dummy `python-stdlib-v1` image (the contracts' `profile`); returns its digest.
+    /// Registers the dummy image under [`guest_profile`] (the contracts' `profile`); returns its digest.
     fn register_guest_image(&self) -> String {
-        let dir = fake_image_dir(self, "guest-image", "python-stdlib-v1", 0x68);
+        let dir = fake_image_dir(self, "guest-image", guest_profile(), 0x68);
         self.json_as(Mode::Plain, &["image", "register", dir.to_str().unwrap()])["digest"]
             .as_str()
             .unwrap()
@@ -289,7 +302,7 @@ impl Cli {
         let contract = json!({
             "goal": "fix the parser",
             "repository": { "source": source, "revision": revision },
-            "profile": "python-stdlib-v1",
+            "profile": guest_profile(),
             "editable_paths": ["src/**"],
             "verification_profile": "parser-checks-v1",
             "capabilities": ["snapshot.read", "workspace.apply_patch", "verification.run", "artifact.export"],
@@ -579,7 +592,7 @@ fn full_flow_submit_status_events_export_and_the_patch_reproduces_the_fix() {
         // The Firecracker worker records the registered image instead of the host's label.
         assert_eq!(
             submitted_event["payload"]["guest_image_id"],
-            "python-stdlib-v1"
+            guest_profile()
         );
         assert!(submitted_event["payload"].get("guest_image").is_none());
     } else {
@@ -1717,10 +1730,23 @@ fn revoke_unknown_capability_name_exits_2() {
     let contract = cli.contract(&cli.repo_copy());
     let done = cli.submit_yes(&contract, &fix_patch());
     let id = done["task_id"].as_str().unwrap();
-    cli.cmd(&["revoke", id, "--capability", "teleport.now"])
+    let mut assert = cli
+        .cmd(&["revoke", id, "--capability", "teleport.now"])
         .assert()
         .code(2)
         .stderr(predicate::str::contains("unknown capability"));
+    // The message lists every capability the contract may name.
+    for name in [
+        "snapshot.read",
+        "workspace.apply_patch",
+        "verification.run",
+        "artifact.export",
+        "model.request",
+        "snapshot.analyze",
+        "agent.session",
+    ] {
+        assert = assert.stderr(predicate::str::contains(name));
+    }
 }
 
 #[test]
@@ -1978,6 +2004,57 @@ fn ids_with_at_sign_or_traversal_are_rejected_at_register() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains("command"));
+}
+
+/// The guest protocol carries file contents without modes, so a command that runs a file from
+/// the profile directory directly could never execute in a VM: registration refuses it and
+/// names the interpreter form. Interpreter commands and absolute guest paths are accepted.
+#[test]
+fn commands_that_need_an_executable_bit_are_rejected_at_register() {
+    let cli = Cli::new();
+    let profile = |name: &str, command: Value| {
+        let dir = cli.path(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("check.sh"), "exit 0\n").unwrap();
+        fs::write(
+            dir.join("profile.json"),
+            json!({ "id": name, "command": command }).to_string(),
+        )
+        .unwrap();
+        dir
+    };
+    for (name, command) in [
+        ("dot-slash-v1", json!(["./check.sh"])),
+        ("nested-v1", json!(["bin/check.sh", "--fast"])),
+        ("bare-file-v1", json!(["check.sh"])),
+    ] {
+        cli.cmd(&[
+            "profile",
+            "register",
+            profile(name, command).to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("file modes"))
+        .stderr(predicate::str::contains("[\"sh\", \"check.sh\"]"));
+    }
+    assert_eq!(profile_registry_entries(&cli), Vec::<String>::new());
+    for (name, command) in [
+        ("sh-v1", json!(["sh", "check.sh"])),
+        ("python-v1", json!(["python3", "check.py"])),
+        ("absolute-v1", json!(["/usr/bin/true"])),
+    ] {
+        assert_eq!(register(&cli, &profile(name, command))["id"], name);
+    }
+    let mut ids: Vec<String> = cli
+        .json(&["profile", "list"])
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, ["absolute-v1", "python-v1", "sh-v1"]);
 }
 
 #[test]
@@ -2355,7 +2432,7 @@ fn fake_image_dir(cli: &Cli, name: &str, id: &str, rootfs_byte: u8) -> PathBuf {
     fs::write(
         dir.join("image.json"),
         json!({
-            "id": id, "protocol": 1, "kernel": "vmlinux", "rootfs": "rootfs.squashfs", "agent_version": "0.1.0",
+            "id": id, "protocol": 2, "kernel": "vmlinux", "rootfs": "rootfs.squashfs", "agent_version": "0.1.0",
             "kernel_sha256": "0545ba1781fc06cfa1d7699069057f4538103fd1644100cf0da434899a1ed447", "built_from": "test",
         })
         .to_string(),
@@ -2368,6 +2445,45 @@ fn fake_image_dir(cli: &Cli, name: &str, id: &str, rootfs_byte: u8) -> PathBuf {
 
 fn register_image(cli: &Cli, dir: &Path) -> Value {
     cli.json(&["image", "register", dir.to_str().unwrap()])
+}
+
+/// The shipped recipes' manifests, rendered as `build-guest-image.sh` renders them, through
+/// `image register`: the protocol-2 agent CLI recipe is accepted, the three protocol-1 recipes
+/// are refused.
+#[test]
+fn image_register_accepts_the_agent_cli_recipe_and_refuses_the_protocol_1_recipes() {
+    let cli = Cli::bare();
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let render = |recipe: &str| -> PathBuf {
+        let template = fs::read_to_string(repo.join("guest").join(recipe).join("image.json.in"))
+            .unwrap_or_else(|e| panic!("{recipe}: {e}"));
+        let dir = cli.path(&format!("render-{recipe}"));
+        fs::create_dir_all(&dir).unwrap();
+        let manifest = template
+            .replace("@AGENT_VERSION@", "0.1.0")
+            .replace(
+                "@KERNEL_SHA256@",
+                "0545ba1781fc06cfa1d7699069057f4538103fd1644100cf0da434899a1ed447",
+            )
+            .replace("@GIT_SHA@", "test");
+        fs::write(dir.join("image.json"), manifest).unwrap();
+        fs::write(dir.join("vmlinux"), [0x7fu8; 16]).unwrap();
+        fs::write(dir.join("rootfs.squashfs"), [0x68u8; 16]).unwrap();
+        dir
+    };
+    let accepted = register_image(&cli, &render("agent-cli-py314-v1"));
+    assert_eq!(accepted["id"], "agent-cli-py314-v1");
+    for recipe in [
+        "python-stdlib-v1",
+        "python-stdlib-py314-v1",
+        "python-stdlib-py314-v2",
+    ] {
+        cli.cmd(&["image", "register", render(recipe).to_str().unwrap()])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("protocol 1, expected 2"));
+    }
+    assert_eq!(cli.json(&["image", "list"]).as_array().unwrap().len(), 1);
 }
 
 #[test]
@@ -2396,7 +2512,7 @@ fn image_register_refuses_a_bad_manifest() {
     let manifest = fs::read_to_string(dir.join("image.json")).unwrap();
     fs::write(
         dir.join("image.json"),
-        manifest.replace("\"protocol\":1", "\"protocol\":2"),
+        manifest.replace("\"protocol\":2", "\"protocol\":1"),
     )
     .unwrap();
     cli.cmd(&["image", "register", dir.to_str().unwrap()])
@@ -2569,11 +2685,11 @@ impl Cli {
             .clone()
     }
 
-    /// `<home>/registry/images/python-stdlib-v1@<digest>/`.
+    /// `<home>/registry/images/<guest_profile>@<digest>/`.
     fn image_entry(&self, digest: &str) -> PathBuf {
         self.home()
             .join("registry/images")
-            .join(format!("python-stdlib-v1@{digest}"))
+            .join(format!("{}@{digest}", guest_profile()))
     }
 
     /// Changes one byte of the registered `rootfs.squashfs` (the registry is read-only: the
@@ -2635,7 +2751,7 @@ fn submit_with_worker_firecracker_records_the_worker_image_version_and_host_kern
     assert_eq!(out["state"], "SUCCEEDED");
     let s = cli.submitted(out["task_id"].as_str().unwrap());
     assert_eq!(s["worker"], "firecracker");
-    assert_eq!(s["guest_image_id"], "python-stdlib-v1");
+    assert_eq!(s["guest_image_id"], guest_profile());
     assert_eq!(s["guest_image_digest"], digest.as_str());
     assert_eq!(s["firecracker_version"], "fake");
     assert!(!s["host_kernel"].as_str().unwrap().is_empty(), "{s}");
@@ -3144,9 +3260,10 @@ fn submit_without_a_registered_image_exits_2() {
     cli.cmd_as(Mode::Fake, &["submit", &contract])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains(
-            "guest image python-stdlib-v1 not found in the registry",
-        ))
+        .stderr(predicate::str::contains(format!(
+            "guest image {} not found in the registry",
+            guest_profile()
+        )))
         .stderr(predicate::str::contains("build and register it first"));
     cli.assert_no_task();
 }
@@ -3183,7 +3300,7 @@ fn submit_with_a_pin_uses_exactly_that_image_even_if_a_newer_entry_exists() {
     let older = cli.register_guest_image();
     // Registration times are milliseconds: make sure the second entry is strictly newer.
     std::thread::sleep(std::time::Duration::from_millis(20));
-    let newer_dir = fake_image_dir(&cli, "guest-image-2", "python-stdlib-v1", 0x69);
+    let newer_dir = fake_image_dir(&cli, "guest-image-2", guest_profile(), 0x69);
     let newer = register_image(&cli, &newer_dir)["digest"]
         .as_str()
         .unwrap()
@@ -3323,7 +3440,8 @@ fn a_recorded_image_that_is_no_longer_registered_fails_before_the_task_is_touche
         .assert()
         .code(1)
         .stderr(predicate::str::contains(format!(
-            "recorded guest image python-stdlib-v1@{digest} is no longer registered"
+            "recorded guest image {}@{digest} is no longer registered",
+            guest_profile()
         )));
     assert_eq!(cli.events(&id), events);
 }
@@ -3341,7 +3459,7 @@ fn status_prints_worker_and_guest_image() {
     assert_eq!(status["worker"], "firecracker");
     assert_eq!(
         status["guest_image"],
-        json!({ "id": "python-stdlib-v1", "digest": digest })
+        json!({ "id": guest_profile(), "digest": digest })
     );
     assert_eq!(status["jailed"], false);
     let host = cli.json_as(Mode::Plain, &["submit", &contract])["task_id"]
@@ -3368,6 +3486,10 @@ fn manifest_names_the_guest_image_for_firecracker_tasks_and_omits_it_for_host_ta
     let dir = cli.path("fc-bundle");
     let manifest = cli.json_as(Mode::Plain, &["export", &fc, dir.to_str().unwrap()]);
     assert_eq!(manifest["guest_image_digest"], digest.as_str());
+    assert_eq!(
+        manifest["vm_resources"],
+        json!({ "version": 1, "disk_mib": 1024, "scratch_mib": 512, "bandwidth_mib_s": null, "iops": null })
+    );
     let host = cli.json_as(
         Mode::Plain,
         &[
@@ -3384,11 +3506,9 @@ fn manifest_names_the_guest_image_for_firecracker_tasks_and_omits_it_for_host_ta
     let dir = cli.path("host-bundle");
     let manifest = cli.json_as(Mode::Plain, &["export", &host, dir.to_str().unwrap()]);
     assert!(manifest.get("guest_image_digest").is_none(), "{manifest}");
-    assert!(
-        !fs::read_to_string(dir.join("manifest.json"))
-            .unwrap()
-            .contains("guest_image_digest")
-    );
+    assert!(manifest.get("vm_resources").is_none(), "{manifest}");
+    let written = fs::read_to_string(dir.join("manifest.json")).unwrap();
+    assert!(!written.contains("guest_image_digest") && !written.contains("vm_resources"));
 }
 
 #[test]
@@ -3851,7 +3971,7 @@ impl Cli {
         let contract = json!({
             "goal": "fix the parser",
             "repository": { "source": repo, "revision": "recorded-at-submission" },
-            "profile": "python-stdlib-v1",
+            "profile": guest_profile(),
             "editable_paths": ["src/**"],
             "verification_profile": "parser-checks-v1",
             "capabilities": ["snapshot.read", "workspace.apply_patch", "verification.run", "artifact.export", "model.request"],
@@ -4986,4 +5106,641 @@ fn cancel_of_an_anthropic_task_needs_no_key_and_never_contacts_the_api() {
         "CANCELLED"
     );
     assert_eq!(api.hits(), 0, "the crash came before the send");
+}
+
+/// The plain contract with `resources` merged into its `limits`.
+fn contract_with_resources(cli: &Cli, name: &str, resources: Value) -> String {
+    let mut contract: Value =
+        serde_json::from_str(&fs::read_to_string(cli.contract(&cli.repo_copy())).unwrap()).unwrap();
+    for (k, v) in resources.as_object().unwrap() {
+        contract["limits"][k] = v.clone();
+    }
+    cli.write(&format!("{name}.json"), &contract.to_string())
+}
+
+/// `submit --yes --crash-at` on the fake Firecracker worker: dies with 75; returns the task id.
+fn crash_fc(cli: &Cli, contract: &str) -> String {
+    let assert = cli
+        .cmd_as(
+            Mode::Fake,
+            &[
+                "submit",
+                contract,
+                "--yes",
+                "--fake-agent-patch",
+                fix_patch().to_str().unwrap(),
+                "--crash-at",
+                "during-execute:apply_patch",
+            ],
+        )
+        .assert()
+        .code(75);
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    stderr
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find_map(|v| v["task_id"].as_str().map(str::to_string))
+        .expect("the crash report names the task")
+}
+
+fn edit_submitted(cli: &Cli, id: &str, sql_expr: &str) {
+    rusqlite::Connection::open(cli.home().join("agentos.db"))
+        .unwrap()
+        .execute(
+            &format!("UPDATE events SET payload={sql_expr} WHERE task_id=?1 AND type='Submitted'"),
+            [id],
+        )
+        .unwrap();
+}
+
+#[test]
+fn submit_records_the_resolved_vm_resources_for_firecracker_tasks_only() {
+    let cli = Cli::bare();
+    cli.register_guest_image();
+    let plain = cli.submit_fc(&cli.contract(&cli.repo_copy()), &[]);
+    assert_eq!(plain["state"], "SUCCEEDED");
+    assert_eq!(
+        cli.submitted(plain["task_id"].as_str().unwrap())["vm_resources"],
+        json!({ "version": 1, "disk_mib": 1024, "scratch_mib": 512, "bandwidth_mib_s": null, "iops": null })
+    );
+    let sized = contract_with_resources(
+        &cli,
+        "sized",
+        json!({ "worker_disk_mib": 2048, "worker_scratch_mib": 768,
+                "worker_disk_bandwidth_mib_s": 64, "worker_disk_iops": 5000 }),
+    );
+    let out = cli.submit_fc(&sized, &[]);
+    assert_eq!(out["state"], "SUCCEEDED");
+    assert_eq!(
+        cli.submitted(out["task_id"].as_str().unwrap())["vm_resources"],
+        json!({ "version": 1, "disk_mib": 2048, "scratch_mib": 768, "bandwidth_mib_s": 64, "iops": 5000 })
+    );
+    let host = cli.json_as(
+        Mode::Plain,
+        &[
+            "submit",
+            &sized,
+            "--yes",
+            "--fake-agent-patch",
+            fix_patch().to_str().unwrap(),
+        ],
+    );
+    assert!(
+        cli.submitted(host["task_id"].as_str().unwrap())
+            .get("vm_resources")
+            .is_none(),
+        "the host worker has no drives"
+    );
+}
+
+#[test]
+fn resume_refuses_vm_resources_that_disagree_with_the_contract_and_journals_nothing() {
+    let cli = Cli::bare();
+    cli.register_guest_image();
+    let sized = contract_with_resources(&cli, "sized", json!({ "worker_disk_mib": 2048 }));
+
+    // A record that differs from what the stored contract resolves to.
+    let id = crash_fc(&cli, &sized);
+    edit_submitted(
+        &cli,
+        &id,
+        "json_set(payload, '$.vm_resources.disk_mib', 4096)",
+    );
+    let before = cli.events(&id);
+    cli.cmd_as(Mode::Fake, &["resume", &id])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("vm_resources"));
+    assert_eq!(cli.events(&id), before);
+
+    // No record (version 0) but a contract that asks for resources: also inconsistent.
+    let id = crash_fc(&cli, &sized);
+    edit_submitted(&cli, &id, "json_remove(payload, '$.vm_resources')");
+    let before = cli.events(&id);
+    cli.cmd_as(Mode::Fake, &["resume", &id])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("vm_resources"));
+    assert_eq!(cli.events(&id), before);
+}
+
+/// A task submitted before resources were recorded resumes with the version-0 values.
+#[test]
+fn a_task_without_recorded_vm_resources_resumes_with_version_zero() {
+    let cli = Cli::bare();
+    cli.register_guest_image();
+    let id = crash_fc(&cli, &cli.contract(&cli.repo_copy()));
+    edit_submitted(&cli, &id, "json_remove(payload, '$.vm_resources')");
+    let done = cli.json_as(Mode::Fake, &["resume", &id]);
+    assert_eq!(done["state"], "SUCCEEDED", "{done}");
+    let dir = cli.path("legacy-bundle");
+    let manifest = cli.json_as(Mode::Plain, &["export", &id, dir.to_str().unwrap()]);
+    assert_eq!(
+        manifest["vm_resources"],
+        json!({ "version": 0, "disk_mib": 1024, "scratch_mib": 512, "bandwidth_mib_s": null, "iops": null })
+    );
+}
+
+#[test]
+fn the_approval_summary_shows_the_vm_disks_of_a_firecracker_task() {
+    let cli = Cli::bare();
+    cli.register_guest_image();
+    let summary = |contract: &str| {
+        let out = cli
+            .cmd_as(Mode::Fake, &["submit", contract])
+            .assert()
+            .success()
+            .get_output()
+            .stderr
+            .clone();
+        String::from_utf8(out).unwrap()
+    };
+    let plain = summary(&cli.contract(&cli.repo_copy()));
+    assert!(
+        plain.contains(
+            "  vm disks:             workspace 1024 MiB, scratch 512 MiB, no rate limit\n"
+        ),
+        "{plain}"
+    );
+    let limited = contract_with_resources(
+        &cli,
+        "limited",
+        json!({ "worker_disk_mib": 2048, "worker_disk_bandwidth_mib_s": 64, "worker_disk_iops": 5000 }),
+    );
+    let text = summary(&limited);
+    assert!(
+        text.contains("  vm disks:             workspace 2048 MiB, scratch 512 MiB, each writable drive at most 64 MiB/s and 5000 operations/s\n"),
+        "{text}"
+    );
+}
+
+#[test]
+fn submit_refuses_a_firecracker_task_the_host_disk_cannot_hold() {
+    let cli = Cli::bare();
+    cli.register_guest_image();
+    let contract = contract_with_resources(&cli, "big", json!({ "worker_disk_mib": 4096 }));
+    cli.cmd_as(
+        Mode::Fake,
+        &[
+            "submit",
+            &contract,
+            "--yes",
+            "--fake-agent-patch",
+            fix_patch().to_str().unwrap(),
+        ],
+    )
+    .env("AGENTOS_TEST_HOST_FREE_MIB", "4000")
+    .assert()
+    .code(1)
+    .stderr(predicate::str::contains("host disk: 4000 MiB free under "))
+    .stderr(predicate::str::contains("the VM may write 4608 MiB"));
+    cli.assert_no_task();
+    let out = cli
+        .cmd_as(
+            Mode::Fake,
+            &[
+                "submit",
+                &contract,
+                "--yes",
+                "--fake-agent-patch",
+                fix_patch().to_str().unwrap(),
+            ],
+        )
+        .env("AGENTOS_TEST_HOST_FREE_MIB", "4608")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let done: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(done["state"], "SUCCEEDED", "{done}");
+}
+
+/// Kill and resume on the real, jailed worker with non-default resources: the recorded
+/// sizes and rates are used before and after the crash, and the export carries them.
+#[test]
+fn a_task_with_contracted_vm_resources_survives_a_kill_on_the_real_worker() {
+    let Some(kvm) = kvm::require() else { return };
+    let cli = Cli::bare();
+    cli.json_as(
+        Mode::Plain,
+        &["image", "register", kvm.image_dir.to_str().unwrap()],
+    );
+    let contract = contract_with_resources(
+        &cli,
+        "resources",
+        json!({ "worker_disk_mib": 1536, "worker_scratch_mib": 768,
+                "worker_disk_bandwidth_mib_s": 64, "worker_disk_iops": 10000 }),
+    );
+    let real = |args: &[&str]| cli.cmd_as(Mode::Real, args);
+    let crashed = real(&[
+        "submit",
+        &contract,
+        "--yes",
+        "--fake-agent-patch",
+        fix_patch().to_str().unwrap(),
+        "--crash-at",
+        "during-execute:apply_patch",
+    ])
+    .assert()
+    .code(75)
+    .get_output()
+    .stderr
+    .clone();
+    let id = String::from_utf8_lossy(&crashed)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find_map(|v| v["task_id"].as_str().map(str::to_string))
+        .unwrap();
+    let recorded = json!({ "version": 1, "disk_mib": 1536, "scratch_mib": 768,
+                           "bandwidth_mib_s": 64, "iops": 10000 });
+    assert_eq!(cli.submitted(&id)["vm_resources"], recorded);
+    let resumed: Value = serde_json::from_slice(
+        &real(&["resume", &id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert_eq!(resumed, json!({ "task_id": id, "state": "SUCCEEDED" }));
+    assert_eq!(
+        fs::metadata(cli.home().join("work").join(&id).join("ws.img"))
+            .unwrap()
+            .len(),
+        1536 << 20
+    );
+    let bundle = cli.path("resources-bundle");
+    let manifest: Value = serde_json::from_slice(
+        &real(&["export", &id, bundle.to_str().unwrap()])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert_eq!(manifest["vm_resources"], recorded);
+    assert_eq!(
+        manifest["verified_digest"],
+        manifest["final_workspace_digest"]
+    );
+}
+
+fn component_fixture(name: &str) -> PathBuf {
+    fixtures().join("components").join(name)
+}
+
+#[test]
+fn component_register_is_content_addressed_and_lists_entries() {
+    let cli = Cli::bare();
+    let first = cli.json(&[
+        "component",
+        "register",
+        component_fixture("repo-analyzer-v1").to_str().unwrap(),
+    ]);
+    assert_eq!(first["id"], "repo-analyzer-v1");
+    let digest = first["digest"].as_str().unwrap().to_string();
+    assert_eq!(digest.len(), 64);
+    let again = cli.json(&[
+        "component",
+        "register",
+        component_fixture("repo-analyzer-v1").to_str().unwrap(),
+    ]);
+    assert_eq!(again, first, "the same bytes twice change nothing");
+    let entry = cli
+        .home()
+        .join("registry/components")
+        .join(format!("repo-analyzer-v1@{digest}"));
+    assert!(entry.join("component.wasm").is_file() && entry.join("component.json").is_file());
+    let listed = cli.json(&["component", "list"]);
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(
+        (listed[0]["id"].clone(), listed[0]["digest"].clone()),
+        (json!("repo-analyzer-v1"), json!(digest))
+    );
+    // Not a profile: the profile registry does not list it.
+    assert_eq!(cli.json(&["profile", "list"]), json!([]));
+}
+
+#[test]
+fn component_register_refuses_what_is_not_an_analyzer() {
+    let cli = Cli::bare();
+    for (fixture, message) in [
+        ("wasi-import-v1", "imports wasi:cli/environment@0.2.0"),
+        ("no-export-v1", "does not export analyze"),
+    ] {
+        cli.cmd(&[
+            "component",
+            "register",
+            component_fixture(fixture).to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(message));
+    }
+    let bad = cli.path("bad-component");
+    fs::create_dir_all(&bad).unwrap();
+    fs::write(
+        bad.join("component.json"),
+        r#"{"id":"bad-v1","world":"agentos:analyzer/analyzer@1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(bad.join("component.wasm"), b"not wasm").unwrap();
+    cli.cmd(&["component", "register", bad.to_str().unwrap()])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("not a component"));
+    fs::write(
+        bad.join("component.json"),
+        r#"{"id":"bad-v1","world":"other:world/x@1.0.0"}"#,
+    )
+    .unwrap();
+    fs::copy(
+        component_fixture("repo-analyzer-v1").join("component.wasm"),
+        bad.join("component.wasm"),
+    )
+    .unwrap();
+    cli.cmd(&["component", "register", bad.to_str().unwrap()])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("agentos:analyzer/analyzer@1.0.0"));
+    fs::write(
+        bad.join("component.json"),
+        r#"{"id":"../x","world":"agentos:analyzer/analyzer@1.0.0"}"#,
+    )
+    .unwrap();
+    cli.cmd(&["component", "register", bad.to_str().unwrap()])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("plain name"));
+    assert_eq!(cli.json(&["component", "list"]), json!([]));
+}
+
+/// The plain contract with the `snapshot.analyze` capability and an analyzer pin.
+fn contract_with_analyzer(cli: &Cli, id: &str, digest: &str) -> String {
+    let mut contract: Value =
+        serde_json::from_str(&fs::read_to_string(cli.contract(&cli.repo_copy())).unwrap()).unwrap();
+    contract["capabilities"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("snapshot.analyze"));
+    contract["analyzer"] = json!({ "id": id, "digest": digest });
+    cli.write(&format!("analyzer-{id}.json"), &contract.to_string())
+}
+
+#[test]
+fn a_task_with_an_analyzer_runs_it_once_and_exports_the_report() {
+    let cli = Cli::new();
+    let registered = cli.json(&[
+        "component",
+        "register",
+        component_fixture("repo-analyzer-v1").to_str().unwrap(),
+    ]);
+    let digest = registered["digest"].as_str().unwrap().to_string();
+    let contract = contract_with_analyzer(&cli, "repo-analyzer-v1", &digest);
+    let out = cli
+        .cmd(&[
+            "submit",
+            &contract,
+            "--yes",
+            "--fake-agent-patch",
+            fix_patch().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains(&format!(
+            "  analyzer:             repo-analyzer-v1@{digest}"
+        )),
+        "{stderr}"
+    );
+    assert!(stderr.contains("snapshot.analyze"), "{stderr}");
+    let done: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(done["state"], "SUCCEEDED", "{done}");
+    let id = done["task_id"].as_str().unwrap().to_string();
+    let submitted = cli.submitted(&id);
+    assert_eq!(
+        (
+            submitted["analyzer_id"].clone(),
+            submitted["analyzer_digest"].clone()
+        ),
+        (json!("repo-analyzer-v1"), json!(digest)),
+        "{submitted}"
+    );
+    assert!(
+        cli.home()
+            .join("tasks")
+            .join(&id)
+            .join("analyzer/component.wasm")
+            .is_file()
+    );
+    let analyses: Vec<Value> = cli
+        .events(&id)
+        .into_iter()
+        .filter(|e| e["type"] == "EffectIntended" && e["payload"]["kind"] == "AnalyzeSnapshot")
+        .collect();
+    assert_eq!(analyses.len(), 1);
+
+    let bundle = cli.path("analysis-bundle");
+    let manifest = cli.json(&["export", &id, bundle.to_str().unwrap()]);
+    assert_eq!(
+        manifest["analysis"]["component_digest"],
+        json!(digest),
+        "{manifest}"
+    );
+    assert_eq!(manifest["analysis"]["state"], "COMPLETED");
+    assert_eq!(manifest["analysis"]["file"], "analysis/report.json");
+    let report: Value =
+        serde_json::from_slice(&fs::read(bundle.join("analysis/report.json")).unwrap()).unwrap();
+    assert_eq!(report["analyzer"], "repo-analyzer-v1");
+    assert_eq!(
+        manifest["analysis"]["report_digest"],
+        json!(Digest::of(&fs::read(bundle.join("analysis/report.json")).unwrap()).to_string())
+    );
+}
+
+#[test]
+fn an_unregistered_analyzer_is_refused_at_submit() {
+    let cli = Cli::new();
+    let contract = contract_with_analyzer(&cli, "repo-analyzer-v1", &"a".repeat(64));
+    cli.cmd(&[
+        "submit",
+        &contract,
+        "--yes",
+        "--fake-agent-patch",
+        fix_patch().to_str().unwrap(),
+    ])
+    .assert()
+    .code(2)
+    .stderr(predicate::str::contains("not in the registry"));
+    cli.assert_no_task();
+}
+
+#[test]
+fn a_task_without_an_analyzer_exports_no_analysis() {
+    let cli = Cli::new();
+    let id = cli.submit_yes(&cli.contract(&cli.repo_copy()), &fix_patch())["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let bundle = cli.path("plain-bundle");
+    let manifest = cli.json(&["export", &id, bundle.to_str().unwrap()]);
+    assert!(manifest.get("analysis").is_none(), "{manifest}");
+    assert!(!bundle.join("analysis").exists());
+}
+
+#[test]
+fn version_reports_what_the_code_speaks() {
+    let cli = Cli::bare();
+    let v = cli.json(&["version"]);
+    assert_eq!(v["agentos"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(v["guest_protocol"], 2);
+    assert_eq!(v["model_policy_version"], 1);
+    assert_eq!(v["model_limits_version"], 1);
+    assert_eq!(v["vm_resources_version"], 1);
+    assert_eq!(v["analyzer_runtime"], "wasmtime 49.0.2");
+    assert_eq!(v["analyzer_world"], "agentos:analyzer/analyzer@1.0.0");
+    assert_eq!(v["firecracker"], "Firecracker v1.17.");
+}
+
+/// The host check reports every requirement; the jail is required unless --allow-unjailed.
+#[test]
+fn host_check_reports_each_requirement_and_fails_on_a_required_one() {
+    let cli = Cli::bare();
+    let check = |extra: &[&str], probe: &str| {
+        let mut args = vec!["--firecracker", "/nonexistent/firecracker"];
+        args.extend_from_slice(extra);
+        args.push("host-check");
+        let out = cli
+            .cmd_as(Mode::Plain, &args)
+            .env("AGENTOS_TEST_WORKERS", "1")
+            .env("AGENTOS_TEST_JAIL_PROBE", probe)
+            .assert()
+            .code(1)
+            .get_output()
+            .clone();
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()
+    };
+    let report = check(&[], "fail:cgroup v2 hierarchy /sys/fs/cgroup is read-only");
+    for key in ["kvm", "firecracker", "git", "jail"] {
+        assert!(report.get(key).is_some(), "{report}");
+    }
+    assert_eq!(report["git"], "ok");
+    assert!(
+        report["firecracker"]
+            .as_str()
+            .unwrap()
+            .contains("/nonexistent/firecracker"),
+        "{report}"
+    );
+    assert_eq!(
+        report["jail"],
+        "cgroup v2 hierarchy /sys/fs/cgroup is read-only"
+    );
+    assert_eq!(report["jail_required"], true);
+    let unjailed = check(&["--allow-unjailed"], "fail:needs root");
+    assert_eq!(unjailed["jail_required"], false);
+    assert_eq!(unjailed["jail"], "needs root");
+    assert_eq!(check(&[], "ok")["jail"], "ok");
+}
+
+/// Registration works for an unprivileged owner: a directory moved to another parent needs
+/// its own write bit, which root bypasses (the test tier runs as root, so it drops to nobody).
+#[test]
+fn an_unprivileged_owner_can_register() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+    let cli = Cli::bare();
+    let source = cli.path("unprivileged-profile");
+    copy_tree(&fixtures().join("profiles/parser-checks-v1"), &source).unwrap();
+    let home = cli.path("unprivileged-home");
+    fs::create_dir_all(&home).unwrap();
+    let root = rustix::process::geteuid().is_root();
+    if root {
+        for p in [cli.path(""), source.clone(), home.clone()] {
+            std::os::unix::fs::chown(&p, Some(65534), Some(65534)).unwrap();
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        for f in fs::read_dir(&source).unwrap() {
+            std::os::unix::fs::chown(f.unwrap().path(), Some(65534), Some(65534)).unwrap();
+        }
+    }
+    let mut cmd = StdCommand::new(env!("CARGO_BIN_EXE_agentos"));
+    cmd.args([
+        "--home",
+        home.to_str().unwrap(),
+        "profile",
+        "register",
+        source.to_str().unwrap(),
+    ]);
+    if root {
+        cmd.uid(65534).gid(65534);
+    }
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let entry = fs::read_dir(home.join("registry"))
+        .unwrap()
+        .flatten()
+        .find(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("parser-checks-v1@")
+                && e.path().is_dir()
+        })
+        .expect("the entry");
+    assert_eq!(
+        fs::metadata(entry.path()).unwrap().permissions().mode() & 0o777,
+        0o555
+    );
+}
+
+/// Without system CA certificates the model provider cannot be reached securely: submit
+/// refuses before anything is written (it used to panic after creating the task), and the
+/// host check reports it.
+#[test]
+fn a_host_without_ca_certificates_is_refused_before_a_model_task_exists() {
+    let cli = Cli::new();
+    let key = cli.write("key", "sk-ant-FAKE-no-certs");
+    let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
+    cli.cmd(&[
+        "--api-key-file",
+        &key,
+        "submit",
+        &contract,
+        "--yes",
+        "--model",
+        "anthropic:claude-opus-5-5",
+    ])
+    .env("SSL_CERT_FILE", "/nonexistent/certs.pem")
+    .env("SSL_CERT_DIR", "/nonexistent/certs")
+    .assert()
+    .code(1)
+    .stderr(predicate::str::contains("CA certificates"));
+    cli.assert_no_task();
+    let out = cli
+        .cmd_as(Mode::Plain, &["host-check"])
+        .env("SSL_CERT_FILE", "/nonexistent/certs.pem")
+        .env("SSL_CERT_DIR", "/nonexistent/certs")
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    assert!(
+        report["tls"].as_str().unwrap().contains("CA certificates"),
+        "{report}"
+    );
+    let ok = cli.cmd_as(Mode::Plain, &["host-check"]).output().unwrap();
+    let report: Value = serde_json::from_slice(&ok.stdout).unwrap();
+    assert_eq!(report["tls"], "ok", "{report}");
 }

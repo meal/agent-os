@@ -22,6 +22,30 @@ pub(crate) struct Check {
     pub stderr_truncated: bool,
 }
 
+/// A finished agent session: how the CLI ended, and the patch it left in the guest's scratch
+/// copy (empty when it changed nothing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AgentEnd {
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub timed_out: bool,
+    pub workspace_digest: Digest,
+    pub patch: Vec<u8>,
+}
+
+/// `RunAgentSession`: `{"exit_code","signal","timed_out","workspace_digest","patch_b64"}`. The
+/// session changes no workspace; the patch goes through `ApplyPatch` like any other.
+pub(crate) fn agent_session(req: &EffectRequest, ctx: &AttemptCtx, end: AgentEnd) -> ExecOutcome {
+    let output = json!({
+        "exit_code": end.exit_code,
+        "signal": end.signal,
+        "timed_out": end.timed_out,
+        "workspace_digest": end.workspace_digest,
+        "patch_b64": agentos_core::guest::b64(&end.patch),
+    });
+    ExecOutcome::success(req, ctx, output.to_string().into_bytes())
+}
+
 /// `ReadSnapshot`: `{"files","workspace_digest"}`.
 pub(crate) fn snapshot_manifest(
     req: &EffectRequest,

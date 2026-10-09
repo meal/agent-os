@@ -1218,6 +1218,7 @@ async fn lease_kill_leaves_the_jail_until_the_controller_collects_it() {
     let short = EffectTimeouts {
         verification: Duration::from_millis(1_500),
         other: Duration::from_secs(30),
+        session: Duration::from_secs(30),
     };
     let exec = fx.executor(None, &[]).with_timeouts(short);
     let (req, c) = (fx.request(EffectKind::RunVerification, b"again"), ctx(3));
@@ -1253,7 +1254,7 @@ fn send(s: &mut UnixStream, m: Message) {
 
 fn ready() -> Message {
     Message::Ready {
-        protocol: 1,
+        protocol: 2,
         agent_version: "0.1.0".into(),
         mode: Mode::Job,
         vcpus: 1,
@@ -1367,7 +1368,11 @@ async fn boot_timeout_failure_mapping() {
     for i in 0..3 {
         let fx = KFx::new();
         fs::create_dir_all(fx.task_dir()).unwrap();
-        fs::write(fx.task_dir().join("ws.img"), b"").unwrap();
+        // Sparse, at the recorded size, as a snapshot leaves it.
+        fs::File::create(fx.task_dir().join("ws.img"))
+            .unwrap()
+            .set_len(agentos_core::resources::VmResources::V0.disk_bytes())
+            .unwrap();
         let req = kinds(&fx)[i].clone();
         runs.push(tokio::spawn(async move {
             let exec = fx.executor(None, &[(NEVER_LISTEN, "1")]);
@@ -1523,7 +1528,7 @@ async fn second_hello_with_another_token_is_refused() {
     stray.read_exact(&mut ok).unwrap();
     assert_eq!(&ok, b"OK 5200\n");
     let hello = Message::Hello {
-        protocol: 1,
+        protocol: 2,
         attempt_token: mint_attempt_token(),
         task_id: fx.task.as_str().to_string(),
         effect_id: req.effect_id.as_str().to_string(),

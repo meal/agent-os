@@ -394,6 +394,7 @@ fn the_fixture_transcripts_drive_the_documented_action_sequence() {
             AgentAction::ApplyPatch(p) => format!("ApplyPatch({})", p.contains("notes.txt")),
             AgentAction::Verify => "Verify".into(),
             AgentAction::Finish => "Finish".into(),
+            AgentAction::RunSession { .. } => "RunSession".into(),
         })
         .collect();
     assert_eq!(

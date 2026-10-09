@@ -15,6 +15,7 @@ use agentos_core::contract::Contract;
 use agentos_core::effect::{AttemptId, EffectId, EffectKind, Outcome};
 use agentos_core::guest::{PatchStateKind, is_attempt_token};
 use agentos_core::ids::{Digest, TaskId};
+use agentos_core::resources::VmResources;
 use agentos_engine::crash::{CrashHook, CrashPoint};
 use agentos_engine::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor, Reconciliation};
 use agentos_engine::firecracker::{
@@ -379,6 +380,29 @@ async fn reconcile_trichotomy_on_base_patched_and_tampered_workspace() {
             .reconcile(&fx.request(EffectKind::RunVerification, b""), &ctx())
             .await,
         Reconciliation::Unknown
+    );
+}
+
+/// An image whose size is not the task's recorded size is never booted for an answer.
+#[tokio::test]
+async fn an_image_of_another_size_is_not_inspected() {
+    let mut fx = Fx::new();
+    fx.snapshot().await;
+    fx.cfg.resources = VmResources {
+        version: 1,
+        disk_mib: 2048,
+        ..VmResources::V0
+    };
+    let why = fx.inspector().query(&fx.task, Query::Digest).unwrap_err();
+    assert!(
+        why.starts_with("workspace inspection failed: workspace image")
+            && why.contains("recorded size"),
+        "{why}"
+    );
+    assert_eq!(
+        fs::metadata(fx.ws_img()).unwrap().len(),
+        1 << 30,
+        "left as is"
     );
 }
 

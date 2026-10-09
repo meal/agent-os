@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 
 use agentos_core::effect::{EffectId, EffectKind, EffectRecord, EffectState};
 use agentos_core::ids::{Digest, TaskId};
+use agentos_core::resources::VmResources;
 use agentos_core::state::TaskState;
 use agentos_store::blob::BlobStore;
 use agentos_store::db::{Db, DbError, StoredEvent};
@@ -88,6 +89,18 @@ pub struct ModelCallEntry {
     pub response_file: Option<String>,
 }
 
+/// The task's analysis: the analyzer's registry digest, the outcome, and for a completed one
+/// the report, in the bundle as `analysis/report.json`. Advisory: never verification evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnalysisEntry {
+    pub effect_id: EffectId,
+    pub component_digest: Digest,
+    /// `COMPLETED` or `FAILED`.
+    pub state: String,
+    pub report_digest: Option<Digest>,
+    pub file: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerificationResult {
     pub effect_id: EffectId,
@@ -147,6 +160,13 @@ pub struct Manifest {
     /// host tasks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_image_digest: Option<Digest>,
+    /// The drive sizes and rate limits a Firecracker task ran with (`Submitted.vm_resources`,
+    /// version 0 for a task submitted before they were recorded); absent for host tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm_resources: Option<VmResources>,
+    /// The contract's analysis, when it has an analyzer and the analysis ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis: Option<AnalysisEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,6 +259,8 @@ struct Contents {
     /// `model/NNNN-request.json` and `-response.json` files, in order.
     model_files: Vec<(String, Vec<u8>)>,
     evidence: BTreeMap<Digest, Vec<u8>>,
+    /// `analysis/report.json`.
+    analysis_report: Option<Vec<u8>>,
 }
 
 fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
@@ -257,6 +279,12 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
         .iter()
         .find(|e| e.event_type == "Submitted")
         .map(|e| &e.payload);
+    let vm_resources = match submitted {
+        Some(s) if s.get("worker").and_then(serde_json::Value::as_str) == Some("firecracker") => {
+            Some(VmResources::from_submitted(s).map_err(inconsistent)?)
+        }
+        _ => None,
+    };
     let (submitted_repo, submitted_profile, guest_image_digest) = match submitted {
         Some(s) => {
             // Submission digests the stored contract serialization, so it can be re-checked.
@@ -280,6 +308,7 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
     let (mut patch_diff, mut patches, mut entries) = (Vec::new(), Vec::new(), Vec::new());
     let mut results = Vec::new();
     let (mut model_calls, mut model_files) = (Vec::new(), Vec::new());
+    let (mut analysis, mut analysis_report) = (None, None);
     for rec in effects(db, &events)? {
         match (&rec.kind, rec.state) {
             (EffectKind::ReadSnapshot, EffectState::Completed) => {
@@ -382,6 +411,28 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
                     response_file,
                 });
             }
+            (EffectKind::AnalyzeSnapshot, EffectState::Completed | EffectState::Failed) => {
+                let component = contract
+                    .analyzer
+                    .as_ref()
+                    .and_then(|a| Digest::from_hex(&a.digest).ok())
+                    .ok_or_else(|| inconsistent("an analysis without a pinned analyzer"))?;
+                let completed = rec.state == EffectState::Completed;
+                let (report_digest, file) = if completed {
+                    let d = result_of(&rec)?;
+                    analysis_report = Some(read_blob(blobs, &d)?);
+                    (Some(d), Some("analysis/report.json".to_string()))
+                } else {
+                    (None, None)
+                };
+                analysis = Some(AnalysisEntry {
+                    effect_id: rec.effect_id.clone(),
+                    component_digest: component,
+                    state: if completed { "COMPLETED" } else { "FAILED" }.to_string(),
+                    report_digest,
+                    file,
+                });
+            }
             // File listings and reads are not exported.
             _ => {}
         }
@@ -481,6 +532,8 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
             })
             .collect(),
         guest_image_digest,
+        vm_resources,
+        analysis,
     };
     Ok(Contents {
         manifest,
@@ -488,6 +541,7 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
         patches,
         model_files,
         evidence,
+        analysis_report,
     })
 }
 
@@ -575,6 +629,9 @@ fn write_bundle(contents: Contents, out_dir: &Path, before: BeforeWrite) -> Resu
     if !contents.model_files.is_empty() {
         fs::create_dir(root.join("model"))?;
     }
+    if contents.analysis_report.is_some() {
+        fs::create_dir(root.join("analysis"))?;
+    }
     let mut files: Vec<(String, &[u8])> = vec![("patch.diff".into(), &contents.patch_diff)];
     files.extend(
         contents
@@ -594,11 +651,14 @@ fn write_bundle(contents: Contents, out_dir: &Path, before: BeforeWrite) -> Resu
             .iter()
             .map(|(d, bytes)| (format!("evidence/{d}.json"), bytes.as_slice())),
     );
+    if let Some(report) = &contents.analysis_report {
+        files.push(("analysis/report.json".into(), report));
+    }
     let manifest_json = serde_json::to_vec_pretty(&contents.manifest).map_err(DbError::from)?;
     files.push(("manifest.json".into(), &manifest_json));
     write_checked(root, &files, before)?;
     let files = files.len();
-    for dir in ["patches", "evidence", "model", ""] {
+    for dir in ["patches", "evidence", "model", "analysis", ""] {
         if root.join(dir).exists() {
             sync_dir(&root.join(dir))?;
         }
@@ -654,6 +714,8 @@ mod tests {
             generated_events: 1,
             capabilities: Vec::new(),
             guest_image_digest: None,
+            vm_resources: None,
+            analysis: None,
         };
         let evidence = [b"{\"a\":1}".to_vec(), b"{\"b\":2}".to_vec()]
             .into_iter()
@@ -664,6 +726,7 @@ mod tests {
             patch_diff: b"diff".to_vec(),
             patches: vec![("patches/0001-x.patch".into(), b"p".to_vec())],
             model_files: Vec::new(),
+            analysis_report: None,
             evidence,
         }
     }

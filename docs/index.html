@@ -153,7 +153,7 @@ footer{color:var(--muted);font-size:.88rem;border-top:1px solid var(--rule);padd
     <div class="fact"><b>It checks permissions every time</b><span>The agent holds no authority itself. A broker checks a handle before each action and records the answer.</span></div>
     <div class="fact"><b>It contains the code it runs</b><span>With <code>--worker firecracker</code>, each step runs in its own microVM with no network, fixed-size disks and a jailed host process. The default host worker is not sandboxed.</span></div>
   </div>
-  <p class="note">This static walkthrough simulates the controls in your browser; it does not run code, contact a model or start a VM. The controller supports a deterministic patch agent and an Anthropic model agent with five tools. Model reliability and recovery are tested offline; live-provider and real KVM acceptance remain open for this build. The event sequence below comes from a fixture run. Sandbox figures are assertions in the gated KVM tier, not measurements from this review.</p>
+  <p class="note">This static walkthrough simulates the controls in your browser; it does not run code, contact a model or start a VM. The controller supports a deterministic patch agent and an Anthropic model agent with five tools. Model reliability and recovery are tested offline, and live-provider and real KVM acceptance passed on 2026-10-08. The event sequence below comes from a fixture run. Sandbox figures are assertions in the gated KVM tier, not measurements from this review.</p>
   <p class="note"><a href="#usage">Use it for a real bug fix</a> · <a href="#model">Try the offline model workflow</a> · <a href="https://github.com/meal/agent-os/blob/main/docs/testing.md">Testing guide</a> · <a href="#status">Current progress and open gates</a></p>
 </header>
 
@@ -275,7 +275,7 @@ printf 'Export: %s/bundle\n' "$demo_home"</pre>
   <pre class="block" aria-label="Offline acceptance commands">docker compose build test
 sh scripts/acceptance.sh offline</pre>
   <p>This runs the host and fake-jail harnesses against a loopback fake API, including a 429 followed by repair, then replays without network. It compares request digests, call counts, final workspace, exported patch and protected profile. It needs no real API key or <code>/dev/kvm</code>. Fake-jail tests exercise the harness; they do not prove VM isolation.</p>
-  <p class="note">Real host and jailed provider runs, real KVM tests and candidate guest-image acceptance remain pending. See the <a href="https://github.com/meal/agent-os/blob/main/docs/evidence/README.md">acceptance setup and evidence requirements</a> before enabling those tiers.</p>
+  <p class="note">Real host and jailed provider runs, the real KVM suites and the candidate guest image passed acceptance on 2026-10-08. See the <a href="https://github.com/meal/agent-os/blob/main/docs/evidence/README.md">acceptance setup and evidence requirements</a> before enabling those tiers.</p>
 </section>
 
 <!-- ============ PRACTICAL USAGE ============ -->
@@ -349,7 +349,7 @@ printf 'Task, evidence and review copy: %s\n' "$practice"</pre>
   <h3>Use the same process on your own repository</h3>
   <p>Prepare a clean snapshot of the committed revision, replace the source path and goal in the contract, and register your project's regression checks as a protected profile. Keep credentials outside the snapshot: Agent OS copies regular files, including untracked files, and does not use <code>.gitignore</code> as a filter. The current Python profile supports standard-library checks; projects needing extra runtimes or packages need a matching execution image.</p>
   <p>For a live task, mount the snapshot read-only and a regular key file read-only into the container, then submit with <code>--model anthropic:MODEL_ID --api-key-file /run/agentos/key</code>. Choose an available ID from <a href="https://platform.claude.com/docs/en/models/overview">Anthropic's model list</a>. Submit first, approve with <code>resume</code> after reviewing permissions, and use the same export/review flow. Repository content included in model requests goes to the selected provider; live calls consume your API account's budget.</p>
-  <p class="note">Use the host worker for a trusted first test; it is not sandboxed. For untrusted checks, prepare the jailed Firecracker worker on a Linux KVM host. Live-provider and real KVM acceptance remain pending. The <a href="https://github.com/meal/agent-os/blob/main/docs/testing.md">hands-on testing guide</a> includes setup, the own-repository commands, expected results, recovery tests and the later KVM/live gates.</p>
+  <p class="note">Use the host worker for a trusted first test; it is not sandboxed. For untrusted checks, prepare the jailed Firecracker worker on a Linux KVM host. Live-provider and real KVM acceptance passed on 2026-10-08. The <a href="https://github.com/meal/agent-os/blob/main/docs/testing.md">hands-on testing guide</a> includes setup, the own-repository commands, expected results, recovery tests and the later KVM/live gates.</p>
 </section>
 
 <!-- ============ CRASH STATION ============ -->
@@ -479,21 +479,21 @@ printf 'Task, evidence and review copy: %s\n' "$practice"</pre>
     <div class="done"><span class="pill live">DONE</span><b>1 Contracts</b>Task state machine, effects, CLI, fixture repo.</div>
     <div class="done"><span class="pill live">DONE</span><b>2 Durability</b>SQLite journal, receipts, recovery after a kill.</div>
     <div class="done"><span class="pill live">DONE</span><b>3 Authority</b>Broker, leases, supervisors, cancel and revoke.</div>
-    <div><span class="pill idle">BUILT</span><b>3b-1 Isolation</b>Jailed Firecracker worker; real KVM revalidation pending.</div>
-    <div><span class="pill idle">BUILT</span><b>4 Model workflow</b>Tools, repair loop, deadlines and durable retries; host/fake-jail tests pass. Live acceptance pending.</div>
+    <div class="done"><span class="pill live">DONE</span><b>3b-1 Isolation</b>Jailed Firecracker worker, accepted on real KVM.</div>
+    <div class="done"><span class="pill live">DONE</span><b>4 Model workflow</b>Tools, repair loop, deadlines and durable retries; live host and jailed runs replay offline.</div>
     <div class="done"><span class="pill live">TESTED OFFLINE</span><b>Reliability and CI</b>Bounded model I/O, Python pins, formatting, lint and Compose test gates.</div>
-    <div><span class="pill warn">LATER</span><b>Resource lifecycle</b>Safe collection, publication failure tests and measured VM resource limits.</div>
-    <div><span class="pill warn">LATER</span><b>5 Wasm ABI</b>Component interfaces and a repository analyzer.</div>
-    <div><span class="pill warn">LATER</span><b>6 Release</b>Source-built kernel, fresh-host installer and evidence across two snapshots.</div>
+    <div class="done"><span class="pill live">DONE</span><b>Resource lifecycle</b>Safe collection, publication failure tests, and contract-driven VM disks and I/O with measured limits.</div>
+    <div class="done"><span class="pill live">DONE</span><b>5 Wasm ABI</b>A capability-checked analyzer component on Wasmtime, without WASI; its report is exported, never verification.</div>
+    <div class="done"><span class="pill live">DONE</span><b>6 Release</b>Release candidate v0.1.0-rc5: reproducible kernel and tarball, checked installer, every gate passed across two snapshots.</div>
   </div>
-  <p>All four required offline gates pass: formatting, strict Clippy, the host suite and the fake-jail suite. Offline and skipped gated tests do not establish real provider or KVM acceptance. The new Python guest is a candidate; the legacy image remains the default.</p>
+  <p>All required offline gates pass: formatting, strict Clippy, the host suite, the fake-jail suite and the mount gate. Offline and skipped gated tests do not establish real provider or KVM acceptance; that evidence is recorded separately. The Python 3.14 guest passed real KVM acceptance; the legacy image remains the default.</p>
   <p class="note"><a href="https://github.com/meal/agent-os/blob/main/docs/superpowers/plans/2026-10-04-v01-completion.md">Completion plan</a> · <a href="https://github.com/meal/agent-os/blob/main/docs/reviews/2026-10-04-offline-milestone-review.md">Verification and review decisions</a></p>
   <h3>Known limits in v0.1</h3>
   <div class="limits">
-    <div><b>Live acceptance pending</b>The Anthropic adapter exists and passes offline tests; no live evidence is claimed.</div>
+    <div><b>One live model</b>Live acceptance covers the Anthropic adapter with one model on one host; other providers are not supported.</div>
     <div><b>Host worker is not sandboxed</b>The VM sandbox is opt-in with <code>--worker firecracker</code>.</div>
     <div><b>Jailing needs root</b>It also needs a delegated cgroup v2 tree and <code>/dev/kvm</code>. x86_64 only.</div>
-    <div><b>Nothing is garbage collected</b>Job directories and disk images grow with every attempt.</div>
+    <div><b>Conservative collection</b><code>agentos gc</code> removes only reconstructible transient data; journals, blobs and registries are kept.</div>
     <div><b>One driver per home</b>Only one process drives a home at a time.</div>
     <div><b>Export is not a journaled effect</b>It is authorized and audited, but outside the effect model.</div>
   </div>
@@ -695,7 +695,7 @@ printf 'Task, evidence and review copy: %s\n' "$practice"</pre>
     {id:'mem-hog',s:'allocate 2x its memory',
      what:'Allocates twice the memory the contract gave the worker.',
      stop:'The VM has a fixed memory size. Inside it the check is the first thing the guest OOM killer picks, and the agent is protected.',
-     result:'The check dies (exit_code null, passed false). The agent survives and reports. The KVM tier asserts a resident-memory ceiling; the jailed memory limit also accounts for host overhead and page cache. Real resource revalidation is pending.'},
+     result:'The check dies (exit_code null, passed false). The agent survives and reports. The KVM tier asserts a resident-memory ceiling; the jailed memory limit also accounts for host overhead and page cache, with its headroom measured under heavy writes.'},
     {id:'fork-bomb',s:'fork without limit',
      what:'Forks processes until something gives.',
      stop:'RLIMIT_NPROC in the guest, a group kill when the check ends, VM teardown, and pids.max=64 on the host cgroup.',

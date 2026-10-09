@@ -1122,3 +1122,52 @@ async fn a_revoked_patch_capability_is_denied_at_intent_and_journaled() {
         "the engine's Denied row is kept"
     );
 }
+
+/// The first patch claude-opus-5-5 sent in the 2026-10-08 host live run, verbatim: a
+/// well-formed header whose hunk counts (8 old, 9 new) exceed the body (7, 8).
+const LIVE_MISCOUNTED_HUNK: &str = r##"--- a/src/parser.py
++++ b/src/parser.py
+@@ -3,8 +3,9 @@
+     result = {}
+     for line in text.splitlines():
+-        if not line.strip() or line.startswith("#"):
++        stripped = line.strip()
++        if not stripped or stripped.startswith("#"):
+             continue
+-        key, _, value = line.partition("=")
+-        result[key] = value
++        key, _, value = stripped.partition("=")
++        result[key.strip()] = value.strip()
+     return result
+"##;
+
+#[tokio::test]
+async fn a_miscounted_hunk_is_denied_before_any_effect_and_costs_no_action() {
+    let env = Env::new(10);
+    let mut agent = FakeAgent::scripted(vec![
+        AgentAction::ApplyPatch(LIVE_MISCOUNTED_HUNK.into()),
+        AgentAction::ApplyPatch(fix_patch()),
+        AgentAction::Verify,
+    ]);
+    assert_eq!(run(&env, &mut agent).await, TaskState::Succeeded);
+    let denials = env.denials("InvalidPatch");
+    assert_eq!(denials.len(), 1, "{denials:?}");
+    assert!(
+        // The same request digest as the live run's denial: this is that request, byte for byte.
+        matches!(&agent.observations()[1], Observation::PatchRejected { reason }
+            if reason.contains("corrupt patch")
+                && reason.contains("e06a45f75c3bb49305fb2cbf85c5e2099e1a4374c0548ed7cab99cf3c50496b9")),
+        "{:?}",
+        agent.observations()
+    );
+    assert_eq!(
+        env.effects("ApplyPatch").len(),
+        1,
+        "only the good patch became an effect"
+    );
+    assert_eq!(
+        env.db.task(&env.task).unwrap().actions_used,
+        2,
+        "the denial used no action"
+    );
+}

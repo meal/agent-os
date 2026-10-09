@@ -13,13 +13,72 @@ still do not establish provider or isolation acceptance.
 | `acceptance.sh live`, host worker | `825d360-dirty` (the dirty change is the test fix above) | `claude-opus-5-5`, `SUCCEEDED`, 5 model calls, final workspace digest equals verified digest; offline replay matched. |
 | `acceptance.sh live`, jailed Firecracker worker | `825d360-dirty` | Same model, `SUCCEEDED`, 4 model calls; offline replay matched. |
 
+Candidate image `python-stdlib-py314-v1` (Task 5), run with
+`AGENTOS_ACCEPTANCE_IMAGE=python-stdlib-py314-v1 sh scripts/acceptance.sh kvm`:
+
+| Run | Commit | Result |
+| --- | --- | --- |
+| First attempt | `97d0f54` | **Failed**: 113/115 in `agentos-cli`; the CLI tests hard-coded the default image id as the contract `profile`. The engine suites never ran. |
+| Second attempt | `2ee9c45` | Every stage passed, but **invalid**: checks ran Debian's Python 3.11.2, because the guest's check `PATH` is `/usr/bin:/bin` and the recipe linked 3.14.8 only into `/usr/local/bin`. |
+| After the recipe fix | `f175de3` | Passed: two byte-identical builds (digest `2ccceaa0…fefeb`), the full workspace suite and the `AGENTOS_TEST_WORKER=firecracker` suite, 986 passed and 0 failed in each. The guest reports Python 3.14.8, matching `image.json` and `runtime/python.lock`. |
+
+Both earlier attempts are in `kvm-py314-failed-attempts/`, the passing run with its
+`image.json` in `kvm-py314-pass/`. A new KVM test,
+`the_guest_interpreter_is_the_one_the_image_manifest_records`, now checks the interpreter
+the guest actually runs against the manifest for every image. The candidate is accepted but
+not the default; the interpreter is copied from the pinned pyenv build, not rebuilt
+independently from source (see the recipe README).
+
+Task 9 (contract-driven VM disks and I/O):
+
+| Run | Commit | Result |
+| --- | --- | --- |
+| `acceptance.sh kvm` | `b58087a` | **Failed**: one engine unit test raced a lock release against another test's process spawn (`kvm-task9-failed-attempt/`). Not a Task 9 change. |
+| `acceptance.sh kvm`, after the test fix | `7955b96` | Passed: both suites, 1018 passed and 0 failed in each (`kvm-task9-pass/`). |
+
+The memory measurements behind the jail's 128 MiB overhead are in `vm-memory/`: the
+hostile disk-fill check at 256 and 1024 MiB of guest memory, alone and four at once. The
+smallest headroom of memory reclaim cannot drop was 61 MiB, and no case recorded an OOM kill.
+
+Task 10 (the component analyzer), `2026-10-09/`:
+
+| Run | Commit | Result |
+| --- | --- | --- |
+| `acceptance.sh kvm` | `d33e82e` | **Failed** before any test ran: the host's root disk was full (`kvm-task10-failed-attempt/`). |
+| `acceptance.sh kvm`, after freeing disk space | `d33e82e` | Passed: both suites, 1045 passed and 0 failed in each, including the analyzer end to end on the real jailed worker (`kvm-task10-pass/`). |
+
+Task 11 (source kernel and installer), `2026-10-09/`:
+
+| Run | Commit | Result |
+| --- | --- | --- |
+| `acceptance.sh kvm` on `python-stdlib-py314-v2` | `22a5e7b` | **Failed**: kernel and image reproducible, one KVM test sized its tmpfs for the smaller image (`kvm-py314-v2-failed-attempt/`). |
+| the same, after the test fix | `a127005` | Passed: two identical kernel builds, two identical image builds, both suites with 1047 passed and 0 failed (`kvm-py314-v2-pass/`). |
+| `smoke-install.sh` on release `0.1.0-rc3` | `2a50d59` | Passed (`smoke-install/`): in a fresh pinned Debian container the installer refused a missing git and an undelegated cgroup tree, then installed as root and ran the fixture jailed with the analyzer through a kill and resume, and an unprivileged user installed with `--allow-unjailed` and ran it unjailed. rc1 and rc2 were dry runs: rc1 shipped the image without kernel provenance, and rc2 exposed a registration bug for non-root users, fixed in `2a50d59`. |
+
+Only one KVM host was available: a fresh container on it stands in for a fresh host.
+
 Image `python-stdlib-v1`; Firecracker v1.17.0; kernel 6.18.51. The live runs predate the test
 fix, which changes only a test assertion. Recordings (schema version 2) are in
 `fixtures/transcripts/live/`; each worker's manifest, `patch.diff`, success report and replay
-report are under `2026-10-08/host` and `2026-10-08/firecracker`. Every file was scanned for the
-key bytes, `sk-ant` and `x-api-key`: none found. The host run recorded one `Denied` event
-that has not been examined. The candidate `python-stdlib-py314-v1` image, two-snapshot
-fresh-host evidence, VM resource measurements and the component ABI remain open.
+report are under `2026-10-08/host` and `2026-10-08/firecracker`.
+
+The host run's one `Denied` event is the broker refusing the model's first patch as
+`InvalidPatch`: its hunk header counted 8 old and 9 new lines where the body had 7 and 8,
+so `git apply` reported a corrupt patch. The refusal created no effect and used no tool
+action (both runs show 4 `ActionUsed`; the host run has one more model call and one more
+`EffectIntended` than the jailed run, for the corrected patch). The model fixed the hunk
+on its next turn. `happy_path::a_miscounted_hunk_is_denied_before_any_effect_and_costs_no_action`
+replays that patch verbatim and reproduces the same request digest.
+
+Secret exclusion and consistency are now checked by `cargo test --test evidence` in the
+default tier. Every file under `docs/evidence/` (except prose) and `fixtures/transcripts/`
+is scanned for `sk-ant-`, `x-api-key`, `authorization`, `bearer ` and full 32-digit
+capability handles. Recordings store provider response bodies as byte arrays, so the scan
+decodes them; a text search would not see them. Each promoted run's success report,
+replay report, manifest, `patch.diff` (by BLAKE3), recording and setup commit must agree.
+The live harness also scans its recording and bundle for the exact key bytes before it
+writes a success report. The method of the first manual scan was not
+recorded; the decoded scan above finds nothing in these runs. Release candidate v0.1.0-rc5: every gate at commit `b8a456a`, under `2026-10-09/rc5/` (see `docs/releases/v0.1.0-rc5.md`).
 
 Run from a normal checkout on the provisioned Linux x86_64 Docker host:
 
@@ -63,3 +122,17 @@ resource measurements, and the new component ABI remain separate gates in the ma
 plan. A copied pyenv interpreter plus two identical guest outputs does not prove an
 independent Python source rebuild; that provenance limit remains documented in the
 candidate recipe.
+
+## 2026-10-09: external agent CLI in the guest
+
+The real Claude Code binary as the task's agent inside the microVM, model traffic over vsock
+through the controller (design and plan in `docs/superpowers/`). Image `agent-cli-py314-v1`
+(guest protocol 2).
+
+| Run | Commit | Result |
+| --- | --- | --- |
+| KVM tier, three agent-session tests, both workspace suites with the default and the real worker | `aba71fc`/`fff1c23` | Passed: no NIC and no key, real CLI fixes the fixture, cancel and lease end the session (`agent-session-kvm.md`). |
+| `acceptance.sh live-agent`, attempt 1 | `9105e7e` | **Rejected by the API** (HTTP 400, per-message beta field), one send (`live-agent-attempt-1.md`). |
+| attempt 2 | `0ebb90f` | Call 1 answered; call 2 **rejected** (HTTP 400, thinking block without its signature) (`live-agent-attempt-2.md`). |
+| attempt 3 | `d90b9ba` | **Passed**: `Succeeded`, 5 model calls, protected verification passed (`live-agent-attempt-3.md`, `live-agent-pass/`). |
+

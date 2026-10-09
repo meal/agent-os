@@ -10,16 +10,19 @@ REPO=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 for interpreter in /usr/bin/python3 "$PYENV_ROOT/versions/$AGENTOS_PYTHON_VERSION/bin/python3"; do
-    mkdir "$scratch/repo"
-    cp -R "$REPO/fixtures/parser-repo/." "$scratch/repo/"
-    if "$interpreter" "$REPO/fixtures/profiles/parser-checks-v1/check_parser.py" "$scratch/repo" > "$scratch/result"; then
-        echo "broken fixture unexpectedly passed: $interpreter" >&2
-        exit 1
-    else
-        [ "$?" -eq 1 ]
-    fi
-    git -C "$scratch/repo" apply "$REPO/fixtures/parser-repo.fix.patch"
-    "$interpreter" "$REPO/fixtures/profiles/parser-checks-v1/check_parser.py" "$scratch/repo"
-    rm -rf "$scratch/repo"
+    for fixture in parser:parser-checks-v1/check_parser.py duration:duration-checks-v1/check_duration.py; do
+        name=${fixture%%:*}; check=${fixture#*:}
+        mkdir "$scratch/repo"
+        cp -R "$REPO/fixtures/$name-repo/." "$scratch/repo/"
+        if "$interpreter" "$REPO/fixtures/profiles/$check" "$scratch/repo" > "$scratch/result"; then
+            echo "broken $name fixture unexpectedly passed: $interpreter" >&2
+            exit 1
+        else
+            [ "$?" -eq 1 ]
+        fi
+        git -C "$scratch/repo" apply "$REPO/fixtures/$name-repo.fix.patch"
+        "$interpreter" "$REPO/fixtures/profiles/$check" "$scratch/repo"
+        rm -rf "$scratch/repo"
+    done
 done
 echo "both interpreter acceptance checks passed"

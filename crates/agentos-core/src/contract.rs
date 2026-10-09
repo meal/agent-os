@@ -27,7 +27,31 @@ pub enum Capability {
     ArtifactExport,
     #[serde(rename = "model.request")]
     ModelRequest,
+    #[serde(rename = "snapshot.analyze")]
+    SnapshotAnalyze,
+    #[serde(rename = "agent.session")]
+    AgentSession,
 }
+
+/// The analyzer component a task runs once over its snapshot: a registered id and the digest
+/// it must have. Always pinned, so the run is reproducible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnalyzerRef {
+    pub id: String,
+    pub digest: String,
+}
+
+/// Bounds of the optional VM resource limits (see `resources::VmResources` for their
+/// defaults). The workspace drive must hold a 256 MiB snapshot with ext4 overhead; scratch the
+/// staged profile (64 MiB) and the reverse-check copy of the workspace content (256 MiB).
+pub const WORKER_DISK_MIB: std::ops::RangeInclusive<u32> = 512..=32768;
+pub const WORKER_SCRATCH_MIB: std::ops::RangeInclusive<u32> = 384..=32768;
+/// The minimum rates keep boot (formatting scratch before the guest's 10 s watchdog), a
+/// near-limit snapshot (120 s reply deadline) and its inspection (60 s) within their
+/// deadlines; measured, see the VM resources design.
+pub const WORKER_DISK_BANDWIDTH_MIB_S: std::ops::RangeInclusive<u32> = 32..=4096;
+pub const WORKER_DISK_IOPS: std::ops::RangeInclusive<u32> = 5000..=1_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,6 +62,19 @@ pub struct Limits {
     pub deadline_seconds: u32,
     pub worker_vcpus: u32,
     pub worker_memory_mib: u32,
+    // Optional, and omitted when absent, so a contract without them keeps its digest.
+    /// The workspace drive's size; absent means the version's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_disk_mib: Option<u32>,
+    /// The scratch drive's size; absent means the version's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_scratch_mib: Option<u32>,
+    /// Bandwidth of each writable drive; absent means unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_disk_bandwidth_mib_s: Option<u32>,
+    /// Operations per second of each writable drive; absent means unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_disk_iops: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,6 +88,9 @@ pub struct Contract {
     pub profile_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_image_digest: Option<String>,
+    /// Requires `snapshot.analyze`; absent, the task runs no analyzer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyzer: Option<AnalyzerRef>,
     pub verification_profile: String,
     pub capabilities: Vec<Capability>,
     pub limits: Limits,
@@ -102,6 +142,31 @@ impl Contract {
                 return Err(ContractError::Invalid(format!("limit {name} must be > 0")));
             }
         }
+        let bounded = [
+            ("worker_disk_mib", l.worker_disk_mib, WORKER_DISK_MIB),
+            (
+                "worker_scratch_mib",
+                l.worker_scratch_mib,
+                WORKER_SCRATCH_MIB,
+            ),
+            (
+                "worker_disk_bandwidth_mib_s",
+                l.worker_disk_bandwidth_mib_s,
+                WORKER_DISK_BANDWIDTH_MIB_S,
+            ),
+            ("worker_disk_iops", l.worker_disk_iops, WORKER_DISK_IOPS),
+        ];
+        for (name, v, range) in bounded {
+            if let Some(v) = v
+                && !range.contains(&v)
+            {
+                return Err(ContractError::Invalid(format!(
+                    "limit {name} must be in {}..={}, got {v}",
+                    range.start(),
+                    range.end()
+                )));
+            }
+        }
         check_plain_name("profile", &self.profile)?;
         check_plain_name("verification_profile", &self.verification_profile)?;
         if self.verification_profile.contains('@') {
@@ -116,6 +181,39 @@ impl Contract {
                 return Err(ContractError::Invalid(format!(
                     "profile_digest {d:?} must be 64 lowercase hex characters"
                 )));
+            }
+        }
+        let analyze = self.capabilities.contains(&Capability::SnapshotAnalyze);
+        match (&self.analyzer, analyze) {
+            (Some(a), true) => {
+                check_plain_name("analyzer.id", &a.id)?;
+                if a.id.contains('@') {
+                    return Err(ContractError::Invalid(format!(
+                        "analyzer.id {:?} must not contain '@'",
+                        a.id
+                    )));
+                }
+                let hex = a.digest.len() == 64
+                    && a.digest
+                        .bytes()
+                        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+                if !hex {
+                    return Err(ContractError::Invalid(format!(
+                        "analyzer.digest {:?} must be 64 lowercase hex characters",
+                        a.digest
+                    )));
+                }
+            }
+            (None, false) => {}
+            (Some(_), false) => {
+                return Err(ContractError::Invalid(
+                    "an analyzer needs the snapshot.analyze capability".into(),
+                ));
+            }
+            (None, true) => {
+                return Err(ContractError::Invalid(
+                    "the snapshot.analyze capability needs an analyzer".into(),
+                ));
             }
         }
         if let Some(d) = &self.guest_image_digest {
@@ -188,6 +286,160 @@ mod tests {
             serde_json::to_string(&Contract::parse(&out).unwrap()).unwrap(),
             out
         );
+    }
+
+    #[test]
+    fn agent_session_capability_parses_and_serializes_as_agent_dot_session() {
+        let j = OK.replace(
+            "\"artifact.export\"]",
+            "\"artifact.export\",\"agent.session\"]",
+        );
+        assert_ne!(j, OK);
+        let c = Contract::parse(&j).unwrap();
+        assert!(c.capabilities.contains(&Capability::AgentSession));
+        assert_eq!(
+            serde_json::to_value(Capability::AgentSession).unwrap(),
+            serde_json::json!("agent.session")
+        );
+        // Needs no analyzer and no pin: a session is not an analysis.
+        assert!(c.analyzer.is_none());
+    }
+
+    /// Contracts that do not name `agent.session` keep the digest they had before the
+    /// capability existed (the same pin as the test above).
+    #[test]
+    fn contracts_without_agent_session_keep_their_digest() {
+        let c = Contract::parse(OK).unwrap();
+        assert!(!serde_json::to_string(&c).unwrap().contains("agent.session"));
+        let digest = crate::ids::Digest::of(&serde_json::to_vec(&c).unwrap());
+        assert_eq!(
+            digest.to_string(),
+            "4ef04e21c7f6cbe572fa7a2ba3102f720ddc45460a90dc76569f0818e22d0062"
+        );
+    }
+
+    /// A contract without the optional VM resource fields serializes exactly as it did before
+    /// they existed, so every stored contract keeps its digest (pinned before the change).
+    #[test]
+    fn a_contract_without_resource_fields_keeps_its_digest() {
+        let c = Contract::parse(OK).unwrap();
+        let digest = crate::ids::Digest::of(&serde_json::to_vec(&c).unwrap());
+        assert_eq!(
+            digest.to_string(),
+            "4ef04e21c7f6cbe572fa7a2ba3102f720ddc45460a90dc76569f0818e22d0062"
+        );
+    }
+
+    fn with_limits(extra: &str) -> String {
+        OK.replace(
+            "\"worker_memory_mib\":2048}",
+            &format!("\"worker_memory_mib\":2048,{extra}}}"),
+        )
+    }
+
+    #[test]
+    fn vm_resource_fields_round_trip_and_are_omitted_when_absent() {
+        let j = with_limits(
+            r#""worker_disk_mib":2048,"worker_scratch_mib":768,"worker_disk_bandwidth_mib_s":64,"worker_disk_iops":5000"#,
+        );
+        let c = Contract::parse(&j).unwrap();
+        assert_eq!(c.limits.worker_disk_mib, Some(2048));
+        assert_eq!(c.limits.worker_scratch_mib, Some(768));
+        assert_eq!(c.limits.worker_disk_bandwidth_mib_s, Some(64));
+        assert_eq!(c.limits.worker_disk_iops, Some(5000));
+        let out = serde_json::to_string(&c).unwrap();
+        assert_eq!(Contract::parse(&out).unwrap(), c);
+        let plain = serde_json::to_string(&Contract::parse(OK).unwrap()).unwrap();
+        assert!(!plain.contains("worker_disk"), "{plain}");
+        assert!(!plain.contains("worker_scratch"), "{plain}");
+    }
+
+    #[test]
+    fn vm_resource_fields_are_bounded() {
+        for (field, lo, hi) in [
+            ("worker_disk_mib", 512u64, 32768u64),
+            ("worker_scratch_mib", 384, 32768),
+            ("worker_disk_bandwidth_mib_s", 32, 4096),
+            ("worker_disk_iops", 5000, 1_000_000),
+        ] {
+            for ok in [lo, hi] {
+                Contract::parse(&with_limits(&format!("\"{field}\":{ok}")))
+                    .unwrap_or_else(|e| panic!("{field}={ok}: {e}"));
+            }
+            for bad in [lo - 1, hi + 1, u64::from(u32::MAX)] {
+                let err = Contract::parse(&with_limits(&format!("\"{field}\":{bad}")))
+                    .expect_err(&format!("{field}={bad} accepted"))
+                    .to_string();
+                assert!(err.contains(field), "{err}");
+                assert!(err.contains(&format!("{lo}..={hi}")), "{err}");
+            }
+            assert!(Contract::parse(&with_limits(&format!("\"{field}\":4294967296"))).is_err());
+        }
+    }
+
+    const PIN_DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn with_analyzer(analyzer: &str, capability: bool) -> String {
+        let mut j = OK.replacen(
+            "\"verification_profile\"",
+            &format!("{analyzer}\"verification_profile\""),
+            1,
+        );
+        if capability {
+            j = j.replace(
+                "\"artifact.export\"]",
+                "\"artifact.export\",\"snapshot.analyze\"]",
+            );
+        }
+        j
+    }
+
+    #[test]
+    fn an_analyzer_needs_the_analyze_capability_and_the_reverse() {
+        let pin = format!(r#""analyzer":{{"id":"repo-analyzer-v1","digest":"{PIN_DIGEST}"}},"#);
+        let c = Contract::parse(&with_analyzer(&pin, true)).unwrap();
+        assert_eq!(
+            c.analyzer,
+            Some(AnalyzerRef {
+                id: "repo-analyzer-v1".into(),
+                digest: PIN_DIGEST.into()
+            })
+        );
+        assert!(c.capabilities.contains(&Capability::SnapshotAnalyze));
+        let out = serde_json::to_string(&c).unwrap();
+        assert_eq!(Contract::parse(&out).unwrap(), c);
+        let without_cap = Contract::parse(&with_analyzer(&pin, false))
+            .unwrap_err()
+            .to_string();
+        assert!(without_cap.contains("snapshot.analyze"), "{without_cap}");
+        let without_pin = Contract::parse(&with_analyzer("", true))
+            .unwrap_err()
+            .to_string();
+        assert!(without_pin.contains("analyzer"), "{without_pin}");
+        assert!(
+            !serde_json::to_string(&Contract::parse(OK).unwrap())
+                .unwrap()
+                .contains("analyzer")
+        );
+    }
+
+    #[test]
+    fn an_analyzer_pin_is_a_plain_id_and_a_full_digest() {
+        for (id, digest) in [
+            ("a/b", PIN_DIGEST),
+            ("x@y", PIN_DIGEST),
+            ("..", PIN_DIGEST),
+            ("ok-v1", "short"),
+            ("ok-v1", &PIN_DIGEST.to_uppercase()),
+        ] {
+            let pin = format!(r#""analyzer":{{"id":"{id}","digest":"{digest}"}},"#);
+            assert!(
+                Contract::parse(&with_analyzer(&pin, true)).is_err(),
+                "{id} {digest}"
+            );
+        }
+        let extra = format!(r#""analyzer":{{"id":"ok-v1","digest":"{PIN_DIGEST}","x":1}},"#);
+        assert!(Contract::parse(&with_analyzer(&extra, true)).is_err());
     }
 
     #[test]

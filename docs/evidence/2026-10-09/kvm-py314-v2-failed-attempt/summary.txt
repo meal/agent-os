@@ -1,0 +1,5 @@
+Commit 22a5e7b: kernel and image built twice identically; the kvm suite failed 1 test:
+host_enospc_under_the_drives_never_yields_an_unbacked_success mounted a fixed 200 MiB tmpfs and
+copied the guest image into it; the py314 image (about 177 MiB) left too little room even for the
+snapshot meant to succeed. Test fixed to size the tmpfs from the image (2625247); the rerun at
+a127005 passed.

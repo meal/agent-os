@@ -1,13 +1,13 @@
 #!/bin/sh
-# Required offline gates. CI selects one gate; local runs default to all five.
+# Required offline gates. CI selects one gate; local runs default to all six.
 # `mount` runs the GC mount-root regressions in the `test-mount` service (CAP_SYS_ADMIN only).
 set -eu
 REPO=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 cd "$REPO"
 export COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-agentos-check}
 check=${1:-all}
-[ "$#" -le 1 ] || { echo "usage: scripts/check.sh [all|fmt|clippy|host|fake|mount]" >&2; exit 2; }
-case "$check" in all|fmt|clippy|host|fake|mount) ;; *) echo "unknown check: $check" >&2; exit 2;; esac
+[ "$#" -le 1 ] || { echo "usage: scripts/check.sh [all|fmt|clippy|host|fake|mount|components]" >&2; exit 2; }
+case "$check" in all|fmt|clippy|host|fake|mount|components) ;; *) echo "unknown check: $check" >&2; exit 2;; esac
 if [ "$check" = all ] || [ "$check" = fmt ]; then docker compose run --rm test cargo fmt --all -- --check; fi
 if [ "$check" = all ] || [ "$check" = clippy ]; then docker compose run --rm test cargo clippy --workspace --all-targets --locked -- -D warnings; fi
 if [ "$check" = all ] || [ "$check" = host ]; then docker compose run --rm test cargo test --workspace --locked; fi
@@ -19,3 +19,5 @@ if [ "$check" = all ] || [ "$check" = mount ]; then
     printf '%s\n' "$out"
     printf '%s\n' "$out" | grep -q 'test result: ok\. 4 passed; 0 failed' || { echo "mount gate: expected exactly 4 mount_gate_ tests to pass" >&2; exit 1; }
 fi
+# The committed analyzer components are exactly what their sources build to.
+if [ "$check" = all ] || [ "$check" = components ]; then docker compose run --rm test sh scripts/build-components.sh --check; fi

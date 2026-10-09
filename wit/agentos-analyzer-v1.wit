@@ -1,0 +1,36 @@
+package agentos:analyzer@1.0.0;
+
+interface snapshot {
+  /// One regular file of the task's recorded snapshot.
+  record entry {
+    path: string,
+    size: u64,
+  }
+
+  variant read-error {
+    /// The task's snapshot.analyze capability is not usable, or the tree is another task's.
+    denied(string),
+    not-found,
+    invalid-path,
+    /// More than 1 MiB asked for in one read.
+    too-large,
+    /// The run's read calls or bytes are used up.
+    budget-exhausted,
+  }
+
+  /// The task's recorded snapshot, bound to one task and its capability.
+  resource tree {
+    /// Every regular file, sorted by path.
+    files: func() -> result<list<entry>, read-error>;
+    /// At most `len` bytes of `path` from `offset`.
+    read: func(path: string, offset: u64, len: u32) -> result<list<u8>, read-error>;
+  }
+}
+
+world analyzer {
+  import snapshot;
+  use snapshot.{tree};
+
+  /// A JSON object of at most 64 KiB describing the snapshot.
+  export analyze: func(tree: borrow<tree>) -> result<string, string>;
+}

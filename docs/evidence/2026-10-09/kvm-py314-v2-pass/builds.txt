@@ -1,0 +1,3 @@
+build-guest-image.sh: --verify: two builds are byte-identical
+{"digest":"8f1932ee97ca84bfb8d1ca6de973a88a2e5a76242671487fe9d580366e6687f7","id":"python-stdlib-py314-v2"}
+two kernel builds are byte-identical

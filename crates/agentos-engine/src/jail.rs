@@ -23,6 +23,8 @@ use rustix::io::Errno;
 use rustix::process::geteuid;
 use serde::{Deserialize, Serialize};
 
+use agentos_core::resources::VmResources;
+
 use crate::firecracker::VmView;
 use crate::guestlink::guest_text;
 
@@ -34,8 +36,11 @@ pub const JAIL_PARENT_CGROUP: &str = "agentos";
 /// `memory.max` = guest memory plus this, for Firecracker's own footprint.
 pub const JAIL_MEMORY_OVERHEAD_MIB: u32 = 128;
 pub const JAIL_PIDS_MAX: u32 = 64;
-/// `RLIMIT_FSIZE` of the jailed process (= `WS_IMAGE_BYTES`).
-pub const JAIL_FSIZE_BYTES: u64 = 1 << 30;
+/// `RLIMIT_FSIZE` of the jailed process: its largest file is the larger drive image (1 GiB
+/// for version-0 resources).
+pub fn jail_fsize_bytes(resources: &VmResources) -> u64 {
+    resources.disk_bytes().max(resources.scratch_bytes())
+}
 /// `cpu.max` period; the quota is `vcpus × CPU_PERIOD_US`.
 pub const CPU_PERIOD_US: u64 = 100_000;
 /// The jailer's `--chroot-base-dir`, under the job (or inspect) directory.
@@ -149,6 +154,7 @@ pub fn jailer_args(
     firecracker_bin: &Path,
     vcpus: u32,
     memory_mib: u32,
+    resources: &VmResources,
 ) -> Vec<OsString> {
     jailer_args_with(
         cfg,
@@ -156,6 +162,7 @@ pub fn jailer_args(
         firecracker_bin,
         vcpus,
         memory_mib,
+        resources,
         CgroupOverrides::default(),
     )
 }
@@ -167,6 +174,7 @@ pub fn jailer_args_with(
     firecracker_bin: &Path,
     vcpus: u32,
     memory_mib: u32,
+    resources: &VmResources,
     overrides: CgroupOverrides,
 ) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec![
@@ -208,7 +216,7 @@ pub fn jailer_args_with(
     }
     args.extend([
         "--resource-limit".into(),
-        format!("fsize={JAIL_FSIZE_BYTES}").into(),
+        format!("fsize={}", jail_fsize_bytes(resources)).into(),
     ]);
     args.extend(["--", "--no-api", "--config-file", "/vm.json"].map(OsString::from));
     args
@@ -739,6 +747,22 @@ mod tests {
     const UUID: &str = "0b8a5f3e-7c1d-4e2a-9f6b-3d5c7e9a1b2c";
 
     #[test]
+    fn the_file_size_limit_is_the_larger_drive_image() {
+        assert_eq!(jail_fsize_bytes(&VmResources::V0), 1 << 30);
+        let big_scratch = VmResources {
+            scratch_mib: 4096,
+            ..VmResources::V0
+        };
+        assert_eq!(jail_fsize_bytes(&big_scratch), 4096 << 20);
+        let big_disk = VmResources {
+            version: 1,
+            disk_mib: 32768,
+            ..VmResources::V0
+        };
+        assert_eq!(jail_fsize_bytes(&big_disk), 32768 << 20);
+    }
+
+    #[test]
     fn plan_lays_out_chroot_and_cgroup_under_the_dir() {
         let p = plan(
             &jail_config(),
@@ -817,7 +841,7 @@ mod tests {
         };
         let fc = Path::new("/home/x/bin/firecracker");
         let p = plan(&cfg, fc, Path::new("/home/x/jobs/e-a"), UUID).unwrap();
-        let args = jailer_args(&cfg, &p, fc, 2, 512);
+        let args = jailer_args(&cfg, &p, fc, 2, 512, &VmResources::V0);
         let expected: Vec<OsString> = [
             "--id",
             UUID,
@@ -864,7 +888,15 @@ mod tests {
         assert_eq!(args.iter().filter(|a| *a == "--id").count(), 1);
         // No override: byte-identical; each override replaces exactly its value.
         assert_eq!(
-            jailer_args_with(&cfg, &p, fc, 2, 512, CgroupOverrides::default()),
+            jailer_args_with(
+                &cfg,
+                &p,
+                fc,
+                2,
+                512,
+                &VmResources::V0,
+                CgroupOverrides::default()
+            ),
             expected
         );
         let lowered = jailer_args_with(
@@ -873,6 +905,7 @@ mod tests {
             fc,
             2,
             512,
+            &VmResources::V0,
             CgroupOverrides {
                 memory_max_mib: Some(96),
                 cpu_quota_us: Some(50_000),
@@ -1020,6 +1053,7 @@ mod tests {
     #[test]
     fn chroot_view_is_the_golden_jailed_vm_json() {
         let cfg = FirecrackerConfig {
+            resources: agentos_core::resources::VmResources::V0,
             firecracker_bin: "/home/x/bin/firecracker".into(),
             image_dir: "/home/x/registry/images/python-stdlib-v1@0545ba17".into(),
             image_digest: Digest::of(b"image"),

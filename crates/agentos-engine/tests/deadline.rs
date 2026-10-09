@@ -71,6 +71,18 @@ impl Executor for PatchesWithoutReceipt {
     async fn fence_job(&self, effect: &EffectId) -> bool {
         self.plain.fence_job(effect).await
     }
+
+    fn runs_agent_sessions(&self) -> bool {
+        self.plain.runs_agent_sessions()
+    }
+
+    fn session_mailbox(&self, effect: &EffectId) -> Option<agentos_engine::job::Mailbox> {
+        self.plain.session_mailbox(effect)
+    }
+
+    fn cancel_jobs(&self, effects: &[EffectId]) -> usize {
+        self.plain.cancel_jobs(effects)
+    }
 }
 
 /// A controller over an approved task whose clock the test moves.
@@ -409,4 +421,16 @@ async fn unapproved_task_has_no_deadline_and_a_late_approval_starts_a_fresh_one(
     assert!(!db.deadline_passed(&task).unwrap());
     clock.store(1_000_600, Ordering::SeqCst);
     assert!(db.deadline_passed(&task).unwrap());
+}
+
+/// The session methods reach the supervised executor through the wrapper.
+#[tokio::test]
+async fn the_test_executor_forwards_the_session_methods() {
+    let w = World::new(600);
+    let jobs = w.path("jobs");
+    let exec = PatchesWithoutReceipt {
+        plain: common::session_supervised(w.dir.path(), &jobs, &w.counts),
+        patches: common::session_supervised(w.dir.path(), &jobs, &w.counts),
+    };
+    common::assert_forwards_sessions(&exec, w.dir.path(), &jobs);
 }

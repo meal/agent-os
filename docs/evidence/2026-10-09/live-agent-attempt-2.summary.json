@@ -1,0 +1,76 @@
+{
+  "attempts": [
+    {
+      "attempt": 1,
+      "bytes": 1817,
+      "input_tokens": 4,
+      "outcome": "response",
+      "output_tokens": 165,
+      "request_digest": "ef88d73ae2c8eec48fec33ba3c08e73d116fd45201ea64ba189ebf85cc4bb2d9"
+    },
+    {
+      "attempt": 2,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"messages.1.content.0.thinking: each thinking block must contain thinking\"},\"request_id\":\"req_011CfroPzsNXpZc24LqCQeb2\"}",
+      "outcome": "rejected",
+      "request_digest": "a55301e344f90265ba23908d09629bf8ad589112593f10b5c6a874131439259d",
+      "status": 400
+    }
+  ],
+  "commit": "0ebb90fa238e31d9fc53918f5cc4d2b5c52dc0c6",
+  "contract": {
+    "deadline_seconds": 900,
+    "max_output_tokens_per_request": 4096,
+    "model_requests": 12,
+    "worker_memory_mib": 1024
+  },
+  "endpoint": "https://api.anthropic.com",
+  "events": {
+    "ActionUsed": 1,
+    "AgentTurn": 1,
+    "ArtifactRegistered": 5,
+    "CapabilitiesIssued": 1,
+    "CapabilityGranted": 8,
+    "EffectCompleted": 2,
+    "EffectDispatched": 4,
+    "EffectFailed": 1,
+    "EffectIntended": 4,
+    "EffectUnknown": 1,
+    "Failed": 1,
+    "SessionModelCall": 2,
+    "Started": 1,
+    "Submitted": 1,
+    "TaskCreated": 1,
+    "WorkspaceUpdated": 1
+  },
+  "failure": "{\"Failed\":{\"reason\":\"http 400: {\\\"type\\\":\\\"error\\\",\\\"error\\\":{\\\"type\\\":\\\"invalid_request_error\\\",\\\"message\\\":\\\"messages.1.content.0.thinking: each thinking block must contain thinking\\\"},\\\"request_id\\\":\\\"req_011CfroPzsNXpZc24LqCQeb2\\\"}\"}}",
+  "image": "agent-cli-py314-v1",
+  "kind": "live-agent-session",
+  "model": "claude-haiku-5-5",
+  "model_calls": [
+    {
+      "effect_id": "9217a2bf576f7af1f08a7164009750a7b9111ed8a98f925cb4b01f2353fb1222",
+      "request_digest": "ef88d73ae2c8eec48fec33ba3c08e73d116fd45201ea64ba189ebf85cc4bb2d9",
+      "request_file": "model/0001-request.json",
+      "response_digest": "972270c1b2a2e7daa52e0a5ce17b8054d6e511c08d0bf3300be4320e9cb06bab",
+      "response_file": "model/0001-response.json",
+      "state": "COMPLETED"
+    },
+    {
+      "effect_id": "ef4cd5494f33fc985bd2946bc0a6dae48216a9d56b523a24482a7aad4186ac6b",
+      "request_digest": "a55301e344f90265ba23908d09629bf8ad589112593f10b5c6a874131439259d",
+      "request_file": "model/0002-request.json",
+      "response_digest": "6e0e06a8eed9ac3f36b044e7d319ac34e5c17e40ee9aa1b2edeecd93096e3d93",
+      "response_file": "model/0002-response.json",
+      "state": "FAILED"
+    }
+  ],
+  "problems": [
+    "the task ended Failed: {\"Failed\":{\"reason\":\"http 400: {\\\"type\\\":\\\"error\\\",\\\"error\\\":{\\\"type\\\":\\\"invalid_request_error\\\",\\\"message\\\":\\\"messages.1.content.0.thinking: each thinking block must contain thinking\\\"},\\\"request_id\\\":\\\"req_011CfroPzsNXpZc24LqCQeb2\\\"}\"}}"
+  ],
+  "schema_version": 1,
+  "state": "Failed",
+  "usage": {
+    "input_tokens": 4,
+    "output_tokens": 165
+  }
+}

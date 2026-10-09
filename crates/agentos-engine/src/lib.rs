@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod analysis;
 pub mod crash;
 pub mod executor;
 pub mod export;
@@ -14,6 +15,7 @@ mod outcomes;
 pub mod patch;
 mod process;
 pub mod recover;
+mod retention;
 pub mod routing;
 pub mod runner;
 pub mod shadow;

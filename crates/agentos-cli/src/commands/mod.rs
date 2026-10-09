@@ -1,6 +1,8 @@
+mod component;
 mod control;
 mod export;
 mod gc;
+mod host_check;
 mod image;
 mod inspect;
 mod profile;
@@ -13,7 +15,7 @@ use agentos_core::ids::TaskId;
 use agentos_core::state::TaskState;
 use serde_json::{Value, json};
 
-use crate::args::{Args, Command, ImageCommand, ProfileCommand};
+use crate::args::{Args, Command, ComponentCommand, ImageCommand, ProfileCommand};
 use crate::error::CliError;
 use crate::home::Home;
 
@@ -83,6 +85,14 @@ pub async fn dispatch(args: Args) -> Result<(), CliError> {
         Command::Image {
             command: ImageCommand::List,
         } => image::list(&home),
+        Command::Version => host_check::version(),
+        Command::HostCheck => host_check::host_check(&home),
+        Command::Component {
+            command: ComponentCommand::Register { dir },
+        } => component::register(&home, &dir),
+        Command::Component {
+            command: ComponentCommand::List,
+        } => component::list(&home),
         Command::Revoke { id, capability } => {
             revoke::revoke(&home, &task_id(&id)?, capability.as_deref())
         }
@@ -132,4 +142,9 @@ fn print(v: &Value) {
 
 fn print_state(task: &TaskId, state: TaskState) {
     print(&json!({ "task_id": task, "state": state.label() }));
+}
+
+/// See [`submit::tls_ready`].
+pub(crate) fn submit_tls_ready() -> Result<(), crate::error::CliError> {
+    submit::tls_ready()
 }

@@ -1,0 +1,60 @@
+{
+  "attempts": [
+    {
+      "attempt": 1,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"messages.1.output_config: Extra inputs are not permitted\"},\"request_id\":\"req_011CfrmbMDJVqqQhJaKmWHS9\"}",
+      "outcome": "rejected",
+      "request_digest": "1995dc11d128b09fadddae26a7aec1f5d08115b548a6d510f8707f4db23ed009",
+      "status": 400
+    }
+  ],
+  "commit": "9105e7ee3771112a276672efebf2ae4f99e5d4b0",
+  "contract": {
+    "deadline_seconds": 900,
+    "max_output_tokens_per_request": 4096,
+    "model_requests": 12,
+    "worker_memory_mib": 1024
+  },
+  "endpoint": "https://api.anthropic.com",
+  "events": {
+    "ActionUsed": 1,
+    "AgentTurn": 1,
+    "ArtifactRegistered": 3,
+    "CapabilitiesIssued": 1,
+    "CapabilityGranted": 6,
+    "EffectCompleted": 1,
+    "EffectDispatched": 3,
+    "EffectFailed": 1,
+    "EffectIntended": 3,
+    "EffectUnknown": 1,
+    "Failed": 1,
+    "SessionModelCall": 1,
+    "Started": 1,
+    "Submitted": 1,
+    "TaskCreated": 1,
+    "WorkspaceUpdated": 1
+  },
+  "failure": "{\"Failed\":{\"reason\":\"http 400: {\\\"type\\\":\\\"error\\\",\\\"error\\\":{\\\"type\\\":\\\"invalid_request_error\\\",\\\"message\\\":\\\"messages.1.output_config: Extra inputs are not permitted\\\"},\\\"request_id\\\":\\\"req_011CfrmbMDJVqqQhJaKmWHS9\\\"}\"}}",
+  "image": "agent-cli-py314-v1",
+  "kind": "live-agent-session",
+  "model": "claude-haiku-5-5",
+  "model_calls": [
+    {
+      "effect_id": "20113279ce383425d49a108a2916cae46631e376ad6274262117514fb215c2c7",
+      "request_digest": "1995dc11d128b09fadddae26a7aec1f5d08115b548a6d510f8707f4db23ed009",
+      "request_file": "model/0001-request.json",
+      "response_digest": "e5694517f57b48e919107313f2cda2da7666954aaf4923beabfa805891cf89b0",
+      "response_file": "model/0001-response.json",
+      "state": "FAILED"
+    }
+  ],
+  "problems": [
+    "the task ended Failed: {\"Failed\":{\"reason\":\"http 400: {\\\"type\\\":\\\"error\\\",\\\"error\\\":{\\\"type\\\":\\\"invalid_request_error\\\",\\\"message\\\":\\\"messages.1.output_config: Extra inputs are not permitted\\\"},\\\"request_id\\\":\\\"req_011CfrmbMDJVqqQhJaKmWHS9\\\"}\"}}"
+  ],
+  "schema_version": 1,
+  "state": "Failed",
+  "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0
+  }
+}

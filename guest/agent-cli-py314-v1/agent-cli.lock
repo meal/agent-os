@@ -1,0 +1,10 @@
+# Claude Code, native Linux x64 (glibc) build from npm. Checked 2026-10-09: `latest` is 2.1.295
+# (`stable` is 2.1.286; the traffic findings were measured on 2.1.295). The tarball sha256 is
+# verified before extraction; INTEGRITY is npm's dist.integrity for the same tarball; the binary
+# sha256 is checked after extraction. Sourced by hooks/customize.sh.
+AGENTOS_CLAUDE_CODE_VERSION=2.1.295
+AGENTOS_CLAUDE_CODE_PACKAGE=@anthropic-ai/claude-code-linux-x64
+AGENTOS_CLAUDE_CODE_URL=https://registry.npmjs.org/@anthropic-ai/claude-code-linux-x64/-/claude-code-linux-x64-2.1.295.tgz
+AGENTOS_CLAUDE_CODE_TARBALL_SHA256=d45a2fa14a7ea0b8ab4f56e502de5893c2b816078c71c4d8ab2e4142148f3d95
+AGENTOS_CLAUDE_CODE_INTEGRITY=sha512-nC9RZ6ZArEavyAiFdEtGK6/XPhjfE79tP2tCh+PjmRUxSO/6W3IuXv/rmo8c6u2UzHyvgKodRj1z6UcBGlbnyA==
+AGENTOS_CLAUDE_CODE_BINARY_SHA256=4503bfe11a6c7fcc1e0b39b5e0d347c04248f750b03b0977b3ad6b531fe6f358

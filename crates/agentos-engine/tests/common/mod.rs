@@ -1,15 +1,21 @@
 #![allow(dead_code)]
 
+pub mod evidence;
 pub mod http;
 pub mod kvm;
 pub mod live;
 pub mod procs;
 
 use std::fs;
+use std::thread;
+
+use agentos_engine::jail;
+use rustix::process::{Pid, Signal, kill_process};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use agentos_core::contract::Contract;
-use agentos_core::effect::{EffectId, EffectRecord};
+use agentos_core::effect::{AgentSessionSpec, AttemptId, EffectId, EffectKind, EffectRecord};
 use agentos_core::guest::mint_attempt_token;
 use agentos_core::ids::{Digest, TaskId};
 use agentos_core::state::TaskState;
@@ -20,10 +26,11 @@ use agentos_engine::firecracker::FirecrackerConfig;
 use agentos_engine::fixture::FixtureExecutor;
 use agentos_engine::guestlink::GuestLauncher;
 use agentos_engine::jail::{JailConfig, JailMode};
-use agentos_engine::job::{HostConfig, WorkerConfig};
+use agentos_engine::job::{HostConfig, JobDir, JobRequest, WorkerConfig};
 use agentos_engine::model::executor::ModelExecutor;
 use agentos_engine::model::fake::FakeProvider;
 use agentos_engine::model::provider::ModelProvider;
+use agentos_engine::model::provider::ProviderResult;
 use agentos_engine::routing::RoutingExecutor;
 use agentos_engine::shadow::ShadowReader;
 use agentos_engine::supervised::{ExecCounts, SupervisedExecutor};
@@ -74,7 +81,7 @@ pub fn fake_image(root: &Path) -> PathBuf {
     fs::create_dir_all(&dir).unwrap();
     fs::write(
         dir.join("image.json"),
-        r#"{"id":"python-stdlib-v1","protocol":1,"kernel":"vmlinux","rootfs":"rootfs.squashfs","agent_version":"0.1.0","kernel_sha256":"0545ba1781fc06cfa1d7699069057f4538103fd1644100cf0da434899a1ed447","built_from":"test"}"#,
+        r#"{"id":"python-stdlib-v1","protocol":2,"kernel":"vmlinux","rootfs":"rootfs.squashfs","agent_version":"0.1.0","kernel_sha256":"0545ba1781fc06cfa1d7699069057f4538103fd1644100cf0da434899a1ed447","built_from":"test"}"#,
     )
     .unwrap();
     fs::write(dir.join("vmlinux"), [0x7fu8; 16]).unwrap();
@@ -88,6 +95,7 @@ pub fn fake_image(root: &Path) -> PathBuf {
 pub fn fake_firecracker_config(root: &Path) -> FirecrackerConfig {
     let image_dir = fake_image(root);
     FirecrackerConfig {
+        resources: agentos_core::resources::VmResources::V0,
         firecracker_bin: root.join("bin/firecracker"),
         image_digest: workspace_digest(&image_dir).unwrap(),
         image_dir,
@@ -417,6 +425,104 @@ pub fn processes_of_home(root: &Path) -> Vec<i32> {
     pids
 }
 
+/// A supervised executor whose jobs run on the fake guest (sessions included): what a test
+/// wrapper wraps when it must forward the session methods.
+pub fn session_supervised(
+    root: &Path,
+    jobs_root: &Path,
+    counts: &ExecCounts,
+) -> SupervisedExecutor {
+    supervised(
+        jobs_root,
+        WorkerConfig::Firecracker(fake_firecracker_config(root)),
+        counts,
+        None,
+        &[(TEST_WORKERS_ENV, "1")],
+    )
+}
+
+/// Writes a live `RunAgentSession` job under `jobs_root`, held by the returned lock: an
+/// executor over `jobs_root` sees it as running. Drop the lock to let it die.
+pub fn live_session_job(root: &Path, jobs_root: &Path) -> (EffectId, fs::File) {
+    let task = TaskId::new();
+    let kind = EffectKind::RunAgentSession {
+        expected_base: Digest::of(b"base"),
+    };
+    let payload = AgentSessionSpec {
+        argv: vec!["/bin/true".into()],
+        env: vec![],
+    }
+    .to_payload();
+    let effect = EffectId::derive(&task, 1, &kind, &Digest::of(&payload));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let (_job, lock) = JobDir::create(
+        jobs_root,
+        &JobRequest {
+            effect_id: effect.clone(),
+            task_id: task,
+            kind,
+            payload,
+            contract: contract(10).0,
+            attempt_id: AttemptId::new(),
+            lease_generation: 1,
+            lease_expiry_ms: now + 600_000,
+            task_deadline_ms: now + 600_000,
+            worker: WorkerConfig::Firecracker(fake_firecracker_config(root)),
+        },
+    )
+    .unwrap();
+    (effect, lock)
+}
+
+/// Asserts that `exec` forwards the three session methods to the executor it wraps: over a
+/// live session job under `jobs_root` (see [`live_session_job`]) it runs sessions, hands out the
+/// job's mailbox and cancels the job. A wrapper that does not forward them answers the trait
+/// defaults (`false`, `None`, 0), which is what a session then silently gets.
+pub fn assert_forwards_sessions<E: Executor>(exec: &E, root: &Path, jobs_root: &Path) {
+    let (effect, _lock) = live_session_job(root, jobs_root);
+    assert!(
+        exec.runs_agent_sessions(),
+        "runs_agent_sessions is not forwarded"
+    );
+    assert!(
+        exec.session_mailbox(&effect).is_some(),
+        "session_mailbox is not forwarded"
+    );
+    assert_eq!(
+        exec.cancel_jobs(std::slice::from_ref(&effect)),
+        1,
+        "cancel_jobs is not forwarded"
+    );
+}
+
+/// Waits up to 10 s for `live()` (the pids of what must be gone) to come back empty, then
+/// panics with the survivors. A killed process leaves `/proc` only once the kernel has torn it
+/// down, and a grandchild of a killed group is reaped by its new parent, which is not this
+/// process: an instant scan right after a run is no test of leftovers.
+pub fn assert_gone_within(what: &str, mut live: impl FnMut() -> Vec<i32>) {
+    let started = Instant::now();
+    loop {
+        let pids = live();
+        if pids.is_empty() {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{what} outlived its job: {pids:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// [`assert_gone_within`] for every process of `root`: its job directories and, in real mode,
+/// its VMs.
+pub fn assert_no_process_survives(root: &Path) {
+    assert_gone_within("a process of this home", || processes_of_home(root));
+}
+
 /// A supervised executor running `worker` jobs under `jobs_root` with the real supervisor
 /// binary, counting launches in `counts`, consulting `crash` right after each launch, and
 /// with `env` set in the supervisor's (and worker's) environment. In fake mode
@@ -564,6 +670,11 @@ impl Env {
     /// A task the owner has not approved yet: no handles, no deadline.
     pub fn unapproved(tool_actions: u32, caps: &[&str]) -> Env {
         Env::build(contract_with(tool_actions, caps), false)
+    }
+
+    /// An approved task over `contract`.
+    pub fn with_contract(contract: (Contract, Digest)) -> Env {
+        Env::build(contract, true)
     }
 
     fn build((contract, digest): (Contract, Digest), approve: bool) -> Env {
@@ -767,4 +878,148 @@ pub async fn run_model<E: Executor>(env: &Env, exec: &E) -> TaskState {
     agentos_engine::runner::run_task(&env.db, &env.blobs, exec, &mut agent, &env.task)
         .await
         .unwrap()
+}
+
+/// `fixtures/components/<name>`: a registry-shaped analyzer (`component.json`,
+/// `component.wasm`).
+pub fn component_dir(name: &str) -> PathBuf {
+    fixtures().join("components").join(name)
+}
+
+/// `contract(tool_actions)` with the `snapshot.analyze` capability and an analyzer pin for the
+/// committed component `name`.
+pub fn analyzer_contract(tool_actions: u32, name: &str) -> (Contract, Digest) {
+    let (contract, _) = contract(tool_actions);
+    let mut json = serde_json::to_value(&contract).unwrap();
+    json["capabilities"]
+        .as_array_mut()
+        .unwrap()
+        .push("snapshot.analyze".into());
+    let digest = workspace_digest(&component_dir(name)).unwrap();
+    json["analyzer"] = serde_json::json!({ "id": name, "digest": digest.to_string() });
+    let contract = Contract::parse(&json.to_string()).unwrap();
+    let digest = Digest::of(&serde_json::to_vec(&contract).unwrap());
+    (contract, digest)
+}
+
+// Shared by the agent session suites: the scripted CLI and the fake provider's answer.
+/// The guest's `curl` of the scripted CLI: one model call, body from `$IN`, reply to `$OUT`.
+pub const CURL: &str = "/usr/bin/curl -fsS -o \"$HOME/$OUT\" -X POST \"$ANTHROPIC_BASE_URL/v1/messages\" -H 'content-type: application/json' --data-binary @\"$HOME/$IN\"";
+
+/// A Messages API answer that stops for good.
+pub fn answer() -> ProviderResult {
+    let body = serde_json::json!({
+        "content": [{"type": "text", "text": "ok"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    });
+    ProviderResult::Response(serde_json::to_vec(&body).unwrap(), Default::default())
+}
+
+/// The parser fix, written by the CLI as the file it wants (the same change as
+/// `fixtures/parser-repo.fix.patch`).
+pub const FIX: &str = r##"cat > src/parser.py <<'PY'
+def parse_kv(text: str) -> dict:
+    """Parse 'key = value' lines into a dict, skipping blanks and '#' comments."""
+    result = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, _, value = line.partition("=")
+        result[key.strip()] = value.strip()
+    return result
+PY
+"##;
+
+/// One model call of a CLI script, its body sent from a file.
+fn call_script(n: u32, body: &str) -> String {
+    format!(
+        "printf '%s' '{body}' > \"$HOME/req{n}.json\"\nIN=req{n}.json\nOUT=reply{n}.json\n{CURL}\n"
+    )
+}
+
+/// A CLI that makes two model calls, and writes the fix between them.
+pub fn two_calls_and_a_fix() -> String {
+    let first = r#"{"model":"m","max_tokens":8,"stream":false,"messages":[]}"#;
+    let again = r#"{"model":"m","max_tokens":8,"stream":false,"messages":[{"role":"user","content":"again"}]}"#;
+    format!(
+        "set -eu\n{}{FIX}{}",
+        call_script(1, first),
+        call_script(2, again)
+    )
+}
+
+/// Cleans a test's home up however the test ends, a failed assertion included, so no VM
+/// or `agentos/<id>` cgroup leaks into later tests: SIGKILLs every Firecracker of the home
+/// (by `--id`: `home_vm_ids`, plus the ids registered with `watch`), waits for them to be
+/// gone, then collects the jail of every job and inspect directory (and the watched ones).
+/// Declare it after the home's `TempDir` (or first in a struct), so it runs before the
+/// directory is removed.
+pub struct HomeGuard {
+    root: PathBuf,
+    cgroup_root: PathBuf,
+    watched: std::sync::Mutex<Vec<(String, PathBuf)>>,
+}
+
+impl HomeGuard {
+    pub fn new(root: &Path, cgroup_root: &Path) -> HomeGuard {
+        HomeGuard {
+            root: root.to_path_buf(),
+            cgroup_root: cgroup_root.to_path_buf(),
+            watched: Default::default(),
+        }
+    }
+
+    /// Also covers the VM `id` run from `dir` (a VM launched by hand, outside `jobs/`).
+    pub fn watch(&self, id: &str, dir: &Path) {
+        self.watched
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((id.to_string(), dir.to_path_buf()));
+    }
+}
+
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        let watched = std::mem::take(&mut *self.watched.lock().unwrap_or_else(|p| p.into_inner()));
+        let mut ids = home_vm_ids(&self.root);
+        ids.extend(watched.iter().map(|(id, _)| id.clone()));
+        let ours = || -> Vec<i32> {
+            firecracker_processes()
+                .into_iter()
+                .filter(|p| p.id().is_some_and(|id| ids.iter().any(|i| i == id)))
+                .map(|p| p.pid)
+                .collect()
+        };
+        for pid in ours() {
+            if let Some(pid) = Pid::from_raw(pid) {
+                let _ = kill_process(pid, Signal::KILL);
+            }
+        }
+        let until = Instant::now() + Duration::from_secs(5);
+        while !ours().is_empty() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let listed = |dir: PathBuf| -> Vec<PathBuf> {
+            fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .collect()
+        };
+        let mut dirs = listed(self.root.join("jobs"));
+        for task in listed(self.root.join("inspect")) {
+            dirs.extend(listed(task));
+        }
+        dirs.extend(watched.into_iter().map(|(_, dir)| dir));
+        for dir in dirs {
+            // A killed VM's cgroup may need a moment to empty.
+            let until = Instant::now() + Duration::from_secs(2);
+            while jail::collect(&dir, &self.cgroup_root).is_err() && Instant::now() < until {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
 }

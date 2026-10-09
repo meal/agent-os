@@ -205,14 +205,52 @@ sh scripts/acceptance.sh live /absolute/path/to/anthropic-key
 `live` requires KVM too: it covers both the host and jailed Firecracker worker,
 with a bounded fixture repair and offline replay of the real recording. It does
 not just run a host smoke test. Missing setup fails explicitly rather than passing
-as a skipped gate. The candidate Python 3.14 image has a separate optional gate:
+as a skipped gate. The Python 3.14 images are selected the same way; `python-stdlib-py314-v2`,
+the release image, first builds its kernel from source twice:
 
 ```sh
-AGENTOS_ACCEPTANCE_IMAGE=python-stdlib-py314-v1 sh scripts/acceptance.sh kvm
+AGENTOS_ACCEPTANCE_IMAGE=python-stdlib-py314-v2 sh scripts/acceptance.sh kvm
 ```
 
-The legacy image stays the default until candidate acceptance succeeds. See
-[evidence requirements](evidence/README.md) before promoting recordings or logs.
+Both passed real KVM acceptance with the v0.1.0-rc5 controller. Since guest protocol 2 a controller
+refuses those protocol-1 images, so `scripts/acceptance.sh` defaults to `agent-cli-py314-v1`
+(protocol 2: py314-v2 plus the pinned Claude Code native binary, see
+`guest/agent-cli-py314-v1/README.md`; same kernel); its KVM runs are recorded in
+`docs/evidence/2026-10-09/agent-session-kvm.md`. The older images work only with an rc5 controller
+and need `AGENTOS_ACCEPTANCE_IMAGE` plus that controller. See [evidence requirements](evidence/README.md) before promoting recordings or logs.
+
+## The live agent run (billed, run once)
+
+`live-agent` runs the real Claude Code CLI (the pinned native binary in
+`agent-cli-py314-v1`) inside the Firecracker microVM. It works on the parser fixture through
+the broker, and each of its model requests goes through the host to the real Messages API as
+`claude-haiku-5-5`. The key is read by the host from a file; the guest only holds a placeholder.
+
+```sh
+sh scripts/acceptance.sh live-agent /absolute/path/to/anthropic-key
+```
+
+It needs `/dev/kvm` and builds the agent image first, like the other KVM modes. Without
+`AGENTOS_LIVE_MODEL_TESTS` the test in `crates/agentos-engine/tests/live_agent_session.rs`
+prints `SKIPPED:` and makes no call. Its offline harness runs under the KVM tier with
+no key, against a local fake API:
+`COMPOSE_PROJECT_NAME=agentos-acceptance docker compose run --rm -e AGENTOS_GUEST_IMAGE=/work/build/guest-images/agent-cli-py314-v1 test-kvm cargo test -p agentos-engine --locked --test live_agent_session -- --nocapture`.
+
+What it costs, in principle: every request carries the CLI's system prompt and tool list,
+which are most of its input tokens, plus the conversation so far. Output is capped at
+4096 tokens per request. The contract allows 12 model requests in total, and retries
+count: a rejected request (400) ends the task at once; a 429 or 5xx makes the host wait
+(2, 4, 8, 16, 32, then 60 seconds) before the CLI sends again, and each send counts. The
+request after the 12th ends the task with "budget exhausted" without being sent. The deadline is 15 minutes. Nothing caps input
+tokens directly, so the 12 requests are the bound on spend. The first run also decides whether
+the API accepts the forwarded bodies without the beta headers the CLI sends.
+
+Every run writes to `build/evidence/<stamp>/agent/`: `live-agent-<ms>.json` (one entry per
+model attempt: request digest, response usage, or a rejection's status and a bounded
+body), `live-agent-<ms>.bundle/` (the exported journal and request/response bodies) and
+`live-agent-<ms>.summary.json` (task state, failure reason, usage, model calls, and the
+problems the checks found). The summary is written even when the run fails. Check it
+for the rejected call's status and body before rerunning anything.
 
 ## What to preserve if a test fails
 

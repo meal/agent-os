@@ -18,10 +18,22 @@ fn capability_name(cap: Capability) -> String {
         .unwrap_or_default()
 }
 
+/// Every capability name a contract may list (the serde names of [`Capability`]).
+const CAPABILITY_NAMES: [&str; 7] = [
+    "snapshot.read",
+    "workspace.apply_patch",
+    "verification.run",
+    "artifact.export",
+    "model.request",
+    "snapshot.analyze",
+    "agent.session",
+];
+
 fn parse_capability(name: &str) -> Result<Capability, CliError> {
     serde_json::from_value(Value::String(name.to_string())).map_err(|_| {
         CliError::usage(format!(
-            "unknown capability {name:?}; expected one of snapshot.read, workspace.apply_patch, verification.run, artifact.export"
+            "unknown capability {name:?}; expected one of {}",
+            CAPABILITY_NAMES.join(", ")
         ))
     })
 }
@@ -66,4 +78,18 @@ pub fn revoke(home: &Home, task: &TaskId, capability: Option<&str>) -> Result<()
         "cancelled_jobs": cancelled,
     }));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The names listed in the error all parse, and every one of them is listed.
+    #[test]
+    fn the_listed_capability_names_all_parse() {
+        for name in CAPABILITY_NAMES {
+            assert!(parse_capability(name).is_ok(), "{name}");
+        }
+        assert!(parse_capability("teleport.now").is_err());
+    }
 }

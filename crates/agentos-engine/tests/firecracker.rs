@@ -8,20 +8,23 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agentos_core::contract::Contract;
-use agentos_core::effect::{AttemptId, EffectId, EffectKind, Outcome};
+use agentos_core::effect::{AgentSessionSpec, AttemptId, EffectId, EffectKind, Outcome};
 use agentos_core::guest::{
-    Frame, Message, Mode, RAW_FRAME_LIMIT, WS_IMAGE_BYTES, b64, read_frame, write_frame,
+    Frame, Message, Mode, RAW_FRAME_LIMIT, WS_IMAGE_BYTES, b64, read_frame, unb64, write_frame,
 };
 use agentos_core::ids::{Digest, TaskId};
+use agentos_core::resources::VmResources;
 use agentos_engine::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor};
 use agentos_engine::firecracker::{FirecrackerConfig, FirecrackerWorker, WorkerResult, preflight};
 use agentos_engine::fixture::FixtureExecutor;
 use agentos_engine::guestlink::{GuestLauncher, socket_path};
-use agentos_engine::job::{JobDir, JobRequest, WorkerConfig};
+use agentos_engine::job::{JobDir, JobRequest, Mailbox, WorkerConfig};
 use agentos_engine::worker::Worker;
 use agentos_engine::workspace::workspace_digest;
 use agentos_store::db::Db;
@@ -101,10 +104,14 @@ impl Fx {
         self.task_dir().join("workspace")
     }
 
-    /// Makes `ws.img` exist without a snapshot (for requests that need one).
+    /// Makes `ws.img` exist without a snapshot (for requests that need one): sparse, at the
+    /// task's recorded size, as a snapshot leaves it.
     fn fake_ws_img(&self) {
         fs::create_dir_all(self.task_dir()).unwrap();
-        fs::write(self.task_dir().join("ws.img"), b"").unwrap();
+        fs::File::create(self.task_dir().join("ws.img"))
+            .unwrap()
+            .set_len(self.cfg.resources.disk_bytes())
+            .unwrap();
     }
 
     fn request(&self, kind: EffectKind, payload: &[u8]) -> EffectRequest {
@@ -295,7 +302,7 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
 
 fn ready() -> Message {
     Message::Ready {
-        protocol: 1,
+        protocol: 2,
         agent_version: "0.1.0".into(),
         mode: Mode::Job,
         vcpus: 1,
@@ -375,11 +382,11 @@ fn preflight_in_fake_mode_checks_the_program_and_the_image() {
     let original = fs::read_to_string(&image_json).unwrap();
     fs::write(
         &image_json,
-        original.replace("\"protocol\":1", "\"protocol\":2"),
+        original.replace("\"protocol\":2", "\"protocol\":1"),
     )
     .unwrap();
     let err = preflight(&fx.cfg).unwrap_err();
-    assert!(err.contains("protocol 2"), "{err}");
+    assert!(err.contains("protocol 1"), "{err}");
     fs::write(&image_json, &original).unwrap();
     preflight(&fx.cfg).unwrap();
 
@@ -460,6 +467,87 @@ async fn read_snapshot_creates_the_sparse_image_and_reports_the_host_bytes() {
     assert_eq!(out.new_workspace, expected.new_workspace);
     assert!(out.new_workspace.is_some());
     assert_eq!(out, expected);
+}
+
+fn sized(disk_mib: u32, scratch_mib: u32) -> VmResources {
+    VmResources {
+        version: 1,
+        disk_mib,
+        scratch_mib,
+        bandwidth_mib_s: None,
+        iops: None,
+    }
+}
+
+#[tokio::test]
+async fn read_snapshot_creates_the_workspace_image_at_the_contracted_size() {
+    let mut fx = Fx::new();
+    fx.cfg.resources = sized(2048, 768);
+    let (out, _job) = fx.run(EffectKind::ReadSnapshot, b"").await;
+    succeeded(&out);
+    let img = fs::metadata(fx.task_dir().join("ws.img")).unwrap();
+    assert_eq!(img.len(), 2048 << 20);
+    assert!(img.blocks() * 512 < 1 << 20, "ws.img stays sparse");
+}
+
+/// The image's size is fixed by the first snapshot: a later effect that expects another
+/// size fails before launching anything and leaves the image as it is.
+#[tokio::test]
+async fn an_existing_workspace_image_of_another_size_fails_and_is_left_as_is() {
+    let mut fx = Fx::new();
+    let (out, _job) = fx.run(EffectKind::ReadSnapshot, b"").await;
+    succeeded(&out);
+    let base = out.new_workspace.unwrap();
+    fx.cfg.resources = sized(2048, 512);
+    for (kind, payload) in [
+        (
+            EffectKind::ApplyPatch {
+                expected_base: base,
+            },
+            fix_patch().into_bytes(),
+        ),
+        (EffectKind::RunVerification, Vec::new()),
+    ] {
+        let (out, job) = fx.run(kind, &payload).await;
+        let why = reason(&out);
+        assert!(
+            why.contains("workspace image") && why.contains("recorded size"),
+            "{why}"
+        );
+        assert!(!out.unresolved, "nothing was sent: a definite failure");
+        assert!(!job.path.join("vm.json").exists(), "nothing was launched");
+    }
+    assert_eq!(
+        fs::metadata(fx.task_dir().join("ws.img")).unwrap().len(),
+        WS_IMAGE_BYTES
+    );
+}
+
+#[tokio::test]
+async fn too_little_host_disk_fails_before_launch() {
+    let fx = Fx::new();
+    let (out, job) = fx
+        .run_with(
+            &fx.request(EffectKind::ReadSnapshot, b""),
+            &ctx(),
+            env_with(&[("AGENTOS_TEST_HOST_FREE_MIB", "100")]),
+        )
+        .await;
+    let why = reason(&out);
+    assert!(why.starts_with("host disk: 100 MiB free under "), "{why}");
+    assert!(why.contains("the VM may write 1536 MiB"), "{why}");
+    assert!(!job.path.join("vm.json").exists());
+    assert!(!fx.task_dir().join("ws.img").exists());
+
+    // Enough room for what is not yet allocated: the job runs.
+    let (out, _job) = fx
+        .run_with(
+            &fx.request(EffectKind::ReadSnapshot, b""),
+            &ctx(),
+            env_with(&[("AGENTOS_TEST_HOST_FREE_MIB", "1536")]),
+        )
+        .await;
+    succeeded(&out);
 }
 
 /// Snapshot, fix patch and verification, with the same requests and attempt contexts.
@@ -1246,4 +1334,256 @@ fn a_no_outcome_worker_cannot_forge_supervisor_log_lines() {
         "{log:?}"
     );
     assert_clean(lines[0]);
+}
+
+// ---------------------------------------------------------------------------------------
+// Agent sessions: the model mailbox, the cancel marker and the lease.
+
+/// The guest's `curl` of the scripted CLI: one model call, body from `$IN`, reply to `$OUT`.
+const CURL: &str = "/usr/bin/curl -fsS -o \"$HOME/$OUT\" -X POST \"$ANTHROPIC_BASE_URL/v1/messages\" -H 'content-type: application/json' --data-binary @\"$HOME/$IN\"";
+
+/// Writes a scripted CLI outside the workspace; its path is what `argv` names.
+fn write_cli(fx: &Fx, script: &str) -> String {
+    let path = fx.path("cli.sh");
+    fs::write(&path, script).unwrap();
+    path.display().to_string()
+}
+
+/// A `RunAgentSession` request over `base`, running `/bin/sh <cli>`.
+fn session_request(fx: &Fx, base: Digest, cli: &str) -> EffectRequest {
+    let payload = AgentSessionSpec {
+        argv: vec!["/bin/sh".into(), cli.into()],
+        env: vec![],
+    }
+    .to_payload();
+    fx.request(
+        EffectKind::RunAgentSession {
+            expected_base: base,
+        },
+        &payload,
+    )
+}
+
+/// Plays the controller side of the job's session mailbox on its own thread until `done`:
+/// each request is answered by `answer` (`None` leaves it unanswered). Returns the requests
+/// it saw, in the order it saw them.
+fn controller(
+    job: &JobDir,
+    done: Arc<AtomicBool>,
+    answer: impl Fn(u64, &[u8]) -> Option<(u16, Vec<u8>)> + Send + 'static,
+) -> thread::JoinHandle<Vec<(u64, Vec<u8>)>> {
+    let mailbox = Mailbox::new(job.session_dir());
+    thread::spawn(move || {
+        let mut seen = Vec::new();
+        let mut after = 0;
+        while !done.load(Ordering::SeqCst) {
+            if let Some((id, body)) = mailbox.controller_next_request(after).unwrap() {
+                if seen.last().is_none_or(|(last, _)| *last != id) {
+                    seen.push((id, body.clone()));
+                }
+                if let Some((status, reply)) = answer(id, &body) {
+                    mailbox.controller_post_reply(id, status, &reply).unwrap();
+                    after = id;
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        seen
+    })
+}
+
+/// The scripted CLI of the happy path: two model calls, an edit in between.
+fn two_call_cli(fx: &Fx) -> String {
+    write_cli(
+        fx,
+        &format!(
+            "set -eu\n\
+             printf '%s' '{{\"model\":\"m\",\"max_tokens\":8,\"stream\":false,\"messages\":[]}}' > \"$HOME/req1.json\"\n\
+             IN=req1.json\nOUT=reply1.json\n{CURL}\n\
+             printf '\\n# edited by the agent\\n' >> src/parser.py\n\
+             printf '%s' '{{\"model\":\"m\",\"max_tokens\":8,\"stream\":false,\"messages\":[{{\"role\":\"user\",\"content\":\"again\"}}]}}' > \"$HOME/req2.json\"\n\
+             IN=req2.json\nOUT=reply2.json\n{CURL}\n"
+        ),
+    )
+}
+
+#[tokio::test]
+async fn a_session_relays_two_model_calls_in_order_and_returns_the_patch() {
+    let fx = Fx::new();
+    let base = fx.snapshot().await;
+    let cli = two_call_cli(&fx);
+    let (req, c) = (session_request(&fx, base, &cli), ctx());
+    let job = fx.job(&req, &c);
+    let done = Arc::new(AtomicBool::new(false));
+    let mailbox = controller(&job, done.clone(), |id, _| {
+        Some((200, format!("{{\"reply\":{id}}}").into_bytes()))
+    });
+    let res = fx.worker(&job, test_env()).run_job(&req, &c).await;
+    done.store(true, Ordering::SeqCst);
+    let seen = mailbox.join().unwrap();
+    let WorkerResult::Outcome(out) = res else {
+        panic!("expected an outcome, got {res:?}")
+    };
+    succeeded(&out);
+    let ids: Vec<u64> = seen.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids, vec![1, 2], "requests in order, each once");
+    assert!(String::from_utf8_lossy(&seen[1].1).contains("again"));
+    let v = json(&out);
+    assert_eq!(v["exit_code"], 0, "{v}");
+    assert_eq!(v["timed_out"], false, "{v}");
+    let patch = String::from_utf8(unb64(v["patch_b64"].as_str().unwrap()).unwrap()).unwrap();
+    assert!(
+        patch.contains("src/parser.py") && patch.contains("+# edited by the agent"),
+        "{patch}"
+    );
+    // The session never touched the workspace image's files: the patch is for ApplyPatch.
+    assert!(guests_of(&job).is_empty());
+}
+
+#[tokio::test]
+async fn a_controller_that_never_answers_is_ended_by_the_cancel_marker_and_the_vm_reaped() {
+    let fx = Fx::new();
+    let base = fx.snapshot().await;
+    // One call, never answered, then the CLI waits for ever.
+    let cli = write_cli(
+        &fx,
+        &format!(
+            "set -eu\nprintf '{{}}' > \"$HOME/req1.json\"\nIN=req1.json\nOUT=reply1.json\n{CURL}\nsleep 600\n"
+        ),
+    );
+    let (req, c) = (session_request(&fx, base, &cli), ctx());
+    let job = fx.job(&req, &c);
+    let done = Arc::new(AtomicBool::new(false));
+    let mailbox = controller(&job, done.clone(), |_, _| None);
+    let cancel = job.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(2));
+        cancel.drop_cancel().unwrap();
+    });
+    let started = Instant::now();
+    let res = fx.worker(&job, test_env()).run_job(&req, &c).await;
+    done.store(true, Ordering::SeqCst);
+    let seen = mailbox.join().unwrap();
+    let WorkerResult::Outcome(out) = res else {
+        panic!("expected an outcome, got {res:?}")
+    };
+    assert!(started.elapsed() < Duration::from_secs(60));
+    assert_eq!(seen.len(), 1, "the one request is seen, never answered");
+    let why = reason(&out);
+    assert!(why.contains("cancelled"), "{why}");
+    assert!(
+        matches!(out.receipt.outcome, Outcome::Failure(_)),
+        "a lost session is a failure, never unresolved"
+    );
+    assert!(guests_of(&job).is_empty(), "the VM is reaped");
+    // The guest kills its CLI as it goes: a process that is still exiting gets a moment.
+    common::assert_gone_within("the CLI", || pids_with(&cli));
+    common::assert_gone_within("the sleep of the CLI", || pids_with("sleep 600"));
+}
+
+#[tokio::test]
+async fn a_session_past_its_lease_is_ended_with_the_vm_reaped() {
+    let fx = Fx::new();
+    let base = fx.snapshot().await;
+    let cli = write_cli(
+        &fx,
+        &format!(
+            "set -eu\nprintf '{{}}' > \"$HOME/req1.json\"\nIN=req1.json\nOUT=reply1.json\n{CURL}\nsleep 600\n"
+        ),
+    );
+    let (req, c) = (session_request(&fx, base, &cli), ctx());
+    // A lease two seconds from now, with the job written for it.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let job = JobDir::create(
+        &fx.path("jobs"),
+        &JobRequest {
+            effect_id: req.effect_id.clone(),
+            task_id: req.task_id.clone(),
+            kind: req.kind.clone(),
+            payload: req.payload.clone(),
+            contract: req.contract.clone(),
+            attempt_id: c.attempt_id.clone(),
+            lease_generation: c.lease_generation,
+            lease_expiry_ms: now + 2_000,
+            task_deadline_ms: i64::MAX,
+            worker: WorkerConfig::Firecracker(fx.cfg.clone()),
+        },
+    )
+    .unwrap()
+    .0;
+    let done = Arc::new(AtomicBool::new(false));
+    let mailbox = controller(&job, done.clone(), |_, _| None);
+    let started = Instant::now();
+    let res = fx.worker(&job, test_env()).run_job(&req, &c).await;
+    done.store(true, Ordering::SeqCst);
+    mailbox.join().unwrap();
+    let WorkerResult::Outcome(out) = res else {
+        panic!("expected an outcome, got {res:?}")
+    };
+    assert!(started.elapsed() < Duration::from_secs(60));
+    let why = reason(&out);
+    assert!(why.contains("lease"), "{why}");
+    assert!(guests_of(&job).is_empty(), "the VM is reaped");
+    common::assert_gone_within("the sleep of the CLI", || pids_with("sleep 600"));
+}
+
+#[tokio::test]
+async fn a_session_over_another_base_is_refused_and_nothing_runs() {
+    let fx = Fx::new();
+    let _ = fx.snapshot().await;
+    let cli = write_cli(&fx, "printf ran > \"$HOME/ran\"\n");
+    let (req, c) = (
+        session_request(&fx, Digest::of(b"not the base"), &cli),
+        ctx(),
+    );
+    let job = fx.job(&req, &c);
+    let done = Arc::new(AtomicBool::new(false));
+    let mailbox = controller(&job, done.clone(), |_, _| None);
+    let res = fx.worker(&job, test_env()).run_job(&req, &c).await;
+    done.store(true, Ordering::SeqCst);
+    let seen = mailbox.join().unwrap();
+    let WorkerResult::Outcome(out) = res else {
+        panic!("expected an outcome, got {res:?}")
+    };
+    assert!(seen.is_empty(), "a refused session sends nothing");
+    assert!(matches!(out.receipt.outcome, Outcome::Failure(_)));
+    assert!(
+        reason(&out).starts_with("version conflict: expected "),
+        "{}",
+        reason(&out)
+    );
+}
+
+#[tokio::test]
+async fn a_model_request_out_of_order_from_the_guest_is_a_failure() {
+    let fx = Fx::with_peer();
+    // The workspace image must exist for a job VM (a snapshot would need the peer's protocol).
+    fs::create_dir_all(fx.task_dir()).unwrap();
+    fs::File::create(fx.task_dir().join("ws.img"))
+        .unwrap()
+        .set_len(fx.cfg.resources.disk_bytes())
+        .unwrap();
+    let (req, c) = (
+        session_request(&fx, Digest::of(b"base"), "/bin/true"),
+        ctx(),
+    );
+    let job = fx.job(&req, &c);
+    let guest = peer(&job, |s, request| {
+        assert!(matches!(request, Message::RunAgent { .. }), "{request:?}");
+        // The first request of a session is 1; a peer that skips to 2 is a violation.
+        send(s, Message::ModelRequest { id: 2 });
+        write_frame(s, &Frame::Raw(b"{}".to_vec())).unwrap();
+        bye(s);
+    });
+    let res = fx.worker(&job, test_env()).run_job(&req, &c).await;
+    guest.join().unwrap();
+    let WorkerResult::Outcome(out) = res else {
+        panic!("expected an outcome, got {res:?}")
+    };
+    let why = reason(&out);
+    assert!(why.contains("model request 2"), "{why}");
+    assert!(matches!(out.receipt.outcome, Outcome::Failure(_)));
 }

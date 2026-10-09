@@ -224,6 +224,7 @@ use agentos_core::contract::Contract;
 use agentos_core::effect::{AttemptId, EffectId, EffectKind, Outcome};
 use agentos_core::guest::{Message, Mode, SCRATCH_IMAGE_BYTES, WS_IMAGE_BYTES, mint_attempt_token};
 use agentos_core::ids::{Digest, TaskId};
+use agentos_core::resources::VmResources;
 use agentos_core::state::TaskState;
 use agentos_engine::agent::FakeAgent;
 use agentos_engine::crash::{CrashHook, CrashPoint, RunOptions};
@@ -240,8 +241,8 @@ use agentos_engine::supervised::{ExecCounts, SupervisedExecutor};
 use agentos_engine::worker::Worker;
 use agentos_engine::workspace::workspace_digest;
 use common::{
-    Env, FcProc, SUPERVISOR_BIN, TEST_WORKERS_ENV, contract, copy_dir, firecracker_processes,
-    fix_patch, fixtures, home_firecrackers, processes_naming, supervised,
+    Env, FcProc, HomeGuard, SUPERVISOR_BIN, TEST_WORKERS_ENV, contract, copy_dir,
+    firecracker_processes, fix_patch, fixtures, home_firecrackers, processes_naming, supervised,
 };
 use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 use tempfile::TempDir;
@@ -400,7 +401,7 @@ struct VmSample {
     cgroup: BTreeMap<&'static str, String>,
 }
 
-const CGROUP_FILES: [&str; 10] = [
+const CGROUP_FILES: [&str; 11] = [
     "cpu.max",
     "memory.max",
     "memory.swap.max",
@@ -409,6 +410,7 @@ const CGROUP_FILES: [&str; 10] = [
     "memory.events",
     "memory.stat",
     "memory.current",
+    "memory.peak",
     "cpu.stat",
     "cgroup.procs",
 ];
@@ -439,80 +441,6 @@ fn watch_vm(id: String, cgroup_root: PathBuf, every: Duration) -> Sampler<VmSamp
     })
 }
 
-/// Cleans a test's home up however the test ends, a failed assertion included, so no VM
-/// or `agentos/<id>` cgroup leaks into later tests: SIGKILLs every Firecracker of the home
-/// (by `--id`: `home_vm_ids`, plus the ids registered with `watch`), waits for them to be
-/// gone, then collects the jail of every job and inspect directory (and the watched ones).
-/// Declare it after the home's `TempDir` (or first in a struct), so it runs before the
-/// directory is removed.
-struct HomeGuard {
-    root: PathBuf,
-    cgroup_root: PathBuf,
-    watched: std::sync::Mutex<Vec<(String, PathBuf)>>,
-}
-
-impl HomeGuard {
-    fn new(root: &Path, cgroup_root: &Path) -> HomeGuard {
-        HomeGuard {
-            root: root.to_path_buf(),
-            cgroup_root: cgroup_root.to_path_buf(),
-            watched: Default::default(),
-        }
-    }
-
-    /// Also covers the VM `id` run from `dir` (a VM launched by hand, outside `jobs/`).
-    fn watch(&self, id: &str, dir: &Path) {
-        self.watched
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push((id.to_string(), dir.to_path_buf()));
-    }
-}
-
-impl Drop for HomeGuard {
-    fn drop(&mut self) {
-        let watched = std::mem::take(&mut *self.watched.lock().unwrap_or_else(|p| p.into_inner()));
-        let mut ids = common::home_vm_ids(&self.root);
-        ids.extend(watched.iter().map(|(id, _)| id.clone()));
-        let ours = || -> Vec<i32> {
-            firecracker_processes()
-                .into_iter()
-                .filter(|p| p.id().is_some_and(|id| ids.iter().any(|i| i == id)))
-                .map(|p| p.pid)
-                .collect()
-        };
-        for pid in ours() {
-            if let Some(pid) = Pid::from_raw(pid) {
-                let _ = kill_process(pid, Signal::KILL);
-            }
-        }
-        let until = Instant::now() + Duration::from_secs(5);
-        while !ours().is_empty() && Instant::now() < until {
-            thread::sleep(Duration::from_millis(10));
-        }
-        let listed = |dir: PathBuf| -> Vec<PathBuf> {
-            fs::read_dir(dir)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .map(|e| e.path())
-                .collect()
-        };
-        let mut dirs = listed(self.root.join("jobs"));
-        for task in listed(self.root.join("inspect")) {
-            dirs.extend(listed(task));
-        }
-        dirs.extend(watched.into_iter().map(|(_, dir)| dir));
-        for dir in dirs {
-            // A killed VM's cgroup may need a moment to empty.
-            let until = Instant::now() + Duration::from_secs(2);
-            while jail::collect(&dir, &self.cgroup_root).is_err() && Instant::now() < until {
-                thread::sleep(Duration::from_millis(10));
-            }
-        }
-    }
-}
-
 /// A task of the real, jailed worker whose files live in a scratch root on the guest image's
 /// filesystem (the jail hard-links the image).
 struct Fx {
@@ -529,7 +457,11 @@ struct Fx {
 
 impl Fx {
     fn new(kvm: &kvm::Kvm) -> Fx {
-        let dir = kvm.root();
+        Fx::new_in(kvm, kvm.root())
+    }
+
+    /// As `new`, with everything (work root, jobs, the image copy) under `dir`.
+    fn new_in(kvm: &kvm::Kvm, dir: TempDir) -> Fx {
         copy_dir(
             &fixtures().join("parser-repo"),
             &dir.path().join("snapshot"),
@@ -550,6 +482,12 @@ impl Fx {
             counts: ExecCounts::default(),
             step: AtomicU32::new(0),
         }
+    }
+
+    /// The task's drive sizes and rate limits, as a recorded contract would set them.
+    fn with_resources(mut self, resources: VmResources) -> Fx {
+        self.cfg.resources = resources;
+        self
     }
 
     fn root(&self) -> &Path {
@@ -881,6 +819,7 @@ async fn real_guest_boots_and_answers_ready_within_5s() {
                 &cfg.firecracker_bin,
                 cfg.vcpus,
                 cfg.memory_mib,
+                &cfg.resources,
             ))
             .env_clear()
             .current_dir(&dir)
@@ -900,7 +839,7 @@ async fn real_guest_boots_and_answers_ready_within_5s() {
             )
         });
         let hello = Message::Hello {
-            protocol: 1,
+            protocol: 2,
             attempt_token: mint_attempt_token(),
             task_id: fx.task.as_str().to_string(),
             effect_id: String::new(),
@@ -924,7 +863,7 @@ async fn real_guest_boots_and_answers_ready_within_5s() {
         assert!(took <= Duration::from_secs(5), "Ready after {took:?}");
         assert_eq!(
             (seen, mode, protocol),
-            (vcpus, Mode::Inspect, 1),
+            (vcpus, Mode::Inspect, 2),
             "Ready.vcpus equals worker_vcpus"
         );
         // MemTotal: the 256 MiB less the kernel's own reservation (about 26 MiB with this
@@ -1002,6 +941,63 @@ async fn snapshot_digest_from_the_real_guest_equals_the_host_digest() {
 
 // ---------------------------------------------------------------------------------------
 // The threat model: one hostile profile per row of the spec's table.
+
+/// The guest's `python3` is the interpreter its image manifest records (an image with an
+/// `interpreter` entry, such as `python-stdlib-py314-v1`); the manifest's claim alone proves
+/// nothing about what was copied into the rootfs.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_guest_interpreter_is_the_one_the_image_manifest_records() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let fx = Fx::new(&kvm);
+    fx.snapshot().await;
+    fx.use_script(
+        "import json, platform, sys; \
+         print(json.dumps({'version': platform.python_version(), 'executable': sys.executable}))",
+    );
+    let v = evidence(&fx.run(EffectKind::RunVerification).await.out);
+    assert_eq!(v["passed"], true, "{v}");
+    let found = findings(&v);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(kvm.image_dir.join("image.json")).unwrap()).unwrap();
+    println!("image {}: guest python {found}", manifest["id"]);
+    match manifest["interpreter"]["version"].as_str() {
+        Some(version) => assert_eq!(found["version"], version, "{found}"),
+        None => assert!(
+            found["version"]
+                .as_str()
+                .is_some_and(|v| v.starts_with("3.")),
+            "{found}"
+        ),
+    }
+}
+
+/// The booted kernel is the one the image manifest records: for an image built with a
+/// source kernel (`kernel_build`), its version and the configuration it embeds
+/// (`/proc/config.gz`, `CONFIG_IKCONFIG_PROC`) match the record.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_booted_kernel_is_the_one_the_image_manifest_records() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let fx = Fx::new(&kvm);
+    fx.snapshot().await;
+    fx.use_script(
+        "import gzip, hashlib, json; \
+         config = gzip.open('/proc/config.gz').read(); \
+         print(json.dumps({'version': open('/proc/version').read().split()[2], \
+                           'config_sha256': hashlib.sha256(config).hexdigest()}))",
+    );
+    let v = evidence(&fx.run(EffectKind::RunVerification).await.out);
+    assert_eq!(v["passed"], true, "{v}");
+    let found = findings(&v);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(kvm.image_dir.join("image.json")).unwrap()).unwrap();
+    println!("image {}: booted kernel {found}", manifest["id"]);
+    if let Some(record) = manifest.get("kernel_build") {
+        assert_eq!(found["version"], record["version"], "{found}");
+        assert_eq!(found["config_sha256"], record["config_sha256"], "{found}");
+    }
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn net_probe_cannot_reach_anything_and_sees_only_lo() {
@@ -1343,6 +1339,613 @@ async fn disk_fill_is_bounded_by_the_images_and_the_root_stays_read_only() {
         max_scratch >= f["scratch_bytes"].as_u64().unwrap() / 2,
         "the fill reached the host file (sampled {max_scratch})"
     );
+}
+
+fn resources(
+    disk_mib: u32,
+    scratch_mib: u32,
+    bandwidth: Option<u32>,
+    iops: Option<u32>,
+) -> VmResources {
+    VmResources {
+        version: 1,
+        disk_mib,
+        scratch_mib,
+        bandwidth_mib_s: bandwidth,
+        iops,
+    }
+}
+
+/// The guest's drives have the recorded sizes, both above the version-0 constants, so the
+/// jail's file-size limit must cover a workspace image over 1 GiB; and the check fills
+/// scratch up to its larger size before ENOSPC.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_guest_sees_and_fills_the_contracted_drive_sizes() {
+    let Some(kvm) = kvm::require() else { return };
+    let _alone = exclusive().await;
+    let fx = Fx::new(&kvm).with_resources(resources(1536, 768, None, None));
+    let ran = fx.snapshot().await;
+    assert_eq!(
+        ran.out.receipt.outcome,
+        Outcome::Success,
+        "{}",
+        out_text(&ran.out)
+    );
+    assert_eq!(fs::metadata(fx.ws_img()).unwrap().len(), 1536 << 20);
+    fx.use_script(
+        "import json; \
+         print(json.dumps({d: int(open(f'/sys/block/{d}/size').read()) * 512 for d in ('vdb', 'vdc')}))",
+    );
+    let v = evidence(&fx.run(EffectKind::RunVerification).await.out);
+    assert_eq!(v["passed"], true, "{v}");
+    let sizes = findings(&v);
+    assert_eq!(
+        (sizes["vdb"].as_u64(), sizes["vdc"].as_u64()),
+        (Some(1536 << 20), Some(768 << 20)),
+        "{sizes}"
+    );
+    fx.use_profile("hostile/disk-fill");
+    let v = evidence(&fx.run(EffectKind::RunVerification).await.out);
+    let f = findings(&v);
+    assert_eq!(f["scratch"], "ENOSPC", "{f}");
+    let wrote = f["scratch_bytes"].as_u64().unwrap();
+    assert!(
+        wrote > 512 << 20 && wrote < 768 << 20,
+        "filled {wrote} bytes of a 768 MiB scratch drive"
+    );
+}
+
+/// At the minimum contracted bandwidth, 32 MiB/s per writable drive, 160 MiB written and
+/// synced to scratch takes at least (160 - 32) / 32 = 4 s: the bucket starts full with one
+/// second's worth. Only a lower bound is asserted; an upper bound would depend on the host.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_bandwidth_limit_bites_on_synced_writes() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let fx = Fx::new(&kvm).with_resources(resources(1024, 512, Some(32), None));
+    fx.snapshot().await;
+    fx.use_script(
+        "import json, os, time; \\
+         block = b'x' * (1 << 20); \\
+         fd = os.open('/scratch/check/rate', os.O_WRONLY | os.O_CREAT, 0o600); \\
+         start = time.monotonic(); \\
+         [os.write(fd, block) for _ in range(160)]; \\
+         os.fsync(fd); \\
+         print(json.dumps({'seconds': time.monotonic() - start}))",
+    );
+    let v = evidence(&fx.run(EffectKind::RunVerification).await.out);
+    assert_eq!(v["passed"], true, "{v}");
+    let seconds = findings(&v)["seconds"].as_f64().unwrap();
+    println!("160 MiB synced at 32 MiB/s in {seconds:.2}s");
+    assert!(seconds >= 3.5, "the limit did not bite: {seconds:.2}s");
+}
+
+/// The lowest contracted rates still boot, format scratch, snapshot, verify and inspect the
+/// fixture within the timeouts.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_minimum_rates_still_run_the_fixture() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let (bandwidth, iops) = (
+        *agentos_core::contract::WORKER_DISK_BANDWIDTH_MIB_S.start(),
+        *agentos_core::contract::WORKER_DISK_IOPS.start(),
+    );
+    let fx = Fx::new(&kvm).with_resources(resources(1024, 512, Some(bandwidth), Some(iops)));
+    let started = Instant::now();
+    let ran = fx.snapshot().await;
+    assert_eq!(
+        ran.out.receipt.outcome,
+        Outcome::Success,
+        "{}",
+        out_text(&ran.out)
+    );
+    let snapshot = started.elapsed();
+    // The unfixed fixture: the check runs to the end and finds the bug.
+    let v = evidence(&fx.run(EffectKind::RunVerification).await.out);
+    assert_eq!(
+        (v["exit_code"].clone(), v["passed"].clone()),
+        (1.into(), false.into()),
+        "{v}"
+    );
+    let digest = fx.digest();
+    println!(
+        "at {bandwidth} MiB/s and {iops} ops/s: snapshot {snapshot:?}, all {:?}, digest {digest}",
+        started.elapsed()
+    );
+}
+
+/// The minimum rates were chosen so that a snapshot near the limits (65,000 files, 243 MiB)
+/// still fits the 120 s reply and the 60 s inspection deadlines; measured on the reference
+/// host at 45 s and 22 s (see the VM resources design).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_minimum_rates_fit_a_near_limit_snapshot_within_the_deadlines() {
+    let Some(kvm) = kvm::require() else { return };
+    let _alone = exclusive().await;
+    let (bandwidth, iops) = (
+        *agentos_core::contract::WORKER_DISK_BANDWIDTH_MIB_S.start(),
+        *agentos_core::contract::WORKER_DISK_IOPS.start(),
+    );
+    let fx = Fx::new(&kvm).with_resources(resources(1024, 512, Some(bandwidth), Some(iops)));
+    let big = fx.path("snapshot/big");
+    let mut seed = 1u64;
+    for i in 0..45 {
+        let block: Vec<u8> = (0..4 << 20)
+            .map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (seed >> 56) as u8
+            })
+            .collect();
+        fs::create_dir_all(&big).unwrap();
+        fs::write(big.join(format!("blob-{i}")), block).unwrap();
+    }
+    for d in 0..65 {
+        let dir = big.join(format!("d{d}"));
+        fs::create_dir_all(&dir).unwrap();
+        for f in 0..1000 {
+            fs::write(dir.join(format!("f{f}")), [b'a'; 1024]).unwrap();
+        }
+    }
+    let started = Instant::now();
+    let ran = fx.run(EffectKind::ReadSnapshot).await;
+    assert_eq!(
+        ran.out.receipt.outcome,
+        Outcome::Success,
+        "{}",
+        out_text(&ran.out)
+    );
+    let snapshot = started.elapsed();
+    let started = Instant::now();
+    assert_eq!(fx.digest(), ran.out.new_workspace.unwrap());
+    println!(
+        "near-limit snapshot at {bandwidth} MiB/s and {iops} ops/s: {snapshot:?}, inspection {:?}",
+        started.elapsed()
+    );
+}
+
+/// A directory with a small tmpfs of its own mounted on it, so the host really runs out of
+/// space. Unmounted and removed on drop, which must come after the fixture inside it.
+struct SmallHostDisk {
+    dir: PathBuf,
+}
+
+impl SmallHostDisk {
+    /// A tmpfs with room for the copy of the guest image the fixture makes in it, plus
+    /// `headroom_mib` (which differs per image, so it is computed, not fixed).
+    fn new(kvm: &kvm::Kvm, headroom_mib: u64) -> (SmallHostDisk, TempDir) {
+        let image: u64 = kvm::IMAGE_FILES
+            .iter()
+            .map(|f| fs::metadata(kvm.image_dir.join(f)).unwrap().len())
+            .sum();
+        let mib = image.div_ceil(1 << 20) + headroom_mib;
+        let root = kvm.root();
+        let status = std::process::Command::new("mount")
+            .args([
+                "-t",
+                "tmpfs",
+                "-o",
+                &format!("size={mib}m,mode=0755"),
+                "tmpfs",
+            ])
+            .arg(root.path())
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "mount a {mib} MiB tmpfs (the KVM tier has CAP_SYS_ADMIN)"
+        );
+        (
+            SmallHostDisk {
+                dir: root.path().to_path_buf(),
+            },
+            root,
+        )
+    }
+
+    fn free_mib(&self) -> u64 {
+        let st = rustix::fs::statvfs(&self.dir).unwrap();
+        (st.f_bavail * st.f_frsize) >> 20
+    }
+
+    /// Fills the disk up to `leave_mib` MiB free with a host file.
+    fn fill_leaving(&self, leave_mib: u64) {
+        fill_leaving(&self.dir, leave_mib);
+    }
+}
+
+fn fill_leaving(dir: &Path, leave_mib: u64) {
+    let st = rustix::fs::statvfs(dir).unwrap();
+    let fill = ((st.f_bavail * st.f_frsize) >> 20).saturating_sub(leave_mib);
+    let mut f = fs::File::options()
+        .create(true)
+        .append(true)
+        .open(dir.join("balloon"))
+        .unwrap();
+    let block = vec![0x5au8; 1 << 20];
+    for _ in 0..fill {
+        if std::io::Write::write_all(&mut f, &block).is_err() {
+            break;
+        }
+    }
+}
+
+impl Drop for SmallHostDisk {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("umount")
+            .arg("-l")
+            .arg(&self.dir)
+            .status();
+        let _ = fs::remove_dir(&self.dir);
+    }
+}
+
+/// Past the advisory free-space check, as if space disappeared right after it.
+fn past_the_space_check(w: FirecrackerWorker) -> FirecrackerWorker {
+    let mut env = test_env();
+    env.push(("AGENTOS_TEST_HOST_FREE_MIB".into(), "1000000".into()));
+    w.with_env(env)
+}
+
+fn io_errors_in(ran: &Ran) -> bool {
+    let console = ran.log("console.log");
+    for line in console.lines().filter(|l| l.contains("error")).take(6) {
+        println!("  console: {line}");
+    }
+    console.contains("I/O error")
+}
+
+/// A successful snapshot on a host whose free space the advisory check would refuse.
+async fn snapshot_past_the_space_check(fx: &Fx) -> Digest {
+    let req = fx.request(EffectKind::ReadSnapshot, b"");
+    let ran = fx
+        .run_with(&req, &fx.cfg.clone(), past_the_space_check)
+        .await;
+    assert_eq!(
+        ran.out.receipt.outcome,
+        Outcome::Success,
+        "{}",
+        out_text(&ran.out)
+    );
+    ran.out.new_workspace.unwrap()
+}
+
+/// A host ENOSPC while the guest writes its drives never yields a success that is not on
+/// the image: during a snapshot, a patch and a verification's scratch writes.
+#[tokio::test(flavor = "multi_thread")]
+async fn host_enospc_under_the_drives_never_yields_an_unbacked_success() {
+    let Some(kvm) = kvm::require() else { return };
+    let _alone = exclusive().await;
+
+    // 1. Snapshot: 150 MiB of incompressible data into a workspace on a nearly full host.
+    let (disk, root) = SmallHostDisk::new(&kvm, 115);
+    let mut fx = Fx::new_in(&kvm, root);
+    let outside = tempfile::tempdir().unwrap();
+    copy_dir(&fixtures().join("parser-repo"), outside.path());
+    let mut seed = 7u64;
+    for i in 0..3 {
+        // Under the 64 MiB per-file snapshot limit.
+        let noise: Vec<u8> = (0..50 << 20)
+            .map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (seed >> 56) as u8
+            })
+            .collect();
+        fs::write(outside.path().join(format!("noise-{i}.bin")), noise).unwrap();
+    }
+    fx.cfg.snapshot_dir = outside.path().to_path_buf();
+    println!("snapshot: {} MiB free before", disk.free_mib());
+    let req = fx.request(EffectKind::ReadSnapshot, b"");
+    let ran = fx
+        .run_with(&req, &fx.cfg.clone(), past_the_space_check)
+        .await;
+    println!(
+        "snapshot under ENOSPC: {:?} new_workspace {:?} unresolved {} console I/O errors {}",
+        ran.out.receipt.outcome,
+        ran.out.new_workspace,
+        ran.out.unresolved,
+        io_errors_in(&ran)
+    );
+    let why = failure(&ran.out);
+    assert!(
+        why.starts_with("host disk: the VM's drives returned I/O errors"),
+        "{why}"
+    );
+    assert_eq!(ran.out.new_workspace, None);
+    drop(fx);
+    drop(disk);
+
+    // 2. Patch: a snapshot first, then the host fills up before the fix is applied.
+    let (disk, root) = SmallHostDisk::new(&kvm, 115);
+    let fx = Fx::new_in(&kvm, root);
+    let base = snapshot_past_the_space_check(&fx).await;
+    // A patch adding a 3.6 MB file (under the 4 MiB patch limit), with less room than that
+    // left on the host once the VM has booted and formatted scratch.
+    let lines = 60_000;
+    let mut big = format!("--- /dev/null\n+++ b/src/big.txt\n@@ -0,0 +1,{lines} @@\n");
+    for i in 0..lines {
+        big.push_str(&format!("+{i:059}\n"));
+    }
+    let req = fx.request(
+        EffectKind::ApplyPatch {
+            expected_base: base,
+        },
+        big.as_bytes(),
+    );
+    // The host fills up once the VM has booted (about 0.6 s), while the patch is applied.
+    let dir = disk.dir.clone();
+    let balloon = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(700));
+        fill_leaving(&dir, 0);
+    });
+    let ran = fx
+        .run_with(&req, &fx.cfg.clone(), past_the_space_check)
+        .await;
+    balloon.join().unwrap();
+    println!(
+        "patch under ENOSPC: {:?} new_workspace {:?} unresolved {} console I/O errors {}",
+        ran.out.receipt.outcome,
+        ran.out.new_workspace,
+        ran.out.unresolved,
+        io_errors_in(&ran)
+    );
+    if io_errors_in(&ran) && ran.out.receipt.outcome != Outcome::Success {
+        let why = failure(&ran.out);
+        assert!(why.starts_with("host disk: "), "{why}");
+    }
+    let _ = fs::remove_file(disk.dir.join("balloon"));
+    let on_image = fx.digest();
+    match (&ran.out.receipt.outcome, ran.out.new_workspace) {
+        // A reported success is what the image holds.
+        (Outcome::Success, Some(reported)) => assert_eq!(on_image, reported),
+        // A failure leaves the base, or an image every later patch refuses as a conflict.
+        _ if on_image == base => println!("patch under ENOSPC: the image is still the base"),
+        _ => {
+            let again = fx
+                .run_with(
+                    &fx.request(
+                        EffectKind::ApplyPatch {
+                            expected_base: base,
+                        },
+                        fix_patch().as_bytes(),
+                    ),
+                    &fx.cfg.clone(),
+                    |w| w,
+                )
+                .await;
+            let why = failure(&again.out);
+            assert!(why.contains("version conflict"), "{why}");
+            println!("patch under ENOSPC: the image moved; the next patch is a version conflict");
+        }
+    }
+    drop(fx);
+    drop(disk);
+
+    // 3. Verification: the check writes and syncs 100 MiB to scratch on a nearly full host.
+    let (disk, root) = SmallHostDisk::new(&kvm, 115);
+    let fx = Fx::new_in(&kvm, root);
+    snapshot_past_the_space_check(&fx).await;
+    fx.use_script(
+        "import os, sys; \\
+         block = b'x' * (1 << 20); \\
+         fd = os.open('/scratch/check/fill', os.O_WRONLY | os.O_CREAT, 0o600); \\
+         [os.write(fd, block) for _ in range(100)]; \\
+         os.fsync(fd); \\
+         print('PASSED')",
+    );
+    disk.fill_leaving(30);
+    let req = fx.request(EffectKind::RunVerification, b"");
+    let ran = fx
+        .run_with(&req, &fx.cfg.clone(), past_the_space_check)
+        .await;
+    println!(
+        "verification under ENOSPC: {} console I/O errors {}",
+        out_text(&ran.out),
+        io_errors_in(&ran)
+    );
+    // Reported as the host's failure, not as a failing check the agent would try to fix.
+    let why = failure(&ran.out);
+    assert!(
+        why.starts_with("host disk: the VM's drives returned I/O errors")
+            && why.contains("is not evidence"),
+        "{why}"
+    );
+    drop(fx);
+    drop(disk);
+}
+
+/// The host reads guest block I/O errors from the serial console, so the check must not be
+/// able to write there (or into the kernel log) to disguise its own failure as the host's.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_check_cannot_write_the_console_or_the_kernel_log() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let fx = Fx::new(&kvm);
+    fx.snapshot().await;
+    let profile = fx.path("profile");
+    fs::remove_dir_all(&profile).unwrap();
+    fs::create_dir_all(&profile).unwrap();
+    fs::write(
+        profile.join("profile.json"),
+        r#"{"id":"console-probe","command":["python3","probe.py"],"protected":true}"#,
+    )
+    .unwrap();
+    fs::write(
+        profile.join("probe.py"),
+        r#"import errno, json
+found = {}
+for path in ["/dev/console", "/dev/ttyS0", "/dev/kmsg", "/dev/tty0"]:
+    try:
+        with open(path, "w") as f:
+            f.write("[    1.0] I/O error, dev vdc, sector 1\n")
+        found[path] = "written"
+    except OSError as e:
+        found[path] = errno.errorcode.get(e.errno, str(e))
+print(json.dumps(found))
+"#,
+    )
+    .unwrap();
+    let ran = fx.run(EffectKind::RunVerification).await;
+    let v = evidence(&ran.out);
+    let f = findings(&v);
+    println!("console probe: {f}");
+    for p in ["/dev/console", "/dev/ttyS0", "/dev/kmsg", "/dev/tty0"] {
+        assert_ne!(f[p], "written", "the check wrote {p}: {f}");
+    }
+    assert!(
+        !ran.log("console.log").contains("dev vdc, sector 1"),
+        "{}",
+        ran.log("console.log")
+    );
+}
+
+/// The memory measurements behind `JAIL_MEMORY_OVERHEAD_MIB` (see the VM resources design):
+/// the hostile disk-fill check at 256 and 1024 MiB of guest memory, with and without the
+/// minimum bandwidth limit, alone and against a host writer outside the jail. Runs only with
+/// `AGENTOS_MEASURE_OUT=<file>`, where it writes one JSON object per case.
+#[tokio::test(flavor = "multi_thread")]
+async fn measure_jail_memory_under_heavy_writes() {
+    let Some(kvm) = kvm::require() else { return };
+    let Some(out) = std::env::var_os("AGENTOS_MEASURE_OUT") else {
+        println!("SKIPPED: set AGENTOS_MEASURE_OUT=<file> to measure");
+        return;
+    };
+    let _alone = exclusive().await;
+    let mut rows = Vec::new();
+    for memory in [256u32, 1024] {
+        for bandwidth in [None, Some(32u32)] {
+            for contention in [false, true] {
+                let mut fx = Fx::new(&kvm).with_resources(resources(1024, 512, bandwidth, None));
+                fx.cfg.memory_mib = memory;
+                fx.snapshot().await;
+                fx.use_profile("hostile/disk-fill");
+                let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let writer = contention.then(|| {
+                    let (stop, file) = (stop.clone(), fx.path("host-writer.bin"));
+                    std::thread::spawn(move || {
+                        let block = vec![0xa5u8; 1 << 20];
+                        while !stop.load(Ordering::Relaxed) {
+                            let mut f = fs::File::create(&file).unwrap();
+                            for _ in 0..256 {
+                                if std::io::Write::write_all(&mut f, &block).is_err() {
+                                    break;
+                                }
+                            }
+                            let _ = f.sync_all();
+                        }
+                        let _ = fs::remove_file(&file);
+                    })
+                });
+                let (ran, samples) = fx.verify_watched(Duration::from_millis(20), |w| w).await;
+                stop.store(true, Ordering::Relaxed);
+                if let Some(w) = writer {
+                    w.join().unwrap();
+                }
+                let max_of = |f: &dyn Fn(&VmSample) -> Option<u64>| {
+                    samples.iter().filter_map(f).max().unwrap_or(0)
+                };
+                let stat = |s: &VmSample, k: &str| {
+                    keyed(s.cgroup.get("memory.stat").map_or("", String::as_str))
+                        .get(k)
+                        .copied()
+                };
+                let num = |s: &VmSample, f: &str| {
+                    s.cgroup.get(f).and_then(|v| v.trim().parse::<u64>().ok())
+                };
+                let events = |s: &VmSample, k: &str| {
+                    s.cgroup
+                        .get("memory.events")
+                        .and_then(|e| keyed(e).get(k).copied())
+                };
+                let peak = max_of(&|s| num(s, "memory.peak").or_else(|| num(s, "memory.current")));
+                // What reclaim cannot drop at that instant: anonymous memory plus dirty and
+                // writeback page cache, summed within one sample.
+                let pinned = max_of(&|s| {
+                    Some(stat(s, "anon")? + stat(s, "file_dirty")? + stat(s, "file_writeback")?)
+                });
+                let limit =
+                    u64::from(memory + agentos_engine::jail::JAIL_MEMORY_OVERHEAD_MIB) << 20;
+                let row = serde_json::json!({
+                    "guest_mib": memory,
+                    "bandwidth_mib_s": bandwidth,
+                    "host_writer": contention,
+                    "outcome": format!("{:?}", ran.out.receipt.outcome),
+                    "peak_mib": peak >> 20,
+                    "overhead_mib": (peak >> 20) as i64 - i64::from(memory),
+                    "unreclaimable_mib": pinned >> 20,
+                    "headroom_mib": (limit as i64 - pinned as i64) >> 20,
+                    "anon_mib": max_of(&|s| stat(s, "anon")) >> 20,
+                    "file_mib": max_of(&|s| stat(s, "file")) >> 20,
+                    "file_dirty_mib": max_of(&|s| stat(s, "file_dirty")) >> 20,
+                    "file_writeback_mib": max_of(&|s| stat(s, "file_writeback")) >> 20,
+                    "events_max": max_of(&|s| events(s, "max")),
+                    "oom_kill": max_of(&|s| events(s, "oom_kill")),
+                    "samples": samples.len(),
+                });
+                println!("MEASURE {row}");
+                rows.push(row);
+            }
+        }
+    }
+    fs::write(&out, serde_json::to_vec_pretty(&rows).unwrap()).unwrap();
+}
+
+/// The condition the disk-fill test once met an OOM in: several VMs filling their drives at
+/// once. Four 256 MiB guests run the hostile disk-fill check together; each row is one VM.
+/// Runs only with `AGENTOS_MEASURE_OUT=<file>` (written as `<file>.concurrent`).
+#[tokio::test(flavor = "multi_thread")]
+async fn measure_jail_memory_with_concurrent_disk_fills() {
+    let Some(kvm) = kvm::require() else { return };
+    let Some(out) = std::env::var_os("AGENTOS_MEASURE_OUT") else {
+        println!("SKIPPED: set AGENTOS_MEASURE_OUT=<file> to measure");
+        return;
+    };
+    let _alone = exclusive().await;
+    let fxs: Vec<Fx> = (0..4).map(|_| Fx::new(&kvm)).collect();
+    for fx in &fxs {
+        fx.snapshot().await;
+        fx.use_profile("hostile/disk-fill");
+    }
+    let every = Duration::from_millis(20);
+    let (a, b, c, d) = tokio::join!(
+        fxs[0].verify_watched(every, |w| w),
+        fxs[1].verify_watched(every, |w| w),
+        fxs[2].verify_watched(every, |w| w),
+        fxs[3].verify_watched(every, |w| w),
+    );
+    let runs = [a, b, c, d];
+    let mut rows = Vec::new();
+    for (ran, samples) in runs {
+        let stat = |s: &VmSample, k: &str| {
+            keyed(s.cgroup.get("memory.stat").map_or("", String::as_str))
+                .get(k)
+                .copied()
+        };
+        let max_of =
+            |f: &dyn Fn(&VmSample) -> Option<u64>| samples.iter().filter_map(f).max().unwrap_or(0);
+        let pinned = max_of(&|s| {
+            Some(stat(s, "anon")? + stat(s, "file_dirty")? + stat(s, "file_writeback")?)
+        });
+        let events = |s: &VmSample, k: &str| {
+            s.cgroup
+                .get("memory.events")
+                .and_then(|e| keyed(e).get(k).copied())
+        };
+        let limit = u64::from(256 + agentos_engine::jail::JAIL_MEMORY_OVERHEAD_MIB) << 20;
+        let row = serde_json::json!({
+            "guest_mib": 256,
+            "concurrent_vms": 4,
+            "outcome": format!("{:?}", ran.out.receipt.outcome),
+            "unreclaimable_mib": pinned >> 20,
+            "headroom_mib": (limit as i64 - pinned as i64) >> 20,
+            "events_max": max_of(&|s| events(s, "max")),
+            "oom_kill": max_of(&|s| events(s, "oom_kill")),
+            "samples": samples.len(),
+        });
+        println!("MEASURE {row}");
+        rows.push(row);
+    }
+    let mut path = out.clone();
+    path.push(".concurrent");
+    fs::write(path, serde_json::to_vec_pretty(&rows).unwrap()).unwrap();
 }
 
 /// A pinned profile whose source changed, a source changed while the check runs, and a
@@ -2106,6 +2709,63 @@ async fn memory_hog_firecracker_is_oom_killed_by_the_cgroup_when_the_bound_is_lo
         evidence(&next.out)["exit_code"],
         1,
         "the unpatched fixture fails its check, in a VM that came up"
+    );
+}
+
+/// An infrastructure OOM in the middle of a write-heavy check never verifies: with the jail's
+/// `memory.max` below the guest's memory, the VM boots, then the check's scratch writes fill
+/// guest RAM and the cgroup kills Firecracker before any result exists.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oom_kill_during_a_write_heavy_check_is_a_visible_failure_not_evidence() {
+    let Some(kvm) = kvm::require() else { return };
+    let _vm = shared().await;
+    let fx = Fx::new(&kvm);
+    fx.snapshot().await;
+    fx.use_script(
+        "import os; \\
+         block = b'x' * (1 << 20); \\
+         fd = os.open('/scratch/check/fill', os.O_WRONLY | os.O_CREAT, 0o600); \\
+         [os.write(fd, block) for _ in range(400)]; \\
+         os.fsync(fd); \\
+         print('PASSED')",
+    );
+    let req = fx.request(EffectKind::RunVerification, b"");
+    let c = ctx(2);
+    let job = JobDir::create(&fx.path("jobs"), &fx.job_request(&req, &c, &fx.cfg, None))
+        .unwrap()
+        .0;
+    let worker = FirecrackerWorker::new(&fx.cfg, &job)
+        .with_env(test_env())
+        .with_jail_memory_max_mib(200);
+    let events = fx.cgroup_of(&c).join("memory.events");
+    let own = sample(Duration::from_micros(200), move |_| {
+        fs::read_to_string(&events)
+            .ok()
+            .and_then(|e| keyed(&e).get("oom_kill").copied())
+    });
+    let out = worker.run(&req, &c).await;
+    let own = own.stop();
+    let ran = Ran {
+        out,
+        job,
+        ctx: c,
+        took: Duration::ZERO,
+    };
+    let why = failure(&ran.out);
+    println!("write-heavy check under a lowered memory.max: {why}");
+    assert_eq!(
+        why,
+        "guest exited before reporting: firecracker killed by signal 9"
+    );
+    let output: serde_json::Value = serde_json::from_slice(&ran.out.output).unwrap_or_default();
+    assert!(
+        output.get("passed").is_none() && output.get("workspace_digest").is_none(),
+        "the failure carries no check result: {output}"
+    );
+    assert!(
+        own.iter().copied().max().unwrap_or(0) >= 1,
+        "the VM's own cgroup recorded the OOM kill ({} reads)",
+        own.len()
     );
 }
 

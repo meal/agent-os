@@ -10,6 +10,13 @@
 
 **Spec:** [v0.1 completion design](../specs/2026-10-04-v01-completion-design.md), [repository review](../../reviews/2026-10-04-repository-review.md), and the original [build plan](../../../Agent_OS_v1_Build_Plan.md).
 
+## Execution status — 2026-10-08
+
+Packages 1–12 are complete; v0.1 is a release candidate. Package 7's live host and jailed runs and the real
+KVM suites passed on 2026-10-08 ([evidence](../../evidence/README.md)), and its evidence is
+checked automatically. Package 5's candidate guest passed real KVM acceptance at `f175de3`. Package 9 passed full KVM acceptance at `7955b96`, package 10 at `d33e82e`, package 11 at `a127005`. Package 12 produced release candidate v0.1.0-rc5 at `b8a456a` with every gate passing there.
+The 2026-10-04 status below is historical.
+
 ## Execution status — 2026-10-04
 
 Packages 1–4 are implemented and verified offline. Package 5 has scoped dependency
@@ -149,7 +156,9 @@ docker compose run --rm test cargo test -p agentos-cli --test cli --locked
 - [x] Recheck official latest versions online. On 2026-10-04 the checked candidates are [Tokio 1.53.2](https://docs.rs/crate/tokio/latest), [UUID 1.27.0](https://docs.rs/crate/uuid/latest), and [Python 3.14.8](https://www.python.org/downloads/). Rust remains [1.98.1](https://doc.rust-lang.org/stable/releases.html).
 - [x] Update Tokio and UUID as scoped changes, remove unused `jsonschema` workspace declaration, and preserve reviewed locked dependencies otherwise.
 - [x] Pin pyenv itself by reviewed release/commit and Python source/version/checksum in the Docker development image; record `.python-version`. Add a new Python guest recipe rather than changing an existing registered digest.
-- [ ] Add fixture/profile compatibility cases for both interpreters. Verify two clean builds of the new guest image are byte-identical and interpreter provenance is correct.
+- [x] Add fixture/profile compatibility cases for both interpreters. Verify two clean builds of the new guest image are byte-identical and interpreter provenance is correct.
+
+**Task 5 result (2026-10-08).** At `f175de3` the candidate built twice byte-identically and passed both KVM suites. Interpreter provenance is checked inside the guest by `the_guest_interpreter_is_the_one_the_image_manifest_records`, which caught that an earlier passing run had executed Debian's 3.11.2. The candidate is accepted; it is not yet the default, and its interpreter is a copy of the pinned pyenv build rather than an independent source rebuild (package 11).
 
 ```sh
 docker compose run --rm test cargo update -p tokio --precise 1.53.2
@@ -199,7 +208,21 @@ docker compose run --rm test-kvm cargo test --workspace --locked
 docker compose run --rm -e AGENTOS_TEST_WORKER=firecracker test-kvm cargo test --workspace --locked
 ```
 
-- [ ] Check evidence schema and secret exclusion; record failed attempts alongside successes. Re-estimate remaining delivery effort from results.
+- [x] Check evidence schema and secret exclusion; record failed attempts alongside successes. Re-estimate remaining delivery effort from results.
+
+**Task 7 result (2026-10-08).** `cargo test --test evidence` checks secret exclusion (decoding byte-encoded response bodies) and cross-file agreement of every promoted run in the default tier; the live harness scans its outputs for the exact key bytes before writing a success report. The one failed KVM attempt is kept beside the passing run. The host run's single `Denied` was an `InvalidPatch` refusal of a miscounted hunk, now pinned by a regression test.
+
+**Re-estimate from Task 7 results.** The provider, the jail and recovery behaved as designed on their first real runs; the only real-environment failure was a test assumption (an environment dump that is empty under guest init). Live runs took 4–5 model calls and about 16 seconds each. Remaining effort, replacing Milestones B and C above:
+
+| Package | Estimate | Main risk |
+| --- | --- | --- |
+| 5. Candidate guest reproducibility and conformance | 0.5–1 day | Image build nondeterminism under the new interpreter |
+| 9. Contract-driven VM disks and I/O | 3–5 days | Measuring page-cache and cgroup pressure reliably |
+| 10. Component analyzer | 4–6 days | WIT world scope and Wasmtime resource limits |
+| 11. Kernel provenance and fresh-host installer | 3–5 days | Access to a fresh supported host |
+| 12. Alpha evidence and release candidate | 2–3 days | Every gate rerun at one frozen commit |
+
+Total remaining: 12.5–20 engineering days. The original estimate for Milestones B and C was 15–24 days, but it covered packages 8–12; package 8 is now done, and package 5's remaining gate belonged to Milestone A, so the two figures are not directly comparable.
 
 **Gate:** actual live success and offline replay, actual jailed worker isolation/recovery evidence. Missing setup keeps the gate open; no skipped test establishes acceptance.
 
@@ -237,10 +260,12 @@ docker compose run --rm test cargo test -p agentos-engine --locked --test export
 
 **Files:** `crates/agentos-core/src/contract.rs`, `crates/agentos-engine/src/{firecracker,jail}.rs`, CLI home/submit/export, contract/worker/KVM tests; profile registration validation.
 
-- [ ] Write focused resource-limit spec/plan: optional disk/scratch/bandwidth/IOPS fields, explicit ranges, old defaults, recorded provenance, and preflight capacity checks.
-- [ ] Test old-contract defaults (1024/512 MiB), minimum/maximum/overflow, full disk, actual I/O rate enforcement, and crash/resume with recorded limits.
-- [ ] Measure page-cache/cgroup pressure under heavy I/O; choose documented overhead from measurements and assert infrastructure OOM cannot accept verification.
-- [ ] Reject guest profiles that require unsupported executable mode transport; test interpreter-based commands continue to work. Keep a protocol-mode upgrade outside this package.
+- [x] Write focused resource-limit spec/plan: optional disk/scratch/bandwidth/IOPS fields, explicit ranges, old defaults, recorded provenance, and preflight capacity checks.
+- [x] Test old-contract defaults (1024/512 MiB), minimum/maximum/overflow, full disk, actual I/O rate enforcement, and crash/resume with recorded limits.
+- [x] Measure page-cache/cgroup pressure under heavy I/O; choose documented overhead from measurements and assert infrastructure OOM cannot accept verification.
+- [x] Reject guest profiles that require unsupported executable mode transport; test interpreter-based commands continue to work. Keep a protocol-mode upgrade outside this package.
+
+**Task 9 result (2026-10-09).** Implemented per the [focused design](../specs/2026-10-08-vm-resources-design.md) and [plan](2026-10-08-vm-resources.md). Two decisions changed from the first draft on measurements: images stay sparse (preallocation would reserve about all free space under the test container), and the rate minimums rose to 32 MiB/s and 5000 operations/s (the first ones could not boot). A full host disk is reported as `host disk: …`. Full KVM acceptance passed at `7955b96`.
 
 ```sh
 docker compose run --rm test cargo test -p agentos-core --locked
@@ -255,10 +280,12 @@ docker compose run --rm -e AGENTOS_TEST_WORKER=firecracker test-kvm cargo test -
 
 **Files:** new `wit/agentos-v1.wit`, `crates/agentos-component/{Cargo.toml,src/lib.rs,tests/analyzer.rs}`, analyzer fixture, core effect/capability types, engine routing/retention/export, store and recovery tests.
 
-- [ ] Write component spec and focused plan defining the exact WIT world, scoped resource handles, effect request/result serialization, and failure/recovery semantics before adding the crate.
-- [ ] Recheck/pin Wasmtime; current checked release is [49.0.2](https://docs.rs/crate/wasmtime/latest). Import no ambient filesystem/network WASI interfaces.
-- [ ] Add red cases: granted object read succeeds; ungranted/revoked/wrong-task handle fails; infinite loop interrupted; memory growth bounded; report oversize/malformed rejected; controller crash after output retention replays without reexecution.
-- [ ] Integrate through broker/effect lifecycle; reference analyzer emits an exported bounded report. Its result cannot produce `VerifyPassed`.
+- [x] Write component spec and focused plan defining the exact WIT world, scoped resource handles, effect request/result serialization, and failure/recovery semantics before adding the crate.
+- [x] Recheck/pin Wasmtime; current checked release is [49.0.2](https://docs.rs/crate/wasmtime/latest). Import no ambient filesystem/network WASI interfaces.
+- [x] Add red cases: granted object read succeeds; ungranted/revoked/wrong-task handle fails; infinite loop interrupted; memory growth bounded; report oversize/malformed rejected; controller crash after output retention replays without reexecution.
+- [x] Integrate through broker/effect lifecycle; reference analyzer emits an exported bounded report. Its result cannot produce `VerifyPassed`.
+
+**Task 10 result (2026-10-09).** Implemented per the [focused design](../specs/2026-10-08-component-analyzer-design.md) and [plan](2026-10-09-component-analyzer.md): Wasmtime 49.0.2 with no WASI, the `agentos:analyzer` world, a registry, one advisory analysis per task after the snapshot, broker checks on every read, retention and recovery at every crash point, GC of settled retention, and the report in the export. Full KVM acceptance passed at `d33e82e`.
 
 ```sh
 docker compose run --rm test cargo test -p agentos-component --locked
@@ -273,10 +300,12 @@ docker compose run --rm test cargo test --workspace --locked
 
 **Files:** new pinned guest kernel source/config/toolchain recipe; `scripts/build-guest-image.sh`; new `scripts/{install,smoke-install}.sh`; release artifact manifest; Docker/Compose packaging; supported-host documentation.
 
-- [ ] Pin kernel source/checksum/config and build toolchain; build twice in independent directories and compare guest artifacts. Record provenance with interpreter and agent versions.
-- [ ] Specify a Docker-based installer with atomic staging, checksum verification, no overwrite of existing homes, idempotent version installation, and actionable KVM/cgroup refusal.
-- [ ] Add red installer cases: corrupted checksum, existing home, interrupted staging, unsupported architecture, missing KVM, nondelegated cgroups. Test no partial install after refusal.
-- [ ] On a fresh supported host, install, register images/profile, run jailed fixture, kill/resume, and export; compare exported patch/evidence against recorded inputs.
+- [x] Pin kernel source/checksum/config and build toolchain; build twice in independent directories and compare guest artifacts. Record provenance with interpreter and agent versions.
+- [x] Specify a Docker-based installer with atomic staging, checksum verification, no overwrite of existing homes, idempotent version installation, and actionable KVM/cgroup refusal.
+- [x] Add red installer cases: corrupted checksum, existing home, interrupted staging, unsupported architecture, missing KVM, nondelegated cgroups. Test no partial install after refusal.
+- [x] On a fresh supported host, install, register images/profile, run jailed fixture, kill/resume, and export; compare exported patch/evidence against recorded inputs.
+
+**Task 11 result (2026-10-09).** Per the [focused design](../specs/2026-10-09-kernel-and-installer-design.md) and [plan](2026-10-09-kernel-and-installer.md): linux 6.18.51 from pinned kernel.org source with Firecracker v1.17.0's config fragments, built reproducibly (three identical builds) in a digest-pinned builder; `python-stdlib-py314-v2` boots it and records its provenance, and passed full KVM acceptance at `a127005`. `scripts/release.sh` builds a reproducible release; `scripts/install.sh` refuses each unsuitable case (self-tested) and runs the release's own `host-check`; the smoke run passed on `0.1.0-rc3` at `2a50d59`. One KVM host was available, so a fresh container on it stands in for a fresh host.
 
 ```sh
 docker compose run --rm test-kvm sh scripts/build-guest-image.sh guest/python-stdlib-v1 build/guest-images/python-stdlib-v1 --verify
@@ -294,11 +323,13 @@ The image command uses the existing recipe to establish the baseline; the new so
 
 **Files:** new second repository/profile/task fixture; `scripts/acceptance.sh`; `docs/evidence/`, supported-host/runbook docs, release workflow and checksums; README/build-plan status.
 
-- [ ] Freeze a release commit and exact image/profile/component/model/policy versions.
-- [ ] Run the four offline CI gates, real KVM full suite, both live worker variants/replays, component tests, image reproducibility, and fresh-host smoke at that commit.
-- [ ] Demonstrate tasks across two distinct registered snapshots; publish successes, failures, settled/uncertain requests, limits, versions, durations, and exported patch/evidence digests.
-- [ ] Verify evidence/recordings contain no key, full capability handle, or unintended secret file. Verify checksums from a clean download.
-- [ ] Produce release candidate and release notes. Mark v0.1 complete only when every gate above has actual evidence; otherwise identify the remaining gate and keep its checkbox open.
+- [x] Freeze a release commit and exact image/profile/component/model/policy versions.
+- [x] Run the four offline CI gates, real KVM full suite, both live worker variants/replays, component tests, image reproducibility, and fresh-host smoke at that commit.
+- [x] Demonstrate tasks across two distinct registered snapshots; publish successes, failures, settled/uncertain requests, limits, versions, durations, and exported patch/evidence digests.
+- [x] Verify evidence/recordings contain no key, full capability handle, or unintended secret file. Verify checksums from a clean download.
+- [x] Produce release candidate and release notes. Mark v0.1 complete only when every gate above has actual evidence; otherwise identify the remaining gate and keep its checkbox open.
+
+**Task 12 result (2026-10-09).** [Release candidate v0.1.0-rc5](../../releases/v0.1.0-rc5.md), frozen at `b8a456a`: every gate above passed at that commit, with evidence under `docs/evidence/2026-10-09/rc5/`. The "clean download" check is a rebuild from a fresh clone, which reproduced the tarball; nothing was published. The fresh-host gate used a fresh container on the only KVM host. v0.1 is complete as a release candidate; tagging, publishing and a run on a separate machine are the owner's to decide.
 
 **Gate:** a third party can reproduce the supported fresh-host workflow and inspect final-workspace evidence. Publishing a release is a separate action from creating this plan.
 

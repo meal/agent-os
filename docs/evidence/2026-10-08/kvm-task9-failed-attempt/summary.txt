@@ -1,0 +1,12 @@
+Commit b58087a: the kvm suite failed 64/65 in agentos-engine's unit tests:
+job::tests::is_dead_is_false_when_the_probe_cannot_tell asserted is_dead() right after
+dropping a job lock. A process spawned by another test thread can inherit the lock's
+descriptor until it execs and hold the flock that long. job.rs was not changed by Task 9.
+Fixed by polling for the release (7955b96); the rerun passed.
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 122 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.92s
+test result: ok. 105 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: FAILED. 64 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.51s

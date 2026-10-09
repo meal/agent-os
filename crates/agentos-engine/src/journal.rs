@@ -59,6 +59,26 @@ pub(crate) fn append_turn(
     Ok(db.append_audit(task, "AgentTurn", &payload)?)
 }
 
+/// Journals one model request a guest session sent: `id` is the CLI's request number,
+/// `request` the digest of the body the runner sent, `requested_model` the model the CLI asked
+/// for and `model` the one it was sent to. An audit event: `session_turns` never reads it.
+pub(crate) fn append_session_call(
+    db: &Db,
+    task: &TaskId,
+    id: u64,
+    request: &Digest,
+    requested_model: &str,
+    model: &str,
+) -> Result<u64> {
+    let payload = json!({
+        "id": id,
+        "request": request,
+        "requested_model": requested_model,
+        "model": model,
+    });
+    Ok(db.append_audit(task, "SessionModelCall", &payload)?)
+}
+
 fn decode<T: serde::de::DeserializeOwned>(v: &Value) -> Result<T> {
     Ok(serde_json::from_value(v.clone()).map_err(DbError::from)?)
 }
@@ -306,6 +326,22 @@ pub(crate) fn effect_observation(blobs: &BlobStore, rec: &EffectRecord) -> Resul
                 output_tokens: result["usage"]["output_tokens"].as_u64().unwrap_or(0),
             }
         }
+        (EffectKind::RunAgentSession { .. }, EffectState::Completed) => {
+            let patch = agentos_core::guest::unb64(result["patch_b64"].as_str().unwrap_or(""))
+                .map_err(|e| protocol(rec, &format!("has an undecodable patch: {e}")))?;
+            let timed_out = result["timed_out"] == true;
+            Observation::SessionEnded {
+                exit_code: result["exit_code"]
+                    .as_i64()
+                    .and_then(|c| i32::try_from(c).ok()),
+                signal: result["signal"]
+                    .as_i64()
+                    .and_then(|c| i32::try_from(c).ok()),
+                timed_out,
+                patch: String::from_utf8(patch).ok().filter(|p| !p.is_empty()),
+                reason: timed_out.then(|| "the session timed out".to_string()),
+            }
+        }
         (EffectKind::ModelCall { .. }, EffectState::Failed) => Observation::ModelCallFailed {
             reason: reason()?,
             failure: result.get("failure").map(decode).transpose()?,
@@ -332,6 +368,7 @@ pub(crate) fn effect_observation(blobs: &BlobStore, rec: &EffectRecord) -> Resul
 
 #[cfg(test)]
 mod tests {
+    use agentos_core::contract::Contract;
     use agentos_core::ids::TaskId;
     use serde_json::json;
 
@@ -551,5 +588,67 @@ mod tests {
             denial_observation(&cap).unwrap(),
             Observation::PatchRejected { .. }
         ));
+    }
+
+    /// The session's model calls are audit events between the agent's turns: `session_turns`
+    /// reads only the turns, so the replay of the open session never sees them.
+    #[test]
+    fn session_model_calls_are_audit_events_that_session_turns_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("agentos.db")).unwrap();
+        let contract = Contract::parse(
+            r#"{"goal": "g", "repository": {"source": "s", "revision": "r"}, "profile": "p",
+                "editable_paths": ["src/**"], "verification_profile": "v", "capabilities": [],
+                "limits": {"model_requests": 2, "max_output_tokens_per_request": 8, "tool_actions": 2,
+                           "deadline_seconds": 60, "worker_vcpus": 1, "worker_memory_mib": 1}}"#,
+        )
+        .unwrap();
+        let task = db.create_task(&contract, &d("c")).unwrap();
+        let start = Observation::Start {
+            files: vec![],
+            workspace: d("w"),
+        };
+        let run = AgentAction::RunSession {
+            argv: vec!["cli".into()],
+            env: vec![],
+            model: "claude-opus-5-5".into(),
+        };
+        append_turn(&db, &task, 1, &start, &run).unwrap();
+        append_session_call(
+            &db,
+            &task,
+            1,
+            &d("r1"),
+            "claude-opus-5-5-big",
+            "claude-opus-5-5",
+        )
+        .unwrap();
+        append_session_call(&db, &task, 2, &d("r2"), "claude-haiku", "claude-opus-5-5").unwrap();
+        let ended = Observation::SessionEnded {
+            exit_code: Some(0),
+            signal: None,
+            timed_out: false,
+            patch: Some("p".into()),
+            reason: None,
+        };
+        append_turn(&db, &task, 2, &ended, &AgentAction::ApplyPatch("p".into())).unwrap();
+
+        let events = db.events(&task).unwrap();
+        let calls: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "SessionModelCall")
+            .collect();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].payload["id"], 1);
+        assert_eq!(calls[0].payload["requested_model"], "claude-opus-5-5-big");
+        assert_eq!(calls[0].payload["model"], "claude-opus-5-5");
+        assert_eq!(calls[1].payload["id"], 2);
+        let turns = session_turns(&events).unwrap();
+        assert_eq!(
+            turns.iter().map(|t| t.turn).collect::<Vec<_>>(),
+            vec![1, 2],
+            "only the AgentTurn events are turns"
+        );
+        assert_eq!(turns[1].action, AgentAction::ApplyPatch("p".into()));
     }
 }

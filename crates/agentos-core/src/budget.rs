@@ -22,14 +22,19 @@ impl Reservation {
 }
 
 /// Snapshot reads, patch applications, file listings and file reads consume a tool
-/// action; verification, export and model calls are not agent tool actions.
+/// action; verification, export, model calls and the controller's analysis are not agent
+/// tool actions.
 pub fn tool_actions_for(kind: &EffectKind) -> u32 {
     match kind {
         EffectKind::ReadSnapshot
         | EffectKind::ApplyPatch { .. }
         | EffectKind::ListFiles { .. }
         | EffectKind::ReadFile { .. } => 1,
-        EffectKind::RunVerification | EffectKind::ExportBundle | EffectKind::ModelCall { .. } => 0,
+        EffectKind::RunVerification
+        | EffectKind::ExportBundle
+        | EffectKind::ModelCall { .. }
+        | EffectKind::AnalyzeSnapshot
+        | EffectKind::RunAgentSession { .. } => 0,
     }
 }
 
@@ -101,6 +106,10 @@ mod tests {
             deadline_seconds: 60,
             worker_vcpus: 1,
             worker_memory_mib: 256,
+            worker_disk_mib: None,
+            worker_scratch_mib: None,
+            worker_disk_bandwidth_mib_s: None,
+            worker_disk_iops: None,
         }
     }
 

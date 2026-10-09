@@ -11,6 +11,7 @@ path = "src/bin/agentos-supervisor.rs"
 agentos-core = { path = "../agentos-core" }
 agentos-guest = { path = "../agentos-guest" }
 agentos-store = { path = "../agentos-store" }
+agentos-component = { path = "../agentos-component" }
 tokio = { workspace = true, features = ["io-util"] }
 rustix = { workspace = true, features = ["fs", "stdio"] }
 serde.workspace = true

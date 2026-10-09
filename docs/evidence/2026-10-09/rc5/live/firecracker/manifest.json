@@ -1,0 +1,112 @@
+{
+  "task_id": "01a11e2b-fe9d-7045-bbf8-757f765a9ac6",
+  "state": "SUCCEEDED",
+  "base_revision": "be77aa19c032f85329a9596adfd692252a0c87fd09d337b1873feb6003bdd3b8",
+  "base_workspace_digest": "be77aa19c032f85329a9596adfd692252a0c87fd09d337b1873feb6003bdd3b8",
+  "patch_digest": "16db89fc561aa6ec2cb741b3fec86406b755d5170ef408a1b7122840825b4301",
+  "patches": [
+    {
+      "effect_id": "fd7383dab67f2a86319975b45e44ad0ac3e8548a496f43a8579c4fa01d07ccc3",
+      "digest": "16db89fc561aa6ec2cb741b3fec86406b755d5170ef408a1b7122840825b4301",
+      "file": "patches/0001-16db89fc561aa6ec2cb741b3fec86406b755d5170ef408a1b7122840825b4301.patch"
+    }
+  ],
+  "final_workspace_digest": "19caa4fcf4e404c7820404402a7122b6619cfe7f95b6f2e76e07dbdd0e85b548",
+  "verified_digest": "19caa4fcf4e404c7820404402a7122b6619cfe7f95b6f2e76e07dbdd0e85b548",
+  "verification_profile_digest": "9ff584f31b7fef8ac5774ced5c8f1620c27f736b4bdc4d9e03e553df5d8ea12c",
+  "verification_results": [
+    {
+      "effect_id": "7d4c179b2ce67ac0504bf9372e2ab86a5155d3e5fa1eca0d61c9c2a9d5b5505c",
+      "completed": true,
+      "passed": true,
+      "workspace_digest": "19caa4fcf4e404c7820404402a7122b6619cfe7f95b6f2e76e07dbdd0e85b548",
+      "evidence_digest": "140431d341571d2478761383c6e3ff1898ff12c0550cfd5e9d36793f96b30853",
+      "profile_digest": "9ff584f31b7fef8ac5774ced5c8f1620c27f736b4bdc4d9e03e553df5d8ea12c",
+      "exit_code": 0,
+      "accepted_for_final_workspace": true
+    }
+  ],
+  "model_calls": [
+    {
+      "effect_id": "d30fe4e773e758c7dd0b584695edb0af2f9708d832941bbb71f98b4e569940b1",
+      "request_digest": "fdbb346a20ffe3feba076da41d538e2340804cf949919b1a237bc7a6ef048449",
+      "response_digest": "7e00f0fab4ab8ece1a8bcbecf46011ee30bfe7c40e291c3e1190dc87fa58d100",
+      "state": "COMPLETED",
+      "request_file": "model/0001-request.json",
+      "response_file": "model/0001-response.json"
+    },
+    {
+      "effect_id": "a16e6584ef5771b9ddea245ef901ff008269f31c4fcbcbdac6d12bf605c9d924",
+      "request_digest": "722dfe8aa767933a8b72e637c60e3d264ce8855ff68f04771f971fa3e16f5806",
+      "response_digest": "d0cbe767249e8a36766e7599e9881073f16140b861cffa9e96f91c86554eed20",
+      "state": "COMPLETED",
+      "request_file": "model/0002-request.json",
+      "response_file": "model/0002-response.json"
+    },
+    {
+      "effect_id": "219010e2e2fb10c764f5b6b9e69f70a7f34e982f9086956d909a4a85ffd227f2",
+      "request_digest": "e2c33fb3d50913ed9ba8997ff7512cb9b25964b58b054908010b891bb895c783",
+      "response_digest": "2edfe183727645e29e0bf6a49dbae8881985a16e6d49c67643eb2263f9201d3e",
+      "state": "COMPLETED",
+      "request_file": "model/0003-request.json",
+      "response_file": "model/0003-response.json"
+    },
+    {
+      "effect_id": "6a5686d7ccdc9ff0264f1489dea55c46797390101647ae2dec49803765c7ec45",
+      "request_digest": "97d3ee6dc0ae3209c3b43774ea89aa02bbe4e311e42de738387db8294751be19",
+      "response_digest": "f5c27e9a01c99bca8159f9b4db2e07d6f739d8e59e02be46123d71f744126748",
+      "state": "COMPLETED",
+      "request_file": "model/0004-request.json",
+      "response_file": "model/0004-response.json"
+    }
+  ],
+  "usage_summary": {
+    "reserved_model_requests": 0,
+    "settled_model_requests": 4,
+    "uncertain_model_requests": 0,
+    "reserved_tool_actions": 0,
+    "settled_tool_actions": 4,
+    "uncertain_tool_actions": 0
+  },
+  "contract_digest": "19fa1d6808e96ba70dfe6d2a45455b59ff3f6af5f9ac0d6906451a9e5106b70e",
+  "model": "anthropic:claude-opus-5-5",
+  "model_policy_version": 1,
+  "model_limits_version": 1,
+  "model_endpoint": "https://api.anthropic.com",
+  "generated_events": 79,
+  "capabilities": [
+    {
+      "operation": "snapshot.read",
+      "handle_prefix": "deb2e93b",
+      "revoked": false
+    },
+    {
+      "operation": "workspace.apply_patch",
+      "handle_prefix": "03dce550",
+      "revoked": false
+    },
+    {
+      "operation": "verification.run",
+      "handle_prefix": "839700c6",
+      "revoked": false
+    },
+    {
+      "operation": "artifact.export",
+      "handle_prefix": "3f0d9f5b",
+      "revoked": false
+    },
+    {
+      "operation": "model.request",
+      "handle_prefix": "2c8059d9",
+      "revoked": false
+    }
+  ],
+  "guest_image_digest": "4fcc30c901feae478894b6818e503d51a235a28fb2407569e69a0bd196740251",
+  "vm_resources": {
+    "version": 0,
+    "disk_mib": 1024,
+    "scratch_mib": 512,
+    "bandwidth_mib_s": null,
+    "iops": null
+  }
+}

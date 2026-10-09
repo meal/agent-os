@@ -1,0 +1,30 @@
+diff --git a/src/duration.py b/src/duration.py
+index 611e79f..b1ec4ba 100644
+--- a/src/duration.py
++++ b/src/duration.py
+@@ -1,14 +1,23 @@
+-UNITS = {"s": 1, "m": 60, "h": 3600}
++UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+ 
+ 
+ def parse_duration(text: str) -> int:
+     """Parse durations like '90s', '5m', '1h30m' or '2d 4h' into seconds."""
++    text = text.strip().lower()
++    if not text:
++        raise ValueError("empty duration")
+     total = 0
+     number = ""
+     for ch in text:
+         if ch.isdigit():
+             number += ch
+-        else:
++        elif ch in UNITS and number:
+             total += int(number) * UNITS[ch]
+             number = ""
++        elif ch.isspace() and not number:
++            continue
++        else:
++            raise ValueError(f"invalid duration: {text!r}")
++    if number:
++        total += int(number)
+     return total

@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use agentos_core::contract::Contract;
 use agentos_core::guest::{GUEST_MIN_MEMORY_MIB, MAX_VCPUS};
 use agentos_core::ids::{Digest, TaskId};
-use agentos_engine::firecracker::firecracker_version;
+use agentos_core::resources::VmResources;
+use agentos_engine::firecracker::{check_host_space, firecracker_version};
 use agentos_engine::guestlink::GuestLauncher;
 use agentos_engine::model::fake::Transcript;
 use agentos_engine::model::provider::ApiKey;
@@ -19,7 +20,7 @@ use crate::args::WorkerKind;
 use crate::crash::CrashSpec;
 use crate::drive::{AGENT_PATCH, FAKE_AGENT, ModelSpec, TRANSCRIPT, agent_for, drive};
 use crate::error::CliError;
-use crate::home::Home;
+use crate::home::{ANALYZER_DIR, Home};
 
 /// A `repository.revision` asking submission to record the source's workspace digest.
 pub const RECORDED_AT_SUBMISSION: &str = "recorded-at-submission";
@@ -52,6 +53,7 @@ struct FirecrackerRecord {
     image_digest: Digest,
     version: String,
     jailed: bool,
+    resources: VmResources,
 }
 
 /// The Firecracker worker's checks, in order: the contract's limits (exit 2), the guest image
@@ -80,7 +82,20 @@ fn check_firecracker(home: &Home, contract: &Contract) -> Result<FirecrackerReco
         })?;
     // The preflight reads only the launcher and the image: the task's own paths do not exist yet.
     let placeholder = std::path::absolute(home.tasks_dir())?;
-    let prepared = home.prepare_firecracker(&image, l, &placeholder, None, None)?;
+    let resources = VmResources::resolve(l);
+    let prepared = home.prepare_firecracker(&image, l, &placeholder, None, None, resources)?;
+    // Advisory: the images are sparse, so this is what the VMs may still write. The nearest
+    // existing directory stands in for a work root that does not exist yet.
+    let existing = placeholder
+        .ancestors()
+        .find(|p| p.is_dir())
+        .unwrap_or(&placeholder);
+    check_host_space(
+        existing,
+        resources.disk_bytes() + resources.scratch_bytes(),
+        &[],
+    )
+    .map_err(CliError::other)?;
     let version = match &prepared.cfg.launcher {
         GuestLauncher::Fake { .. } => FAKE_FIRECRACKER_VERSION.to_string(),
         GuestLauncher::Real { .. } => {
@@ -96,6 +111,7 @@ fn check_firecracker(home: &Home, contract: &Contract) -> Result<FirecrackerReco
         image_digest: prepared.cfg.image_digest,
         version,
         jailed: prepared.jailed,
+        resources,
     })
 }
 
@@ -191,6 +207,7 @@ fn validate(
                 // with the task untouched.
                 ModelSpec::Anthropic(_) => {
                     home.checked_base_url()?;
+                    tls_ready()?;
                     if yes {
                         api_key = Some(home.api_key()?);
                     }
@@ -268,6 +285,12 @@ fn summarize(
         l.worker_vcpus,
         l.worker_memory_mib
     );
+    if let Some(a) = &contract.analyzer {
+        eprintln!(
+            "  analyzer:             {}@{}, reads the snapshot once before the first turn; its report is exported, never verified",
+            a.id, a.digest
+        );
+    }
     eprintln!("  agent:                {agent}");
     if let Some(endpoint) = endpoint {
         eprintln!("  model endpoint:       {endpoint}");
@@ -280,6 +303,21 @@ fn summarize(
             fc.image_digest,
             if fc.jailed { "jailed" } else { "unjailed" }
         ),
+    }
+    if let Some(fc) = fc {
+        let r = &fc.resources;
+        let rates = match (r.bandwidth_mib_s, r.iops) {
+            (None, None) => "no rate limit".to_string(),
+            (Some(b), None) => format!("each writable drive at most {b} MiB/s"),
+            (None, Some(o)) => format!("each writable drive at most {o} operations/s"),
+            (Some(b), Some(o)) => {
+                format!("each writable drive at most {b} MiB/s and {o} operations/s")
+            }
+        };
+        eprintln!(
+            "  vm disks:             workspace {} MiB, scratch {} MiB, {rates}",
+            r.disk_mib, r.scratch_mib
+        );
     }
 }
 
@@ -323,6 +361,19 @@ pub async fn submit(
             "verification profile changed while it was recorded: pinned {pin}, found {profile_digest}"
         )));
     }
+    // The analyzer's registry entry is copied like the profile and must still be the pinned one.
+    if let Some(a) = &contract.analyzer {
+        let entry = home.resolve_component(&a.id, &a.digest)?;
+        let staged = staging.path().join(ANALYZER_DIR);
+        copy_tree(&entry.dir, &staged)?;
+        let found = workspace_digest(&staged)?;
+        if found.to_string() != a.digest {
+            return Err(CliError::usage(format!(
+                "analyzer changed while it was recorded: pinned {}, found {found}",
+                a.digest
+            )));
+        }
+    }
     if expected_revision.is_some_and(|d| d != repo_digest) {
         return Err(CliError::usage(format!(
             "repository source changed while it was recorded (now {repo_digest})"
@@ -348,7 +399,7 @@ pub async fn submit(
         "profile_digest": profile_digest,
         "model": model.as_ref().map_or_else(|| FAKE_AGENT.to_string(), ModelSpec::recorded),
         "model_policy_version": 1,
-        "model_limits_version": 1,
+        "model_limits_version": agentos_engine::model::policy::LIMITS_VERSION,
         "model_endpoint": match &model {
             Some(ModelSpec::Anthropic(_)) => Some(home.checked_base_url()?
                 .unwrap_or_else(|| agentos_engine::model::anthropic::ANTHROPIC_BASE_URL.into())
@@ -357,6 +408,11 @@ pub async fn submit(
         },
         "fake_agent_patch_digest": patch.as_ref().map(|p| Digest::of(p.as_bytes())),
     });
+    if let Some(a) = &contract.analyzer {
+        let fields = submitted.as_object_mut().expect("an object");
+        fields.insert("analyzer_id".into(), json!(a.id));
+        fields.insert("analyzer_digest".into(), json!(a.digest));
+    }
     let fields = submitted.as_object_mut().expect("an object");
     let transcript_digest = transcript.as_ref().map(|b| Digest::of(b));
     if let Some(d) = &transcript_digest {
@@ -374,6 +430,7 @@ pub async fn submit(
             fields.insert("firecracker_version".into(), json!(fc.version));
             fields.insert("host_kernel".into(), json!(host_kernel()));
             fields.insert("jailed".into(), json!(fc.jailed));
+            fields.insert("vm_resources".into(), json!(fc.resources));
         }
     }
     store.db.append_audit(&task, "Submitted", &submitted)?;
@@ -412,4 +469,14 @@ pub async fn submit(
         })),
     }
     Ok(())
+}
+
+/// Refuses a model task on a host whose CA certificates cannot be loaded, before anything is
+/// written.
+pub fn tls_ready() -> Result<(), CliError> {
+    agentos_engine::model::anthropic::check_http_client().map_err(|e| {
+        CliError::other(format!(
+            "{e}; install the system CA certificates (the ca-certificates package)"
+        ))
+    })
 }

@@ -155,9 +155,11 @@ pub fn authorize(
 pub fn scope_for(op: Capability, contract: &Contract) -> Scope {
     match op {
         Capability::WorkspaceApplyPatch => Scope::Paths(contract.editable_paths.clone()),
-        Capability::SnapshotRead | Capability::ArtifactExport | Capability::ModelRequest => {
-            Scope::Task
-        }
+        Capability::SnapshotRead
+        | Capability::ArtifactExport
+        | Capability::ModelRequest
+        | Capability::SnapshotAnalyze
+        | Capability::AgentSession => Scope::Task,
         Capability::VerificationRun => Scope::Profile(contract.verification_profile.clone()),
     }
 }

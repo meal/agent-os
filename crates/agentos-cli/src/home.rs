@@ -25,6 +25,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agentos_core::contract::Limits;
 use agentos_core::ids::{Digest, TaskId};
+use agentos_core::resources::VmResources;
+use agentos_engine::analysis::AnalysisExecutor;
 use agentos_engine::firecracker::{FirecrackerConfig, preflight};
 use agentos_engine::guestlink::GuestLauncher;
 use agentos_engine::jail::{self, JAIL_GID, JAIL_UID, JailConfig, JailDecision, JailMode};
@@ -44,6 +46,9 @@ use crate::args::WorkerKind;
 use crate::commands::registry::{check_id, list_entries};
 use crate::commands::supervise::supervisor_cmd;
 use crate::error::CliError;
+
+/// Where a task keeps its copy of the analyzer's registry entry, under its task directory.
+pub const ANALYZER_DIR: &str = "analyzer";
 
 /// How long a verification check may run (the fixture executor's default).
 const VERIFY_TIMEOUT_SECS: u64 = 60;
@@ -140,6 +145,9 @@ pub struct RecordedWorker {
     pub image: Option<(String, Digest)>,
     /// `None` for host (and 3a) tasks.
     pub jailed: Option<bool>,
+    /// The recorded drive sizes and rate limits (version 0 when the record predates them);
+    /// `None` for host (and 3a) tasks.
+    pub resources: Option<VmResources>,
 }
 
 /// A Firecracker worker configuration that passed the preflight and the jail decision.
@@ -313,6 +321,30 @@ impl Home {
         self.registry_dir().join("images")
     }
 
+    pub fn components_dir(&self) -> PathBuf {
+        self.registry_dir().join("components")
+    }
+
+    /// Every registered analyzer component, unordered.
+    pub fn component_list(&self) -> Vec<RegistryEntry> {
+        list_entries(&self.components_dir(), |dir| {
+            dir.join("component.json").is_file() && dir.join("component.wasm").is_file()
+        })
+    }
+
+    /// The registered analyzer `id` with exactly the digest `digest`.
+    pub fn resolve_component(&self, id: &str, digest: &str) -> Result<RegistryEntry, CliError> {
+        check_id("analyzer", id)?;
+        self.component_list()
+            .into_iter()
+            .find(|e| e.id == id && e.digest == digest)
+            .ok_or_else(|| {
+                CliError::usage(format!(
+                    "analyzer {id}@{digest} is not in the registry; `agentos component register` it first"
+                ))
+            })
+    }
+
     /// Every registered guest image, unordered.
     pub fn image_list(&self) -> Vec<RegistryEntry> {
         list_entries(&self.images_dir(), |dir| dir.join("image.json").is_file())
@@ -455,6 +487,7 @@ impl Home {
             kind: WorkerKind::Host,
             image: None,
             jailed: None,
+            resources: None,
         };
         let Some(submitted) = events.iter().find(|e| e.event_type == "Submitted") else {
             return Ok(host);
@@ -477,10 +510,13 @@ impl Home {
                     .and_then(|d| Digest::from_hex(d).ok())
                     .ok_or_else(|| broken("guest_image_digest"))?;
                 let jailed = p["jailed"].as_bool().ok_or_else(|| broken("jailed"))?;
+                let resources = VmResources::from_submitted(p)
+                    .map_err(|e| CliError::other(format!("task {task}: {e}")))?;
                 Ok(RecordedWorker {
                     kind: WorkerKind::Firecracker,
                     image: Some((id, digest)),
                     jailed: Some(jailed),
+                    resources: Some(resources),
                 })
             }
             Some(other) => Err(CliError::other(format!(
@@ -531,6 +567,7 @@ impl Home {
         task_dir: &Path,
         profile_digest: Option<Digest>,
         recorded_jailed: Option<bool>,
+        resources: VmResources,
     ) -> Result<PreparedFirecracker, CliError> {
         let root = std::path::absolute(&self.root)?;
         let image_digest = Digest::from_hex(&image.digest).map_err(|e| {
@@ -552,6 +589,7 @@ impl Home {
             attempt_token: String::new(),
             launcher,
             jail: JailMode::Unjailed,
+            resources,
         };
         // The registry entry itself is validated: manifest, files, and its digest now.
         preflight(&cfg)
@@ -563,6 +601,21 @@ impl Home {
 
     /// The jail configuration: the jailer, the jail uid/gid, and the cgroup root `/proc/mounts`
     /// names (the one the probe checks, `collect` cleans and the real jailer writes to).
+    /// The jail probe `submit` runs, over this home's paths (the test hook answers first).
+    pub fn probe_jail(&self) -> Result<Result<(), String>, CliError> {
+        if let Some(answer) = probe_hook(|k| std::env::var(k).ok())? {
+            return Ok(answer);
+        }
+        let root = std::path::absolute(&self.root)?;
+        Ok(jail::probe(
+            &self.jail_config()?,
+            &root.join("jobs"),
+            &root.join("inspect"),
+            &root.join("work"),
+            &self.images_dir(),
+        ))
+    }
+
     fn jail_config(&self) -> std::io::Result<JailConfig> {
         Ok(JailConfig {
             jailer_bin: std::path::absolute(self.jailer_bin())?,
@@ -743,6 +796,7 @@ impl Home {
                 Some(key) => key,
                 None => self.api_key()?,
             };
+            crate::commands::submit_tls_ready()?;
             let provider = AnthropicProvider::new(key);
             let provider = match base {
                 Some(url) => provider.with_base_url(url),
@@ -846,6 +900,12 @@ impl Home {
                         ))
                     })?;
                 let limits = store.db.contract(task)?.limits;
+                // The values the task was submitted with, which its stored contract must
+                // still resolve to; nothing is journaled when it does not.
+                let resources = recorded.resources.unwrap_or(VmResources::V0);
+                resources
+                    .check_recorded(&limits)
+                    .map_err(|e| CliError::other(format!("task {task}: {e}")))?;
                 WorkerConfig::Firecracker(
                     self.prepare_firecracker(
                         &entry,
@@ -853,6 +913,7 @@ impl Home {
                         &task_dir,
                         profile_digest,
                         recorded.jailed,
+                        resources,
                     )?
                     .cfg,
                 )
@@ -889,7 +950,18 @@ impl Home {
             task_dir.join("snapshot"),
             root.join("tasks"),
         );
-        Ok(RoutingExecutor::new(jobs, model, reads))
+        let exec = RoutingExecutor::new(jobs, model, reads);
+        // The task's copy of its analyzer's registry entry, recorded at submission.
+        Ok(match store.db.contract(task)?.analyzer {
+            Some(_) => exec.with_analysis(AnalysisExecutor::new(
+                root.join("analysis"),
+                root.join("agentos.db"),
+                task_dir.join("snapshot"),
+                task_dir.join(ANALYZER_DIR),
+                ExecCounts::default(),
+            )),
+            None => exec,
+        })
     }
 }
 

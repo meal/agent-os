@@ -123,3 +123,25 @@ pub fn contract() -> (Contract, Digest) {
     let digest = Digest::of(&serde_json::to_vec(&contract).unwrap());
     (contract, digest)
 }
+
+/// Panics when `key` occurs in any file under `paths` (decoded response bodies included).
+/// The message names the file and location, never the key.
+pub fn assert_key_absent(key: &str, paths: &[&Path]) {
+    let mut found = Vec::new();
+    for path in paths {
+        let hits = if path.is_dir() {
+            super::evidence::tree_findings(path, &[key.as_bytes()])
+        } else {
+            super::evidence::file_findings(path, &[key.as_bytes()])
+        };
+        found.extend(
+            hits.into_iter()
+                .filter(|f| f.ends_with("a secret, verbatim")),
+        );
+    }
+    assert!(
+        found.is_empty(),
+        "the API key was written to evidence:\n{}",
+        found.join("\n")
+    );
+}

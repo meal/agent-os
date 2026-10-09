@@ -26,6 +26,14 @@ pub enum AgentAction {
     ReadFile(String),
     /// Stop; the task fails unless it already succeeded.
     Finish,
+    /// Run a coding-agent CLI in the guest with its model calls served by the runner. The
+    /// session changes only its own scratch copy; its patch comes back as `SessionEnded`.
+    RunSession {
+        argv: Vec<String>,
+        env: Vec<(String, String)>,
+        /// The model the runner sends every request to (the CLI's own choice is recorded).
+        model: String,
+    },
 }
 
 /// What the runner tells the agent after each step.
@@ -76,6 +84,15 @@ pub enum Observation {
     },
     FileReadRejected {
         reason: String,
+    },
+    /// The agent session ended: how the CLI ended, and the patch it left (`None` when it
+    /// changed nothing or the patch is not UTF-8). `reason` says why a timed-out CLI ended.
+    SessionEnded {
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+        timed_out: bool,
+        patch: Option<String>,
+        reason: Option<String>,
     },
 }
 
@@ -292,6 +309,48 @@ impl ModelAgent {
     }
 }
 
+/// An agent that runs one coding-agent CLI session and then applies and verifies its patch:
+/// `RunSession`, then `ApplyPatch` of the patch the session left, then `Verify`, then `Finish`.
+#[derive(Debug, Clone)]
+pub struct SessionAgent {
+    argv: Vec<String>,
+    env: Vec<(String, String)>,
+    model: String,
+}
+
+impl SessionAgent {
+    pub fn new(
+        argv: Vec<String>,
+        env: Vec<(String, String)>,
+        model: impl Into<String>,
+    ) -> SessionAgent {
+        SessionAgent {
+            argv,
+            env,
+            model: model.into(),
+        }
+    }
+}
+
+impl Agent for SessionAgent {
+    fn next(&mut self, obs: &Observation) -> AgentAction {
+        match obs {
+            Observation::Start { .. } => AgentAction::RunSession {
+                argv: self.argv.clone(),
+                env: self.env.clone(),
+                model: self.model.clone(),
+            },
+            Observation::SessionEnded {
+                patch: Some(patch), ..
+            } => AgentAction::ApplyPatch(patch.clone()),
+            Observation::SessionEnded { patch: None, .. } => AgentAction::Finish,
+            Observation::PatchApplied { .. } => AgentAction::Verify,
+            Observation::Verification { .. } => AgentAction::Finish,
+            _ => AgentAction::Finish,
+        }
+    }
+}
+
 /// A model-chosen tool name is echoed back into JSON only, bounded in length.
 fn bounded_name(name: &str) -> String {
     name.chars().take(64).collect()
@@ -341,6 +400,105 @@ impl Agent for ModelAgent {
             }
             Observation::ModelCallFailed { .. } | Observation::ModelCallLost => self.call(),
             Observation::BudgetExhausted => AgentAction::Finish,
+            // Sessions are driven by `SessionAgent`; a model agent never starts one.
+            Observation::SessionEnded { .. } => AgentAction::Finish,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session_ended(patch: Option<&str>) -> Observation {
+        Observation::SessionEnded {
+            exit_code: Some(0),
+            signal: None,
+            timed_out: false,
+            patch: patch.map(str::to_string),
+            reason: None,
+        }
+    }
+
+    fn agent() -> SessionAgent {
+        SessionAgent::new(
+            vec!["/bin/sh".into(), "cli.sh".into()],
+            vec![("K".into(), "V".into())],
+            "claude-opus-5-5",
+        )
+    }
+
+    #[test]
+    fn the_start_runs_the_session_with_its_argv_env_and_model() {
+        assert_eq!(
+            agent().next(&Observation::Start {
+                files: vec![],
+                workspace: Digest::of(b"ws"),
+            }),
+            AgentAction::RunSession {
+                argv: vec!["/bin/sh".into(), "cli.sh".into()],
+                env: vec![("K".into(), "V".into())],
+                model: "claude-opus-5-5".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_session_that_left_a_patch_has_it_applied() {
+        assert_eq!(
+            agent().next(&session_ended(Some("--- a/src/x\n"))),
+            AgentAction::ApplyPatch("--- a/src/x\n".into())
+        );
+    }
+
+    #[test]
+    fn a_session_that_changed_nothing_finishes() {
+        assert_eq!(agent().next(&session_ended(None)), AgentAction::Finish);
+    }
+
+    #[test]
+    fn an_applied_patch_is_verified_and_the_verification_finishes() {
+        let mut a = agent();
+        assert_eq!(
+            a.next(&Observation::PatchApplied {
+                workspace: Digest::of(b"ws"),
+            }),
+            AgentAction::Verify
+        );
+        assert_eq!(
+            a.next(&Observation::Verification {
+                passed: true,
+                summary: "ok".into(),
+            }),
+            AgentAction::Finish
+        );
+    }
+
+    #[test]
+    fn everything_else_finishes() {
+        let mut a = agent();
+        for obs in [
+            Observation::PatchRejected {
+                reason: "PathNotEditable".into(),
+            },
+            Observation::ModelCallLost,
+            Observation::BudgetExhausted,
+        ] {
+            assert_eq!(a.next(&obs), AgentAction::Finish, "{obs:?}");
+        }
+    }
+
+    #[test]
+    fn the_session_actions_and_observations_serialize_like_the_others() {
+        let action = agent().next(&Observation::Start {
+            files: vec![],
+            workspace: Digest::of(b"ws"),
+        });
+        let json = serde_json::to_value(&action).unwrap();
+        assert_eq!(json["RunSession"]["model"], "claude-opus-5-5");
+        assert_eq!(serde_json::from_value::<AgentAction>(json).unwrap(), action);
+        let obs = session_ended(Some("p"));
+        let json = serde_json::to_value(&obs).unwrap();
+        assert_eq!(serde_json::from_value::<Observation>(json).unwrap(), obs);
     }
 }

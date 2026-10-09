@@ -1923,3 +1923,130 @@ fn a_removal_ticket_recording_another_file_type_is_refused() {
     );
     assert!(data.join("file").exists());
 }
+
+/// An analysis retained under `analysis/` is kept while its effect is unsettled, as a model
+/// response is.
+#[test]
+fn a_dispatched_analysis_keeps_its_retained_outcome() {
+    let env = Env::with_contract(common::analyzer_contract(10, "repo-analyzer-v1"));
+    env.db.append(&env.task, &TaskEvent::Started).unwrap();
+    let base = env.db.task(&env.task).unwrap().workspace_digest;
+    let analysis = steps::intend(
+        &env.db,
+        &env.task,
+        EffectKind::AnalyzeSnapshot,
+        Digest::of(b"{}"),
+        &base,
+        &Resource::Task,
+    )
+    .unwrap();
+    let ctx = steps::dispatch(&env.db, &analysis).unwrap();
+    let out = ExecOutcome::success(
+        &steps::request(&analysis, Vec::new(), &env.contract, 0),
+        &ctx,
+        b"{\"files\":1}".to_vec(),
+    );
+    let retention = env
+        .dir
+        .path()
+        .join("analysis")
+        .join(format!("{}-{}", analysis.effect_id, ctx.attempt_id));
+    fs::create_dir_all(&retention).unwrap();
+    fs::write(
+        retention.join("outcome.json"),
+        serde_json::to_vec(&out).unwrap(),
+    )
+    .unwrap();
+    finish(&env, &env.task);
+    let report = gc(env.dir.path(), &env, false);
+    assert!(retention.join("outcome.json").exists(), "{report:?}");
+    assert_eq!(
+        status_of(&report, &rel(&env, &retention)),
+        ["retained"],
+        "{report:?}"
+    );
+}
+
+/// After a real run the analysis is settled and published: its retention is a redundant copy
+/// and is collected, while the report blob stays.
+#[test]
+fn a_settled_analysis_retention_is_collected() {
+    let env = Env::with_contract(common::analyzer_contract(10, "repo-analyzer-v1"));
+    let root = env.dir.path().to_path_buf();
+    let counts = agentos_engine::supervised::ExecCounts::default();
+    let exec = common::routing_over(&root, env.fixture_exec(), None, &counts, None).with_analysis(
+        agentos_engine::analysis::AnalysisExecutor::new(
+            root.join("analysis"),
+            root.join("agentos.db"),
+            env.snapshot_dir(),
+            common::component_dir("repo-analyzer-v1"),
+            counts.clone(),
+        ),
+    );
+    let mut agent = agentos_engine::agent::FakeAgent::scripted(vec![
+        agentos_engine::agent::AgentAction::ApplyPatch(common::fix_patch()),
+        agentos_engine::agent::AgentAction::Verify,
+    ]);
+    let state = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(agentos_engine::runner::run_task(
+            &env.db, &env.blobs, &exec, &mut agent, &env.task,
+        ));
+    assert_eq!(state.unwrap(), agentos_core::state::TaskState::Succeeded);
+    let retained: Vec<_> = fs::read_dir(root.join("analysis"))
+        .unwrap()
+        .flatten()
+        .collect();
+    assert_eq!(retained.len(), 1);
+    let retention = retained[0].path();
+    let report = gc(&root, &env, false);
+    assert!(!report.failed(), "{report:?}");
+    assert!(!retention.exists(), "{report:?}");
+    let effect = env
+        .db
+        .events(&env.task)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.event_type == "EffectIntended" && e.payload["kind"] == "AnalyzeSnapshot")
+        .unwrap();
+    let rec = env
+        .db
+        .effect(&serde_json::from_value(effect.payload["effect_id"].clone()).unwrap())
+        .unwrap();
+    assert!(
+        env.blobs.get(&rec.result_digest.unwrap()).is_ok(),
+        "the report blob stays"
+    );
+}
+
+/// A settled job's agent-session mailbox (`session/`) is part of the job: its request and
+/// response files are copies of journaled bodies and go with the job's redundant copies, and a
+/// half-written `.tmp` is never kept.
+#[test]
+fn a_settled_jobs_session_mailbox_is_collected_with_its_redundant_copies() {
+    let (env, job, retention) = settled();
+    let session = job.path.join("session");
+    fs::create_dir(&session).unwrap();
+    for name in ["1.req", "1.resp", "2.req.tmp"] {
+        fs::write(session.join(name), b"mailbox bytes").unwrap();
+    }
+    let report = gc(env.dir.path(), &env, false);
+    for name in ["1.req", "1.resp", "2.req.tmp"] {
+        assert!(
+            !session.join(name).exists(),
+            "{name} is redundant: {report:?}"
+        );
+    }
+    assert!(
+        job.path.join("receipt.json").exists(),
+        "the receipt is kept"
+    );
+    assert!(!retention.exists());
+    let again = gc(env.dir.path(), &env, false);
+    assert_eq!(
+        status_of(&again, &rel(&env, &job.path)),
+        ["collected"],
+        "{again:?}"
+    );
+    assert!(!again.failed(), "{again:?}");
+}

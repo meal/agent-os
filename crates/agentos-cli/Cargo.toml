@@ -11,6 +11,7 @@ path = "src/main.rs"
 agentos-core = { path = "../agentos-core" }
 agentos-store = { path = "../agentos-store" }
 agentos-engine = { path = "../agentos-engine" }
+agentos-component = { path = "../agentos-component" }
 clap.workspace = true
 reqwest.workspace = true
 rustix = { workspace = true, features = ["system", "fs"] }

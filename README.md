@@ -7,13 +7,13 @@ through a protected verification of exactly the final workspace. The controller 
 killed at any of those boundaries, and a restarted one recovers the same task without
 repeating completed effects.
 
-This is milestone **v0.1, Phases 1-3b-1 and 4**. The agent is either a deterministic fake that
+This is **v0.1** (release candidate [v0.1.0-rc5](docs/releases/v0.1.0-rc5.md)). The agent is either a deterministic fake that
 applies a given patch (`--fake-agent-patch`, the default for tests and demos) or a model agent
 that drives the repository through five tools (`--model anthropic:<model>` for the Anthropic
-Messages API, `--model fake:<transcript>` for a scripted, offline provider). **The real-model
-path has not been validated end-to-end against the live Anthropic API in this build:** the
-gated live test exists but was never run with a real key (see [Running a real
-model](#running-a-real-model)). Every effect is a job under its own supervisor, and every capability is an
+Messages API, `--model fake:<transcript>` for a scripted, offline provider). The real-model
+path passed live acceptance on the host and jailed workers, with offline replay, most recently
+at `b8a456a` (see [Running a real model](#running-a-real-model) and
+[the evidence](docs/evidence/README.md)). Every effect is a job under its own supervisor, and every capability is an
 opaque, revocable handle checked by a broker. By default effects run as host processes (the
 `host` worker, not sandboxed). The VM sandbox is opt-in per task with `--worker firecracker`:
 one Firecracker microVM per effect, booted from a registered guest image, with no network
@@ -31,11 +31,36 @@ Current completion work is tracked in the [v0.1 plan](docs/superpowers/plans/202
 Model deadlines, bounded I/O, versioned retry/endpoint policy, the development runtime, and
 CI, conservative transient GC (`agentos gc`) and host publication failure recovery are
 implemented and tested offline. Real provider/KVM acceptance passed on 2026-10-08
-([evidence](docs/evidence/)). Contract-driven VM resources, the component analyzer, and
-fresh-host release validation remain planned work.
+([evidence](docs/evidence/)). Contract-driven VM disks and I/O limits (optional
+`worker_disk_mib`, `worker_scratch_mib`, `worker_disk_bandwidth_mib_s` and
+`worker_disk_iops`, recorded at submission and exported) passed real KVM acceptance on
+2026-10-09. A contract can name a registered WebAssembly analyzer component, which runs
+once over the snapshot with broker-checked reads and no WASI, and whose report is exported
+but never counts as verification (KVM acceptance 2026-10-09). Fresh-host release
+validation was smoke-tested in a fresh container (see below). Release candidate
+[v0.1.0-rc5](docs/releases/v0.1.0-rc5.md) passed every v0.1 gate at commit `b8a456a`.
+
+## Installing a release
+
+A release is `agentos-VERSION-x86_64-linux.tar.gz` with its `.sha256`, built by
+`docker compose run --rm test-kvm sh scripts/release.sh VERSION` from a clean committed tree.
+Supported hosts: x86_64 Linux with usable `/dev/kvm`, git, the system CA certificates (for
+the model provider), and, for the jailed worker, root
+with a writable cgroup v2 tree that can delegate `cpu`, `memory` and `pids` (systemd hosts
+normally can). Install with:
+
+```sh
+sh scripts/install.sh agentos-VERSION-x86_64-linux.tar.gz --sha256 "$(cat agentos-VERSION-x86_64-linux.tar.gz.sha256)"
+```
+
+It verifies every file, runs the release's own `agentos host-check`, stages and activates the
+version atomically under `~/.local/share/agentos`, never replaces an existing home
+(`~/.agentos`), and registers the release's image, profile and analyzer. Without root or
+delegable cgroups, pass `--allow-unjailed` and submit with `--allow-unjailed` too.
+`agentos host-check` and `agentos version` can be run at any time.
 
 Required offline gates are centralized in `sh scripts/check.sh`: formatting, strict Clippy,
-host tests, fake-jail tests and the GC mount gate, all through Docker Compose with the
+host tests, fake-jail tests, the GC mount gate and the analyzer component rebuild check, all through Docker Compose with the
 lockfile enforced. The mount gate (`sh scripts/check.sh mount`) runs the GC mount-root
 regressions in the `test-mount` service, which adds only `CAP_SYS_ADMIN` (and AppArmor
 unconfined) so they can mount a tmpfs inside real candidates; elsewhere those tests print
@@ -45,8 +70,9 @@ The PR/push workflow uses the same commands with separate Compose projects. Run
 3.14.8 pinned by source checksums; `pyenv exec python` selects the project version.
 The image exposes that interpreter directly to verification so pyenv shims add no
 environment variables. `scripts/test-python-runtime.sh` checks both legacy and current
-interpreter acceptance. The separate `python-stdlib-py314-v1` guest is a candidate;
-real conformance and reproducibility are pending, so the existing guest stays the default.
+interpreter acceptance. The `python-stdlib-py314-v1` and `python-stdlib-py314-v2` guests passed
+real KVM acceptance; `python-stdlib-py314-v2` (with a source-built kernel) is the release image,
+and the tests' default stays `python-stdlib-v1`.
 
 Everything runs in Docker through compose (Rust toolchain, `python3` and `git` are in the
 image):
@@ -56,7 +82,7 @@ docker compose run --rm test cargo test --workspace          # all tests (defaul
 docker compose run --rm test cargo test -p agentos-engine --test crash_matrix   # crash/recovery matrix
 docker compose run --rm test cargo test -p agentos-engine --test supervisor     # supervisor, leases, kills
 docker compose run --rm test cargo build -p agentos-cli     # the `agentos` binary
-# the gated live model test (never run in this build; needs a real key and the network)
+# the gated live model test (billed; needs a real key and the network)
 docker compose run --rm -e AGENTOS_LIVE_MODEL_TESTS=1 -e ANTHROPIC_API_KEY test \
   cargo test -p agentos-engine --test live_model -- --nocapture --test-threads 1
 ```
@@ -488,13 +514,12 @@ What differs from the host run, and what does not:
 or --model`); `--yes` needs one of them (exit 2 `--yes needs --fake-agent-patch FILE or --model
 anthropic:<model>|fake:<transcript>`). `resume` takes no `--model`: it uses the recorded one.
 
-**What has and has not been validated.** The real-model path has **not** been validated
-end-to-end against the live Anthropic API in this build. The gated live test
-(`docker compose run --rm -e AGENTOS_LIVE_MODEL_TESTS=1 -e ANTHROPIC_API_KEY test cargo test -p
-agentos-engine --test live_model -- --nocapture --test-threads 1`) exists, but it was never run
-with a real key. Everything below that touches the provider is tested against a local fake of the
-Messages API (`127.0.0.1`) and the scripted transcript. Whether a real model fixes the fixture
-within the budget, and whether its real response bytes replay with the same digests, is unknown.
+**What has been validated.** The real-model path passed live acceptance against the Anthropic
+API (`sh scripts/acceptance.sh live KEY_FILE`, which runs the gated live test on the host and
+jailed workers and replays each recording offline): on 2026-10-08, and at the release candidate's
+frozen commit `b8a456a`, where the model also fixed a second, distinct snapshot on the installed
+release, each run using 4 of its 12 allowed requests. The offline tests below exercise the
+provider against a local fake of the Messages API (`127.0.0.1`) and scripted transcripts.
 
 ### The API key
 
@@ -891,7 +916,7 @@ process itself after a VM escape.
   jailer runs as root for the milliseconds of setup), the pinned guest kernel and image bytes,
   `agentos-guest`, `git`/`python3` in the guest, the controller, supervisor and worker.
 
-## Known limits (v0.1, Phases 1-3b-1 and 4)
+## Known limits (v0.1)
 
 Sandboxing and the jail:
 
@@ -915,14 +940,14 @@ Sandboxing and the jail:
   home used jailed must stay used as root. The jail hard-links the registry image, `ws.img` and
   `scratch.img` into the chroot, so the home must be one filesystem mounted without `nodev` or
   `noexec` (`/tmp` is `nodev` on most hosts: not a valid home for jailed use).
-- **Jail memory bound vs host page cache — owner decision pending.** The jail's `memory.max` is
+- **Jail memory bound vs host page cache.** The jail's `memory.max` is
   the guest's memory + 128 MiB (`JAIL_MEMORY_OVERHEAD_MIB`). The host page cache generated by the
   drive files (`ws.img`, `scratch.img`) is charged to the same cgroup, so a disk-heavy guest under
   host I/O contention can get Firecracker OOM-killed by its own cgroup (seen once in the KVM tier:
   `guest exited before reporting: firecracker killed by signal 9`). The check's evidence is then
-  lost and the effect fails; it is never a false pass. Options for the owner: raise
-  `JAIL_MEMORY_OVERHEAD_MIB`, add a `memory.high` below `memory.max`, or change the drives'
-  `cache_type`/I/O path.
+  lost and the effect fails; it is never a false pass. Measured in Task 9: memory that reclaim
+  cannot drop left at least 61 MiB of headroom, with four VMs filling their drives at once and no
+  OOM kill, so the overhead stays 128 MiB (`docs/evidence/2026-10-08/vm-memory/`).
 - **A VM escape lands in the jail, not nowhere.** Micro-architectural side channels are not
   mitigated beyond `smt: false` per VM (host SMT stays on). The guest agent and the jailer's
   setup (as root) are in the TCB.
@@ -991,9 +1016,9 @@ The Firecracker worker:
 
 The model workflow (Phase 4):
 
-- **Not validated against the live API.** The live test was never run with a real key. Unknown:
-  whether a real model fixes the fixture within its request budget, how real response bytes
-  behave, what the real provider's errors look like.
+- **Validated live on two small fixtures only.** The live runs fixed the parser and duration
+  fixtures within budget; real provider errors (rate limits, overload) have been exercised only
+  against the local fake.
 - **One provider, no streaming, no parallel tool calls.** Only the Anthropic Messages API (and
   the scripted fake) exists; each answer is read whole; `disable_parallel_tool_use` is set.
 - **An environment-variable key is readable in `/proc/<controller pid>/environ`** for the life of
@@ -1102,7 +1127,7 @@ and replay against the local fake API. The other tiers fail when setup is unavai
 they require a usable `/dev/kvm`, and live also requires a regular nonsymlink key file of
 at most 4096 bytes. Live runs mount that file read-only and produce host and actual jailed
 recordings, exports, and replay comparisons under `build/evidence/`.
-See [evidence collection](docs/evidence/README.md) for runner setup and pending gates.
+See [evidence collection](docs/evidence/README.md) for runner setup and the recorded results.
 
 ## Collecting transient data
 

@@ -1,7 +1,6 @@
 //! Runs a `ModelCall` effect: sends the request exactly once and retains the answer
 //! before returning it, so recovery publishes the answer instead of sending again.
 
-use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -14,7 +13,7 @@ use super::provider::{ModelProvider, ProviderResult};
 use crate::crash::{CrashHook, CrashPoint};
 use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor};
 use crate::guestlink::guest_text;
-use crate::job::{atomic_write, check_plain_name, sync_dir};
+use crate::retention::Retention;
 use crate::supervised::ExecCounts;
 
 /// How much of an unusable response body an error quotes (it is bounded again by
@@ -22,7 +21,7 @@ use crate::supervised::ExecCounts;
 const EXCERPT: usize = 256;
 
 pub struct ModelExecutor {
-    root: PathBuf,
+    retention: Retention,
     provider: Option<Box<dyn ModelProvider>>,
     counts: ExecCounts,
     crash: Option<CrashHook>,
@@ -35,7 +34,11 @@ impl ModelExecutor {
         counts: ExecCounts,
     ) -> ModelExecutor {
         ModelExecutor {
-            root,
+            retention: Retention {
+                root,
+                file: "response.json",
+                what: "model response",
+            },
             provider,
             counts,
             crash: None,
@@ -49,40 +52,7 @@ impl ModelExecutor {
 
     /// Where the answer of one attempt is retained: `<root>/<effect>-<attempt>`.
     pub fn retention_dir(&self, effect: &EffectId, attempt: &AttemptId) -> PathBuf {
-        self.root.join(format!("{effect}-{attempt}"))
-    }
-
-    fn retain(&self, req: &EffectRequest, ctx: &AttemptCtx, out: &ExecOutcome) {
-        if let Err(e) = self.try_retain(req, ctx, out) {
-            tracing::warn!(effect = %req.effect_id, error = %e, "cannot retain the model response");
-        }
-    }
-
-    /// Writes the answer durably: the file and its directory are synced by `atomic_write`;
-    /// the directory's entry in `root` (and `root`'s own entry, when this created it) are
-    /// synced here, so a power loss cannot leave a synced file under a vanished directory.
-    fn try_retain(
-        &self,
-        req: &EffectRequest,
-        ctx: &AttemptCtx,
-        out: &ExecOutcome,
-    ) -> std::io::Result<()> {
-        check_plain_name("effect id", req.effect_id.as_str())?;
-        let attempt = ctx.attempt_id.to_string();
-        check_plain_name("attempt id", &attempt)?;
-        let created_root = !self.root.exists();
-        std::fs::create_dir_all(&self.root)?;
-        let dir = self.retention_dir(&req.effect_id, &ctx.attempt_id);
-        std::fs::create_dir_all(&dir)?;
-        atomic_write(
-            &dir.join("response.json"),
-            &serde_json::to_vec(out).expect("an outcome serializes"),
-        )?;
-        sync_dir(&self.root)?;
-        if created_root && let Some(parent) = self.root.parent() {
-            sync_dir(parent)?;
-        }
-        Ok(())
+        self.retention.dir(effect, attempt)
     }
 }
 
@@ -195,62 +165,14 @@ impl Executor for ModelExecutor {
             );
         }
         if !out.unresolved {
-            self.retain(req, ctx, &out);
+            self.retention.retain(req, ctx, &out);
         }
         out
     }
 
-    /// The newest-lease resolved outcome retained for `effect`, if any. Anything this cannot
-    /// read or parse is logged (`warn`) and counts as not retained: the caller then treats
-    /// the effect as lost, which is the safe side (it is never sent again on a guess).
-    ///
-    /// Cost: one listing of the retention directory per call; only entries named
-    /// `<effect>-<attempt>` are opened.
+    /// The newest-lease resolved outcome retained for `effect` (see [`Retention::retained`]).
     fn retained_outcome(&self, effect: &EffectId) -> Option<ExecOutcome> {
-        let prefix = format!("{effect}-");
-        let mut best: Option<ExecOutcome> = None;
-        let entries = match std::fs::read_dir(&self.root) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == ErrorKind::NotFound => return None,
-            Err(e) => {
-                tracing::warn!(root = %self.root.display(), error = %e,
-                    "cannot list the model retention directory; treating nothing as retained");
-                return None;
-            }
-        };
-        for entry in entries.flatten() {
-            if !entry.file_name().to_string_lossy().starts_with(&prefix) {
-                continue;
-            }
-            let file = entry.path().join("response.json");
-            let bytes = match std::fs::read(&file) {
-                Ok(bytes) => bytes,
-                Err(e) if e.kind() == ErrorKind::NotFound => continue,
-                Err(e) => {
-                    tracing::warn!(%effect, file = %file.display(), error = %e,
-                        "cannot read a retained model response; treating it as not retained");
-                    continue;
-                }
-            };
-            let out = match serde_json::from_slice::<ExecOutcome>(&bytes) {
-                Ok(out) => out,
-                Err(e) => {
-                    tracing::warn!(%effect, file = %file.display(), error = %e,
-                        "cannot parse a retained model response; treating it as not retained");
-                    continue;
-                }
-            };
-            if out.receipt.effect_id != *effect || out.unresolved {
-                continue;
-            }
-            if best
-                .as_ref()
-                .is_none_or(|b| out.receipt.lease_generation > b.receipt.lease_generation)
-            {
-                best = Some(out);
-            }
-        }
-        best
+        self.retention.retained(effect)
     }
 }
 

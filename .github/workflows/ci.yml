@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        check: [fmt, clippy, host, fake, mount]
+        check: [fmt, clippy, host, fake, mount, components]
     env:
       COMPOSE_PROJECT_NAME: agentos-${{ github.run_id }}-${{ matrix.check }}
     steps:
@@ -24,6 +24,7 @@ jobs:
       - run: sh scripts/test-check.sh
       - run: sh scripts/test-check-pages.sh
       - run: sh scripts/test-acceptance.sh
+      - run: docker compose run --rm test sh scripts/install.sh --self-test
       - run: sh scripts/build-guest-image.sh --self-test
       - run: docker compose run --rm test sh scripts/test-python-runtime.sh
       - run: docker compose run --rm test sh scripts/check-pages.sh

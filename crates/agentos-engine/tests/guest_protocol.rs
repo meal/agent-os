@@ -7,7 +7,7 @@ use agentos_core::guest::{Frame, Message, Mode, RAW_FRAME_LIMIT, read_frame, wri
 fn frames_cross_a_real_pipe_in_both_directions() {
     let (mut a, mut b) = UnixStream::pair().unwrap();
     let hello = Message::Hello {
-        protocol: 1,
+        protocol: 2,
         attempt_token: "0123456789abcdef0123456789abcdef".into(),
         task_id: "task".into(),
         effect_id: "effect".into(),

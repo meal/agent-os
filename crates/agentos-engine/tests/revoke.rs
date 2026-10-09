@@ -64,6 +64,18 @@ impl Executor for WithoutReceipt {
     async fn fence_job(&self, effect: &EffectId) -> bool {
         self.plain.fence_job(effect).await
     }
+
+    fn runs_agent_sessions(&self) -> bool {
+        self.plain.runs_agent_sessions()
+    }
+
+    fn session_mailbox(&self, effect: &EffectId) -> Option<agentos_engine::job::Mailbox> {
+        self.plain.session_mailbox(effect)
+    }
+
+    fn cancel_jobs(&self, effects: &[EffectId]) -> usize {
+        self.plain.cancel_jobs(effects)
+    }
 }
 
 /// A controller over an approved task.
@@ -428,4 +440,17 @@ async fn revoke_one_capability_keeps_other_running_effects() {
     let (state, ()) = tokio::join!(run_task(&w.db, &w.blobs, &exec, &mut agent, &w.task), steer);
     assert_eq!(state.unwrap(), TaskState::Succeeded);
     assert_eq!(w.count("EffectFailed"), 0);
+}
+
+/// The session methods reach the supervised executor through the wrapper.
+#[tokio::test]
+async fn the_test_executor_forwards_the_session_methods() {
+    let w = World::new(600);
+    let jobs = w.path("jobs");
+    let exec = WithoutReceipt {
+        kind: "apply_patch",
+        plain: common::session_supervised(w.dir.path(), &jobs, &w.counts),
+        special: common::session_supervised(w.dir.path(), &jobs, &w.counts),
+    };
+    common::assert_forwards_sessions(&exec, w.dir.path(), &jobs);
 }

@@ -1,0 +1,11 @@
+5c995212b398653aeeefa334c07e0d1f763c70d259a3a64d381a26063d41ba7a  ./MANIFEST.json
+36ce30600af55d50091a9ec7bc01faf7faa9b5d17106c183256fec1e4ee7addf  ./bin/agentos
+99ad0f5cd0514a88aad0e9ae8cfdb3cc3b4ab9d190e1194602406c786b5de7a5  ./bin/firecracker
+65ef226e96f0ceda55ba643f445801ef2cc0ea667ef67cad8ac4f406c9c8434f  ./bin/jailer
+34421bd68240cbe20805308e25e93015a01b31f15e684ee9d09e30157a2de6b8  ./components/repo-analyzer-v1/component.json
+25c522e421281321ac7a7cc9e3e96cba208f8689f2ac14028d2ff700cdbeb480  ./components/repo-analyzer-v1/component.wasm
+bfbad289ebdbd2d291285d9cf93d78bcbd4b3e7566e102a739e6f1729b486043  ./images/python-stdlib-py314-v2/image.json
+ce004a6357af0e2056bdd8cb7db394a18235119cc374efba17e51d648224b54c  ./images/python-stdlib-py314-v2/rootfs.squashfs
+99ee7d43e73fca86c475ed3180f670e47964a3e25de12bda8556747852376bcd  ./images/python-stdlib-py314-v2/vmlinux
+37b0a0d3d212f074b9b9c98f57b79a772088ac595c4dcaebddd37644f6b315af  ./profiles/parser-checks-v1/check_parser.py
+e610fa11793eb32a8a3bea05f759de6c969367b3f5fba876b79e6adf4d083dfa  ./profiles/parser-checks-v1/profile.json

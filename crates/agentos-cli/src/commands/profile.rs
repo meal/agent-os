@@ -36,9 +36,26 @@ pub fn register(home: &Home, dir: &Path) -> Result<(), CliError> {
     if profile.command.is_empty() {
         return Err(CliError::usage("profile.json: command must not be empty"));
     }
+    check_runnable_without_modes(&source, &profile.command[0])?;
 
     let registered = register_tree(&home.registry_dir(), &profile.id, &source)?;
     print(&json!({ "id": registered.id, "digest": registered.digest }));
+    Ok(())
+}
+
+/// The guest protocol transfers file contents without modes, so a profile file can never be
+/// executed directly in a VM. `program` must be a program of the guest image (a bare name
+/// looked up on the check's `PATH`, or an absolute path), not a file of the profile.
+fn check_runnable_without_modes(source: &Path, program: &str) -> Result<(), CliError> {
+    let relative_path = program.contains('/') && !program.starts_with('/');
+    let profile_file = !program.contains('/') && fs::symlink_metadata(source.join(program)).is_ok();
+    if relative_path || profile_file {
+        return Err(CliError::usage(format!(
+            "profile.json: command[0] {program:?} runs a file from the profile directory, which \
+             needs its executable bit, and the guest does not transport file modes; run it \
+             through its interpreter, e.g. [\"sh\", \"check.sh\"] or [\"python3\", \"check.py\"]"
+        )));
+    }
     Ok(())
 }
 

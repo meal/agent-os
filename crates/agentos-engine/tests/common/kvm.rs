@@ -45,6 +45,15 @@ fn workspace_root() -> PathBuf {
 }
 
 /// `var`, or `default` under the workspace root; a relative value is taken from the root too.
+/// The `id` in the configured image's `image.json` (`$AGENTOS_GUEST_IMAGE`, else the
+/// default image), when that file is readable. Contracts name it as their `profile`.
+pub fn configured_image_id() -> Option<String> {
+    let dir = setting("AGENTOS_GUEST_IMAGE", DEFAULT_GUEST_IMAGE);
+    let json: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join("image.json")).ok()?).ok()?;
+    json["id"].as_str().map(str::to_string)
+}
+
 fn setting(var: &str, default: &str) -> PathBuf {
     let value = std::env::var_os(var).map_or_else(|| PathBuf::from(default), PathBuf::from);
     if value.is_absolute() {
@@ -202,6 +211,7 @@ impl Kvm {
     pub fn jailed_config(&self, root: &Path) -> FirecrackerConfig {
         let image_dir = self.image_for(root);
         FirecrackerConfig {
+            resources: agentos_core::resources::VmResources::V0,
             firecracker_bin: self.firecracker_bin.clone(),
             image_digest: workspace_digest(&image_dir).expect("digest the guest image"),
             image_dir,
