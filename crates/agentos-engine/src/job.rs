@@ -10,11 +10,16 @@
 //! cancel         marker: the controller asks the supervisor to stop the worker
 //! receipt.json + output.bin   the worker's receipt, once it is durable
 //! outcome.json + outcome.bin  the controller-visible outcome
+//! session/                    agent session mailbox (below)
 //! ```
 //!
 //! Every file has exactly one writer, which is why temp-file names are fixed:
 //! `request.json`/`lock`/`cancel` belong to the controller, `status.json`/`receipt.json`/
 //! `output.bin` to the supervisor, `outcome.json`/`outcome.bin`/`groups` to the worker.
+//!
+//! The agent session mailbox (`session/`, see [`Mailbox`]): `<id>.req` is a model request
+//! body, written by the worker; `<id>.resp` is its answer, written by the controller. Each is
+//! written to `<name>.tmp` and renamed, so a reader sees it whole or not at all.
 //!
 //! Liveness is the advisory lock, never a pid: pids are reused, a lock dies with the
 //! process (and with every process that inherited the descriptor).
@@ -28,7 +33,7 @@ use agentos_core::effect::{AttemptId, EffectId, EffectKind};
 use agentos_core::ids::{Digest, TaskId};
 use serde::{Deserialize, Serialize};
 
-use agentos_core::guest::is_attempt_token;
+use agentos_core::guest::{RAW_FRAME_LIMIT, is_attempt_token};
 
 use crate::executor::ExecOutcome;
 use crate::firecracker::FirecrackerConfig;
@@ -328,6 +333,11 @@ impl JobDir {
         Some(out)
     }
 
+    /// The agent session mailbox directory (it exists once the worker first posts to it).
+    pub fn session_dir(&self) -> PathBuf {
+        self.path.join("session")
+    }
+
     pub fn drop_cancel(&self) -> io::Result<()> {
         atomic_write(&self.path.join("cancel"), b"")
     }
@@ -404,6 +414,127 @@ impl JobDir {
 
 /// Appends `pgid` to a `groups` file and makes it durable before returning, so the
 /// supervisor can kill the group even if this process dies right after.
+/// The agent session mailbox of one job (`session/`). A model request `id` (1, 2, ...) is the
+/// worker's `<id>.req`, the raw body; the controller answers with `<id>.resp`: the decimal HTTP
+/// status, a newline, then the raw body. Each file is written once.
+pub struct Mailbox {
+    dir: PathBuf,
+}
+
+impl Mailbox {
+    pub fn new(dir: PathBuf) -> Mailbox {
+        Mailbox { dir }
+    }
+
+    fn file(&self, id: u64, ext: &str) -> PathBuf {
+        self.dir.join(format!("{id}.{ext}"))
+    }
+
+    /// Worker: posts the body of model request `id`. A request id is posted once.
+    pub fn worker_post_request(&self, id: u64, body: &[u8]) -> io::Result<()> {
+        check_body(body.len())?;
+        if self.file(id, "req").exists() {
+            return Err(invalid(format!("model request {id} is already posted")));
+        }
+        fs::create_dir_all(&self.dir)?;
+        publish(&self.dir, &format!("{id}.req"), body)
+    }
+
+    /// Worker: the answer to request `id`, once the controller has written it.
+    pub fn worker_poll_reply(&self, id: u64) -> io::Result<Option<(u16, Vec<u8>)>> {
+        let bytes = match read_bounded(&self.file(id, "resp"))? {
+            Some(bytes) => bytes,
+            None => return Ok(None),
+        };
+        parse_reply(&bytes).map(Some)
+    }
+
+    /// Controller: the request after `after` (the last one it answered), if it has arrived and
+    /// is unanswered. Only `after + 1` is ever returned: a later request waits for it.
+    pub fn controller_next_request(&self, after: u64) -> io::Result<Option<(u64, Vec<u8>)>> {
+        let Some(id) = after.checked_add(1) else {
+            return Ok(None);
+        };
+        if self.file(id, "resp").exists() {
+            return Ok(None);
+        }
+        Ok(read_bounded(&self.file(id, "req"))?.map(|body| (id, body)))
+    }
+
+    /// Controller: answers request `id`. An id is answered once.
+    pub fn controller_post_reply(&self, id: u64, status: u16, body: &[u8]) -> io::Result<()> {
+        check_body(body.len())?;
+        if !(100..=599).contains(&status) {
+            return Err(invalid(format!("HTTP status {status} is not a status")));
+        }
+        if self.file(id, "resp").exists() {
+            return Err(invalid(format!("model request {id} is already answered")));
+        }
+        let mut bytes = format!("{status}\n").into_bytes();
+        bytes.extend_from_slice(body);
+        publish(&self.dir, &format!("{id}.resp"), &bytes)
+    }
+}
+
+/// A body (request, reply) never exceeds one raw frame.
+fn check_body(len: usize) -> io::Result<()> {
+    if len > RAW_FRAME_LIMIT {
+        return Err(invalid(format!(
+            "mailbox body of {len} bytes, over the {RAW_FRAME_LIMIT} limit"
+        )));
+    }
+    Ok(())
+}
+
+/// Writes `dir/name` whole: `name.tmp` first, then a rename.
+fn publish(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
+    let tmp = dir.join(format!("{name}.tmp"));
+    let mut file = File::create(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&tmp, dir.join(name))?;
+    sync_dir(dir)
+}
+
+/// The file's bytes, `None` when it does not exist; over one raw frame is an error.
+fn read_bounded(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    match fs::metadata(path) {
+        Ok(meta) => check_body(meta.len() as usize)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// `status\nbody`: the status is three decimal digits.
+fn parse_reply(bytes: &[u8]) -> io::Result<(u16, Vec<u8>)> {
+    let newline = bytes
+        .iter()
+        .position(|&b| b == b'\n')
+        .ok_or_else(|| invalid("mailbox reply has no status line".into()))?;
+    let line = &bytes[..newline];
+    let status = match line.len() == 3 && line.iter().all(u8::is_ascii_digit) {
+        true => std::str::from_utf8(line)
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok()),
+        false => None,
+    };
+    match status {
+        Some(status) if (100..=599).contains(&status) => {
+            Ok((status, bytes[newline + 1..].to_vec()))
+        }
+        _ => Err(invalid(format!(
+            "mailbox reply status line {:?} is not an HTTP status",
+            String::from_utf8_lossy(&line[..line.len().min(16)])
+        ))),
+    }
+}
+
 pub fn append_group(path: &Path, pgid: i32) -> io::Result<()> {
     let mut f = OpenOptions::new().create(true).append(true).open(path)?;
     f.write_all(format!("{pgid}\n").as_bytes())?;
@@ -502,5 +633,104 @@ mod tests {
         assert_eq!(err.to_string(), "boom");
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
         JobDir::create(root.path(), &r).unwrap();
+    }
+
+    fn mailbox() -> (tempfile::TempDir, Mailbox) {
+        let root = tempfile::tempdir().unwrap();
+        let mailbox = Mailbox::new(root.path().join("session"));
+        (root, mailbox)
+    }
+
+    #[test]
+    fn a_request_and_its_reply_round_trip() {
+        let (_root, m) = mailbox();
+        assert_eq!(m.controller_next_request(0).unwrap(), None);
+        m.worker_post_request(1, b"{\"model\":\"m\"}").unwrap();
+        assert_eq!(
+            m.controller_next_request(0).unwrap(),
+            Some((1, b"{\"model\":\"m\"}".to_vec()))
+        );
+        assert_eq!(m.worker_poll_reply(1).unwrap(), None);
+        m.controller_post_reply(1, 200, b"answer").unwrap();
+        assert_eq!(
+            m.worker_poll_reply(1).unwrap(),
+            Some((200, b"answer".to_vec()))
+        );
+        // Answered: the controller has nothing left to serve.
+        assert_eq!(m.controller_next_request(1).unwrap(), None);
+    }
+
+    #[test]
+    fn the_controller_serves_only_the_next_request_in_order() {
+        let (_root, m) = mailbox();
+        m.worker_post_request(2, b"second").unwrap();
+        // Request 1 has not arrived: request 2 waits for it.
+        assert_eq!(m.controller_next_request(0).unwrap(), None);
+        m.worker_post_request(1, b"first").unwrap();
+        assert_eq!(
+            m.controller_next_request(0).unwrap(),
+            Some((1, b"first".to_vec()))
+        );
+        m.controller_post_reply(1, 200, b"r1").unwrap();
+        assert_eq!(
+            m.controller_next_request(1).unwrap(),
+            Some((2, b"second".to_vec()))
+        );
+    }
+
+    #[test]
+    fn partial_temp_files_are_invisible() {
+        let (_root, m) = mailbox();
+        fs::create_dir_all(&m.dir).unwrap();
+        fs::write(m.dir.join("1.req.tmp"), b"half a req").unwrap();
+        fs::write(m.dir.join("1.resp.tmp"), b"200\npart").unwrap();
+        assert_eq!(m.controller_next_request(0).unwrap(), None);
+        assert_eq!(m.worker_poll_reply(1).unwrap(), None);
+    }
+
+    #[test]
+    fn a_status_line_that_is_not_a_status_is_rejected() {
+        let (_root, m) = mailbox();
+        fs::create_dir_all(&m.dir).unwrap();
+        for bad in [
+            &b"abc\nbody"[..],
+            b"\nbody",
+            b"200",
+            b"99999\n",
+            b"+200\n",
+            b"20 0\n",
+            b"0200\n",
+        ] {
+            fs::write(m.dir.join("1.resp"), bad).unwrap();
+            assert!(
+                m.worker_poll_reply(1).is_err(),
+                "{:?} must be rejected",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        fs::write(m.dir.join("1.resp"), b"404\n").unwrap();
+        assert_eq!(m.worker_poll_reply(1).unwrap(), Some((404, vec![])));
+    }
+
+    #[test]
+    fn an_oversized_body_is_rejected_both_ways() {
+        let (_root, m) = mailbox();
+        let big = vec![b'x'; RAW_FRAME_LIMIT + 1];
+        assert!(m.worker_post_request(1, &big).is_err());
+        assert!(m.controller_post_reply(1, 200, &big).is_err());
+        assert_eq!(m.controller_next_request(0).unwrap(), None);
+    }
+
+    #[test]
+    fn an_answered_request_cannot_be_posted_or_answered_again() {
+        let (_root, m) = mailbox();
+        m.worker_post_request(1, b"req").unwrap();
+        assert!(m.worker_post_request(1, b"again").is_err());
+        m.controller_post_reply(1, 200, b"first").unwrap();
+        assert!(m.controller_post_reply(1, 500, b"second").is_err());
+        assert_eq!(
+            m.worker_poll_reply(1).unwrap(),
+            Some((200, b"first".to_vec()))
+        );
     }
 }
