@@ -198,7 +198,24 @@ Each line has its test in the named task.
   every crash point, with the execution counter proving a retained response is never sent
   twice. GC rule: `session/` mailbox files are collected with the job directory.
 
-- [ ] **9. Real CLI image and KVM tier.** New guest image `guest/claude-code-<ver>/` (hook,
+- [ ] **9a. New image recipe (no KVM run).** Decision: the three existing recipes are frozen (the
+  rc5 evidence cites their digests; their `image.json.in` stay at protocol 1 and are documented
+  as v1-protocol only). One new recipe `guest/agent-cli-py314-v1` = the py314-v2 recipe (same
+  kernel lock, same Python) with `"protocol":2` in its `image.json.in` plus the Claude Code
+  **native** binary: the CLI is a per-platform npm package (`@anthropic-ai/claude-code-linux-x64`,
+  ~245 MB), so no Node runtime is needed. Pin the version (2.1.295 was `latest` on 2026-10-09; check
+  again) and its sha256 in a lock file; download in the build container, verify the hash, fail
+  closed. `scripts/acceptance.sh` allows the new image and defaults to it; the reproducibility
+  `--verify` build must pass.
+- [ ] **9b. KVM tier.** Fix what the VM tier shows for Task 5's untested paths (loopback ioctl,
+  chown handover, trampoline exec as uid 1001, git under split uids, process limit for the
+  binary, guest memory). Tests in a new `crates/agentos-engine/tests/kvm_agent.rs`: (1) a
+  scripted sh "CLI" session proves no NIC and no key (connect to a non-loopback address fails,
+  the environment has no secret, `lo` is down again after the session, the proxy is the only
+  listener) and (2) the REAL CLI, driven by the fake provider (Bash `sed -i` tool call so no
+  absolute path is needed, then `end_turn`), produces a patch that verifies. Confirm or refute
+  the "grandchildren reaped late" explanation from Task 8. Evidence under `docs/evidence/`.
+  Original Task 9 text:  New guest image `guest/claude-code-<ver>/` (hook,
   `packages.txt`, pinned Node and CLI from Task 1, locks), `scripts/build-guest-image.sh` entry,
   `kvm_tier.rs` test: the fake model provider drives the real CLI through the proxy to a
   verified fix; the existing `secret-probe` and `net-probe` profiles run in the same VM and
