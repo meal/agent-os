@@ -7,7 +7,7 @@
 the v0.1 guarantees intact, as designed in
 [External agent CLI inside the guest](../specs/2026-10-09-guest-agent-runner-design.md).
 
-**Constraints:** red/green per step (state it in every subagent brief; show the failing output);
+**Constraints:** subagents may stop or kill only containers named `agent-os-test-run-*` (never `docker kill $(docker ps -q)`: a Task 6 subagent did, and stopped unrelated containers); red/green per step (state it in every subagent brief; show the failing output);
 the controller reads each diff against the brief before ticking a task; `sh scripts/check.sh` after each commit; **no Co-Authored-By
 trailer on any commit** (user CLAUDE.md overrides the harness attribution; say so in every
 subagent prompt); check library and CLI versions online when they are first pinned, never from
@@ -165,7 +165,7 @@ Each line has its test in the named task.
   `apply_patch`; a CLI that sleeps forever is killed
   at `timeout_secs` and the reply says so; `/proc` shows no leftover process.
 
-- [ ] **6. Host link and worker.** Session lease class first (Decision 6): `EffectTimeouts.session`,
+- [x] **6. Host link and worker** (20f352c, 8d33aa8, d635bb6; `RunAgentSession { expected_base }` is a struct variant like `ApplyPatch`). **Carried:** (Task 7) `await_job` now waits up to the session maximum (4 h) for a job whose request cannot be read, for every kind: make it kind-aware or bound it separately; (Task 8) `recover.rs::payload()` returns an empty payload for the kind and must rebuild the request or refuse, `unreconcilable` needs the "agent session lost" wording; the CLI `parse_capability` error text lists four capabilities.  Session lease class first (Decision 6): `EffectTimeouts.session`,
   `MAX_SESSION_TIMEOUT_MS`, and the supervised lease/fence tests for a session longer than
   600 s. Then: `GuestLink` gains `recv_request(until)` handling the
   guest-initiated frames. `FirecrackerWorker::run_vm` branches on `EffectKind::RunAgentSession`:
