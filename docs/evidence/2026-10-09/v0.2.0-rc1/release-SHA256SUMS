@@ -1,0 +1,13 @@
+fbe85398c2a30ab3163c2fe23b34c78e5873e5475092ddc0ceb0e192c60244ff  ./MANIFEST.json
+e0c6133bc65717e44346b878725c92270fa3ebc3c521ef81f45dfcc9e94dc707  ./bin/agentos
+99ad0f5cd0514a88aad0e9ae8cfdb3cc3b4ab9d190e1194602406c786b5de7a5  ./bin/firecracker
+65ef226e96f0ceda55ba643f445801ef2cc0ea667ef67cad8ac4f406c9c8434f  ./bin/jailer
+34421bd68240cbe20805308e25e93015a01b31f15e684ee9d09e30157a2de6b8  ./components/repo-analyzer-v1/component.json
+25c522e421281321ac7a7cc9e3e96cba208f8689f2ac14028d2ff700cdbeb480  ./components/repo-analyzer-v1/component.wasm
+1c30d65846ea86062ae0b38ce34db9e3e64cd7dafaa8cc8df0f584ebd61864e3  ./images/agent-cli-py314-v1/image.json
+f168903cd0cc4d054da080f618949d203ea6585154e83d6126e908fd869ae1fc  ./images/agent-cli-py314-v1/rootfs.squashfs
+99ee7d43e73fca86c475ed3180f670e47964a3e25de12bda8556747852376bcd  ./images/agent-cli-py314-v1/vmlinux
+726f0cbf99f5e927358eb02e849e3c080b64525be41ebc1f07ed8adc9351814d  ./profiles/duration-checks-v1/check_duration.py
+c3faa2aab58d69ad90ef7243cd51e937c78c4c89ecc8ebe8f82deea3bdf3859d  ./profiles/duration-checks-v1/profile.json
+37b0a0d3d212f074b9b9c98f57b79a772088ac595c4dcaebddd37644f6b315af  ./profiles/parser-checks-v1/check_parser.py
+e610fa11793eb32a8a3bea05f759de6c969367b3f5fba876b79e6adf4d083dfa  ./profiles/parser-checks-v1/profile.json

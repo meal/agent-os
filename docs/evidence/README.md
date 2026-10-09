@@ -136,3 +136,14 @@ through the controller (design and plan in `docs/superpowers/`). Image `agent-cl
 | attempt 2 | `0ebb90f` | Call 1 answered; call 2 **rejected** (HTTP 400, thinking block without its signature) (`live-agent-attempt-2.md`). |
 | attempt 3 | `d90b9ba` | **Passed**: `Succeeded`, 5 model calls, protected verification passed (`live-agent-attempt-3.md`, `live-agent-pass/`). |
 
+## 2026-10-09: v0.2.0-rc1 release gates
+
+All at frozen commit `866eb45`, under `2026-10-09/v0.2.0-rc1/`.
+
+| Gate | Result |
+| --- | --- |
+| `acceptance.sh kvm` on `agent-cli-py314-v1` | Passed: identical kernel and image builds, 1162 tests in each suite (`kvm/`). |
+| `smoke-install.sh` on the tarball | Passed: root jailed with kill and resume, unprivileged unjailed (`smoke/`). |
+| `alpha-evidence.sh` with the live-model runs skipped | Both deterministic snapshot runs SUCCEEDED, digests equal to rc5's (`alpha/`). |
+| Fresh-clone rebuild | Tarball `241840c6e45b…` identical (`../../releases/v0.2.0-rc1.md`). |
+

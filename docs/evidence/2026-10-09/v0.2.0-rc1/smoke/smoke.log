@@ -1,0 +1,14 @@
+smoke: refused as expected: install.sh: git is required (agentos parses patches with it); install git
+debconf: delaying package configuration, since apt-utils is not installed
+smoke: refused as expected: agentos: host check failed
+smoke: delegating cgroups as a host init would
+smoke: installing /release/agentos-0.2.0-rc1-x86_64-linux.tar.gz
+installed agentos 0.2.0-rc1 in /opt/agentos/0.2.0-rc1
+agentos 0.2.0-rc1 is ready: /opt/agentos/0.2.0-rc1/bin/agentos --home /root/.agentos
+smoke: release image agent-cli-py314-v1@82cd66556e184b049eac22ffce28c737116671308dc4138c4405ca28aa9b9e03, analyzer repo-analyzer-v1@d3725d10f95890d2704c3fdcabf31c6da3f96d8500e50fd86fc1c1f2c51e32d0
+smoke: submitting with a crash during the patch
+smoke: task 01a1216e-44af-728d-a7d2-5d814bd4f3b0 crashed as asked; resuming
+{"state":"SUCCEEDED","task_id":"01a1216e-44af-728d-a7d2-5d814bd4f3b0"}
+smoke: root: install, jailed run, kill and resume, export passed
+smoke: unprivileged: install with --allow-unjailed, unjailed run passed
+smoke: install, jailed run, kill and resume, export, unprivileged unjailed run: all checks passed

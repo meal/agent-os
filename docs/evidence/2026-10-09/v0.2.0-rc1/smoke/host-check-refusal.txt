@@ -1,0 +1,2 @@
+install.sh: host check failed: {"firecracker":"ok","git":"ok","jail":"cgroup v2 hierarchy /sys/fs/cgroup is read-only","jail_required":true,"kvm":"ok","tls":"ok"}
+agentos: host check failed
