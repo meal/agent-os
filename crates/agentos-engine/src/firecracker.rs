@@ -2497,6 +2497,106 @@ mod tests {
         assert!(read_image(dir.path()).unwrap_err().contains("is missing"));
     }
 
+    /// The shipped recipes' manifests, rendered the way `build-guest-image.sh` renders them. The
+    /// agent CLI recipe speaks protocol 2; the three recipes frozen for the rc5 evidence still
+    /// say protocol 1, and a controller at `GUEST_PROTOCOL` refuses them.
+    #[test]
+    fn shipped_recipe_manifests_speak_the_protocol_they_declare() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let kernel_sha = "0545ba1781fc06cfa1d7699069057f4538103fd1644100cf0da434899a1ed447";
+        for recipe in [
+            "agent-cli-py314-v1",
+            "python-stdlib-v1",
+            "python-stdlib-py314-v1",
+            "python-stdlib-py314-v2",
+        ] {
+            let template =
+                fs::read_to_string(repo.join("guest").join(recipe).join("image.json.in"))
+                    .unwrap_or_else(|e| panic!("{recipe}: {e}"));
+            let rendered = template
+                .replace("@AGENT_VERSION@", "0.1.0")
+                .replace("@KERNEL_SHA256@", kernel_sha)
+                .replace("@GIT_SHA@", "test");
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("image.json"), rendered).unwrap();
+            fs::write(dir.path().join(KERNEL_FILE), b"k").unwrap();
+            fs::write(dir.path().join(ROOTFS_FILE), b"r").unwrap();
+            let result = read_image(dir.path());
+            if recipe == "agent-cli-py314-v1" {
+                let manifest = result.unwrap_or_else(|e| panic!("{recipe}: {e}"));
+                assert_eq!(manifest.id, recipe);
+            } else {
+                let err = result.expect_err(recipe);
+                assert!(err.contains("protocol 1, expected 2"), "{recipe}: {err}");
+            }
+        }
+    }
+
+    /// `agent-cli.lock` is sourced by the image hook: plain `KEY=VALUE` lines, the npm tarball
+    /// the pin names, and hashes of the right shape. Malformed or missing fields fail here.
+    #[test]
+    fn agent_cli_lock_is_well_formed_and_names_the_npm_tarball() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let text = fs::read_to_string(repo.join("guest/agent-cli-py314-v1/agent-cli.lock"))
+            .expect("guest/agent-cli-py314-v1/agent-cli.lock");
+        let mut fields = std::collections::BTreeMap::new();
+        for line in text
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        {
+            let (key, value) = line.split_once('=').expect("KEY=VALUE");
+            let plain = |s: &str| {
+                !s.is_empty()
+                    && s.bytes()
+                        .all(|b| b.is_ascii_graphic() && !b"\"'$`\\".contains(&b))
+            };
+            assert!(
+                key.bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'),
+                "key {key:?}"
+            );
+            assert!(plain(value), "value of {key} is not a plain token");
+            assert!(
+                fields.insert(key.to_string(), value.to_string()).is_none(),
+                "{key} twice"
+            );
+        }
+        let get = |k: &str| {
+            fields
+                .get(k)
+                .unwrap_or_else(|| panic!("{k} missing"))
+                .clone()
+        };
+        let version = get("AGENTOS_CLAUDE_CODE_VERSION");
+        assert!(
+            version.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+                && version.matches('.').count() == 2
+        );
+        assert_eq!(
+            get("AGENTOS_CLAUDE_CODE_PACKAGE"),
+            "@anthropic-ai/claude-code-linux-x64"
+        );
+        assert_eq!(
+            get("AGENTOS_CLAUDE_CODE_URL"),
+            format!(
+                "https://registry.npmjs.org/@anthropic-ai/claude-code-linux-x64/-/claude-code-linux-x64-{version}.tgz"
+            )
+        );
+        let hex64 = |s: String| {
+            s.len() == 64
+                && s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        assert!(hex64(get("AGENTOS_CLAUDE_CODE_TARBALL_SHA256")));
+        assert!(hex64(get("AGENTOS_CLAUDE_CODE_BINARY_SHA256")));
+        let integrity = get("AGENTOS_CLAUDE_CODE_INTEGRITY");
+        assert!(
+            integrity.starts_with("sha512-") && integrity.len() == "sha512-".len() + 88,
+            "{integrity}"
+        );
+        assert_eq!(fields.len(), 6, "unexpected fields: {:?}", fields.keys());
+    }
+
     #[test]
     fn image_manifest_records_optional_interpreter_provenance() {
         let dir = tempfile::tempdir().unwrap();

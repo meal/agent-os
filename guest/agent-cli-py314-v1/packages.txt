@@ -1,0 +1,13 @@
+git
+e2fsprogs
+libbz2-1.0
+libffi8
+liblzma5
+libsqlite3-0
+libssl3
+libreadline8
+libncursesw6
+libtcl8.6
+libtk8.6
+libzstd1
+zlib1g
