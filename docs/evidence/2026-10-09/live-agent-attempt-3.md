@@ -3,7 +3,11 @@
 Run by the owner with `sh scripts/acceptance.sh live-agent <key file>` at commit
 `d90b9ba08c9ea6713b87f98b08979fc1766ee616` (the two codec fixes included), image
 `agent-cli-py314-v1` (rebuilt reproducibly by the run), model `claude-haiku-5-5`, cap 12 requests.
-Files: `live-agent-pass/` (summary, recording, bundle, log, setup, image log).
+Files: `live-agent-pass/` (summary, recording, log, setup, image log). The run's exported bundle
+is not committed: its request files carry the agent CLI's full system prompt, whose security-policy
+sentence contains the word "authorization" and trips the repository's secret scan (a false
+positive; the key is absent). The recording and summary keep every request digest and the full
+responses.
 
 - The real Claude Code 2.1.295 binary ran in the Firecracker microVM, talked to the loopback
   proxy, and every model request went through the controller as a journaled, capability-checked
