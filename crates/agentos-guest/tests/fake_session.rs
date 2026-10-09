@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use agentos_core::guest::{
     Frame, FrameError, Message, Mode, RAW_FRAME_LIMIT, read_frame, write_frame,
 };
+use agentos_core::ids::Digest;
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 const OTHER: &str = "fedcba9876543210fedcba9876543210";
@@ -225,15 +226,15 @@ fn run_agent_in_inspect_mode_is_refused_and_the_session_lost() {
 }
 
 #[test]
-fn run_agent_in_job_mode_is_refused_until_agent_sessions_exist() {
+fn run_agent_before_any_snapshot_is_refused_and_the_session_goes_on() {
     let g = spawn();
     let mut s = g.hello(TOKEN, Mode::Job);
     send(&mut s, run_agent_msg());
     let Message::Refused { reason } = recv(&mut s) else {
         panic!("no Refused")
     };
-    assert_eq!(reason, "agent sessions are not implemented yet");
-    assert_closed(&mut s);
+    assert_eq!(reason, "workspace missing: no snapshot was read");
+    empty_snapshot(&mut s);
 }
 
 #[test]
@@ -447,4 +448,519 @@ fn no_arguments_prints_the_usage_and_exits_2() {
     let exec_check = agentos_guest::trampoline::USAGE.trim_start_matches("usage: ");
     assert!(stderr.contains(exec_check), "{stderr}");
     assert!(exec_check.contains("--uid U --gid G"), "{exec_check}");
+}
+
+// ---- RunAgent (Task 5): a scripted shell CLI runs in a scratch copy of the workspace ----
+
+/// Snapshots `files` into the workspace and returns the digest the guest reports.
+fn snapshot(s: &mut UnixStream, files: &[(&str, &[u8])]) -> Digest {
+    let total: u64 = files.iter().map(|(_, b)| b.len() as u64).sum();
+    send(
+        s,
+        Message::ReadSnapshot {
+            file_count: files.len() as u64,
+            total_bytes: total,
+        },
+    );
+    for (path, bytes) in files {
+        send(
+            s,
+            Message::File {
+                path: path.to_string(),
+                len: bytes.len() as u64,
+            },
+        );
+        if !bytes.is_empty() {
+            write_frame(s, &Frame::Raw(bytes.to_vec())).unwrap();
+        }
+    }
+    send(s, Message::EndFiles);
+    let Message::SnapshotDone {
+        workspace_digest, ..
+    } = recv(s)
+    else {
+        panic!("no SnapshotDone")
+    };
+    workspace_digest
+}
+
+fn workspace_digest_of(dir: &Path) -> Digest {
+    agentos_core::workspace::workspace_digest(dir).unwrap()
+}
+
+#[derive(Debug)]
+enum Outcome {
+    Done {
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+        timed_out: bool,
+        workspace_digest: Digest,
+        patch: Vec<u8>,
+    },
+    Refused(String),
+}
+
+/// Sends `RunAgent` and serves it as the host does: each `ModelRequest` gets `answer`'s
+/// status and body back as a `ModelReply`. Returns the request bodies and the outcome.
+fn run_agent(
+    s: &mut UnixStream,
+    argv: &[&str],
+    env: &[(&str, &str)],
+    timeout_secs: u64,
+    expected_base: Digest,
+    mut answer: impl FnMut(&[u8]) -> (u16, Vec<u8>),
+) -> (Vec<Vec<u8>>, Outcome) {
+    send(
+        s,
+        Message::RunAgent {
+            argv: argv.iter().map(|a| a.to_string()).collect(),
+            env: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            timeout_secs,
+            expected_base,
+        },
+    );
+    let mut requests = Vec::new();
+    loop {
+        match read_frame(s, RAW_FRAME_LIMIT).unwrap() {
+            Frame::Json(Message::ModelRequest { id }) => {
+                let Frame::Raw(body) = read_frame(s, RAW_FRAME_LIMIT).unwrap() else {
+                    panic!("ModelRequest without its body")
+                };
+                let (status, reply) = answer(&body);
+                requests.push(body);
+                send(s, Message::ModelReply { id, status });
+                write_frame(s, &Frame::Raw(reply)).unwrap();
+            }
+            Frame::Json(Message::AgentDone {
+                exit_code,
+                signal,
+                timed_out,
+                workspace_digest,
+            }) => {
+                let Frame::Raw(patch) = read_frame(s, RAW_FRAME_LIMIT).unwrap() else {
+                    panic!("AgentDone without its patch")
+                };
+                return (
+                    requests,
+                    Outcome::Done {
+                        exit_code,
+                        signal,
+                        timed_out,
+                        workspace_digest,
+                        patch,
+                    },
+                );
+            }
+            Frame::Json(Message::Refused { reason }) => {
+                return (requests, Outcome::Refused(reason));
+            }
+            other => panic!("unexpected frame during RunAgent: {other:?}"),
+        }
+    }
+}
+
+/// Writes a shell script next to the fake guest's root (never inside the workspace).
+fn write_cli(g: &FakeGuest, script: &str) -> String {
+    let path = g.root.parent().unwrap().join("cli.sh");
+    fs::write(&path, script).unwrap();
+    path.display().to_string()
+}
+
+fn answer_json(n: &mut u32) -> impl FnMut(&[u8]) -> (u16, Vec<u8>) + '_ {
+    move |_| {
+        *n += 1;
+        (200, format!("{{\"reply\":{n}}}").into_bytes())
+    }
+}
+
+fn is_running(pid: &str) -> bool {
+    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // The state follows the last `)` of the stat line; a zombie is no longer running.
+        Ok(stat) => stat
+            .rsplit(')')
+            .next()
+            .and_then(|rest| rest.split_whitespace().next())
+            .is_some_and(|state| state != "Z"),
+        Err(_) => false,
+    }
+}
+
+const CURL_POST: &str = "/usr/bin/curl -fsS -o \"$HOME/$OUT\" -X POST \"$ANTHROPIC_BASE_URL/v1/messages\" -H 'content-type: application/json' --data-binary @\"$HOME/$IN\"";
+
+#[test]
+fn run_agent_relays_each_model_call_and_returns_the_patch() {
+    let g = spawn();
+    let mut s = g.hello(TOKEN, Mode::Job);
+    let base = snapshot(&mut s, &[("hello.txt", b"original\n")]);
+    let script = format!(
+        "set -eu\n\
+         printf '%s' '{{\"model\":\"m\",\"max_tokens\":8,\"stream\":false,\"messages\":[]}}' > \"$HOME/req1.json\"\n\
+         IN=req1.json\n\
+         OUT=reply1.json\n\
+         {CURL_POST}\n\
+         printf 'edited\\n' > hello.txt\n\
+         printf '%s' '{{\"model\":\"m\",\"max_tokens\":8,\"stream\":false,\"messages\":[{{\"role\":\"user\",\"content\":\"again\"}}]}}' > \"$HOME/req2.json\"\n\
+         IN=req2.json\n\
+         OUT=reply2.json\n\
+         {CURL_POST}\n"
+    );
+    let cli = write_cli(&g, &script);
+    let mut n = 0;
+    let (requests, outcome) = run_agent(
+        &mut s,
+        &["/bin/sh", &cli],
+        &[],
+        20,
+        base,
+        answer_json(&mut n),
+    );
+    assert_eq!(requests.len(), 2, "one ModelRequest per model call");
+    assert!(String::from_utf8_lossy(&requests[1]).contains("again"));
+    let home = g.root.join("scratch/agent/home");
+    assert_eq!(
+        fs::read(home.join("reply1.json")).unwrap(),
+        b"{\"reply\":1}"
+    );
+    assert_eq!(
+        fs::read(home.join("reply2.json")).unwrap(),
+        b"{\"reply\":2}"
+    );
+    let Outcome::Done {
+        exit_code,
+        signal,
+        timed_out,
+        patch,
+        workspace_digest,
+    } = outcome
+    else {
+        panic!("expected AgentDone, got {outcome:?}")
+    };
+    assert_eq!((exit_code, signal, timed_out), (Some(0), None, false));
+    // The digest is of the scratch tree the patch was cut from, after the purge.
+    let tree = g.root.join("scratch/agent/work");
+    assert_eq!(workspace_digest, workspace_digest_of(&tree));
+    let patch = String::from_utf8(patch).unwrap();
+    assert!(
+        patch.contains("hello.txt") && patch.contains("+edited"),
+        "{patch}"
+    );
+    // The real workspace is never touched.
+    assert_eq!(
+        fs::read(g.root.join("workspace/hello.txt")).unwrap(),
+        b"original\n"
+    );
+}
+
+#[test]
+fn the_patch_has_the_edits_and_new_files_but_no_bytecode_or_caches_and_applies() {
+    let g = spawn();
+    let mut s = g.hello(TOKEN, Mode::Job);
+    let base = snapshot(&mut s, &[("hello.txt", b"original\n")]);
+    let script = "set -eu\n\
+        printf 'edited\\n' > hello.txt\n\
+        printf 'new\\n' > added.txt\n\
+        mkdir -p __pycache__ .pytest_cache sub\n\
+        printf x > __pycache__/m.cpython-314.pyc\n\
+        printf x > sub/n.pyc\n\
+        printf x > .pytest_cache/v\n";
+    let cli = write_cli(&g, script);
+    let mut n = 0;
+    let (_, outcome) = run_agent(
+        &mut s,
+        &["/bin/sh", &cli],
+        &[],
+        20,
+        base,
+        answer_json(&mut n),
+    );
+    let Outcome::Done {
+        patch, exit_code, ..
+    } = outcome
+    else {
+        panic!("expected AgentDone, got {outcome:?}")
+    };
+    assert_eq!(exit_code, Some(0));
+    let text = String::from_utf8(patch.clone()).unwrap();
+    assert!(
+        text.contains("+++ b/added.txt") && text.contains("+++ b/hello.txt"),
+        "{text}"
+    );
+    for banned in ["__pycache__", ".pyc", ".pytest_cache"] {
+        assert!(!text.contains(banned), "{banned} in the patch:\n{text}");
+    }
+    // The same patch applies through the existing ApplyPatch path to a copy of the original.
+    let copy = tempfile::tempdir().unwrap();
+    let mut backend = agentos_guest::FakeBackend::new(copy.path()).unwrap();
+    fs::create_dir_all(copy.path().join("workspace")).unwrap();
+    fs::write(copy.path().join("workspace/hello.txt"), b"original\n").unwrap();
+    let editable = ["hello.txt".to_string(), "added.txt".to_string()];
+    agentos_guest::handlers::apply_patch(&mut backend, base, &editable, &patch).unwrap();
+    assert_eq!(
+        fs::read(copy.path().join("workspace/hello.txt")).unwrap(),
+        b"edited\n"
+    );
+    assert_eq!(
+        fs::read(copy.path().join("workspace/added.txt")).unwrap(),
+        b"new\n"
+    );
+    assert!(!copy.path().join("workspace/__pycache__").exists());
+}
+
+#[test]
+fn a_cli_that_never_exits_is_killed_at_its_deadline_with_its_whole_group() {
+    let g = spawn();
+    let mut s = g.hello(TOKEN, Mode::Job);
+    let base = snapshot(&mut s, &[("hello.txt", b"original\n")]);
+    let script = "/bin/sleep 1000 &\n\
+        echo $! > \"$HOME/sleeper.pid\"\n\
+        echo $$ > \"$HOME/leader.pid\"\n\
+        wait\n";
+    let cli = write_cli(&g, script);
+    let started = Instant::now();
+    let mut n = 0;
+    let (_, outcome) = run_agent(
+        &mut s,
+        &["/bin/sh", &cli],
+        &[],
+        1,
+        base,
+        answer_json(&mut n),
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    let Outcome::Done {
+        exit_code,
+        signal,
+        timed_out,
+        patch,
+        ..
+    } = outcome
+    else {
+        panic!("expected AgentDone, got {outcome:?}")
+    };
+    assert_eq!((exit_code, signal, timed_out), (None, Some(9), true));
+    assert!(patch.is_empty());
+    let home = g.root.join("scratch/agent/home");
+    for file in ["leader.pid", "sleeper.pid"] {
+        let pid = fs::read_to_string(home.join(file)).unwrap();
+        let pid = pid.trim();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while is_running(pid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!is_running(pid), "{file} ({pid}) survived the kill");
+    }
+}
+
+#[test]
+fn a_wrong_expected_base_is_refused_and_nothing_runs() {
+    let g = spawn();
+    let mut s = g.hello(TOKEN, Mode::Job);
+    snapshot(&mut s, &[("hello.txt", b"original\n")]);
+    let cli = write_cli(&g, "printf ran > \"$HOME/ran\"\n");
+    let mut n = 0;
+    let (requests, outcome) = run_agent(
+        &mut s,
+        &["/bin/sh", &cli],
+        &[],
+        20,
+        Digest::of(b"not the base"),
+        answer_json(&mut n),
+    );
+    assert!(requests.is_empty());
+    let Outcome::Refused(reason) = outcome else {
+        panic!("expected Refused, got {outcome:?}")
+    };
+    assert!(
+        reason.starts_with("version conflict: expected "),
+        "{reason}"
+    );
+    assert!(!g.root.join("scratch/agent/home/ran").exists());
+}
+
+#[test]
+fn a_binary_change_is_refused_with_the_patchrules_reason() {
+    let g = spawn();
+    let mut s = g.hello(TOKEN, Mode::Job);
+    let base = snapshot(&mut s, &[("data.bin", &[0u8, 1, 2, 3])]);
+    let cli = write_cli(&g, "printf 'x\\000y' > data.bin\n");
+    let mut n = 0;
+    let (_, outcome) = run_agent(
+        &mut s,
+        &["/bin/sh", &cli],
+        &[],
+        20,
+        base,
+        answer_json(&mut n),
+    );
+    let Outcome::Refused(reason) = outcome else {
+        panic!("expected Refused, got {outcome:?}")
+    };
+    assert_eq!(reason, "binary patches are not supported: data.bin");
+}
+
+#[test]
+fn the_message_cannot_override_the_proxy_key_or_the_session_variables() {
+    let g = spawn();
+    let mut s = g.hello(TOKEN, Mode::Job);
+    let base = snapshot(&mut s, &[("hello.txt", b"original\n")]);
+    let cli = write_cli(&g, "/usr/bin/env > \"$HOME/env.txt\"\n");
+    let mut n = 0;
+    let (_, outcome) = run_agent(
+        &mut s,
+        &["/bin/sh", &cli],
+        &[
+            ("ANTHROPIC_API_KEY", "sk-real-secret"),
+            ("ANTHROPIC_BASE_URL", "http://203.0.113.9"),
+            ("HOME", "/etc"),
+            ("FOO", "bar"),
+        ],
+        20,
+        base,
+        answer_json(&mut n),
+    );
+    assert!(
+        matches!(
+            outcome,
+            Outcome::Done {
+                exit_code: Some(0),
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    let home = g.root.join("scratch/agent/home");
+    let env = fs::read_to_string(home.join("env.txt")).unwrap();
+    assert!(
+        !env.contains("sk-real-secret") && !env.contains("203.0.113.9"),
+        "{env}"
+    );
+    assert!(
+        env.lines().any(|l| l == "ANTHROPIC_API_KEY=placeholder"),
+        "{env}"
+    );
+    assert!(
+        env.lines()
+            .any(|l| l.starts_with("ANTHROPIC_BASE_URL=http://127.0.0.1:")),
+        "{env}"
+    );
+    assert!(
+        env.lines().any(|l| l == format!("HOME={}", home.display())),
+        "{env}"
+    );
+    assert!(env.lines().any(|l| l == "FOO=bar"), "{env}");
+    assert!(
+        env.lines().any(|l| l == "PYTHONDONTWRITEBYTECODE=1"),
+        "{env}"
+    );
+    assert!(env.lines().any(|l| l == "DISABLE_TELEMETRY=1"), "{env}");
+    assert!(env.lines().any(|l| l == "DISABLE_AUTOUPDATER=1"), "{env}");
+    assert!(
+        env.lines()
+            .any(|l| l == "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"),
+        "{env}"
+    );
+}
+
+#[test]
+fn a_cli_that_changes_nothing_gets_an_empty_patch() {
+    let g = spawn();
+    let mut s = g.hello(TOKEN, Mode::Job);
+    let base = snapshot(&mut s, &[("hello.txt", b"original\n")]);
+    let cli = write_cli(&g, "exit 0\n");
+    let mut n = 0;
+    let (_, outcome) = run_agent(
+        &mut s,
+        &["/bin/sh", &cli],
+        &[],
+        20,
+        base,
+        answer_json(&mut n),
+    );
+    let Outcome::Done {
+        exit_code, patch, ..
+    } = outcome
+    else {
+        panic!("expected AgentDone, got {outcome:?}")
+    };
+    assert_eq!(exit_code, Some(0));
+    assert!(patch.is_empty());
+}
+
+#[test]
+fn a_relative_argv0_is_refused() {
+    let g = spawn();
+    let mut s = g.hello(TOKEN, Mode::Job);
+    let base = snapshot(&mut s, &[("hello.txt", b"original\n")]);
+    let mut n = 0;
+    let (_, outcome) = run_agent(
+        &mut s,
+        &["sh", "-c", "true"],
+        &[],
+        20,
+        base,
+        answer_json(&mut n),
+    );
+    let Outcome::Refused(reason) = outcome else {
+        panic!("expected Refused, got {outcome:?}")
+    };
+    assert_eq!(reason, "argv[0] must be an absolute path: sh");
+}
+
+/// Runs `script` against a snapshot of `files` and returns the outcome and the patch.
+fn cut_for(files: &[(&str, &[u8])], script: &str) -> (FakeGuest, Digest, Outcome) {
+    let g = spawn();
+    let mut s = g.hello(TOKEN, Mode::Job);
+    let base = snapshot(&mut s, files);
+    let cli = write_cli(&g, script);
+    let mut n = 0;
+    let (_, outcome) = run_agent(
+        &mut s,
+        &["/bin/sh", &cli],
+        &[],
+        20,
+        base,
+        answer_json(&mut n),
+    );
+    (g, base, outcome)
+}
+
+#[test]
+fn a_moved_file_is_a_deletion_and_a_creation_not_a_rename() {
+    let (_g, _base, outcome) = cut_for(&[("old.txt", b"same contents\n")], "mv old.txt new.txt\n");
+    let Outcome::Done { patch, .. } = outcome else {
+        panic!("expected AgentDone, got {outcome:?}")
+    };
+    let text = String::from_utf8(patch).unwrap();
+    assert!(text.contains("deleted file mode 100644"), "{text}");
+    assert!(text.contains("new file mode 100644"), "{text}");
+    assert!(!text.contains("rename"), "{text}");
+}
+
+#[test]
+fn a_gitignore_in_the_workspace_does_not_hide_the_cli_files_from_the_patch() {
+    let (_g, _base, outcome) = cut_for(&[(".gitignore", b"*.log\n")], "printf 'x\\n' > run.log\n");
+    let Outcome::Done { patch, .. } = outcome else {
+        panic!("expected AgentDone, got {outcome:?}")
+    };
+    let text = String::from_utf8(patch).unwrap();
+    assert!(text.contains("+++ b/run.log"), "{text}");
+}
+
+#[test]
+fn a_symlink_made_by_the_cli_is_refused() {
+    let (_g, _base, outcome) = cut_for(&[("hello.txt", b"original\n")], "ln -s hello.txt link\n");
+    let Outcome::Refused(reason) = outcome else {
+        panic!("expected Refused, got {outcome:?}")
+    };
+    assert!(
+        reason.starts_with("cannot digest the agent's tree: symlink in workspace"),
+        "{reason}"
+    );
 }

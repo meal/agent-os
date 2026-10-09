@@ -99,7 +99,7 @@ impl PatchStateIs {
     }
 }
 
-const WORKSPACE_MISSING: &str = "workspace missing: no snapshot was read";
+pub(crate) const WORKSPACE_MISSING: &str = "workspace missing: no snapshot was read";
 
 /// Where streamed files go.
 trait FileSink {
@@ -347,7 +347,7 @@ fn empty_dir(dir: &Path) -> io::Result<()> {
 }
 
 /// A fresh, empty `<scratch>/<name>`.
-fn fresh_scratch(backend: &dyn Backend, name: &str) -> Result<PathBuf, String> {
+pub(crate) fn fresh_scratch(backend: &dyn Backend, name: &str) -> Result<PathBuf, String> {
     let dir = backend.scratch_dir().join(name);
     let made = || -> io::Result<()> {
         match fs::remove_dir_all(&dir) {
@@ -661,7 +661,10 @@ enum GroupError {
 }
 
 /// Keeps the first `limit + 1` bytes and drains the rest, so a chatty child never blocks.
-fn capture(mut pipe: impl Read + Send + 'static, limit: usize) -> thread::JoinHandle<Vec<u8>> {
+pub(crate) fn capture(
+    mut pipe: impl Read + Send + 'static,
+    limit: usize,
+) -> thread::JoinHandle<Vec<u8>> {
     thread::spawn(move || {
         let mut kept = Vec::new();
         let _ = (&mut pipe).take(limit as u64 + 1).read_to_end(&mut kept);
@@ -670,7 +673,7 @@ fn capture(mut pipe: impl Read + Send + 'static, limit: usize) -> thread::JoinHa
     })
 }
 
-fn kill_group(pgid: Option<Pid>) {
+pub(crate) fn kill_group(pgid: Option<Pid>) {
     if let Some(pgid) = pgid {
         // ESRCH (the group is already gone) is fine.
         let _ = kill_process_group(pgid, Signal::KILL);
@@ -685,7 +688,7 @@ const REAP_WINDOW: Duration = Duration::from_secs(1);
 /// would keep counting against its `RLIMIT_NPROC` for the next run. Only this group is
 /// waited for (never "any child", which would steal the statuses of `git` and other children
 /// std is waiting on). Elsewhere (the fake) orphans go to the real init: `ECHILD` at once.
-fn reap_group(pgid: Option<Pid>) {
+pub(crate) fn reap_group(pgid: Option<Pid>) {
     let Some(pgid) = pgid else { return };
     let deadline = std::time::Instant::now() + REAP_WINDOW;
     loop {

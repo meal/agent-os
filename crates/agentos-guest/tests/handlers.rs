@@ -731,6 +731,9 @@ impl Backend for Recording {
     fn git(&self, cwd: &Path) -> std::process::Command {
         self.inner.git(cwd)
     }
+    fn agent_command(&self, argv: &[String], cwd: &Path) -> std::process::Command {
+        self.inner.agent_command(argv, cwd)
+    }
     fn check_command(
         &self,
         program: &str,

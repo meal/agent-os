@@ -55,6 +55,20 @@ pub trait Backend: Send {
     fn check_program(&self, _program: &str, _cwd: &Path) -> io::Result<()> {
         Ok(())
     }
+    /// The command that runs an agent CLI (`argv`, with an absolute `argv[0]`) in `cwd`, as
+    /// the agent's unprivileged user with the check's limits. The caller sets the environment
+    /// and the process group.
+    fn agent_command(&self, argv: &[String], cwd: &Path) -> Command;
+    /// Hands a scratch directory the agent writes to (as root) to the agent's uid. The fake
+    /// runs everything as the current user, so it has nothing to do.
+    fn hand_to_agent(&self, _dir: &Path) -> Result<(), String> {
+        Ok(())
+    }
+    /// Brings the loopback interface up or down: the VM keeps `lo` down except while a
+    /// session runs its model proxy. The fake has no network to configure.
+    fn set_loopback(&self, _up: bool) -> Result<(), String> {
+        Ok(())
+    }
     fn vcpus(&self) -> u32;
     fn memory_mib(&self) -> u32;
     /// Test hook (fake guest only, with `AGENTOS_TEST_WORKERS=1`): `PatchState` is never
@@ -175,6 +189,12 @@ impl Backend for FakeBackend {
         if let Some(path) = std::env::var_os("PATH") {
             cmd.env("PATH", path);
         }
+        cmd
+    }
+
+    fn agent_command(&self, argv: &[String], cwd: &Path) -> Command {
+        let mut cmd = Command::new(argv.first().map_or("", String::as_str));
+        cmd.args(argv.iter().skip(1)).current_dir(cwd);
         cmd
     }
 
@@ -452,6 +472,44 @@ impl Backend for VmBackend {
         find_program(program, cwd).map(|_| ())
     }
 
+    /// The trampoline as `check`, with the check's limits, and no workspace argument: the
+    /// argv is the whole command.
+    fn agent_command(&self, argv: &[String], cwd: &Path) -> Command {
+        let (nproc, nofile, oom) = (
+            CHECK_NPROC.to_string(),
+            CHECK_NOFILE.to_string(),
+            CHECK_OOM_SCORE_ADJ.to_string(),
+        );
+        let id = CHECK_UID.to_string();
+        let mut cmd = Command::new(INIT_PATH);
+        cmd.args([
+            "exec-check",
+            "--uid",
+            &id,
+            "--gid",
+            &id,
+            "--nproc",
+            &nproc,
+            "--nofile",
+            &nofile,
+            "--oom",
+            &oom,
+            "--",
+        ])
+        .args(argv)
+        .current_dir(cwd);
+        cmd
+    }
+
+    fn hand_to_agent(&self, dir: &Path) -> Result<(), String> {
+        chown_tree(dir, CHECK_UID, CHECK_UID)
+            .map_err(|e| format!("cannot hand {} to the agent: {e}", dir.display()))
+    }
+
+    fn set_loopback(&self, up: bool) -> Result<(), String> {
+        crate::loopback::set_loopback(up).map_err(|e| format!("lo: {e}"))
+    }
+
     fn vcpus(&self) -> u32 {
         visible_vcpus()
     }
@@ -537,6 +595,48 @@ mod tests {
         );
         assert_eq!((parsed.uid, parsed.gid), (CHECK_UID, CHECK_UID));
         assert_eq!(parsed.program, "python3");
+    }
+
+    #[test]
+    fn vm_agent_command_runs_the_argv_through_the_trampoline_as_check() {
+        let argv = ["/bin/sh".to_string(), "/x/cli.sh".to_string()];
+        let cmd = VmBackend::default().agent_command(&argv, Path::new("/scratch/agent/work"));
+        assert_eq!(cmd.get_program(), OsStr::new(INIT_PATH));
+        let args: Vec<&OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            [
+                "exec-check",
+                "--uid",
+                "1001",
+                "--gid",
+                "1001",
+                "--nproc",
+                "256",
+                "--nofile",
+                "1024",
+                "--oom",
+                "1000",
+                "--",
+                "/bin/sh",
+                "/x/cli.sh"
+            ]
+            .map(OsStr::new)
+        );
+        assert_eq!(
+            cmd.get_current_dir(),
+            Some(Path::new("/scratch/agent/work"))
+        );
+        let parsed = crate::trampoline::parse(
+            &args
+                .iter()
+                .skip(1)
+                .map(|a| a.to_os_string())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(parsed.program, "/bin/sh");
+        assert_eq!(parsed.args, ["/x/cli.sh"]);
     }
 
     #[test]

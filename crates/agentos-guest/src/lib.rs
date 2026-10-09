@@ -7,7 +7,9 @@ pub mod backend;
 pub mod fake;
 pub mod handlers;
 pub mod init;
+pub mod loopback;
 pub mod proxy;
+pub mod session_agent;
 pub mod trampoline;
 
 pub use backend::{Backend, FakeBackend, VmBackend};

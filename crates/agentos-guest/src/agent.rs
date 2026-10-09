@@ -14,6 +14,7 @@ use agentos_core::guest::{
 use crate::AGENT_VERSION;
 use crate::backend::Backend;
 use crate::handlers::{self, StreamError};
+use crate::session_agent;
 
 /// How a session ended; the caller acts on it (fake: exit 0 on `Shutdown`/`Lost`; VM:
 /// reboot).
@@ -276,17 +277,34 @@ impl Session {
                     send(&mut stream, Message::Bye);
                     return Exit::Shutdown;
                 }
-                Message::RunAgent { .. } => {
-                    // Agent sessions land in a later step; until then the request is refused
-                    // and the session ends like any unexpected request.
-                    let reason = "agent sessions are not implemented yet".to_string();
-                    send(
+                Message::RunAgent {
+                    argv,
+                    env,
+                    timeout_secs,
+                    expected_base,
+                } => {
+                    match session_agent::run_agent(
+                        backend,
                         &mut stream,
-                        Message::Refused {
-                            reason: reason.clone(),
-                        },
-                    );
-                    return lost(reason);
+                        &argv,
+                        &env,
+                        timeout_secs,
+                        expected_base,
+                    ) {
+                        Ok(done) => {
+                            if !send(&mut stream, done.message) {
+                                return lost("cannot send AgentDone");
+                            }
+                            if write_frame(&mut stream, &Frame::Raw(done.patch)).is_err() {
+                                return lost("cannot send the patch");
+                            }
+                            continue;
+                        }
+                        Err(session_agent::AgentError::Refused(reason)) => {
+                            Message::Refused { reason }
+                        }
+                        Err(session_agent::AgentError::Lost(why)) => return lost(why),
+                    }
                 }
                 other => return lost(format!("unexpected request {}", type_of(&other))),
             };
