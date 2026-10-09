@@ -1765,6 +1765,7 @@ async fn recovery_with_a_sigstopped_supervisor_fences_then_redispatches() {
         timeouts: Some(EffectTimeouts {
             verification: Duration::from_secs(2),
             other: Duration::from_secs(30),
+            session: Duration::from_secs(30),
         }),
         ..ExecOpts::default()
     };
@@ -2027,6 +2028,7 @@ async fn recovery_never_fences_a_job_inside_its_own_lease_under_shorter_timeouts
     let short = EffectTimeouts {
         verification: Duration::from_millis(100),
         other: Duration::from_millis(100),
+        session: Duration::from_secs(30),
     };
     let ctl = w.open_with(
         None,
@@ -2148,6 +2150,7 @@ async fn a_fenced_patch_job_that_applied_its_patch_is_reconciled_not_failed() {
         timeouts: Some(EffectTimeouts {
             verification: Duration::from_secs(70),
             other: Duration::from_secs(2),
+            session: Duration::from_secs(30),
         }),
         ..ExecOpts::default()
     };

@@ -1218,6 +1218,7 @@ async fn lease_kill_leaves_the_jail_until_the_controller_collects_it() {
     let short = EffectTimeouts {
         verification: Duration::from_millis(1_500),
         other: Duration::from_secs(30),
+        session: Duration::from_secs(30),
     };
     let exec = fx.executor(None, &[]).with_timeouts(short);
     let (req, c) = (fx.request(EffectKind::RunVerification, b"again"), ctx(3));

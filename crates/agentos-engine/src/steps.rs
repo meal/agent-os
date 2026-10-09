@@ -187,6 +187,7 @@ fn artifact_type(kind: &EffectKind, outcome: &Outcome) -> &'static str {
         (EffectKind::ListFiles { .. }, _) => "file-list",
         (EffectKind::ReadFile { .. }, _) => "file-content",
         (EffectKind::AnalyzeSnapshot, _) => "analysis-report",
+        (EffectKind::RunAgentSession { .. }, _) => "agent-session",
     }
 }
 
@@ -375,7 +376,8 @@ pub fn follow_up_event(kind: &EffectKind, out: &ExecOutcome, task: &Task) -> Opt
         | EffectKind::ModelCall { .. }
         | EffectKind::ListFiles { .. }
         | EffectKind::ReadFile { .. }
-        | EffectKind::AnalyzeSnapshot => None,
+        | EffectKind::AnalyzeSnapshot
+        | EffectKind::RunAgentSession { .. } => None,
     }
 }
 

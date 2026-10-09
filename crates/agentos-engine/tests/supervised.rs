@@ -421,6 +421,7 @@ async fn killed_verification_returns_the_failure_receipt() {
     let timeouts = EffectTimeouts {
         verification: Duration::from_millis(800),
         other: Duration::from_secs(30),
+        session: Duration::from_secs(30),
     };
     let exec = fx.host().with_timeouts(timeouts);
     let (req, ctx) = (fx.request(EffectKind::RunVerification, b""), ctx(2));

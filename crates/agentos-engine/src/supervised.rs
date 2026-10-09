@@ -30,7 +30,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use agentos_core::effect::{EffectId, EffectKind, RetryPolicy};
 use agentos_core::guest::{PatchStateKind, mint_attempt_token};
 use agentos_core::ids::{Digest, TaskId};
-use agentos_core::lease::{EffectTimeouts, lease_expiry_ms};
+use agentos_core::lease::{EffectTimeouts, MAX_SESSION_TIMEOUT_MS, lease_expiry_ms};
 use rustix::process::{
     Pid, PidfdFlags, Signal, getpgrp, getpid, getsid, kill_process_group, pidfd_open,
     pidfd_send_signal,
@@ -56,16 +56,30 @@ const GRACE_MS: i64 = 5_000;
 const FENCE_GRACE_MS: i64 = 2_000;
 /// How long the lock may take to come free after the kills.
 const KILL_SETTLE_MS: i64 = 2_000;
-/// The longest lease any job may honestly have: no configuration may use an effect timeout
-/// above it, so it must stay >= the largest `EffectTimeouts` the product ships. It exists
-/// only to bound a forged or corrupt `lease_expiry_ms` (or a wall clock that jumped back):
-/// no wait for a job lasts longer than this plus `GRACE_MS` from now.
+/// The longest lease any job of a kind other than an agent session may honestly have: no
+/// configuration may use an effect timeout above it, so it must stay >= the largest
+/// `EffectTimeouts` those kinds ship. It exists only to bound a forged or corrupt
+/// `lease_expiry_ms` (or a wall clock that jumped back): no wait for a job lasts longer than
+/// this plus `GRACE_MS` from now. An agent session is bounded by `MAX_SESSION_TIMEOUT_MS`.
 pub const MAX_EFFECT_TIMEOUT_MS: i64 = 600_000;
+
+/// The wait bound for a job whose lease ends at `lease_expiry_ms`: its lease, cut at `clamp_ms`
+/// from now, plus `GRACE_MS`.
+fn bounded_lease(now: i64, lease_expiry_ms: i64, clamp_ms: i64) -> i64 {
+    lease_expiry_ms
+        .min(now.saturating_add(clamp_ms))
+        .saturating_add(GRACE_MS)
+}
+
+/// A session's configured timeout, never above `MAX_SESSION_TIMEOUT_MS`.
+fn session_timeout(configured: Duration) -> Duration {
+    configured.min(Duration::from_millis(MAX_SESSION_TIMEOUT_MS as u64))
+}
 
 /// How many times each effect kind was really executed, shared across executor instances
 /// so it survives a simulated restart.
 #[derive(Debug, Clone, Default)]
-pub struct ExecCounts(Arc<[AtomicUsize; 8]>);
+pub struct ExecCounts(Arc<[AtomicUsize; 9]>);
 
 fn slot(tag: &str) -> usize {
     match tag {
@@ -76,6 +90,7 @@ fn slot(tag: &str) -> usize {
         "list_files" => 5,
         "read_file" => 6,
         "analyze_snapshot" => 7,
+        "run_agent_session" => 8,
         _ => 3,
     }
 }
@@ -204,8 +219,10 @@ pub struct SupervisedExecutor {
     /// Answers `reconcile` and `current_workspace`, read-only: the host workspace directly
     /// (host workers), or an inspection boot (Firecracker); none for scripted workers.
     reconciler: Option<Reconciler>,
-    /// `MAX_EFFECT_TIMEOUT_MS` except in tests.
+    /// `MAX_EFFECT_TIMEOUT_MS` except in tests; for every kind but an agent session.
     max_lease_clamp_ms: i64,
+    /// `MAX_SESSION_TIMEOUT_MS`: the wait bound of an agent session's job.
+    max_session_clamp_ms: i64,
 }
 
 fn now_ms() -> i64 {
@@ -541,6 +558,7 @@ impl SupervisedExecutor {
             extra_env: Vec::new(),
             reconciler,
             max_lease_clamp_ms: MAX_EFFECT_TIMEOUT_MS,
+            max_session_clamp_ms: MAX_SESSION_TIMEOUT_MS,
         })
     }
 
@@ -585,6 +603,7 @@ impl SupervisedExecutor {
     fn timeout(&self, kind: &EffectKind) -> Duration {
         match kind {
             EffectKind::RunVerification => self.timeouts.verification,
+            EffectKind::RunAgentSession { .. } => session_timeout(self.timeouts.session),
             _ => self.timeouts.other,
         }
     }
@@ -637,10 +656,12 @@ impl SupervisedExecutor {
     /// `GRACE_MS`, but never later than the longest honest lease from `now`
     /// (`MAX_EFFECT_TIMEOUT_MS`) plus `GRACE_MS`, so a forged or corrupt lease cannot stall
     /// the wait.
-    fn lease_bound(&self, now: i64, lease_expiry_ms: i64) -> i64 {
-        lease_expiry_ms
-            .min(now.saturating_add(self.max_lease_clamp_ms))
-            .saturating_add(GRACE_MS)
+    fn lease_bound(&self, kind: &EffectKind, now: i64, lease_expiry_ms: i64) -> i64 {
+        let clamp = match kind {
+            EffectKind::RunAgentSession { .. } => self.max_session_clamp_ms,
+            _ => self.max_lease_clamp_ms,
+        };
+        bounded_lease(now, lease_expiry_ms, clamp)
     }
 
     /// The job's `request.json`. A Firecracker job gets a fresh attempt token of its own.
@@ -800,9 +821,9 @@ impl SupervisedExecutor {
             .filter(|j| !settled(j))
             .map(|j| match j.is_dead() {
                 true => now.saturating_add(KILL_SETTLE_MS),
-                false => j
-                    .request()
-                    .map_or(unknown_lease, |r| self.lease_bound(now, r.lease_expiry_ms)),
+                false => j.request().map_or(unknown_lease, |r| {
+                    self.lease_bound(&r.kind, now, r.lease_expiry_ms)
+                }),
             })
             .max()
             .unwrap_or(now);
@@ -857,7 +878,8 @@ impl Executor for SupervisedExecutor {
             return ExecOutcome::failure(req, ctx, "injected crash after the launch");
         }
         let jobs = std::slice::from_ref(&job);
-        if !wait_dead(jobs, self.lease_bound(now_ms(), lease)).await && !self.fence_jobs(jobs).await
+        if !wait_dead(jobs, self.lease_bound(&req.kind, now_ms(), lease)).await
+            && !self.fence_jobs(jobs).await
         {
             return ExecOutcome::unresolved(
                 req,
@@ -910,7 +932,11 @@ impl Executor for SupervisedExecutor {
     /// [`SupervisedExecutor::wait_for_job`]; a job whose request cannot be read is waited
     /// for as long as the longest effect timeout plus `GRACE_MS`.
     async fn await_job(&self, effect: &EffectId) -> JobWait {
-        let longest = self.timeouts.verification.max(self.timeouts.other);
+        let longest = self
+            .timeouts
+            .verification
+            .max(self.timeouts.other)
+            .max(session_timeout(self.timeouts.session));
         self.wait_for_job(effect, longest + Duration::from_millis(GRACE_MS as u64))
             .await
     }
@@ -952,5 +978,41 @@ mod tests {
                 "{state:?} {digest:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_session_lease_is_honoured_up_to_the_session_cap_and_other_kinds_keep_theirs() {
+        let now = 1_000_000_000;
+        let half_hour = 1_800_000;
+        let five_hours = 5 * 3_600_000;
+        // A 30 min session is not clamped to the 600 s of every other kind.
+        assert_eq!(
+            bounded_lease(now, now + half_hour, MAX_SESSION_TIMEOUT_MS),
+            now + half_hour + GRACE_MS
+        );
+        // A 5 h session is clamped at four hours.
+        assert_eq!(
+            bounded_lease(now, now + five_hours, MAX_SESSION_TIMEOUT_MS),
+            now + MAX_SESSION_TIMEOUT_MS + GRACE_MS
+        );
+        // A non-session kind is still clamped at 600 s.
+        assert_eq!(
+            bounded_lease(now, now + half_hour, MAX_EFFECT_TIMEOUT_MS),
+            now + MAX_EFFECT_TIMEOUT_MS + GRACE_MS
+        );
+    }
+
+    #[test]
+    fn a_configured_session_timeout_is_capped_at_four_hours() {
+        assert_eq!(
+            session_timeout(Duration::from_secs(1800)),
+            Duration::from_secs(1800)
+        );
+        assert_eq!(
+            session_timeout(Duration::from_secs(5 * 3600)),
+            Duration::from_millis(MAX_SESSION_TIMEOUT_MS as u64)
+        );
+        assert_eq!(MAX_SESSION_TIMEOUT_MS, 14_400_000);
+        assert_eq!(MAX_EFFECT_TIMEOUT_MS, 600_000);
     }
 }

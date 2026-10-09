@@ -158,7 +158,8 @@ pub fn scope_for(op: Capability, contract: &Contract) -> Scope {
         Capability::SnapshotRead
         | Capability::ArtifactExport
         | Capability::ModelRequest
-        | Capability::SnapshotAnalyze => Scope::Task,
+        | Capability::SnapshotAnalyze
+        | Capability::AgentSession => Scope::Task,
         Capability::VerificationRun => Scope::Profile(contract.verification_profile.clone()),
     }
 }

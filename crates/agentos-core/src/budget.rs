@@ -33,7 +33,8 @@ pub fn tool_actions_for(kind: &EffectKind) -> u32 {
         EffectKind::RunVerification
         | EffectKind::ExportBundle
         | EffectKind::ModelCall { .. }
-        | EffectKind::AnalyzeSnapshot => 0,
+        | EffectKind::AnalyzeSnapshot
+        | EffectKind::RunAgentSession { .. } => 0,
     }
 }
 

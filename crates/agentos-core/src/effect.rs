@@ -42,6 +42,31 @@ pub enum EffectKind {
     },
     /// The contract's analyzer over the task's snapshot (payload: the request identity).
     AnalyzeSnapshot,
+    /// A coding-agent CLI session in the guest (payload: an [`AgentSessionSpec`]) over the
+    /// workspace at `expected_base`, like `ApplyPatch`. Never retried: a session that is lost
+    /// fails its task.
+    RunAgentSession {
+        expected_base: Digest,
+    },
+}
+
+/// The payload of a [`EffectKind::RunAgentSession`] effect: what the guest runs and with which
+/// extra environment. Serialized as JSON in the effect's payload bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSessionSpec {
+    pub argv: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+impl AgentSessionSpec {
+    pub fn to_payload(&self) -> Vec<u8> {
+        // Plain strings only: serialization cannot fail.
+        serde_json::to_vec(self).unwrap_or_default()
+    }
+
+    pub fn from_payload(bytes: &[u8]) -> Result<AgentSessionSpec, serde_json::Error> {
+        serde_json::from_slice(bytes)
+    }
 }
 
 impl EffectKind {
@@ -55,6 +80,7 @@ impl EffectKind {
             EffectKind::RunVerification => Capability::VerificationRun,
             EffectKind::ExportBundle => Capability::ArtifactExport,
             EffectKind::AnalyzeSnapshot => Capability::SnapshotAnalyze,
+            EffectKind::RunAgentSession { .. } => Capability::AgentSession,
         }
     }
 
@@ -66,6 +92,8 @@ impl EffectKind {
             | EffectKind::ReadFile { .. }
             // Deterministic over an immutable input: running it again gives the same report.
             | EffectKind::AnalyzeSnapshot => RetryPolicy::Retry,
+            // A session's edits and model calls are not replayable: a lost one is a failure.
+            EffectKind::RunAgentSession { .. } => RetryPolicy::NoRetry,
             EffectKind::ModelCall { .. } => RetryPolicy::ForfeitThenRetry,
             // Safe to retry after reconciling because of the expected-version check.
             EffectKind::ApplyPatch { .. } | EffectKind::ExportBundle => {
@@ -85,6 +113,7 @@ impl EffectKind {
             EffectKind::ListFiles { .. } => "list_files",
             EffectKind::ReadFile { .. } => "read_file",
             EffectKind::AnalyzeSnapshot => "analyze_snapshot",
+            EffectKind::RunAgentSession { .. } => "run_agent_session",
         }
     }
 }
@@ -122,7 +151,9 @@ impl EffectId {
         put(&mut h, task_id.as_str().as_bytes());
         put(&mut h, &step.to_le_bytes());
         put(&mut h, kind.tag().as_bytes());
-        if let EffectKind::ApplyPatch { expected_base } = kind {
+        if let EffectKind::ApplyPatch { expected_base }
+        | EffectKind::RunAgentSession { expected_base } = kind
+        {
             put(&mut h, expected_base.to_string().as_bytes());
         }
         match kind {
@@ -299,6 +330,7 @@ mod tests {
                 path: "src/a.py".into(),
                 turn: 1,
             },
+            EffectKind::RunAgentSession { expected_base: b },
         ];
         let ids: Vec<_> = kinds.iter().map(|k| id_of("t", 1, k, b"r")).collect();
         for i in 0..ids.len() {
@@ -643,5 +675,32 @@ mod tests {
         assert_eq!(kind.retry_policy(), RetryPolicy::Retry);
         let json = serde_json::to_string(&kind).unwrap();
         assert_eq!(serde_json::from_str::<EffectKind>(&json).unwrap(), kind);
+    }
+
+    #[test]
+    fn run_agent_session_is_a_never_retried_agent_session_effect() {
+        let kind = EffectKind::RunAgentSession {
+            expected_base: Digest::of(b"base"),
+        };
+        assert_eq!(kind.tag(), "run_agent_session");
+        assert_eq!(kind.capability(), Capability::AgentSession);
+        assert_eq!(kind.retry_policy(), RetryPolicy::NoRetry);
+        let json = serde_json::to_string(&kind).unwrap();
+        assert_eq!(serde_json::from_str::<EffectKind>(&json).unwrap(), kind);
+    }
+
+    #[test]
+    fn agent_session_spec_is_argv_and_env_json() {
+        let spec = AgentSessionSpec {
+            argv: vec!["claude".into(), "-p".into()],
+            env: vec![("K".into(), "V".into())],
+        };
+        let bytes = spec.to_payload();
+        assert_eq!(
+            bytes,
+            br#"{"argv":["claude","-p"],"env":[["K","V"]]}"#.to_vec()
+        );
+        assert_eq!(AgentSessionSpec::from_payload(&bytes).unwrap(), spec);
+        assert!(AgentSessionSpec::from_payload(b"not json").is_err());
     }
 }

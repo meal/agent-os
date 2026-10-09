@@ -29,6 +29,8 @@ pub enum Capability {
     ModelRequest,
     #[serde(rename = "snapshot.analyze")]
     SnapshotAnalyze,
+    #[serde(rename = "agent.session")]
+    AgentSession,
 }
 
 /// The analyzer component a task runs once over its snapshot: a registered id and the digest
@@ -283,6 +285,36 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Contract::parse(&out).unwrap()).unwrap(),
             out
+        );
+    }
+
+    #[test]
+    fn agent_session_capability_parses_and_serializes_as_agent_dot_session() {
+        let j = OK.replace(
+            "\"artifact.export\"]",
+            "\"artifact.export\",\"agent.session\"]",
+        );
+        assert_ne!(j, OK);
+        let c = Contract::parse(&j).unwrap();
+        assert!(c.capabilities.contains(&Capability::AgentSession));
+        assert_eq!(
+            serde_json::to_value(Capability::AgentSession).unwrap(),
+            serde_json::json!("agent.session")
+        );
+        // Needs no analyzer and no pin: a session is not an analysis.
+        assert!(c.analyzer.is_none());
+    }
+
+    /// Contracts that do not name `agent.session` keep the digest they had before the
+    /// capability existed (the same pin as the test above).
+    #[test]
+    fn contracts_without_agent_session_keep_their_digest() {
+        let c = Contract::parse(OK).unwrap();
+        assert!(!serde_json::to_string(&c).unwrap().contains("agent.session"));
+        let digest = crate::ids::Digest::of(&serde_json::to_vec(&c).unwrap());
+        assert_eq!(
+            digest.to_string(),
+            "4ef04e21c7f6cbe572fa7a2ba3102f720ddc45460a90dc76569f0818e22d0062"
         );
     }
 
