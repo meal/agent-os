@@ -1,7 +1,7 @@
 #!/bin/sh
 # Builds the release tarball agentos-VERSION-x86_64-linux.tar.gz (and its .sha256) into
 # build/release/: a static musl agentos, the pinned Firecracker and jailer, one guest image,
-# the parser profile and the reference analyzer, MANIFEST.json and SHA256SUMS. The tarball is
+# the parser and duration profiles and the reference analyzer, MANIFEST.json and SHA256SUMS. The tarball is
 # reproducible: sorted names, fixed times and owners, gzip without a timestamp.
 #
 #   docker compose run --rm test-kvm sh scripts/release.sh VERSION [IMAGE]
@@ -43,13 +43,14 @@ mkdir -p "$stage/bin" "$stage/images" "$stage/profiles" "$stage/components"
 install -m 0755 "$bin" "$stage/bin/agentos"
 install -m 0755 "$fc/firecracker" "$fc/jailer" "$stage/bin/"
 cp -R "build/guest-images/$image" "$stage/images/$image"
-cp -R fixtures/profiles/parser-checks-v1 "$stage/profiles/"
+cp -R fixtures/profiles/parser-checks-v1 fixtures/profiles/duration-checks-v1 "$stage/profiles/"
 cp -R fixtures/components/repo-analyzer-v1 "$stage/components/"
 # The registry digests, computed by the release's own agentos.
 home="$scratch/home"
 digest() { "$stage/bin/agentos" --home "$home" "$1" register "$2" | python3 -c 'import json, sys; print(json.load(sys.stdin)["digest"])'; }
 image_digest=$(digest image "$stage/images/$image")
 profile_digest=$(digest profile "$stage/profiles/parser-checks-v1")
+duration_digest=$(digest profile "$stage/profiles/duration-checks-v1")
 component_digest=$(digest component "$stage/components/repo-analyzer-v1")
 # The versions the code itself reports (protocols, policies, runtimes), the toolchain, and the
 # image's own provenance record.
@@ -69,6 +70,8 @@ json.dump({
               "kernel_build": image.get("kernel_build"),
               "interpreter": image.get("interpreter")},
     "profile": {"id": "parser-checks-v1", "digest": "$profile_digest"},
+    "profiles": [{"id": "parser-checks-v1", "digest": "$profile_digest"},
+                 {"id": "duration-checks-v1", "digest": "$duration_digest"}],
     "component": {"id": "repo-analyzer-v1", "digest": "$component_digest"},
 }, open(out, "w"), separators=(",", ":"), sort_keys=True)
 PY

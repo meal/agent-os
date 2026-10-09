@@ -1,0 +1,1 @@
+{ "id": "duration-checks-v1", "command": ["python3", "check_duration.py"], "protected": true }
