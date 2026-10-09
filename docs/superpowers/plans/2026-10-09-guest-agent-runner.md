@@ -99,7 +99,7 @@ Each line has its test in the named task.
   a text block, a tool_use block and an empty `content`, each event `event:`/`data:` framed with
   a blank line. Both host and guest crates use it.
 
-- [ ] **3. Protocol v2.** `GUEST_PROTOCOL = 2`; add `RunAgent { argv, env, base_url, timeout_secs,
+- [x] **3. Protocol v2** (490a8a8). **Follow-up, owned by Task 9:** the three `guest/*/image.json.in` still say `"protocol":1`, so a v2 controller refuses every existing image until they are bumped and the images rebuilt (and re-registered); the v0.1 rc5 images keep working only with an rc5 controller. `GUEST_PROTOCOL = 2`; add `RunAgent { argv, env, base_url, timeout_secs,
   expected_base }`, `ModelRequest { id }` (guest -> host, followed by one raw frame), `ModelReply
   { id, status }` (host -> guest, followed by one raw frame), `AgentDone { exit_code, signal,
   workspace_digest, patch_bytes }` (followed by one raw frame holding the patch, empty if none).
