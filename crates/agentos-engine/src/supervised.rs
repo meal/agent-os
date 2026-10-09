@@ -43,7 +43,7 @@ use crate::firecracker::{Answer, Inspector, Query, collect_root};
 use crate::fixture::FixtureExecutor;
 use crate::guestlink::guest_text;
 use crate::jail;
-use crate::job::{JobDir, JobRequest, JobState, WorkerConfig};
+use crate::job::{JobDir, JobRequest, JobState, Mailbox, WorkerConfig};
 use crate::outcomes;
 use crate::supervisor::{SupervisorCmd, group_in_session, proc_stats};
 
@@ -949,6 +949,23 @@ impl Executor for SupervisedExecutor {
                 false
             }
         }
+    }
+
+    /// Only a Firecracker worker runs the guest's agent session.
+    fn runs_agent_sessions(&self) -> bool {
+        matches!(self.worker, WorkerConfig::Firecracker(_))
+    }
+
+    /// The newest attempt's job (the jobs list in ascending lease generation).
+    fn session_mailbox(&self, effect: &EffectId) -> Option<Mailbox> {
+        self.jobs(effect)
+            .ok()?
+            .last()
+            .map(|job| Mailbox::new(job.session_dir()))
+    }
+
+    fn cancel_jobs(&self, effects: &[EffectId]) -> usize {
+        SupervisedExecutor::cancel_jobs(self, effects)
     }
 }
 

@@ -1476,6 +1476,11 @@ async fn a_controller_that_never_answers_is_ended_by_the_cancel_marker_and_the_v
         "a lost session is a failure, never unresolved"
     );
     assert!(guests_of(&job).is_empty(), "the VM is reaped");
+    // The guest kills its CLI as it goes: a process that is still exiting gets a moment.
+    let until = Instant::now() + Duration::from_secs(10);
+    while !pids_with(&cli).is_empty() && Instant::now() < until {
+        thread::sleep(Duration::from_millis(50));
+    }
     assert!(pids_with(&cli).is_empty(), "no CLI survives the job");
     assert!(
         pids_with("sleep 600").is_empty(),

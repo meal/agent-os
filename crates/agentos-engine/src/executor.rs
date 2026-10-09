@@ -8,6 +8,8 @@ use agentos_core::effect::{AttemptId, EffectId, EffectKind, Outcome, Receipt};
 use agentos_core::ids::{Digest, TaskId};
 use serde::{Deserialize, Serialize};
 
+use crate::job::Mailbox;
+
 #[derive(Debug, Clone)]
 pub struct EffectRequest {
     pub effect_id: EffectId,
@@ -170,5 +172,23 @@ pub trait Executor {
     /// executor without out-of-process jobs has nothing to stop.
     fn fence_job(&self, _effect: &EffectId) -> impl Future<Output = bool> + Send {
         async { true }
+    }
+
+    /// Whether this executor can run agent sessions (`RunAgentSession`). Without it a session
+    /// task fails at once.
+    fn runs_agent_sessions(&self) -> bool {
+        false
+    }
+
+    /// The mailbox of the newest job of `effect`, where a session's model requests arrive.
+    /// `None` while no job exists yet, and always for an executor without jobs.
+    fn session_mailbox(&self, _effect: &EffectId) -> Option<Mailbox> {
+        None
+    }
+
+    /// Asks the live jobs of `effects` to stop and returns how many were asked. Nothing is
+    /// waited for.
+    fn cancel_jobs(&self, _effects: &[EffectId]) -> usize {
+        0
     }
 }

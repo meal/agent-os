@@ -328,6 +328,22 @@ pub(crate) fn effect_observation(blobs: &BlobStore, rec: &EffectRecord) -> Resul
                 output_tokens: result["usage"]["output_tokens"].as_u64().unwrap_or(0),
             }
         }
+        (EffectKind::RunAgentSession { .. }, EffectState::Completed) => {
+            let patch = agentos_core::guest::unb64(result["patch_b64"].as_str().unwrap_or(""))
+                .map_err(|e| protocol(rec, &format!("has an undecodable patch: {e}")))?;
+            let timed_out = result["timed_out"] == true;
+            Observation::SessionEnded {
+                exit_code: result["exit_code"]
+                    .as_i64()
+                    .and_then(|c| i32::try_from(c).ok()),
+                signal: result["signal"]
+                    .as_i64()
+                    .and_then(|c| i32::try_from(c).ok()),
+                timed_out,
+                patch: String::from_utf8(patch).ok().filter(|p| !p.is_empty()),
+                reason: timed_out.then(|| "the session timed out".to_string()),
+            }
+        }
         (EffectKind::ModelCall { .. }, EffectState::Failed) => Observation::ModelCallFailed {
             reason: reason()?,
             failure: result.get("failure").map(decode).transpose()?,

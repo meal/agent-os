@@ -7,6 +7,7 @@ use agentos_core::ids::{Digest, TaskId};
 
 use crate::analysis::AnalysisExecutor;
 use crate::executor::{AttemptCtx, EffectRequest, ExecOutcome, Executor, JobWait, Reconciliation};
+use crate::job::Mailbox;
 use crate::model::executor::ModelExecutor;
 use crate::shadow::ShadowReader;
 
@@ -74,5 +75,17 @@ impl<J: Executor + Sync> Executor for RoutingExecutor<J> {
 
     async fn fence_job(&self, effect: &EffectId) -> bool {
         self.jobs.fence_job(effect).await
+    }
+
+    fn runs_agent_sessions(&self) -> bool {
+        self.jobs.runs_agent_sessions()
+    }
+
+    fn session_mailbox(&self, effect: &EffectId) -> Option<Mailbox> {
+        self.jobs.session_mailbox(effect)
+    }
+
+    fn cancel_jobs(&self, effects: &[EffectId]) -> usize {
+        self.jobs.cancel_jobs(effects)
     }
 }

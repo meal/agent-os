@@ -6,8 +6,11 @@
 
 use agentos_core::broker::Resource;
 use agentos_core::contract::{Capability, Contract};
-use agentos_core::effect::{EffectId, EffectKind, EffectRecord, EffectState, ReceiptVerdict};
+use agentos_core::effect::{
+    AgentSessionSpec, EffectId, EffectKind, EffectRecord, EffectState, ReceiptVerdict,
+};
 use agentos_core::ids::{Digest, TaskId};
+use agentos_core::messages::normalize_request;
 use agentos_core::state::{TaskEvent, TaskState, TransitionError};
 use agentos_store::blob::BlobStore;
 use agentos_store::db::{Db, DbError};
@@ -24,7 +27,7 @@ use crate::shadow::check_path;
 use crate::steps::{Attempt, Cx, intend, run_attempt};
 use crate::workspace::has_excluded_component;
 
-use crate::model::policy::{ModelFailureClass, backoff_seconds, check_request_size};
+use crate::model::policy::{ModelFailure, ModelFailureClass, backoff_seconds, check_request_size};
 pub use crate::steps::{WORKER, follow_up_event, verification_verdict};
 use agentos_store::effects::ModelRetrySchedule;
 
@@ -690,6 +693,285 @@ async fn read_file<E: Executor>(
     effect_turn(cx, rec, Vec::new()).await
 }
 
+/// How often the session's mailbox is looked at while nothing is waiting in it.
+const MAILBOX_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The model request a session sends, as the runner forwards it: normalized (see
+/// [`normalize_request`]) with the session's model in place of the CLI's, and the name the CLI
+/// asked for. `Err` is why the request is refused.
+fn session_body(
+    body: &[u8],
+    cap: u32,
+    model: &str,
+) -> std::result::Result<(Vec<u8>, String), String> {
+    let normalized = normalize_request(body, cap)?;
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&normalized).map_err(|e| e.to_string())?;
+    let requested: String = value["model"]
+        .as_str()
+        .unwrap_or("unknown")
+        .chars()
+        .take(128)
+        .collect();
+    value["model"] = json!(model);
+    let bytes = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
+    Ok((bytes, requested))
+}
+
+/// The body of an error answer to a session's request, in the Messages API's error shape.
+fn error_reply(kind: &str, message: &str) -> Vec<u8> {
+    json!({ "type": "error", "error": { "type": kind, "message": guest_text(message) } })
+        .to_string()
+        .into_bytes()
+}
+
+/// The response bytes of the `ModelCall` for `request` journaled after `window`: the blob its
+/// effect published.
+fn response_bytes<E>(cx: &Cx<'_, E>, window: u64, request: &Digest) -> Result<Vec<u8>> {
+    let events = journal::events_after(cx.db, &cx.task, window)?;
+    let id = journal::intended(&events, "ModelCall", Some(request))?.ok_or_else(|| {
+        EngineError::Protocol(format!("the model call {request} was not journaled"))
+    })?;
+    let rec = cx.db.effect(&id)?;
+    let digest = rec
+        .result_digest
+        .ok_or_else(|| EngineError::Protocol(format!("model call {id} has no response")))?;
+    Ok(cx.blobs.get(&digest)?)
+}
+
+/// Serves the model requests of the session whose job is `effect`, strictly one at a time and
+/// in order, until a guard ends the task: the state it ends in. Each request is a journaled
+/// `ModelCall` through [`call_model`], and its reply is the response, or the error its failure
+/// maps to. Nothing is replied to a request that is refused before the call.
+async fn serve_mailbox<E: Executor>(
+    cx: &Cx<'_, E>,
+    since: u64,
+    session_turn: u32,
+    base: Digest,
+    effect: &EffectId,
+    model: &str,
+) -> Result<TaskState> {
+    let (db, task) = (cx.db, &cx.task);
+    let mailbox = loop {
+        match cx.exec.session_mailbox(effect) {
+            Some(mailbox) => break mailbox,
+            None => tokio::time::sleep(MAILBOX_POLL).await,
+        }
+    };
+    let cap = cx.contract.limits.max_output_tokens_per_request;
+    let mut answered = 0u64;
+    loop {
+        let Some((id, body)) = mailbox.controller_next_request(answered)? else {
+            tokio::time::sleep(MAILBOX_POLL).await;
+            continue;
+        };
+        answered = id;
+        if let Some(state) = interrupted(db, task)? {
+            return Ok(state);
+        }
+        if let Some(state) = deadline_stop(cx).await? {
+            return Ok(state);
+        }
+        if let Err(denial) = granted(db, task, Capability::ModelRequest, &Resource::Task)? {
+            let capability = capability_name(Capability::ModelRequest);
+            let audit = json!({ "action": "CallModel", "reason": "CapabilityDenied", "capability": capability, "denial": denial });
+            db.append_audit(task, "Denied", &audit)?;
+            tracing::info!(task_id = %task, %audit, "model call denied");
+            return fail(db, task, &format!("capability {capability} not granted"));
+        }
+        if cx.model_limits_version == 1
+            && let Err(reason) = check_request_size(body.len())
+        {
+            return fail(db, task, reason);
+        }
+        if cx.model_policy_version == 1
+            && let Some(schedule) = pending_model_retry(cx)?
+            && let Some(state) = wait_model_retry(cx, &schedule).await?
+        {
+            return Ok(state);
+        }
+        let (body, requested) = match session_body(&body, cap, model) {
+            Ok(forwarded) => forwarded,
+            Err(reason) => {
+                // Refused before any call: no budget is spent on it.
+                mailbox.controller_post_reply(
+                    id,
+                    400,
+                    &error_reply("invalid_request_error", &reason),
+                )?;
+                continue;
+            }
+        };
+        let request = Digest::of(&body);
+        // The request's own call is looked for among the events journaled from here on.
+        let window = db.events(task)?.last().map_or(since, |e| e.seq.max(since));
+        journal::append_session_call(db, task, id, &request, &requested, model)?;
+        ensure_request_artifact(cx, None, &request, &body)?;
+        let turn = session_turn.saturating_add(u32::try_from(id).unwrap_or(u32::MAX));
+        let obs = match interruptible(
+            db,
+            task,
+            call_model(cx, window, turn, base, request, body).await,
+        )? {
+            Next::Stop(state) => return Ok(state),
+            Next::Observe(obs) => obs,
+        };
+        match obs {
+            Observation::ModelResponse { .. } => {
+                let bytes = response_bytes(cx, window, &request)?;
+                mailbox.controller_post_reply(id, 200, &bytes)?;
+            }
+            obs @ (Observation::ModelCallFailed { .. } | Observation::ModelCallLost) => {
+                if let Some(state) = model_failure_policy(cx, &obs, turn.saturating_add(1)).await? {
+                    return Ok(state);
+                }
+                let (status, message) = match &obs {
+                    Observation::ModelCallFailed { reason, failure } => {
+                        let transient = matches!(
+                            failure,
+                            Some(ModelFailure {
+                                class: ModelFailureClass::Transient,
+                                ..
+                            })
+                        );
+                        (if transient { 529 } else { 400 }, reason.clone())
+                    }
+                    _ => (502, "the model call was lost".to_string()),
+                };
+                mailbox.controller_post_reply(id, status, &error_reply("api_error", &message))?;
+            }
+            other => {
+                return Err(EngineError::Protocol(format!(
+                    "a session's model call gave {other:?}"
+                )));
+            }
+        }
+    }
+}
+
+/// The observation of a session whose effect is decided: its end, or the task's failure when
+/// the session failed (a session cut short by the task's deadline is the deadline's failure).
+fn session_end<E: Executor>(cx: &Cx<'_, E>, rec: &EffectRecord) -> Result<Next> {
+    let (db, task) = (cx.db, &cx.task);
+    match rec.state {
+        EffectState::Completed => Ok(Next::Observe(journal::effect_observation(cx.blobs, rec)?)),
+        EffectState::Failed => {
+            if db.deadline_passed(task)? {
+                return Ok(Next::Stop(fail(db, task, recover::DEADLINE_EXCEEDED)?));
+            }
+            let reason = match rec.result_digest {
+                Some(digest) => {
+                    let result: serde_json::Value =
+                        serde_json::from_slice(&cx.blobs.get(&digest)?).map_err(DbError::from)?;
+                    result["reason"].as_str().unwrap_or("unknown").to_string()
+                }
+                None => "unknown".to_string(),
+            };
+            Ok(Next::Stop(fail(
+                db,
+                task,
+                &format!("agent session failed: {reason}"),
+            )?))
+        }
+        state => Err(EngineError::UnexpectedEffectState {
+            effect: rec.effect_id.clone(),
+            state,
+        }),
+    }
+}
+
+/// Runs the agent session of the turn journaled at `since`. The session effect runs as a job
+/// while its model requests are served from the job's mailbox ([`serve_mailbox`]). The job's
+/// end is the observation; a guard that stops the task ends the mailbox first, then the job is
+/// cancelled and its attempt awaited, and the task ends as the guard said.
+async fn run_session<E: Executor>(
+    cx: &Cx<'_, E>,
+    since: u64,
+    turn: u32,
+    base: Digest,
+    spec: AgentSessionSpec,
+    model: String,
+) -> Result<Next> {
+    let (db, task) = (cx.db, &cx.task);
+    if let Err(denial) = granted(db, task, Capability::AgentSession, &Resource::Task)? {
+        let capability = capability_name(Capability::AgentSession);
+        let audit = json!({ "action": "RunSession", "reason": "CapabilityDenied", "capability": capability, "denial": denial });
+        db.append_audit(task, "Denied", &audit)?;
+        tracing::info!(task_id = %task, %audit, "agent session denied");
+        return Ok(Next::Stop(fail(
+            db,
+            task,
+            &format!("capability {capability} not granted"),
+        )?));
+    }
+    let after = journal::events_after(db, task, since)?;
+    if journal::intended(&after, "RunAgentSession", None)?.is_some() {
+        // Recovery of an open session is not implemented: a session is never run twice.
+        return Ok(Next::Stop(fail(db, task, "agent session lost")?));
+    }
+    if !cx.exec.runs_agent_sessions() {
+        return Ok(Next::Stop(fail(
+            db,
+            task,
+            "executor cannot run agent sessions",
+        )?));
+    }
+    if let Some(state) = deadline_stop(cx).await? {
+        return Ok(Next::Stop(state));
+    }
+    let payload = spec.to_payload();
+    let kind = EffectKind::RunAgentSession {
+        expected_base: base,
+    };
+    let rec = match intend(db, task, kind, Digest::of(&payload), &base, &Resource::Task) {
+        Ok(rec) => rec,
+        Err(EngineError::Db(DbError::BudgetExceeded(_))) => {
+            return Ok(Next::Stop(fail(db, task, "budget exhausted")?));
+        }
+        Err(EngineError::Db(DbError::CapabilityDenied { capability, .. })) => {
+            let reason = format!("capability {} not granted", capability_name(capability));
+            return Ok(Next::Stop(fail(db, task, &reason)?));
+        }
+        Err(e) => return Err(e),
+    };
+    if rec.state != EffectState::Intended {
+        return session_end(cx, &rec);
+    }
+    cx.crash(CrashPoint::AfterIntent, Some(rec.kind.tag()))?;
+
+    let mut attempt = std::pin::pin!(run_attempt(cx, &rec, payload));
+    let mut serving = std::pin::pin!(serve_mailbox(cx, since, turn, base, &rec.effect_id, &model));
+    let mut stop = None;
+    let decided = loop {
+        tokio::select! {
+            done = &mut attempt => break done,
+            served = &mut serving, if stop.is_none() => {
+                cx.exec.cancel_jobs(std::slice::from_ref(&rec.effect_id));
+                stop = Some(served);
+            }
+        }
+    };
+    if let Some(served) = stop {
+        // The task already stopped: an attempt that failed alongside it (for instance one that
+        // raced with recovery over the same effect) changes nothing the stop did not.
+        if let Err(e) = &decided {
+            tracing::warn!(task_id = %task, error = %e, "the session's attempt failed after the task stopped");
+        }
+        return Ok(Next::Stop(served?));
+    }
+    match decided? {
+        Attempt::Published(ReceiptVerdict::Apply) => session_end(cx, &db.effect(&rec.effect_id)?),
+        Attempt::Published(verdict) => Err(EngineError::ReceiptNotApplied {
+            effect: rec.effect_id.clone(),
+            verdict,
+        }),
+        Attempt::Ended(state) => Ok(Next::Stop(state)),
+        Attempt::Forfeited => Err(EngineError::Protocol(
+            "an agent session cannot be forfeited".into(),
+        )),
+    }
+}
+
 async fn act<E: Executor>(
     cx: &Cx<'_, E>,
     since: u64,
@@ -706,11 +988,10 @@ async fn act<E: Executor>(
         }
         AgentAction::ListFiles => list_files(cx, since, turn, base).await,
         AgentAction::ReadFile(path) => read_file(cx, since, turn, base, path).await,
-        AgentAction::RunSession { .. } => Ok(Next::Stop(fail(
-            cx.db,
-            &cx.task,
-            "agent sessions are not wired into the runner yet",
-        )?)),
+        AgentAction::RunSession { argv, env, model } => {
+            let spec = AgentSessionSpec { argv, env };
+            run_session(cx, since, turn, base, spec, model).await
+        }
     }
 }
 
