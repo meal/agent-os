@@ -61,6 +61,7 @@ fn allowed(mode: Mode, m: &Message) -> bool {
             Message::ReadSnapshot { .. }
                 | Message::ApplyPatch { .. }
                 | Message::RunVerification { .. }
+                | Message::RunAgent { .. }
                 | Message::Shutdown
         ),
         Mode::Inspect => matches!(
@@ -274,6 +275,18 @@ impl Session {
                     }
                     send(&mut stream, Message::Bye);
                     return Exit::Shutdown;
+                }
+                Message::RunAgent { .. } => {
+                    // Agent sessions land in a later step; until then the request is refused
+                    // and the session ends like any unexpected request.
+                    let reason = "agent sessions are not implemented yet".to_string();
+                    send(
+                        &mut stream,
+                        Message::Refused {
+                            reason: reason.clone(),
+                        },
+                    );
+                    return lost(reason);
                 }
                 other => return lost(format!("unexpected request {}", type_of(&other))),
             };

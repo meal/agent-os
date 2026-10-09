@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::Digest;
 
-pub const GUEST_PROTOCOL: u32 = 1;
+pub const GUEST_PROTOCOL: u32 = 2;
 pub const VSOCK_PORT: u32 = 5200;
 pub const GUEST_CID: u32 = 3;
 pub const JSON_FRAME_LIMIT: usize = 1 << 20;
@@ -119,6 +119,33 @@ pub enum Message {
         paths: Vec<String>,
         workspace_digest: Option<Digest>,
         reason: Option<String>,
+    },
+    /// Host -> guest, Job mode only. Starts the agent CLI in a scratch copy of the workspace.
+    /// No raw frame follows.
+    RunAgent {
+        argv: Vec<String>,
+        env: Vec<(String, String)>,
+        timeout_secs: u64,
+        expected_base: Digest,
+    },
+    /// Guest -> host. The agent CLI called the model through the guest's loopback proxy. One
+    /// raw frame (the request body) follows.
+    ModelRequest {
+        id: u64,
+    },
+    /// Host -> guest. The answer to `ModelRequest { id }`. One raw frame (the response body)
+    /// follows.
+    ModelReply {
+        id: u64,
+        status: u16,
+    },
+    /// Guest -> host. The agent CLI exited, or was killed at its deadline. One raw frame (the
+    /// patch, empty if none) follows.
+    AgentDone {
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+        timed_out: bool,
+        workspace_digest: Digest,
     },
     Refused {
         reason: String,
@@ -263,7 +290,7 @@ mod tests {
             (
                 "Ready",
                 Message::Ready {
-                    protocol: 1,
+                    protocol: GUEST_PROTOCOL,
                     agent_version: "0.1.0".into(),
                     mode: Mode::Inspect,
                     vcpus: 2,
@@ -359,13 +386,33 @@ mod tests {
             ),
             ("Shutdown", Message::Shutdown),
             ("Bye", Message::Bye),
+            (
+                "RunAgent",
+                Message::RunAgent {
+                    argv: vec!["claude".into(), "-p".into()],
+                    env: vec![("HOME".into(), "/scratch".into())],
+                    timeout_secs: 300,
+                    expected_base: d(9),
+                },
+            ),
+            ("ModelRequest", Message::ModelRequest { id: 1 }),
+            ("ModelReply", Message::ModelReply { id: 1, status: 200 }),
+            (
+                "AgentDone",
+                Message::AgentDone {
+                    exit_code: None,
+                    signal: Some(9),
+                    timed_out: true,
+                    workspace_digest: d(10),
+                },
+            ),
         ]
     }
 
     #[test]
     fn every_message_round_trips_through_json_with_its_type_tag() {
         let all = all_messages();
-        assert_eq!(all.len(), 17);
+        assert_eq!(all.len(), 21);
         for (tag, m) in all {
             let json = serde_json::to_string(&m).unwrap();
             assert!(json.contains(&format!("\"type\":\"{tag}\"")), "{json}");

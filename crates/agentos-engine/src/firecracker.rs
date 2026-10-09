@@ -2291,7 +2291,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join(KERNEL_FILE), b"k").unwrap();
         fs::write(dir.path().join(ROOTFS_FILE), b"r").unwrap();
-        let good = r#"{"id":"python-stdlib-v1","protocol":1,"kernel":"vmlinux","rootfs":"rootfs.squashfs","agent_version":"0.1.0","kernel_sha256":"0545ba1781fc06cfa1d7699069057f4538103fd1644100cf0da434899a1ed447","built_from":"test"}"#;
+        let good = r#"{"id":"python-stdlib-v1","protocol":2,"kernel":"vmlinux","rootfs":"rootfs.squashfs","agent_version":"0.1.0","kernel_sha256":"0545ba1781fc06cfa1d7699069057f4538103fd1644100cf0da434899a1ed447","built_from":"test"}"#;
         let write = |s: &str| fs::write(dir.path().join("image.json"), s).unwrap();
         write(good);
         assert_eq!(read_image(dir.path()).unwrap().id, "python-stdlib-v1");
@@ -2302,11 +2302,11 @@ mod tests {
                 .unwrap_err()
                 .contains("unknown field `extra`")
         );
-        write(&good.replace(r#""protocol":1"#, r#""protocol":2"#));
+        write(&good.replace(r#""protocol":2"#, r#""protocol":1"#));
         assert!(
             read_image(dir.path())
                 .unwrap_err()
-                .contains("protocol 2, expected 1")
+                .contains("protocol 1, expected 2")
         );
         write(&good.replace(r#""kernel":"vmlinux""#, r#""kernel":"../../etc/vmlinux""#));
         assert!(
@@ -2325,7 +2325,7 @@ mod tests {
         fs::write(dir.path().join(KERNEL_FILE), b"k").unwrap();
         fs::write(dir.path().join(ROOTFS_FILE), b"r").unwrap();
         let mut value = serde_json::json!({
-            "id": "python-stdlib-py314-v1", "protocol": 1, "kernel": "vmlinux",
+            "id": "python-stdlib-py314-v1", "protocol": 2, "kernel": "vmlinux",
             "rootfs": "rootfs.squashfs", "agent_version": "0.1.0",
             "kernel_sha256": "0545ba1781fc06cfa1d7699069057f4538103fd1644100cf0da434899a1ed447",
             "built_from": "test",

@@ -300,7 +300,7 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
 
 fn ready() -> Message {
     Message::Ready {
-        protocol: 1,
+        protocol: 2,
         agent_version: "0.1.0".into(),
         mode: Mode::Job,
         vcpus: 1,
@@ -380,11 +380,11 @@ fn preflight_in_fake_mode_checks_the_program_and_the_image() {
     let original = fs::read_to_string(&image_json).unwrap();
     fs::write(
         &image_json,
-        original.replace("\"protocol\":1", "\"protocol\":2"),
+        original.replace("\"protocol\":2", "\"protocol\":1"),
     )
     .unwrap();
     let err = preflight(&fx.cfg).unwrap_err();
-    assert!(err.contains("protocol 2"), "{err}");
+    assert!(err.contains("protocol 1"), "{err}");
     fs::write(&image_json, &original).unwrap();
     preflight(&fx.cfg).unwrap();
 

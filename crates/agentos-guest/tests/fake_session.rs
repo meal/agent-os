@@ -100,7 +100,7 @@ impl FakeGuest {
 
     fn hello(&self, token: &str, mode: Mode) -> UnixStream {
         let mut s = self.connect();
-        send(&mut s, hello_msg(1, token, mode));
+        send(&mut s, hello_msg(2, token, mode));
         let Message::Ready { mode: got, .. } = recv(&mut s) else {
             panic!("no Ready")
         };
@@ -159,7 +159,7 @@ fn empty_snapshot(s: &mut UnixStream) {
 fn fake_guest_answers_connect_with_ok_and_hello_with_ready() {
     let g = spawn();
     let mut s = g.connect();
-    send(&mut s, hello_msg(1, TOKEN, Mode::Job));
+    send(&mut s, hello_msg(2, TOKEN, Mode::Job));
     let Message::Ready {
         protocol,
         agent_version,
@@ -172,7 +172,7 @@ fn fake_guest_answers_connect_with_ok_and_hello_with_ready() {
     };
     assert_eq!(
         (protocol, agent_version.as_str(), mode),
-        (1, "0.1.0", Mode::Job)
+        (2, "0.1.0", Mode::Job)
     );
     assert!(vcpus >= 1 && memory_mib > 0, "{vcpus} {memory_mib}");
 }
@@ -189,14 +189,50 @@ fn a_bad_connect_line_is_closed_and_the_guest_keeps_listening() {
 }
 
 #[test]
-fn a_hello_with_protocol_2_is_refused_and_the_connection_closed() {
+fn a_hello_with_protocol_1_is_refused_and_the_connection_closed() {
     let g = spawn();
     let mut s = g.connect();
-    send(&mut s, hello_msg(2, TOKEN, Mode::Job));
+    send(&mut s, hello_msg(1, TOKEN, Mode::Job));
     let Message::Refused { reason } = recv(&mut s) else {
         panic!("no Refused")
     };
-    assert!(reason.contains("protocol 2"), "{reason}");
+    assert_eq!(
+        reason,
+        "unsupported protocol 1, this agent speaks protocol 2"
+    );
+    assert_closed(&mut s);
+}
+
+fn run_agent_msg() -> Message {
+    Message::RunAgent {
+        argv: vec!["/bin/true".into()],
+        env: vec![],
+        timeout_secs: 5,
+        expected_base: agentos_core::ids::Digest::of(b"base"),
+    }
+}
+
+#[test]
+fn run_agent_in_inspect_mode_is_refused_and_the_session_lost() {
+    let g = spawn();
+    let mut s = g.hello(TOKEN, Mode::Inspect);
+    send(&mut s, run_agent_msg());
+    let Message::Refused { reason } = recv(&mut s) else {
+        panic!("no Refused")
+    };
+    assert_eq!(reason, "unexpected request RunAgent in inspect mode");
+    assert_closed(&mut s);
+}
+
+#[test]
+fn run_agent_in_job_mode_is_refused_until_agent_sessions_exist() {
+    let g = spawn();
+    let mut s = g.hello(TOKEN, Mode::Job);
+    send(&mut s, run_agent_msg());
+    let Message::Refused { reason } = recv(&mut s) else {
+        panic!("no Refused")
+    };
+    assert_eq!(reason, "agent sessions are not implemented yet");
     assert_closed(&mut s);
 }
 
@@ -205,7 +241,7 @@ fn a_second_connection_with_another_token_is_closed_without_a_reply() {
     let g = spawn();
     let mut first = g.hello(TOKEN, Mode::Job);
     let mut second = g.connect();
-    send(&mut second, hello_msg(1, OTHER, Mode::Job));
+    send(&mut second, hello_msg(2, OTHER, Mode::Job));
     assert_closed(&mut second);
     // The bound session is unaffected.
     empty_snapshot(&mut first);
@@ -228,7 +264,7 @@ fn a_second_connection_with_the_same_token_but_another_mode_is_closed_without_a_
     // The mode is bound with the token for the whole process: an inspect Hello mid-job
     // must never reach the inspect path (the VM would remount the workspace read-only).
     let mut second = g.connect();
-    send(&mut second, hello_msg(1, TOKEN, Mode::Inspect));
+    send(&mut second, hello_msg(2, TOKEN, Mode::Inspect));
     assert_closed(&mut second);
     empty_snapshot(&mut first);
 
@@ -236,7 +272,7 @@ fn a_second_connection_with_the_same_token_but_another_mode_is_closed_without_a_
     let g = spawn();
     let mut first = g.hello(TOKEN, Mode::Inspect);
     let mut second = g.connect();
-    send(&mut second, hello_msg(1, TOKEN, Mode::Job));
+    send(&mut second, hello_msg(2, TOKEN, Mode::Job));
     assert_closed(&mut second);
     send(&mut first, Message::Digest);
     assert!(matches!(
@@ -284,7 +320,7 @@ fn the_watchdog_ends_a_guest_that_never_gets_a_hello() {
         |_| {},
     );
     let mut s = g.connect();
-    send(&mut s, hello_msg(2, TOKEN, Mode::Job));
+    send(&mut s, hello_msg(1, TOKEN, Mode::Job));
     let status = wait_exit(&mut g.child, Duration::from_secs(5)).expect("the watchdog never fired");
     assert_eq!(status.code(), Some(0));
 

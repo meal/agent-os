@@ -913,7 +913,7 @@ async fn real_guest_boots_and_answers_ready_within_5s() {
             )
         });
         let hello = Message::Hello {
-            protocol: 1,
+            protocol: 2,
             attempt_token: mint_attempt_token(),
             task_id: fx.task.as_str().to_string(),
             effect_id: String::new(),
@@ -937,7 +937,7 @@ async fn real_guest_boots_and_answers_ready_within_5s() {
         assert!(took <= Duration::from_secs(5), "Ready after {took:?}");
         assert_eq!(
             (seen, mode, protocol),
-            (vcpus, Mode::Inspect, 1),
+            (vcpus, Mode::Inspect, 2),
             "Ready.vcpus equals worker_vcpus"
         );
         // MemTotal: the 256 MiB less the kernel's own reservation (about 26 MiB with this

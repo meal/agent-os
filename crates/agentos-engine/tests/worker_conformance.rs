@@ -1253,7 +1253,7 @@ fn send(s: &mut UnixStream, m: Message) {
 
 fn ready() -> Message {
     Message::Ready {
-        protocol: 1,
+        protocol: 2,
         agent_version: "0.1.0".into(),
         mode: Mode::Job,
         vcpus: 1,
@@ -1527,7 +1527,7 @@ async fn second_hello_with_another_token_is_refused() {
     stray.read_exact(&mut ok).unwrap();
     assert_eq!(&ok, b"OK 5200\n");
     let hello = Message::Hello {
-        protocol: 1,
+        protocol: 2,
         attempt_token: mint_attempt_token(),
         task_id: fx.task.as_str().to_string(),
         effect_id: req.effect_id.as_str().to_string(),

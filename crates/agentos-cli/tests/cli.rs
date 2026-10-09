@@ -2419,7 +2419,7 @@ fn fake_image_dir(cli: &Cli, name: &str, id: &str, rootfs_byte: u8) -> PathBuf {
     fs::write(
         dir.join("image.json"),
         json!({
-            "id": id, "protocol": 1, "kernel": "vmlinux", "rootfs": "rootfs.squashfs", "agent_version": "0.1.0",
+            "id": id, "protocol": 2, "kernel": "vmlinux", "rootfs": "rootfs.squashfs", "agent_version": "0.1.0",
             "kernel_sha256": "0545ba1781fc06cfa1d7699069057f4538103fd1644100cf0da434899a1ed447", "built_from": "test",
         })
         .to_string(),
@@ -2460,7 +2460,7 @@ fn image_register_refuses_a_bad_manifest() {
     let manifest = fs::read_to_string(dir.join("image.json")).unwrap();
     fs::write(
         dir.join("image.json"),
-        manifest.replace("\"protocol\":1", "\"protocol\":2"),
+        manifest.replace("\"protocol\":2", "\"protocol\":1"),
     )
     .unwrap();
     cli.cmd(&["image", "register", dir.to_str().unwrap()])
@@ -5547,7 +5547,7 @@ fn version_reports_what_the_code_speaks() {
     let cli = Cli::bare();
     let v = cli.json(&["version"]);
     assert_eq!(v["agentos"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(v["guest_protocol"], 1);
+    assert_eq!(v["guest_protocol"], 2);
     assert_eq!(v["model_policy_version"], 1);
     assert_eq!(v["model_limits_version"], 1);
     assert_eq!(v["vm_resources_version"], 1);

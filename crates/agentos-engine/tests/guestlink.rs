@@ -62,7 +62,7 @@ fn spawn_guest(env: &[(String, String)]) -> Guest {
 
 fn hello() -> Message {
     Message::Hello {
-        protocol: 1,
+        protocol: 2,
         attempt_token: TOKEN.into(),
         task_id: "t".into(),
         effect_id: "e".into(),
@@ -83,7 +83,7 @@ fn connected(g: &Guest) -> GuestLink {
         matches!(
             ready,
             Message::Ready {
-                protocol: 1,
+                protocol: 2,
                 mode: Mode::Job,
                 ..
             }
@@ -121,7 +121,7 @@ fn connect_waits_for_the_socket_and_completes_the_handshake() {
     );
     let ready = link.hello(hello(), soon(5)).unwrap();
     assert!(
-        matches!(ready, Message::Ready { protocol: 1, .. }),
+        matches!(ready, Message::Ready { protocol: 2, .. }),
         "{ready:?}"
     );
     let mut child = spawner.join().unwrap();
@@ -334,7 +334,7 @@ fn fake_guest_verb_is_wired_in_the_supervisor_binary() {
 }
 
 #[test]
-fn hello_requires_ready_protocol_one() {
+fn hello_requires_ready_at_our_protocol() {
     let dir = tempfile::tempdir().unwrap();
     let uds = dir.path().join("peer.sock");
     let listener = UnixListener::bind(&uds).unwrap();
@@ -345,7 +345,7 @@ fn hello_requires_ready_protocol_one() {
         s.write_all(b"OK 5200\n").unwrap();
         let _ = read_frame(&mut s, 0).unwrap();
         let ready = Message::Ready {
-            protocol: 2,
+            protocol: 1,
             agent_version: "x".into(),
             mode: Mode::Job,
             vcpus: 1,

@@ -75,7 +75,7 @@ pub fn fake_image(root: &Path) -> PathBuf {
     fs::create_dir_all(&dir).unwrap();
     fs::write(
         dir.join("image.json"),
-        r#"{"id":"python-stdlib-v1","protocol":1,"kernel":"vmlinux","rootfs":"rootfs.squashfs","agent_version":"0.1.0","kernel_sha256":"0545ba1781fc06cfa1d7699069057f4538103fd1644100cf0da434899a1ed447","built_from":"test"}"#,
+        r#"{"id":"python-stdlib-v1","protocol":2,"kernel":"vmlinux","rootfs":"rootfs.squashfs","agent_version":"0.1.0","kernel_sha256":"0545ba1781fc06cfa1d7699069057f4538103fd1644100cf0da434899a1ed447","built_from":"test"}"#,
     )
     .unwrap();
     fs::write(dir.join("vmlinux"), [0x7fu8; 16]).unwrap();

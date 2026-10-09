@@ -768,7 +768,7 @@ async fn staged_ws_img_is_owned_by_the_jail_uid_and_still_inspectable() {
     let until = Instant::now() + Duration::from_secs(15);
     let mut link = GuestLink::connect(&jail::host_uds(&plan), until).unwrap();
     let hello = Message::Hello {
-        protocol: 1,
+        protocol: 2,
         attempt_token: agentos_core::guest::mint_attempt_token(),
         task_id: fx.task.as_str().to_string(),
         effect_id: "inspect".into(),
