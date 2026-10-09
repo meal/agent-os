@@ -198,7 +198,7 @@ Each line has its test in the named task.
   every crash point, with the execution counter proving a retained response is never sent
   twice. GC rule: `session/` mailbox files are collected with the job directory.
 
-- [ ] **9a. New image recipe (no KVM run).** Decision: the three existing recipes are frozen (the
+- [x] **9a. New image recipe (no KVM run)** (aec9ec6, 84f3470; Claude Code 2.1.295 pinned by tarball sha256 d45a2fa1…, cross-checked against npm's sha512 by the controller; image digest f704479a60416b0e2c22e93bccdbaf21a87d569403dcd95a244517d977ae7aac, 237 MiB rootfs, reproducible; `acceptance.sh` allows it but its default image is unchanged).  Decision: the three existing recipes are frozen (the
   rc5 evidence cites their digests; their `image.json.in` stay at protocol 1 and are documented
   as v1-protocol only). One new recipe `guest/agent-cli-py314-v1` = the py314-v2 recipe (same
   kernel lock, same Python) with `"protocol":2` in its `image.json.in` plus the Claude Code
