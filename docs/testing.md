@@ -213,7 +213,7 @@ AGENTOS_ACCEPTANCE_IMAGE=python-stdlib-py314-v2 sh scripts/acceptance.sh kvm
 ```
 
 Both passed real KVM acceptance with the v0.1.0-rc5 controller. Since guest protocol 2 a controller
-refuses those protocol-1 images, so `scripts/acceptance.sh` defaults to `agent-cli-py314-v1`
+refuses those protocol-1 images, so `scripts/acceptance.sh` defaults to `agent-cli-py314-v1` (the release image is `python-stdlib-py314-v3`, the same without the CLI; the three agent tests need the CLI and name the image they require)
 (protocol 2: py314-v2 plus the pinned Claude Code native binary, see
 `guest/agent-cli-py314-v1/README.md`; same kernel); its KVM runs are recorded in
 `docs/evidence/2026-10-09/agent-session-kvm.md`. The older images work only with an rc5 controller

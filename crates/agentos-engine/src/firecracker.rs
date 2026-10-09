@@ -2506,6 +2506,7 @@ mod tests {
         let kernel_sha = "0545ba1781fc06cfa1d7699069057f4538103fd1644100cf0da434899a1ed447";
         for recipe in [
             "agent-cli-py314-v1",
+            "python-stdlib-py314-v3",
             "python-stdlib-v1",
             "python-stdlib-py314-v1",
             "python-stdlib-py314-v2",
@@ -2522,7 +2523,7 @@ mod tests {
             fs::write(dir.path().join(KERNEL_FILE), b"k").unwrap();
             fs::write(dir.path().join(ROOTFS_FILE), b"r").unwrap();
             let result = read_image(dir.path());
-            if recipe == "agent-cli-py314-v1" {
+            if recipe == "agent-cli-py314-v1" || recipe == "python-stdlib-py314-v3" {
                 let manifest = result.unwrap_or_else(|e| panic!("{recipe}: {e}"));
                 assert_eq!(manifest.id, recipe);
             } else {
@@ -2530,6 +2531,36 @@ mod tests {
                 assert!(err.contains("protocol 1, expected 2"), "{recipe}: {err}");
             }
         }
+    }
+
+    /// The agent CLI binary is Anthropic's, under an all-rights-reserved license: a published
+    /// release must not carry it. The release image is the protocol-2 Python image without the
+    /// CLI; the agent image is built by whoever wants it, which downloads the pinned binary.
+    #[test]
+    fn the_release_image_carries_no_agent_cli() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let release = fs::read_to_string(repo.join("scripts/release.sh")).unwrap();
+        let default = release
+            .lines()
+            .find(|l| l.starts_with("image=${2:-"))
+            .expect("release.sh names its default image");
+        assert_eq!(default, "image=${2:-python-stdlib-py314-v3}");
+        let recipe = repo.join("guest/python-stdlib-py314-v3");
+        for entry in fs::read_dir(&recipe)
+            .unwrap()
+            .chain(fs::read_dir(recipe.join("hooks")).unwrap())
+        {
+            let path = entry.unwrap().path();
+            if path.is_file() && path.file_name().is_some_and(|n| n != "README.md") {
+                let text = fs::read_to_string(&path).unwrap_or_default();
+                assert!(
+                    !text.contains("agent-cli") && !text.contains("claude-code"),
+                    "{} mentions the agent CLI",
+                    path.display()
+                );
+            }
+        }
+        assert!(!recipe.join("agent-cli.lock").exists());
     }
 
     /// `agent-cli.lock` is sourced by the image hook: plain `KEY=VALUE` lines, the npm tarball

@@ -7,7 +7,7 @@ through a protected verification of exactly the final workspace. The controller 
 killed at any of those boundaries, and a restarted one recovers the same task without
 repeating completed effects.
 
-This is **v0.2** (engine preview [v0.2.0-rc1](docs/releases/v0.2.0-rc1.md), which adds an agent CLI that can run inside the microVM; the CLI does not expose it yet). The v0.1 feature set below is unchanged (last v0.1 candidate: [v0.1.0-rc5](docs/releases/v0.1.0-rc5.md)). The agent is either a deterministic fake that
+This is **v0.2** (engine preview [v0.2.0-rc2](docs/releases/v0.2.0-rc2.md), which adds an agent CLI that can run inside the microVM (you build that image yourself); the CLI does not expose it yet). The v0.1 feature set below is unchanged (last v0.1 candidate: [v0.1.0-rc5](docs/releases/v0.1.0-rc5.md)). The agent is either a deterministic fake that
 applies a given patch (`--fake-agent-patch`, the default for tests and demos) or a model agent
 that drives the repository through five tools (`--model anthropic:<model>` for the Anthropic
 Messages API, `--model fake:<transcript>` for a scripted, offline provider). The real-model
@@ -71,9 +71,11 @@ The PR/push workflow uses the same commands with separate Compose projects. Run
 The image exposes that interpreter directly to verification so pyenv shims add no
 environment variables. `scripts/test-python-runtime.sh` checks both legacy and current
 interpreter acceptance. The `python-stdlib-py314-v1` and `python-stdlib-py314-v2` guests passed
-real KVM acceptance; `agent-cli-py314-v1` (guest protocol 2, the py314-v2 recipe plus the pinned agent CLI) is the
-release image and the default of `scripts/acceptance.sh`; the protocol-1 images work only with a
-v0.1.0-rc5 controller.
+real KVM acceptance; `python-stdlib-py314-v3` (guest protocol 2, the py314-v2 recipe without an agent CLI) is the
+release image. `agent-cli-py314-v1` (the same plus the pinned Claude Code binary) is the default of
+`scripts/acceptance.sh` and is **built by whoever wants it** from `guest/agent-cli-py314-v1`: the
+binary is Anthropic's (all rights reserved), so no release ships it. The protocol-1 images work only
+with a v0.1.0-rc5 controller.
 
 Everything runs in Docker through compose (Rust toolchain, `python3` and `git` are in the
 image):

@@ -27,7 +27,7 @@ export COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-agentos-acceptance}
 # The protocol-1 recipes are refused by a protocol-2 controller; only the agent image is current.
 default_image=agent-cli-py314-v1
 image=${AGENTOS_ACCEPTANCE_IMAGE:-$default_image}
-case "$image" in python-stdlib-v1|python-stdlib-py314-v1|python-stdlib-py314-v2|agent-cli-py314-v1) ;; *) echo 'unsupported acceptance image' >&2; exit 2;; esac
+case "$image" in python-stdlib-v1|python-stdlib-py314-v1|python-stdlib-py314-v2|python-stdlib-py314-v3|agent-cli-py314-v1) ;; *) echo 'unsupported acceptance image' >&2; exit 2;; esac
 out=${AGENTOS_ACCEPTANCE_OUTPUT:-build/evidence/$(date -u +%Y%m%dT%H%M%SZ)-$$}
 mkdir -p "$(dirname "$out")"
 mkdir "$out" # Refuse existing destinations; preserve every attempt.
@@ -53,7 +53,7 @@ if [ "$mode" = offline ]; then
 fi
 run build docker compose build test test-kvm
 run firecracker docker compose run --rm test-kvm sh scripts/fetch-firecracker.sh
-if [ "$image" = python-stdlib-py314-v2 ] || [ "$image" = agent-cli-py314-v1 ]; then
+if [ "$image" = python-stdlib-py314-v2 ] || [ "$image" = python-stdlib-py314-v3 ] || [ "$image" = agent-cli-py314-v1 ]; then
   # Its kernel is built here from pinned source, twice, before the image is built (the same
   # kernel for agent-cli-py314-v1, which is py314-v2 plus the agent CLI).
   run kernel-builder docker compose build kernel-builder

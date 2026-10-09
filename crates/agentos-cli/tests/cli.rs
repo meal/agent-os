@@ -2473,6 +2473,8 @@ fn image_register_accepts_the_agent_cli_recipe_and_refuses_the_protocol_1_recipe
     };
     let accepted = register_image(&cli, &render("agent-cli-py314-v1"));
     assert_eq!(accepted["id"], "agent-cli-py314-v1");
+    let release_image = register_image(&cli, &render("python-stdlib-py314-v3"));
+    assert_eq!(release_image["id"], "python-stdlib-py314-v3");
     for recipe in [
         "python-stdlib-v1",
         "python-stdlib-py314-v1",
@@ -2483,7 +2485,7 @@ fn image_register_accepts_the_agent_cli_recipe_and_refuses_the_protocol_1_recipe
             .code(2)
             .stderr(predicate::str::contains("protocol 1, expected 2"));
     }
-    assert_eq!(cli.json(&["image", "list"]).as_array().unwrap().len(), 1);
+    assert_eq!(cli.json(&["image", "list"]).as_array().unwrap().len(), 2);
 }
 
 #[test]
