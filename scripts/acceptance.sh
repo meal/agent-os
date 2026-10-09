@@ -4,12 +4,12 @@ set -eu
 umask 077
 REPO=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 cd "$REPO"
-usage() { echo 'usage: scripts/acceptance.sh offline|kvm|live [KEY_FILE]' >&2; exit 2; }
+usage() { echo 'usage: scripts/acceptance.sh offline|kvm|live|live-agent [KEY_FILE]' >&2; exit 2; }
 [ "$#" -ge 1 ] || usage
 mode=$1
 case "$mode" in
   offline|kvm) [ "$#" -eq 1 ] || usage;;
-  live)
+  live|live-agent)
     [ "$#" -eq 2 ] || usage
     key=$2
     # Refuse FIFOs/symlinks before any read, network, image build or model invocation.
@@ -23,7 +23,10 @@ if [ "$mode" != offline ]; then
   [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] || { echo 'requested acceptance requires usable /dev/kvm' >&2; exit 2; }
 fi
 export COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-agentos-acceptance}
-image=${AGENTOS_ACCEPTANCE_IMAGE:-python-stdlib-v1}
+# The agent session runs the Claude Code image; every other mode keeps the parser image.
+default_image=python-stdlib-v1
+[ "$mode" != live-agent ] || default_image=agent-cli-py314-v1
+image=${AGENTOS_ACCEPTANCE_IMAGE:-$default_image}
 case "$image" in python-stdlib-v1|python-stdlib-py314-v1|python-stdlib-py314-v2|agent-cli-py314-v1) ;; *) echo 'unsupported acceptance image' >&2; exit 2;; esac
 out=${AGENTOS_ACCEPTANCE_OUTPUT:-build/evidence/$(date -u +%Y%m%dT%H%M%SZ)-$$}
 mkdir -p "$(dirname "$out")"
@@ -57,6 +60,18 @@ if [ "$image" = python-stdlib-py314-v2 ] || [ "$image" = agent-cli-py314-v1 ]; t
   run kernel docker compose run --rm kernel-builder sh scripts/build-kernel.sh build/kernels/out --verify
 fi
 run image docker compose run --rm test-kvm sh scripts/build-guest-image.sh "guest/$image" "build/guest-images/$image" --verify
+if [ "$mode" = live-agent ]; then
+  # One billed run of the real CLI on the microVM. Its recording, bundle and summary land in
+  # $out/agent; the key is a read-only mount, never a value.
+  mkdir "$out/agent"
+  run live-agent docker compose run --rm \
+    -v "$key:/run/agentos/key:ro" -v "$out/agent:/evidence" \
+    -e AGENTOS_API_KEY_FILE=/run/agentos/key -e AGENTOS_LIVE_MODEL_TESTS=1 \
+    -e AGENTOS_LIVE_RECORDING_DIR=/evidence \
+    -e "AGENTOS_EVIDENCE_COMMIT=$commit" -e "AGENTOS_GUEST_IMAGE=/work/build/guest-images/$image" \
+    test-kvm cargo test -p agentos-engine --locked --test live_agent_session -- --nocapture --test-threads 1
+  exit 0
+fi
 if [ "$mode" = kvm ]; then
   run kvm docker compose run --rm -e "AGENTOS_GUEST_IMAGE=/work/build/guest-images/$image" test-kvm cargo test --workspace --locked
   run real-worker docker compose run --rm -e "AGENTOS_GUEST_IMAGE=/work/build/guest-images/$image" -e AGENTOS_TEST_WORKER=firecracker test-kvm cargo test --workspace --locked
