@@ -1477,15 +1477,8 @@ async fn a_controller_that_never_answers_is_ended_by_the_cancel_marker_and_the_v
     );
     assert!(guests_of(&job).is_empty(), "the VM is reaped");
     // The guest kills its CLI as it goes: a process that is still exiting gets a moment.
-    let until = Instant::now() + Duration::from_secs(10);
-    while !pids_with(&cli).is_empty() && Instant::now() < until {
-        thread::sleep(Duration::from_millis(50));
-    }
-    assert!(pids_with(&cli).is_empty(), "no CLI survives the job");
-    assert!(
-        pids_with("sleep 600").is_empty(),
-        "no sleep survives the job"
-    );
+    common::assert_gone_within("the CLI", || pids_with(&cli));
+    common::assert_gone_within("the sleep of the CLI", || pids_with("sleep 600"));
 }
 
 #[tokio::test]
@@ -1534,10 +1527,7 @@ async fn a_session_past_its_lease_is_ended_with_the_vm_reaped() {
     let why = reason(&out);
     assert!(why.contains("lease"), "{why}");
     assert!(guests_of(&job).is_empty(), "the VM is reaped");
-    assert!(
-        pids_with("sleep 600").is_empty(),
-        "no sleep survives the job"
-    );
+    common::assert_gone_within("the sleep of the CLI", || pids_with("sleep 600"));
 }
 
 #[tokio::test]

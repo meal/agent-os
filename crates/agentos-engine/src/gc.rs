@@ -47,6 +47,16 @@ const TICKET_VERSION: u64 = 2;
 const TICKET_TMP_PREFIX: &str = ".tmp-ticket-";
 /// The only files removed from a job directory, once its receipt is the published result.
 const JOB_FILES: [&str; 3] = ["output.bin", "scratch.img", "v.sock"];
+/// The agent-session mailbox of a job (`session/`): a request or response copy, `<id>.req` or
+/// `<id>.resp`, or either one's half-written `<name>.tmp`.
+fn is_mailbox_file(name: &str) -> bool {
+    let stem = name.strip_suffix(".tmp").unwrap_or(name);
+    matches!(
+        stem.rsplit_once('.'),
+        Some((id, "req" | "resp"))
+            if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())
+    )
+}
 const WORKSPACES: [&str; 3] = ["ws", "workspace", "ws.img"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -668,11 +678,18 @@ fn ticket_shape(ticket: &Ticket) -> Result<(), String> {
                 && proof.result.is_none()
         }
         Kind::JobFile => {
-            parts.len() == 3
-                && parts[0] == "jobs"
+            // A redundant file of the job, or a file of its session mailbox.
+            let inside = match parts.len() {
+                3 => {
+                    JOB_FILES.iter().any(|n| parts[2] == *n)
+                        && (parts[2] != "v.sock" || proof.firecracker_socket)
+                }
+                4 => parts[2] == "session" && parts[3].to_str().is_some_and(is_mailbox_file),
+                _ => false,
+            };
+            parts[0] == "jobs"
                 && owned(&proof.effect, &proof.attempt).is_some_and(|o| parts[1] == o.as_str())
-                && JOB_FILES.iter().any(|n| parts[2] == *n)
-                && (parts[2] != "v.sock" || proof.firecracker_socket)
+                && inside
                 && proof.result.is_some()
         }
         Kind::Model | Kind::Analysis => {
@@ -1222,6 +1239,43 @@ impl Pass<'_> {
                 parent: job_identity,
             });
         }
+        // The agent-session mailbox is a copy of journaled bodies too: its files go with the rest.
+        if let Some(session) = owned_dir_opt(&job, "session")? {
+            let session_identity = confined::dir_identity(&session)?;
+            for entry in fs::read_dir(pinned(&session)).map_err(path_error)? {
+                let entry = entry.map_err(path_error)?;
+                let file = entry.file_name();
+                let Some(file) = file.to_str().filter(|f| is_mailbox_file(f)) else {
+                    return Err(Fail::Retain(
+                        "unexpected entry in the job's session mailbox".into(),
+                    ));
+                };
+                let Some(st) = confined::stat(&session, OsStr::new(file))? else {
+                    continue;
+                };
+                let ft = confined::file_type(&st);
+                if ft != FileType::RegularFile {
+                    return Err(Fail::Retain(
+                        "unexpected entry in the job's session mailbox".into(),
+                    ));
+                }
+                deletes.push(Delete {
+                    relative: Path::new("jobs").join(name).join("session").join(file),
+                    kind: Kind::JobFile,
+                    proof: Proof {
+                        task: task.clone(),
+                        effect: Some(rec.effect_id.clone()),
+                        attempt: Some(out.receipt.attempt_id.clone()),
+                        result: Some(digest),
+                        lease: rec.lease_generation,
+                        firecracker_socket: firecracker,
+                    },
+                    identity: confined::identity_of(&st),
+                    file_type: ft,
+                    parent: session_identity,
+                });
+            }
+        }
         Ok(if deletes.is_empty() {
             JobClass::Collected
         } else {
@@ -1673,8 +1727,15 @@ impl Pass<'_> {
             ));
         }
         let name = d.relative.file_name().expect("owned name");
+        // A session file is guarded by its job's lock, the directory above `session/`.
+        let job_dir = match d.relative.parent() {
+            Some(dir) if dir.file_name() == Some(OsStr::new("session")) => {
+                Some(confined::parent(&self.anchor, dir).map_err(path_error)?)
+            }
+            _ => None,
+        };
         let _job_lock = if d.kind == Kind::JobFile {
-            self.job_lock(&parent)
+            self.job_lock(job_dir.as_ref().unwrap_or(&parent))
                 .map_err(|f| Fail::Refuse(f.text().to_string()))?
         } else {
             None

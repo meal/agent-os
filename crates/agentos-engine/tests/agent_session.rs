@@ -24,8 +24,7 @@ use agentos_store::blob::BlobStore;
 use agentos_store::db::{Db, StoredEvent};
 use common::{
     CURL, FnAgent, answer, assert_no_process_survives, copy_dir, create_patch,
-    fake_firecracker_config, fixtures, processes_of_home, routing_over, supervised,
-    two_calls_and_a_fix,
+    fake_firecracker_config, fixtures, routing_over, supervised, two_calls_and_a_fix,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -309,10 +308,7 @@ async fn the_model_budget_stops_a_session_that_calls_past_it_and_kills_the_cli()
         1,
         "the second call never reached the provider"
     );
-    assert!(
-        processes_of_home(w.dir.path()).is_empty(),
-        "the CLI was killed and reaped"
-    );
+    assert_no_process_survives(w.dir.path());
 }
 
 #[tokio::test]
@@ -332,7 +328,7 @@ async fn a_task_without_model_request_sends_nothing_to_the_provider() {
     );
     assert_eq!(w.provider.calls(), 0);
     assert_eq!(w.denials("CapabilityDenied").len(), 1);
-    assert!(processes_of_home(w.dir.path()).is_empty());
+    assert_no_process_survives(w.dir.path());
 }
 
 #[tokio::test]
@@ -437,10 +433,7 @@ async fn a_session_that_outlives_its_time_is_ended_with_the_cli_killed_and_repor
         ended.payload["observation"]["SessionEnded"]["timed_out"],
         true
     );
-    assert!(
-        processes_of_home(w.dir.path()).is_empty(),
-        "the CLI was killed"
-    );
+    assert_no_process_survives(w.dir.path());
 }
 
 #[tokio::test]
@@ -658,9 +651,17 @@ async fn a_model_call_still_in_flight_when_its_session_ends_is_settled() {
             .unwrap(),
         TaskState::Failed
     );
-    assert_eq!(w.failed_reason().as_deref(), Some("agent session lost"));
+    // Whether the cancelled job left its receipt before it was killed decides the session's
+    // end: a failure receipt (FAILED), or none (UNKNOWN, lost). Both end the task as lost.
+    let session = w.effects("RunAgentSession")[0].state;
+    match w.failed_reason().as_deref() {
+        Some("agent session lost") => assert_eq!(session, EffectState::Unknown),
+        Some("agent session failed: agent session cancelled") => {
+            assert_eq!(session, EffectState::Failed)
+        }
+        other => panic!("the session ended as {other:?}"),
+    }
     assert_eq!(w.provider.calls(), 1, "the call was sent once");
-    assert_eq!(w.effects("RunAgentSession")[0].state, EffectState::Unknown);
     assert_eq!(w.effects("ModelCall")[0].state, EffectState::Completed);
     // Only the lost session stays open (UNKNOWN); no model call is left in flight.
     let open = w.db.outstanding_effects(&w.task).unwrap();

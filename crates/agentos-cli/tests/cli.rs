@@ -1730,10 +1730,23 @@ fn revoke_unknown_capability_name_exits_2() {
     let contract = cli.contract(&cli.repo_copy());
     let done = cli.submit_yes(&contract, &fix_patch());
     let id = done["task_id"].as_str().unwrap();
-    cli.cmd(&["revoke", id, "--capability", "teleport.now"])
+    let mut assert = cli
+        .cmd(&["revoke", id, "--capability", "teleport.now"])
         .assert()
         .code(2)
         .stderr(predicate::str::contains("unknown capability"));
+    // The message lists every capability the contract may name.
+    for name in [
+        "snapshot.read",
+        "workspace.apply_patch",
+        "verification.run",
+        "artifact.export",
+        "model.request",
+        "snapshot.analyze",
+        "agent.session",
+    ] {
+        assert = assert.stderr(predicate::str::contains(name));
+    }
 }
 
 #[test]

@@ -494,23 +494,29 @@ pub fn assert_forwards_sessions<E: Executor>(exec: &E, root: &Path, jobs_root: &
     );
 }
 
-/// Waits up to 10 s for every process of `root` (its job directories and, in real mode, its
-/// VMs) to be gone, then panics with the survivors. A job's processes are reaped a moment
-/// after its receipt is written, so an instant scan right after the run is not a test of
-/// leftovers.
-pub fn assert_no_process_survives(root: &Path) {
+/// Waits up to 10 s for `live()` (the pids of what must be gone) to come back empty, then
+/// panics with the survivors. A killed process leaves `/proc` only once the kernel has torn it
+/// down, and a grandchild of a killed group is reaped by its new parent, which is not this
+/// process: an instant scan right after a run is no test of leftovers.
+pub fn assert_gone_within(what: &str, mut live: impl FnMut() -> Vec<i32>) {
     let started = Instant::now();
     loop {
-        let live = processes_of_home(root);
-        if live.is_empty() {
+        let pids = live();
+        if pids.is_empty() {
             return;
         }
         assert!(
             started.elapsed() < Duration::from_secs(10),
-            "processes outlived their job: {live:?}"
+            "{what} outlived its job: {pids:?}"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// [`assert_gone_within`] for every process of `root`: its job directories and, in real mode,
+/// its VMs.
+pub fn assert_no_process_survives(root: &Path) {
+    assert_gone_within("a process of this home", || processes_of_home(root));
 }
 
 /// A supervised executor running `worker` jobs under `jobs_root` with the real supervisor

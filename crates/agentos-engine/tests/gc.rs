@@ -2018,3 +2018,35 @@ fn a_settled_analysis_retention_is_collected() {
         "the report blob stays"
     );
 }
+
+/// A settled job's agent-session mailbox (`session/`) is part of the job: its request and
+/// response files are copies of journaled bodies and go with the job's redundant copies, and a
+/// half-written `.tmp` is never kept.
+#[test]
+fn a_settled_jobs_session_mailbox_is_collected_with_its_redundant_copies() {
+    let (env, job, retention) = settled();
+    let session = job.path.join("session");
+    fs::create_dir(&session).unwrap();
+    for name in ["1.req", "1.resp", "2.req.tmp"] {
+        fs::write(session.join(name), b"mailbox bytes").unwrap();
+    }
+    let report = gc(env.dir.path(), &env, false);
+    for name in ["1.req", "1.resp", "2.req.tmp"] {
+        assert!(
+            !session.join(name).exists(),
+            "{name} is redundant: {report:?}"
+        );
+    }
+    assert!(
+        job.path.join("receipt.json").exists(),
+        "the receipt is kept"
+    );
+    assert!(!retention.exists());
+    let again = gc(env.dir.path(), &env, false);
+    assert_eq!(
+        status_of(&again, &rel(&env, &job.path)),
+        ["collected"],
+        "{again:?}"
+    );
+    assert!(!again.failed(), "{again:?}");
+}

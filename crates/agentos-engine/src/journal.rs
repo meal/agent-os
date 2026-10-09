@@ -62,8 +62,6 @@ pub(crate) fn append_turn(
 /// Journals one model request a guest session sent: `id` is the CLI's request number,
 /// `request` the digest of the body the runner sent, `requested_model` the model the CLI asked
 /// for and `model` the one it was sent to. An audit event: `session_turns` never reads it.
-// The session runner journals through it; until then nothing calls it.
-#[allow(dead_code)]
 pub(crate) fn append_session_call(
     db: &Db,
     task: &TaskId,
