@@ -1228,3 +1228,44 @@ async fn supervisor_environment_holds_only_path_and_the_explicit_extras() {
         }
     }
 }
+
+/// A job whose request cannot be read has no known kind, so no known lease: it is waited
+/// for no longer than the longest job of any kind may run (the clamp, plus the grace), and
+/// a session is not waited for hours.
+#[tokio::test]
+async fn an_unreadable_request_is_waited_for_no_longer_than_the_non_session_bound() {
+    let fx = Fx::new();
+    let exec = fx
+        .scripted("true")
+        .with_max_lease_clamp(Duration::from_millis(200))
+        .with_timeouts(EffectTimeouts {
+            verification: Duration::from_secs(1),
+            other: Duration::from_secs(1),
+            session: Duration::from_secs(20),
+        });
+    let req = fx.request(EffectKind::ReadSnapshot, b"");
+    let job_request = JobRequest {
+        effect_id: req.effect_id.clone(),
+        task_id: req.task_id.clone(),
+        kind: req.kind.clone(),
+        payload: Vec::new(),
+        contract: req.contract.clone(),
+        attempt_id: AttemptId::new(),
+        lease_generation: 1,
+        lease_expiry_ms: i64::MAX,
+        task_deadline_ms: 0,
+        worker: WorkerConfig::Scripted(ScriptedConfig {
+            script: "true".into(),
+        }),
+    };
+    // Alive (its lock held) with a request that cannot be read.
+    let (job, _lock) = JobDir::create(&fx.path("jobs"), &job_request).unwrap();
+    fs::write(job.path.join("request.json"), b"{ not a request").unwrap();
+    let started = Instant::now();
+    assert_eq!(exec.await_job(&req.effect_id).await, JobWait::StillAlive);
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_millis(5_100) && waited < Duration::from_secs(8),
+        "waited {waited:?}"
+    );
+}

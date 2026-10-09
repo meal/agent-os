@@ -929,15 +929,13 @@ impl Executor for SupervisedExecutor {
             .and_then(|r| r.current_workspace(task))
     }
 
-    /// [`SupervisedExecutor::wait_for_job`]; a job whose request cannot be read is waited
-    /// for as long as the longest effect timeout plus `GRACE_MS`.
+    /// [`SupervisedExecutor::wait_for_job`]. A job whose request cannot be read has no known
+    /// kind, so no known lease (`request.json` is the only record of one): it is waited for
+    /// the longest job of any kind may run, `max_lease_clamp_ms` plus `GRACE_MS`, and never
+    /// longer, whatever the session timeout is.
     async fn await_job(&self, effect: &EffectId) -> JobWait {
-        let longest = self
-            .timeouts
-            .verification
-            .max(self.timeouts.other)
-            .max(session_timeout(self.timeouts.session));
-        self.wait_for_job(effect, longest + Duration::from_millis(GRACE_MS as u64))
+        let bound = self.max_lease_clamp_ms.max(0).saturating_add(GRACE_MS);
+        self.wait_for_job(effect, Duration::from_millis(bound as u64))
             .await
     }
 
