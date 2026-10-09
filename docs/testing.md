@@ -205,13 +205,14 @@ sh scripts/acceptance.sh live /absolute/path/to/anthropic-key
 `live` requires KVM too: it covers both the host and jailed Firecracker worker,
 with a bounded fixture repair and offline replay of the real recording. It does
 not just run a host smoke test. Missing setup fails explicitly rather than passing
-as a skipped gate. The candidate Python 3.14 image has a separate optional gate:
+as a skipped gate. The Python 3.14 images are selected the same way; `python-stdlib-py314-v2`,
+the release image, first builds its kernel from source twice:
 
 ```sh
-AGENTOS_ACCEPTANCE_IMAGE=python-stdlib-py314-v1 sh scripts/acceptance.sh kvm
+AGENTOS_ACCEPTANCE_IMAGE=python-stdlib-py314-v2 sh scripts/acceptance.sh kvm
 ```
 
-The legacy image stays the default until candidate acceptance succeeds. See
+Both passed real KVM acceptance; the tests' default image stays `python-stdlib-v1`. See
 [evidence requirements](evidence/README.md) before promoting recordings or logs.
 
 ## What to preserve if a test fails
