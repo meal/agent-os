@@ -28,7 +28,65 @@ pub fn normalize_request(body: &[u8], max_tokens_cap: u32) -> Result<Vec<u8>, St
     for field in STRIPPED_FIELDS {
         object.remove(field);
     }
+    if let Some(messages) = object.get_mut("messages").and_then(Value::as_array_mut) {
+        *messages = plain_messages(messages)?;
+    }
     serde_json::to_vec(&request).map_err(|e| e.to_string())
+}
+
+/// The messages as the standard Messages API takes them: only `role` and `content`, and no
+/// `system` role (a beta feature, sent without its beta header). A `system` message's content
+/// joins the `user` message before it, or else the one after it, after that message's own
+/// blocks, so a `tool_result` is never separated from its `tool_use` and stays first; a
+/// `system` message with no `user` message to join stands alone as one.
+fn plain_messages(messages: &[Value]) -> Result<Vec<Value>, String> {
+    let mut out: Vec<Value> = Vec::new();
+    let mut pending: Vec<Value> = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        let object = message
+            .as_object()
+            .ok_or_else(|| format!("message {index} is not an object"))?;
+        let role = object
+            .get("role")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("message {index} has no role"))?;
+        let content = object.get("content").cloned().unwrap_or(Value::Null);
+        match role {
+            "system" => {
+                let blocks = blocks_of(content);
+                match out.last_mut() {
+                    Some(last) if last["role"] == "user" => append_blocks(last, blocks),
+                    _ => pending.extend(blocks),
+                }
+            }
+            role => {
+                let mut plain = json!({"role": role, "content": content});
+                if role == "user" && !pending.is_empty() {
+                    append_blocks(&mut plain, std::mem::take(&mut pending));
+                }
+                out.push(plain);
+            }
+        }
+    }
+    if !pending.is_empty() {
+        out.push(json!({"role": "user", "content": pending}));
+    }
+    Ok(out)
+}
+
+/// Content as a list of blocks (a bare string is one text block).
+fn blocks_of(content: Value) -> Vec<Value> {
+    match content {
+        Value::Array(blocks) => blocks,
+        Value::String(text) => vec![json!({"type": "text", "text": text})],
+        _ => Vec::new(),
+    }
+}
+
+fn append_blocks(message: &mut Value, extra: Vec<Value>) {
+    let mut blocks = blocks_of(message["content"].take());
+    blocks.extend(extra);
+    message["content"] = Value::Array(blocks);
 }
 
 /// True only when the body is a JSON object whose `stream` is `true`.
@@ -177,6 +235,60 @@ mod tests {
     fn stream_true_is_forced_false() {
         let body = normalized(r#"{"messages":[],"stream":true}"#);
         assert_eq!(body["stream"], json!(false));
+    }
+
+    #[test]
+    fn a_mid_conversation_system_message_joins_the_user_message_before_it() {
+        // What the live API refused: `messages.1.output_config: Extra inputs are not permitted`
+        // on a `system`-role message the agent CLI sends with its own `output_config`.
+        let body = r#"{"messages":[
+            {"role":"user","content":[{"type":"text","text":"goal"}]},
+            {"role":"system","output_config":{"effort":"low"},"content":[{"type":"text","text":"reminder","cache_control":{"type":"ephemeral"}}]},
+            {"role":"assistant","content":"ok","extra":1}
+        ]}"#;
+        let request = normalized(body);
+        let messages = request["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(
+            messages[0]["content"][1]["cache_control"]["type"],
+            "ephemeral"
+        );
+        for message in messages {
+            let mut keys: Vec<_> = message.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            assert_eq!(keys, ["content", "role"], "{message}");
+        }
+        assert_eq!(messages[0]["content"][0]["text"], "goal");
+        assert_eq!(messages[1]["role"], "assistant");
+    }
+
+    #[test]
+    fn a_system_message_between_a_tool_use_and_its_result_never_separates_them() {
+        let body = r#"{"messages":[
+            {"role":"user","content":"goal"},
+            {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]},
+            {"role":"system","content":[{"type":"text","text":"reminder"}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]},
+            {"role":"system","content":"trailing"}
+        ]}"#;
+        let request = normalized(body);
+        let messages = request["messages"].as_array().unwrap();
+        let roles: Vec<_> = messages
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "user"]);
+        let last = messages[2]["content"].as_array().unwrap();
+        assert_eq!(last[0]["type"], "tool_result", "{last:?}");
+        assert_eq!(last[1], json!({"type":"text","text":"reminder"}));
+        assert_eq!(last[2], json!({"type":"text","text":"trailing"}));
+    }
+
+    #[test]
+    fn a_message_that_is_not_an_object_is_refused() {
+        let err = normalize_request(br#"{"messages":["plain"]}"#, CAP).unwrap_err();
+        assert!(err.contains("message 0"), "{err}");
     }
 
     #[test]
