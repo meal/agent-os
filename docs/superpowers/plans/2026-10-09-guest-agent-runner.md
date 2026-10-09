@@ -67,7 +67,7 @@ Each line has its test in the named task.
 - `stream:true` from the CLI gets a valid SSE event sequence back (Task 2, Task 4).
 - A body with `max_tokens` above the contract cap is clamped and the clamped body is journaled
   (Task 2, Task 7).
-- A request to `/v1/messages/count_tokens`, `/api/event_logging`, or an unknown path returns at
+- A request to `/v1/messages/count_tokens` or an unknown path; `POST /v1/messages?beta=true` (the query string) is the forwarded one returns at
   once and is not counted against the budget (Task 4).
 - A CLI that never calls the model and never exits, or one that keeps calling past the budget,
   ends at the deadline/budget with the process killed (Task 5, Task 7).
@@ -78,7 +78,7 @@ Each line has its test in the named task.
 
 ---
 
-- [ ] **1. Spike the real CLI's traffic (no key, no bill).** Look up the current Claude Code and
+- [x] **1. Spike the real CLI's traffic (no key, no bill).** Look up the current Claude Code and
   Node versions online; record them. `scripts/cli-traffic-stub.py` (stdlib `http.server`) logs
   method, path, headers and body shape of every request and answers `401`-style errors without
   contacting anyone. Run the CLI with `ANTHROPIC_BASE_URL` pointing at it, a dummy
@@ -90,7 +90,7 @@ Each line has its test in the named task.
 
 - [ ] **2. Pure message codec (`agentos-core/src/messages.rs`).** `normalize_request(body, cap)
   -> Result<Vec<u8>, String>`: parses JSON, requires an object with `messages`, sets
-  `stream:false`, lowers `max_tokens` to `cap` (missing => `cap`), keeps sorted-key canonical
+  `stream:false`, lowers `max_tokens` to `cap` (missing => `cap`), removes `context_management`, `safeguards` and `output_config` (Task 1 findings: beta-only fields, and we send no beta header), keeps sorted-key canonical
   bytes (serde_json maps are sorted). `sse_from_message(response: &Value) -> Vec<u8>`:
   `message_start`, one `content_block_start`/`..._delta`/`..._stop` per block (text ->
   `text_delta`, tool_use -> `input_json_delta` with the input serialized once), `message_delta`
