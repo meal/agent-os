@@ -706,6 +706,11 @@ async fn act<E: Executor>(
         }
         AgentAction::ListFiles => list_files(cx, since, turn, base).await,
         AgentAction::ReadFile(path) => read_file(cx, since, turn, base, path).await,
+        AgentAction::RunSession { .. } => Ok(Next::Stop(fail(
+            cx.db,
+            &cx.task,
+            "agent sessions are not wired into the runner yet",
+        )?)),
     }
 }
 
@@ -717,6 +722,7 @@ fn action_kind(action: &AgentAction) -> Option<&'static str> {
         AgentAction::CallModel { .. } => Some("model_call"),
         AgentAction::ListFiles => Some("list_files"),
         AgentAction::ReadFile(_) => Some("read_file"),
+        AgentAction::RunSession { .. } => Some("run_agent_session"),
         AgentAction::Finish => None,
     }
 }
@@ -725,6 +731,11 @@ fn describe(action: &AgentAction) -> String {
     match action {
         AgentAction::ApplyPatch(patch) => format!("ApplyPatch({})", Digest::of(patch.as_bytes())),
         AgentAction::CallModel { request, .. } => format!("CallModel({request})"),
+        // A session's argv, env and model are compared by digest: they are journaled once.
+        AgentAction::RunSession { .. } => format!(
+            "RunSession({})",
+            Digest::of(&serde_json::to_vec(action).unwrap_or_default())
+        ),
         other => format!("{other:?}"),
     }
 }
