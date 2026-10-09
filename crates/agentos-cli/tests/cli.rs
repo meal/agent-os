@@ -2447,6 +2447,45 @@ fn register_image(cli: &Cli, dir: &Path) -> Value {
     cli.json(&["image", "register", dir.to_str().unwrap()])
 }
 
+/// The shipped recipes' manifests, rendered as `build-guest-image.sh` renders them, through
+/// `image register`: the protocol-2 agent CLI recipe is accepted, the three protocol-1 recipes
+/// are refused.
+#[test]
+fn image_register_accepts_the_agent_cli_recipe_and_refuses_the_protocol_1_recipes() {
+    let cli = Cli::bare();
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let render = |recipe: &str| -> PathBuf {
+        let template = fs::read_to_string(repo.join("guest").join(recipe).join("image.json.in"))
+            .unwrap_or_else(|e| panic!("{recipe}: {e}"));
+        let dir = cli.path(&format!("render-{recipe}"));
+        fs::create_dir_all(&dir).unwrap();
+        let manifest = template
+            .replace("@AGENT_VERSION@", "0.1.0")
+            .replace(
+                "@KERNEL_SHA256@",
+                "0545ba1781fc06cfa1d7699069057f4538103fd1644100cf0da434899a1ed447",
+            )
+            .replace("@GIT_SHA@", "test");
+        fs::write(dir.join("image.json"), manifest).unwrap();
+        fs::write(dir.join("vmlinux"), [0x7fu8; 16]).unwrap();
+        fs::write(dir.join("rootfs.squashfs"), [0x68u8; 16]).unwrap();
+        dir
+    };
+    let accepted = register_image(&cli, &render("agent-cli-py314-v1"));
+    assert_eq!(accepted["id"], "agent-cli-py314-v1");
+    for recipe in [
+        "python-stdlib-v1",
+        "python-stdlib-py314-v1",
+        "python-stdlib-py314-v2",
+    ] {
+        cli.cmd(&["image", "register", render(recipe).to_str().unwrap()])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("protocol 1, expected 2"));
+    }
+    assert_eq!(cli.json(&["image", "list"]).as_array().unwrap().len(), 1);
+}
+
 #[test]
 fn image_register_twice_is_a_noop_and_changed_bytes_are_a_new_entry() {
     let cli = Cli::bare();

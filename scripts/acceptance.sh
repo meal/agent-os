@@ -24,7 +24,7 @@ if [ "$mode" != offline ]; then
 fi
 export COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-agentos-acceptance}
 image=${AGENTOS_ACCEPTANCE_IMAGE:-python-stdlib-v1}
-case "$image" in python-stdlib-v1|python-stdlib-py314-v1|python-stdlib-py314-v2) ;; *) echo 'unsupported acceptance image' >&2; exit 2;; esac
+case "$image" in python-stdlib-v1|python-stdlib-py314-v1|python-stdlib-py314-v2|agent-cli-py314-v1) ;; *) echo 'unsupported acceptance image' >&2; exit 2;; esac
 out=${AGENTOS_ACCEPTANCE_OUTPUT:-build/evidence/$(date -u +%Y%m%dT%H%M%SZ)-$$}
 mkdir -p "$(dirname "$out")"
 mkdir "$out" # Refuse existing destinations; preserve every attempt.
@@ -50,8 +50,9 @@ if [ "$mode" = offline ]; then
 fi
 run build docker compose build test test-kvm
 run firecracker docker compose run --rm test-kvm sh scripts/fetch-firecracker.sh
-if [ "$image" = python-stdlib-py314-v2 ]; then
-  # Its kernel is built here from pinned source, twice, before the image is built.
+if [ "$image" = python-stdlib-py314-v2 ] || [ "$image" = agent-cli-py314-v1 ]; then
+  # Its kernel is built here from pinned source, twice, before the image is built (the same
+  # kernel for agent-cli-py314-v1, which is py314-v2 plus the agent CLI).
   run kernel-builder docker compose build kernel-builder
   run kernel docker compose run --rm kernel-builder sh scripts/build-kernel.sh build/kernels/out --verify
 fi
