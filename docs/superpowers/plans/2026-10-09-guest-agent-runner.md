@@ -88,7 +88,7 @@ Each line has its test in the named task.
   non-messages paths, and the model names it requests. **Gate:** if the CLI cannot run without a
   login or a second host, stop and report; do not widen the plan. Commit stub and findings.
 
-- [ ] **2. Pure message codec (`agentos-core/src/messages.rs`).** `normalize_request(body, cap)
+- [x] **2. Pure message codec (`agentos-core/src/messages.rs`).** `normalize_request(body, cap)
   -> Result<Vec<u8>, String>`: parses JSON, requires an object with `messages`, sets
   `stream:false`, lowers `max_tokens` to `cap` (missing => `cap`), removes `context_management`, `safeguards` and `output_config` (Task 1 findings: beta-only fields, and we send no beta header), keeps sorted-key canonical
   bytes (serde_json maps are sorted). `sse_from_message(response: &Value) -> Vec<u8>`:
