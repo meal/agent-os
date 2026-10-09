@@ -7,6 +7,7 @@ pub mod backend;
 pub mod fake;
 pub mod handlers;
 pub mod init;
+pub mod proxy;
 pub mod trampoline;
 
 pub use backend::{Backend, FakeBackend, VmBackend};
