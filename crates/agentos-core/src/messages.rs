@@ -140,6 +140,26 @@ pub fn sse_from_message(response: &Value) -> Vec<u8> {
                 let delta = json!({"type": "input_json_delta", "partial_json": partial_json});
                 push_delta(&mut out, index, delta);
             }
+            Some("thinking") => {
+                // A stream starts the block empty and delivers the text and then the signature
+                // in deltas; the client rebuilds the block from them and sends it back, and the
+                // API refuses a thinking block that lost its signature.
+                let text = block.get("thinking").and_then(Value::as_str).unwrap_or("");
+                let signature = block.get("signature").and_then(Value::as_str).unwrap_or("");
+                start_block(
+                    &mut out,
+                    index,
+                    json!({"type": "thinking", "thinking": "", "signature": ""}),
+                );
+                if !text.is_empty() {
+                    let delta = json!({"type": "thinking_delta", "thinking": text});
+                    push_delta(&mut out, index, delta);
+                }
+                if !signature.is_empty() {
+                    let delta = json!({"type": "signature_delta", "signature": signature});
+                    push_delta(&mut out, index, delta);
+                }
+            }
             _ => start_block(&mut out, index, block.clone()),
         }
         push_event(
@@ -409,6 +429,59 @@ mod tests {
         let partial = events[2].1["delta"]["partial_json"].as_str().unwrap();
         assert_eq!(serde_json::from_str::<Value>(partial).unwrap(), input);
         assert_eq!(events[4].1["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn sse_for_a_thinking_block_carries_its_signature() {
+        // What the live API sends with `display: omitted`: no thinking text, a signature that
+        // must come back with the block (a stream delivers it as a `signature_delta`).
+        let sse = sse_from_message(&response(
+            json!([
+                {"type": "thinking", "thinking": "", "signature": "sig-abc"},
+                {"type": "thinking", "thinking": "step one", "signature": "sig-def"},
+                {"type": "redacted_thinking", "data": "opaque"}
+            ]),
+            "end_turn",
+        ));
+        let events = events(&sse);
+        let names: Vec<_> = events.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_stop",
+                "message_delta",
+                "message_stop"
+            ]
+        );
+        assert_eq!(
+            events[1].1["content_block"],
+            json!({"type": "thinking", "thinking": "", "signature": ""})
+        );
+        assert_eq!(
+            events[2].1["delta"],
+            json!({"type": "signature_delta", "signature": "sig-abc"})
+        );
+        assert_eq!(
+            events[5].1["delta"],
+            json!({"type": "thinking_delta", "thinking": "step one"})
+        );
+        assert_eq!(
+            events[6].1["delta"],
+            json!({"type": "signature_delta", "signature": "sig-def"})
+        );
+        assert_eq!(
+            events[8].1["content_block"],
+            json!({"type": "redacted_thinking", "data": "opaque"})
+        );
     }
 
     #[test]

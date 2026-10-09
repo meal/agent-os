@@ -18,7 +18,12 @@ class H(BaseHTTPRequestHandler):
             entry.update(model=body.get("model"), stream=body.get("stream"), max_tokens=body.get("max_tokens"),
                          thinking=body.get("thinking"), output_config=body.get("output_config"),
                          context_management=body.get("context_management"),
-                         tools=[t.get("name") for t in body.get("tools", [])][:40])
+                         tools=[t.get("name") for t in body.get("tools", [])][:40],
+                         assistant_blocks=[[{"type": c.get("type"), "thinking_len": len(c.get("thinking") or ""),
+                                             "signature_len": len(c.get("signature") or "")}
+                                            for c in m["content"] if isinstance(c, dict)]
+                                           for m in body.get("messages", [])
+                                           if m.get("role") == "assistant" and isinstance(m.get("content"), list)])
             data = open(FILES[min(len(calls), len(FILES) - 1)], "rb").read().replace(b"/WORKDIR", WORKDIR.encode())
             calls.append(1)
             self.send_response(200)
