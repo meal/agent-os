@@ -212,10 +212,12 @@ the release image, first builds its kernel from source twice:
 AGENTOS_ACCEPTANCE_IMAGE=python-stdlib-py314-v2 sh scripts/acceptance.sh kvm
 ```
 
-Both passed real KVM acceptance; the tests' default image stays `python-stdlib-v1`.
-`agent-cli-py314-v1` (protocol 2: py314-v2 plus the pinned Claude Code native binary, see
-`guest/agent-cli-py314-v1/README.md`) is selected the same way and builds the same kernel; its KVM
-run is not yet recorded. See [evidence requirements](evidence/README.md) before promoting recordings or logs.
+Both passed real KVM acceptance with the v0.1.0-rc5 controller. Since guest protocol 2 a controller
+refuses those protocol-1 images, so `scripts/acceptance.sh` defaults to `agent-cli-py314-v1`
+(protocol 2: py314-v2 plus the pinned Claude Code native binary, see
+`guest/agent-cli-py314-v1/README.md`; same kernel); its KVM runs are recorded in
+`docs/evidence/2026-10-09/agent-session-kvm.md`. The older images work only with an rc5 controller
+and need `AGENTOS_ACCEPTANCE_IMAGE` plus that controller. See [evidence requirements](evidence/README.md) before promoting recordings or logs.
 
 ## The live agent run (billed, run once)
 

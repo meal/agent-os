@@ -24,8 +24,8 @@ if [ "$mode" != offline ]; then
 fi
 export COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-agentos-acceptance}
 # The agent session runs the Claude Code image; every other mode keeps the parser image.
-default_image=python-stdlib-v1
-[ "$mode" != live-agent ] || default_image=agent-cli-py314-v1
+# The protocol-1 recipes are refused by a protocol-2 controller; only the agent image is current.
+default_image=agent-cli-py314-v1
 image=${AGENTOS_ACCEPTANCE_IMAGE:-$default_image}
 case "$image" in python-stdlib-v1|python-stdlib-py314-v1|python-stdlib-py314-v2|agent-cli-py314-v1) ;; *) echo 'unsupported acceptance image' >&2; exit 2;; esac
 out=${AGENTOS_ACCEPTANCE_OUTPUT:-build/evidence/$(date -u +%Y%m%dT%H%M%SZ)-$$}
