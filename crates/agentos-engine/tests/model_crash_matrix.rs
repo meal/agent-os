@@ -84,6 +84,18 @@ impl Executor for Jobs {
     async fn fence_job(&self, effect: &EffectId) -> bool {
         self.plain.fence_job(effect).await
     }
+
+    fn runs_agent_sessions(&self) -> bool {
+        self.plain.runs_agent_sessions()
+    }
+
+    fn session_mailbox(&self, effect: &EffectId) -> Option<agentos_engine::job::Mailbox> {
+        self.plain.session_mailbox(effect)
+    }
+
+    fn cancel_jobs(&self, effects: &[EffectId]) -> usize {
+        self.plain.cancel_jobs(effects)
+    }
 }
 
 /// The routing executor, counting how often the shadow reader is run (`ExecCounts` counts
@@ -121,6 +133,18 @@ impl Executor for Exec {
 
     async fn fence_job(&self, effect: &EffectId) -> bool {
         self.inner.fence_job(effect).await
+    }
+
+    fn runs_agent_sessions(&self) -> bool {
+        self.inner.runs_agent_sessions()
+    }
+
+    fn session_mailbox(&self, effect: &EffectId) -> Option<agentos_engine::job::Mailbox> {
+        self.inner.session_mailbox(effect)
+    }
+
+    fn cancel_jobs(&self, effects: &[EffectId]) -> usize {
+        self.inner.cancel_jobs(effects)
     }
 }
 
@@ -1076,4 +1100,32 @@ async fn a_crash_during_the_patch_job_still_reconciles_with_a_model_agent() {
     assert_eq!(ctl.of_type(&w, "ReceiptIgnored").len(), 0);
     assert_journal_sound(&w, &ctl);
     w.assert_no_live_process().await;
+}
+
+/// The session methods reach the supervised executor through both wrappers: `Jobs` and the
+/// `Exec` around the routing executor.
+#[tokio::test]
+async fn the_test_executors_forward_the_session_methods() {
+    let w = World::new();
+    let jobs = w.path("jobs");
+    let direct = Jobs {
+        plain: common::session_supervised(w.dir.path(), &jobs, &w.counts),
+        special: None,
+    };
+    common::assert_forwards_sessions(&direct, w.dir.path(), &jobs);
+    let inner = routing_over(
+        w.dir.path(),
+        Jobs {
+            plain: common::session_supervised(w.dir.path(), &jobs, &w.counts),
+            special: None,
+        },
+        Some(Box::new(FakeProvider::scripted(vec![]))),
+        &w.counts,
+        None,
+    );
+    let exec = Exec {
+        inner,
+        reads: Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]),
+    };
+    common::assert_forwards_sessions(&exec, w.dir.path(), &jobs);
 }

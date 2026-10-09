@@ -4,6 +4,8 @@
 //! outstanding effects ([`crate::recover`]), replays the open session into a fresh agent
 //! and carries on exactly where the killed controller stopped.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use agentos_core::broker::Resource;
 use agentos_core::contract::{Capability, Contract};
 use agentos_core::effect::{
@@ -742,7 +744,9 @@ fn response_bytes<E>(cx: &Cx<'_, E>, window: u64, request: &Digest) -> Result<Ve
 /// Serves the model requests of the session whose job is `effect`, strictly one at a time and
 /// in order, until a guard ends the task: the state it ends in. Each request is a journaled
 /// `ModelCall` through [`call_model`], and its reply is the response, or the error its failure
-/// maps to. Nothing is replied to a request that is refused before the call.
+/// maps to. Nothing is replied to a request that is refused before the call. Once `ended` is
+/// set (the session's job has ended) nothing new is taken from the mailbox: `None` is returned
+/// when the last call in flight, if any, has been settled.
 async fn serve_mailbox<E: Executor>(
     cx: &Cx<'_, E>,
     since: u64,
@@ -750,7 +754,8 @@ async fn serve_mailbox<E: Executor>(
     base: Digest,
     effect: &EffectId,
     model: &str,
-) -> Result<TaskState> {
+    ended: &AtomicBool,
+) -> Result<Option<TaskState>> {
     let (db, task) = (cx.db, &cx.task);
     let mailbox = loop {
         match cx.exec.session_mailbox(effect) {
@@ -761,34 +766,37 @@ async fn serve_mailbox<E: Executor>(
     let cap = cx.contract.limits.max_output_tokens_per_request;
     let mut answered = 0u64;
     loop {
+        if ended.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
         let Some((id, body)) = mailbox.controller_next_request(answered)? else {
             tokio::time::sleep(MAILBOX_POLL).await;
             continue;
         };
         answered = id;
         if let Some(state) = interrupted(db, task)? {
-            return Ok(state);
+            return Ok(Some(state));
         }
         if let Some(state) = deadline_stop(cx).await? {
-            return Ok(state);
+            return Ok(Some(state));
         }
         if let Err(denial) = granted(db, task, Capability::ModelRequest, &Resource::Task)? {
             let capability = capability_name(Capability::ModelRequest);
             let audit = json!({ "action": "CallModel", "reason": "CapabilityDenied", "capability": capability, "denial": denial });
             db.append_audit(task, "Denied", &audit)?;
             tracing::info!(task_id = %task, %audit, "model call denied");
-            return fail(db, task, &format!("capability {capability} not granted"));
+            return fail(db, task, &format!("capability {capability} not granted")).map(Some);
         }
         if cx.model_limits_version == 1
             && let Err(reason) = check_request_size(body.len())
         {
-            return fail(db, task, reason);
+            return fail(db, task, reason).map(Some);
         }
         if cx.model_policy_version == 1
             && let Some(schedule) = pending_model_retry(cx)?
             && let Some(state) = wait_model_retry(cx, &schedule).await?
         {
-            return Ok(state);
+            return Ok(Some(state));
         }
         let (body, requested) = match session_body(&body, cap, model) {
             Ok(forwarded) => forwarded,
@@ -813,7 +821,7 @@ async fn serve_mailbox<E: Executor>(
             task,
             call_model(cx, window, turn, base, request, body).await,
         )? {
-            Next::Stop(state) => return Ok(state),
+            Next::Stop(state) => return Ok(Some(state)),
             Next::Observe(obs) => obs,
         };
         match obs {
@@ -823,7 +831,7 @@ async fn serve_mailbox<E: Executor>(
             }
             obs @ (Observation::ModelCallFailed { .. } | Observation::ModelCallLost) => {
                 if let Some(state) = model_failure_policy(cx, &obs, turn.saturating_add(1)).await? {
-                    return Ok(state);
+                    return Ok(Some(state));
                 }
                 let (status, message) = match &obs {
                     Observation::ModelCallFailed { reason, failure } => {
@@ -948,8 +956,17 @@ async fn run_session<E: Executor>(
     }
     cx.crash(CrashPoint::AfterIntent, Some(rec.kind.tag()))?;
 
+    let ended = AtomicBool::new(false);
     let mut attempt = std::pin::pin!(run_attempt(cx, &rec, payload));
-    let mut serving = std::pin::pin!(serve_mailbox(cx, since, turn, base, &rec.effect_id, &model));
+    let mut serving = std::pin::pin!(serve_mailbox(
+        cx,
+        since,
+        turn,
+        base,
+        &rec.effect_id,
+        &model,
+        &ended
+    ));
     let mut stop = None;
     let decided = loop {
         tokio::select! {
@@ -957,7 +974,9 @@ async fn run_session<E: Executor>(
             // A mailbox error ends the run as a kill would: the session is left open for
             // recovery, its job is not cancelled and nothing is journaled for it.
             served = &mut serving, if stop.is_none() => {
-                let state = served?;
+                let state = served?.ok_or_else(|| {
+                    EngineError::Protocol("the session's mailbox ended before its job".into())
+                })?;
                 cx.exec.cancel_jobs(std::slice::from_ref(&rec.effect_id));
                 stop = Some(state);
             }
@@ -971,7 +990,14 @@ async fn run_session<E: Executor>(
         }
         return Ok(Next::Stop(state));
     }
-    match decided? {
+    let verdict = decided?;
+    // The job ended first: a model call it left in flight is settled (answered, or failed by
+    // its own rules) before the session's end is read, never left DISPATCHED for recovery.
+    ended.store(true, Ordering::SeqCst);
+    if let Some(state) = serving.await? {
+        return Ok(Next::Stop(state));
+    }
+    match verdict {
         Attempt::Published(ReceiptVerdict::Apply) => session_end(cx, &db.effect(&rec.effect_id)?),
         Attempt::Published(verdict) => Err(EngineError::ReceiptNotApplied {
             effect: rec.effect_id.clone(),

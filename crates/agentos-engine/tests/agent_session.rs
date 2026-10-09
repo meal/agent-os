@@ -9,23 +9,23 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use agentos_core::contract::Contract;
-use agentos_core::effect::EffectRecord;
-use agentos_core::effect::EffectState;
+use agentos_core::effect::{EffectKind, EffectRecord, EffectState};
 use agentos_core::ids::{Digest, TaskId};
 use agentos_core::state::TaskState;
 use agentos_engine::agent::{Agent, AgentAction, Observation, SessionAgent};
 use agentos_engine::crash::{CrashHook, CrashPoint, RunOptions};
-use agentos_engine::job::WorkerConfig;
+use agentos_engine::job::{JobDir, WorkerConfig};
 use agentos_engine::model::fake::FakeProvider;
-use agentos_engine::model::provider::ProviderResult;
+use agentos_engine::model::provider::{BoxFuture, ModelProvider, ProviderResult};
 use agentos_engine::runner::{EngineError, run_task_with};
 use agentos_engine::supervised::ExecCounts;
 use agentos_engine::workspace::workspace_digest;
 use agentos_store::blob::BlobStore;
 use agentos_store::db::{Db, StoredEvent};
 use common::{
-    FnAgent, assert_no_process_survives, copy_dir, create_patch, fake_firecracker_config, fixtures,
-    processes_of_home, routing_over, supervised,
+    CURL, FnAgent, answer, assert_no_process_survives, copy_dir, create_patch,
+    fake_firecracker_config, fixtures, processes_of_home, routing_over, supervised,
+    two_calls_and_a_fix,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -37,19 +37,6 @@ const CAPS: &[&str] = &[
     "model.request",
     "agent.session",
 ];
-
-/// The guest's `curl` of the scripted CLI: one model call, body from `$IN`, reply to `$OUT`.
-const CURL: &str = "/usr/bin/curl -fsS -o \"$HOME/$OUT\" -X POST \"$ANTHROPIC_BASE_URL/v1/messages\" -H 'content-type: application/json' --data-binary @\"$HOME/$IN\"";
-
-/// A Messages API answer that stops for good.
-fn answer() -> ProviderResult {
-    let body = json!({
-        "content": [{"type": "text", "text": "ok"}],
-        "stop_reason": "end_turn",
-        "usage": {"input_tokens": 1, "output_tokens": 1},
-    });
-    ProviderResult::Response(serde_json::to_vec(&body).unwrap(), Default::default())
-}
 
 struct World {
     dir: TempDir,
@@ -206,6 +193,17 @@ impl World {
         agent: &mut impl Agent,
         opts: &RunOptions,
     ) -> Result<TaskState, EngineError> {
+        self.run_via(agent, opts, Box::new(self.provider.clone_handle()))
+            .await
+    }
+
+    /// [`World::run_with`], with the model calls answered by `provider`.
+    async fn run_via(
+        &self,
+        agent: &mut impl Agent,
+        opts: &RunOptions,
+        provider: Box<dyn ModelProvider>,
+    ) -> Result<TaskState, EngineError> {
         let worker = WorkerConfig::Firecracker(fake_firecracker_config(self.dir.path()));
         let jobs = supervised(
             &self.path("jobs"),
@@ -214,19 +212,29 @@ impl World {
             None,
             &[("AGENTOS_TEST_WORKERS", "1")],
         );
-        let exec = routing_over(
-            self.dir.path(),
-            jobs,
-            Some(Box::new(self.provider.clone_handle())),
-            &self.counts,
-            None,
-        );
+        let exec = routing_over(self.dir.path(), jobs, Some(provider), &self.counts, None);
         run_task_with(&self.db, &self.blobs, &exec, agent, &self.task, opts).await
     }
 
     /// Runs `agent` over the task to its end (no crash).
     async fn run(&self, agent: &mut impl Agent) -> TaskState {
         self.run_with(agent, &RunOptions::default()).await.unwrap()
+    }
+}
+
+/// The fake provider, answering only after `wait`: a model call that is still in flight when
+/// its session has already ended.
+struct SlowProvider {
+    wait: Duration,
+    inner: FakeProvider,
+}
+
+impl ModelProvider for SlowProvider {
+    fn complete<'a>(&'a self, body: &'a [u8]) -> BoxFuture<'a, ProviderResult> {
+        Box::pin(async move {
+            tokio::time::sleep(self.wait).await;
+            self.inner.complete(body).await
+        })
     }
 }
 
@@ -241,40 +249,6 @@ fn kind_of(payload: &Value) -> &str {
                 .map(String::as_str)
         })
         .unwrap_or("")
-}
-
-/// The parser fix, written by the CLI as the file it wants (the same change as
-/// `fixtures/parser-repo.fix.patch`).
-const FIX: &str = r##"cat > src/parser.py <<'PY'
-def parse_kv(text: str) -> dict:
-    """Parse 'key = value' lines into a dict, skipping blanks and '#' comments."""
-    result = {}
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        key, _, value = line.partition("=")
-        result[key.strip()] = value.strip()
-    return result
-PY
-"##;
-
-/// One model call of a CLI script, its body sent from a file.
-fn call_script(n: u32, body: &str) -> String {
-    format!(
-        "printf '%s' '{body}' > \"$HOME/req{n}.json\"\nIN=req{n}.json\nOUT=reply{n}.json\n{CURL}\n"
-    )
-}
-
-/// A CLI that makes two model calls, and writes the fix between them.
-fn two_calls_and_a_fix() -> String {
-    let first = r#"{"model":"m","max_tokens":8,"stream":false,"messages":[]}"#;
-    let again = r#"{"model":"m","max_tokens":8,"stream":false,"messages":[{"role":"user","content":"again"}]}"#;
-    format!(
-        "set -eu\n{}{FIX}{}",
-        call_script(1, first),
-        call_script(2, again)
-    )
 }
 
 /// One call with a body the runner must rewrite: a huge `max_tokens`, beta-only fields, and
@@ -644,6 +618,59 @@ async fn a_session_killed_while_running_ends_the_task_as_lost_and_the_call_is_no
             .iter()
             .any(|e| e.event_type == "EffectFailed" && e.payload["effect_id"] == session.as_str()),
         "the cancelled receipt was not published"
+    );
+    assert_no_process_survives(w.dir.path());
+}
+
+/// The session job ends while its model call is still in flight (here: it is cancelled after
+/// the call was sent). The call is answered and settled as any other (it is not left DISPATCHED
+/// for a later recovery), and it is sent exactly once.
+#[tokio::test]
+async fn a_model_call_still_in_flight_when_its_session_ends_is_settled() {
+    let w = World::new(CAPS, 4, 600, vec![answer()]);
+    // The CLI asks once, then waits; the session is cancelled while the answer is on its way.
+    let body = r#"{"model":"m","max_tokens":8,"messages":[]}"#;
+    let script = format!(
+        "set -eu\nprintf '%s' '{body}' > \"$HOME/req1.json\"\nIN=req1.json\nOUT=reply1.json\n{CURL} &\nsleep 30\n"
+    );
+    let argv = w.cli(&script);
+    let jobs = w.path("jobs");
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(1));
+        for entry in fs::read_dir(jobs).unwrap().flatten() {
+            let job = JobDir::open(&entry.path()).unwrap();
+            if job
+                .request()
+                .is_ok_and(|r| matches!(r.kind, EffectKind::RunAgentSession { .. }))
+            {
+                job.drop_cancel().unwrap();
+            }
+        }
+    });
+    let slow = SlowProvider {
+        wait: Duration::from_secs(3),
+        inner: w.provider.clone_handle(),
+    };
+    let mut agent = w.session(argv);
+    assert_eq!(
+        w.run_via(&mut agent, &RunOptions::default(), Box::new(slow))
+            .await
+            .unwrap(),
+        TaskState::Failed
+    );
+    assert_eq!(w.failed_reason().as_deref(), Some("agent session lost"));
+    assert_eq!(w.provider.calls(), 1, "the call was sent once");
+    assert_eq!(w.effects("RunAgentSession")[0].state, EffectState::Unknown);
+    assert_eq!(w.effects("ModelCall")[0].state, EffectState::Completed);
+    // Only the lost session stays open (UNKNOWN); no model call is left in flight.
+    let open = w.db.outstanding_effects(&w.task).unwrap();
+    assert!(
+        open.iter().all(|e| e.kind.tag() == "run_agent_session"),
+        "{open:?}"
+    );
+    assert_eq!(
+        w.db.usage_summary(&w.task).unwrap().settled_model_requests,
+        1
     );
     assert_no_process_survives(w.dir.path());
 }

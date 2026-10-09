@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use agentos_core::contract::Contract;
-use agentos_core::effect::{EffectId, EffectRecord};
+use agentos_core::effect::{AgentSessionSpec, AttemptId, EffectId, EffectKind, EffectRecord};
 use agentos_core::guest::mint_attempt_token;
 use agentos_core::ids::{Digest, TaskId};
 use agentos_core::state::TaskState;
@@ -22,10 +22,11 @@ use agentos_engine::firecracker::FirecrackerConfig;
 use agentos_engine::fixture::FixtureExecutor;
 use agentos_engine::guestlink::GuestLauncher;
 use agentos_engine::jail::{JailConfig, JailMode};
-use agentos_engine::job::{HostConfig, WorkerConfig};
+use agentos_engine::job::{HostConfig, JobDir, JobRequest, WorkerConfig};
 use agentos_engine::model::executor::ModelExecutor;
 use agentos_engine::model::fake::FakeProvider;
 use agentos_engine::model::provider::ModelProvider;
+use agentos_engine::model::provider::ProviderResult;
 use agentos_engine::routing::RoutingExecutor;
 use agentos_engine::shadow::ShadowReader;
 use agentos_engine::supervised::{ExecCounts, SupervisedExecutor};
@@ -418,6 +419,79 @@ pub fn processes_of_home(root: &Path) -> Vec<i32> {
         pids.extend(home_firecrackers(root).into_iter().map(|p| p.pid));
     }
     pids
+}
+
+/// A supervised executor whose jobs run on the fake guest (sessions included): what a test
+/// wrapper wraps when it must forward the session methods.
+pub fn session_supervised(
+    root: &Path,
+    jobs_root: &Path,
+    counts: &ExecCounts,
+) -> SupervisedExecutor {
+    supervised(
+        jobs_root,
+        WorkerConfig::Firecracker(fake_firecracker_config(root)),
+        counts,
+        None,
+        &[(TEST_WORKERS_ENV, "1")],
+    )
+}
+
+/// Writes a live `RunAgentSession` job under `jobs_root`, held by the returned lock: an
+/// executor over `jobs_root` sees it as running. Drop the lock to let it die.
+pub fn live_session_job(root: &Path, jobs_root: &Path) -> (EffectId, fs::File) {
+    let task = TaskId::new();
+    let kind = EffectKind::RunAgentSession {
+        expected_base: Digest::of(b"base"),
+    };
+    let payload = AgentSessionSpec {
+        argv: vec!["/bin/true".into()],
+        env: vec![],
+    }
+    .to_payload();
+    let effect = EffectId::derive(&task, 1, &kind, &Digest::of(&payload));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let (_job, lock) = JobDir::create(
+        jobs_root,
+        &JobRequest {
+            effect_id: effect.clone(),
+            task_id: task,
+            kind,
+            payload,
+            contract: contract(10).0,
+            attempt_id: AttemptId::new(),
+            lease_generation: 1,
+            lease_expiry_ms: now + 600_000,
+            task_deadline_ms: now + 600_000,
+            worker: WorkerConfig::Firecracker(fake_firecracker_config(root)),
+        },
+    )
+    .unwrap();
+    (effect, lock)
+}
+
+/// Asserts that `exec` forwards the three session methods to the executor it wraps: over a
+/// live session job under `jobs_root` (see [`live_session_job`]) it runs sessions, hands out the
+/// job's mailbox and cancels the job. A wrapper that does not forward them answers the trait
+/// defaults (`false`, `None`, 0), which is what a session then silently gets.
+pub fn assert_forwards_sessions<E: Executor>(exec: &E, root: &Path, jobs_root: &Path) {
+    let (effect, _lock) = live_session_job(root, jobs_root);
+    assert!(
+        exec.runs_agent_sessions(),
+        "runs_agent_sessions is not forwarded"
+    );
+    assert!(
+        exec.session_mailbox(&effect).is_some(),
+        "session_mailbox is not forwarded"
+    );
+    assert_eq!(
+        exec.cancel_jobs(std::slice::from_ref(&effect)),
+        1,
+        "cancel_jobs is not forwarded"
+    );
 }
 
 /// Waits up to 10 s for every process of `root` (its job directories and, in real mode, its
@@ -816,4 +890,52 @@ pub fn analyzer_contract(tool_actions: u32, name: &str) -> (Contract, Digest) {
     let contract = Contract::parse(&json.to_string()).unwrap();
     let digest = Digest::of(&serde_json::to_vec(&contract).unwrap());
     (contract, digest)
+}
+
+// Shared by the agent session suites: the scripted CLI and the fake provider's answer.
+/// The guest's `curl` of the scripted CLI: one model call, body from `$IN`, reply to `$OUT`.
+pub const CURL: &str = "/usr/bin/curl -fsS -o \"$HOME/$OUT\" -X POST \"$ANTHROPIC_BASE_URL/v1/messages\" -H 'content-type: application/json' --data-binary @\"$HOME/$IN\"";
+
+/// A Messages API answer that stops for good.
+pub fn answer() -> ProviderResult {
+    let body = serde_json::json!({
+        "content": [{"type": "text", "text": "ok"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    });
+    ProviderResult::Response(serde_json::to_vec(&body).unwrap(), Default::default())
+}
+
+/// The parser fix, written by the CLI as the file it wants (the same change as
+/// `fixtures/parser-repo.fix.patch`).
+pub const FIX: &str = r##"cat > src/parser.py <<'PY'
+def parse_kv(text: str) -> dict:
+    """Parse 'key = value' lines into a dict, skipping blanks and '#' comments."""
+    result = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, _, value = line.partition("=")
+        result[key.strip()] = value.strip()
+    return result
+PY
+"##;
+
+/// One model call of a CLI script, its body sent from a file.
+fn call_script(n: u32, body: &str) -> String {
+    format!(
+        "printf '%s' '{body}' > \"$HOME/req{n}.json\"\nIN=req{n}.json\nOUT=reply{n}.json\n{CURL}\n"
+    )
+}
+
+/// A CLI that makes two model calls, and writes the fix between them.
+pub fn two_calls_and_a_fix() -> String {
+    let first = r#"{"model":"m","max_tokens":8,"stream":false,"messages":[]}"#;
+    let again = r#"{"model":"m","max_tokens":8,"stream":false,"messages":[{"role":"user","content":"again"}]}"#;
+    format!(
+        "set -eu\n{}{FIX}{}",
+        call_script(1, first),
+        call_script(2, again)
+    )
 }

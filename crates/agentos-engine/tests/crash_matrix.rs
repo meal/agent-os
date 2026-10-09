@@ -26,7 +26,9 @@ use agentos_engine::executor::{
     AttemptCtx, EffectRequest, ExecOutcome, Executor, JobWait, Reconciliation,
 };
 use agentos_engine::job::{JobDir, JobRequest, JobState, ScriptedConfig, WorkerConfig};
+use agentos_engine::model::fake::FakeProvider;
 use agentos_engine::recover::{Decision, RecoveryReport, recover, recover_with};
+use agentos_engine::routing::RoutingExecutor;
 use agentos_engine::runner::{EngineError, run_task, run_task_with};
 use agentos_engine::supervised::{ExecCounts, SupervisedExecutor};
 use agentos_engine::supervisor::POLL_ENV;
@@ -36,8 +38,9 @@ use agentos_store::db::{Db, StoredEvent};
 use agentos_store::effects::UsageSummary;
 use common::{
     EXIT_BEFORE_RECEIPT_ENV, TEST_WORKERS_ENV, all_pids, comment_patch, contract, copy_dir,
-    firecracker_processes, fix_patch, fixtures, lose_workspace, proc_state, processes_naming,
-    processes_of_home, real_mode, supervised, worker_config, workspace_dir, write_in_workspace,
+    fake_firecracker_config, firecracker_processes, fix_patch, fixtures, lose_workspace,
+    proc_state, processes_naming, processes_of_home, real_mode, routing_over, supervised,
+    worker_config, workspace_dir, write_in_workspace,
 };
 use rustix::process::{Pid, PidfdFlags, Signal, kill_process, pidfd_open, pidfd_send_signal};
 use tempfile::TempDir;
@@ -116,6 +119,18 @@ impl Executor for Exec {
             Fence::Fails => false,
             Fence::Hangs => std::future::pending().await,
         }
+    }
+
+    fn runs_agent_sessions(&self) -> bool {
+        self.plain.runs_agent_sessions()
+    }
+
+    fn session_mailbox(&self, effect: &EffectId) -> Option<agentos_engine::job::Mailbox> {
+        self.plain.session_mailbox(effect)
+    }
+
+    fn cancel_jobs(&self, effects: &[EffectId]) -> usize {
+        self.plain.cancel_jobs(effects)
     }
 }
 
@@ -2197,4 +2212,340 @@ async fn a_fenced_patch_job_that_applied_its_patch_is_reconciled_not_failed() {
     assert_journal_sound(&w, &ctl);
     w.assert_no_live_process().await;
     assert_job_sessions_empty(&w);
+}
+
+/// The session methods reach the supervised executor through the wrapper: without the forwards
+/// a session through this executor is silently unrunnable.
+#[tokio::test]
+async fn the_test_executor_forwards_the_session_methods() {
+    let w = World::new();
+    let jobs = w.path("jobs");
+    let exec = Exec {
+        plain: common::session_supervised(w.dir.path(), &jobs, &w.counts),
+        special: None,
+        fence: Fence::Real,
+    };
+    common::assert_forwards_sessions(&exec, w.dir.path(), &jobs);
+}
+
+// The agent session. A `RunAgentSession` effect runs on the fake guest through the routing
+// executor (so its model calls reach the fake provider) and is killed at every crash point.
+
+/// A task whose contract allows one agent session and its two model calls.
+struct SessionWorld {
+    dir: TempDir,
+    task: TaskId,
+    counts: ExecCounts,
+    provider: FakeProvider,
+}
+
+impl SessionWorld {
+    fn new() -> SessionWorld {
+        let dir = common::scratch_root();
+        copy_dir(
+            &fixtures().join("parser-repo"),
+            &dir.path().join("snapshot"),
+        );
+        copy_dir(
+            &fixtures().join("profiles/parser-checks-v1"),
+            &dir.path().join("profile"),
+        );
+        let caps = [
+            "snapshot.read",
+            "workspace.apply_patch",
+            "verification.run",
+            "model.request",
+            "agent.session",
+        ];
+        let json = format!(
+            r#"{{
+            "goal": "fix the parser",
+            "repository": {{"source": "fixtures/parser-repo", "revision": "rev-1"}},
+            "profile": "python-stdlib-v1",
+            "editable_paths": ["src/**"],
+            "verification_profile": "parser-checks-v1",
+            "capabilities": {},
+            "limits": {{
+                "model_requests": 4,
+                "max_output_tokens_per_request": 1000,
+                "tool_actions": 10,
+                "deadline_seconds": 600,
+                "worker_vcpus": 1,
+                "worker_memory_mib": 256
+            }}
+        }}"#,
+            serde_json::to_string(&caps).unwrap()
+        );
+        let contract = agentos_core::contract::Contract::parse(&json).unwrap();
+        let db = Db::open(&dir.path().join("agentos.db")).unwrap();
+        let task = db
+            .create_task(&contract, &Digest::of(json.as_bytes()))
+            .unwrap();
+        db.append_audit(
+            &task,
+            "Submitted",
+            &serde_json::json!({"model_policy_version": 1, "model_limits_version": 1, "model": "fake:test"}),
+        )
+        .unwrap();
+        db.approve_task(&task).unwrap();
+        SessionWorld {
+            dir,
+            task,
+            counts: ExecCounts::default(),
+            provider: FakeProvider::scripted(vec![common::answer(), common::answer()]),
+        }
+    }
+
+    fn path(&self, rel: &str) -> PathBuf {
+        self.dir.path().join(rel)
+    }
+
+    /// The scripted CLI: two model calls and the fix between them.
+    fn argv(&self) -> Vec<String> {
+        let path = self.path("cli.sh");
+        fs::write(&path, common::two_calls_and_a_fix()).unwrap();
+        vec!["/bin/sh".into(), path.display().to_string()]
+    }
+
+    /// The session agent of a (re)started controller.
+    fn agent(&self) -> agentos_engine::agent::SessionAgent {
+        agentos_engine::agent::SessionAgent::new(self.argv(), vec![], "claude-opus-5-5")
+    }
+
+    /// The executor of a (re)started controller: sessions on the fake guest, model calls to
+    /// the fake provider, every job and the routing consulting `hook`.
+    fn exec(&self, hook: Option<CrashHook>) -> RoutingExecutor<Exec> {
+        let jobs = self.path("jobs");
+        let plain = supervised(
+            &jobs,
+            WorkerConfig::Firecracker(fake_firecracker_config(self.dir.path())),
+            &self.counts,
+            hook.clone(),
+            &[(TEST_WORKERS_ENV, "1")],
+        );
+        routing_over(
+            self.dir.path(),
+            Exec {
+                plain,
+                special: None,
+                fence: Fence::Real,
+            },
+            Some(Box::new(self.provider.clone_handle())),
+            &self.counts,
+            hook,
+        )
+    }
+
+    /// Runs the task to its end (or to the crash) with a fresh session agent.
+    async fn run(&self, hook: Option<CrashHook>) -> Result<TaskState, EngineError> {
+        let db = Db::open(&self.path("agentos.db")).unwrap();
+        let blobs = BlobStore::open(self.path("blobs")).unwrap();
+        let exec = self.exec(hook.clone());
+        let opts = match hook {
+            Some(hook) => RunOptions::crash_with(hook),
+            None => RunOptions::default(),
+        };
+        run_task_with(&db, &blobs, &exec, &mut self.agent(), &self.task, &opts).await
+    }
+
+    /// The recovery decisions journaled for the session effect.
+    fn session_decisions(&self) -> Vec<serde_json::Value> {
+        let db = Db::open(&self.path("agentos.db")).unwrap();
+        db.events(&self.task)
+            .unwrap()
+            .into_iter()
+            .filter(|e| {
+                e.event_type == "RecoveryDecision" && e.payload["kind"] == "run_agent_session"
+            })
+            .map(|e| e.payload["decision"].clone())
+            .collect()
+    }
+
+    /// The reason the task failed with, if it did.
+    fn failed_reason(&self) -> Option<String> {
+        let db = Db::open(&self.path("agentos.db")).unwrap();
+        db.events(&self.task)
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find(|e| e.event_type == "Failed")
+            .map(|e| e.payload["Failed"]["reason"].as_str().unwrap().to_string())
+    }
+}
+
+/// What a restarted run must show after a session killed at a crash point.
+struct SessionExpect {
+    state: TaskState,
+    reason: Option<&'static str>,
+    /// Starts of the session's job (the session is never started twice).
+    session_runs: usize,
+    /// Model calls the provider received, across both runs.
+    provider_calls: usize,
+    /// The one recovery decision on the session, if recovery had one to make.
+    decision: Option<Decision>,
+}
+
+/// The expected end of a session killed at `point`, derived from the recovery rules: a session
+/// that never started is lost; one whose job may have started is lost unless its job left a
+/// completed result; a session that completed is rebuilt and carried on.
+fn session_expect(point: CrashPoint) -> SessionExpect {
+    let finished = |session_runs, decision| SessionExpect {
+        state: TaskState::Succeeded,
+        reason: None,
+        session_runs,
+        provider_calls: 2,
+        decision,
+    };
+    let lost = |session_runs| SessionExpect {
+        state: TaskState::Failed,
+        reason: Some("agent session lost"),
+        session_runs,
+        provider_calls: 0,
+        decision: Some(Decision::Unreconcilable),
+    };
+    match point {
+        // Nothing was intended: the restarted controller starts the session.
+        CrashPoint::AfterAgentTurnJournaled => finished(1, None),
+        // Intended, or dispatched with no job: never started, so lost.
+        CrashPoint::AfterIntent | CrashPoint::AfterDispatch => lost(0),
+        // The job was launched and the controller died with it running: cancelled, lost.
+        CrashPoint::DuringExecute => lost(1),
+        // The job completed: its result is published, not run again.
+        CrashPoint::AfterExecuteBeforePublish
+        | CrashPoint::AfterBlobPut
+        | CrashPoint::AfterRegister => finished(1, Some(Decision::PublishRetained)),
+        CrashPoint::AfterComplete => finished(1, None),
+    }
+}
+
+async fn session_crash_case(point: CrashPoint) {
+    let w = SessionWorld::new();
+    let hook = CrashHook::at(point, "run_agent_session");
+    let err = w.run(Some(hook)).await.unwrap_err();
+    assert!(
+        matches!(err, EngineError::Crashed(p) if p == point),
+        "{err:?}"
+    );
+
+    let expect = session_expect(point);
+    let state = w.run(None).await.unwrap();
+    assert_eq!(
+        state,
+        expect.state,
+        "crash at {point}: {:?}",
+        w.failed_reason()
+    );
+    assert_eq!(
+        w.failed_reason().as_deref(),
+        expect.reason,
+        "crash at {point}"
+    );
+    assert_eq!(
+        w.counts.get("run_agent_session"),
+        expect.session_runs,
+        "session starts after a crash at {point}"
+    );
+    assert_eq!(
+        w.provider.calls(),
+        expect.provider_calls,
+        "model calls at {point}"
+    );
+    let decisions = w.session_decisions();
+    assert_eq!(
+        decisions,
+        expect
+            .decision
+            .map(|d| vec![serde_json::to_value(d).unwrap()])
+            .unwrap_or_default(),
+        "recovery of the session at {point}"
+    );
+    common::assert_no_process_survives(w.dir.path());
+}
+
+macro_rules! session_matrix {
+    ($($name:ident: $point:ident;)*) => {
+        $(
+            #[tokio::test]
+            async fn $name() {
+                session_crash_case(CrashPoint::$point).await;
+            }
+        )*
+    };
+}
+
+session_matrix! {
+    session_after_agent_turn: AfterAgentTurnJournaled;
+    session_after_intent: AfterIntent;
+    session_after_dispatch: AfterDispatch;
+    session_during_execute: DuringExecute;
+    session_after_execute_before_publish: AfterExecuteBeforePublish;
+    session_after_blob_put: AfterBlobPut;
+    session_after_register: AfterRegister;
+    session_after_complete: AfterComplete;
+}
+
+/// The model calls a session makes, killed at each crash point of a `ModelCall` inside it. The
+/// session is always lost (its job is cancelled, never run again); the call is abandoned if it
+/// was never dispatched, forfeited (counted used, never sent again) if it was dispatched without
+/// a retained response, and completed if its response was retained.
+#[tokio::test]
+async fn session_model_call_is_settled_by_its_own_rules_at_every_crash_point() {
+    let rows = [
+        // (point, provider calls, the call's state, uncertain requests)
+        (CrashPoint::AfterIntent, 0, EffectState::Abandoned, 0),
+        (CrashPoint::AfterDispatch, 0, EffectState::Failed, 1),
+        (CrashPoint::DuringExecute, 1, EffectState::Failed, 1),
+        (
+            CrashPoint::AfterExecuteBeforePublish,
+            1,
+            EffectState::Completed,
+            0,
+        ),
+        (CrashPoint::AfterBlobPut, 1, EffectState::Completed, 0),
+        (CrashPoint::AfterRegister, 1, EffectState::Completed, 0),
+        (CrashPoint::AfterComplete, 1, EffectState::Completed, 0),
+    ];
+    for (point, calls, state, uncertain) in rows {
+        let w = SessionWorld::new();
+        let hook = CrashHook::at(point, "model_call");
+        let err = w.run(Some(hook)).await.unwrap_err();
+        assert!(
+            matches!(err, EngineError::Crashed(p) if p == point),
+            "{point}: {err:?}"
+        );
+
+        assert_eq!(w.run(None).await.unwrap(), TaskState::Failed, "{point}");
+        assert_eq!(
+            w.failed_reason().as_deref(),
+            Some("agent session lost"),
+            "{point}"
+        );
+        assert_eq!(w.provider.calls(), calls, "model calls sent at {point}");
+        assert_eq!(w.counts.get("run_agent_session"), 1, "{point}");
+        assert_eq!(
+            w.session_decisions(),
+            vec![serde_json::to_value(Decision::Unreconcilable).unwrap()],
+            "{point}"
+        );
+        let db = Db::open(&w.path("agentos.db")).unwrap();
+        let calls_made: Vec<EffectState> = db
+            .events(&w.task)
+            .unwrap()
+            .into_iter()
+            .filter(|e| {
+                e.event_type == "EffectIntended" && e.payload["kind"].get("ModelCall").is_some()
+            })
+            .map(|e| {
+                let id = serde_json::from_value(e.payload["effect_id"].clone()).unwrap();
+                db.effect(&id).unwrap().state
+            })
+            .collect();
+        assert_eq!(calls_made, vec![state], "the model call at {point}");
+        assert_eq!(
+            db.usage_summary(&w.task).unwrap().uncertain_model_requests,
+            uncertain,
+            "uncertain requests at {point}"
+        );
+        common::assert_no_process_survives(w.dir.path());
+    }
 }
