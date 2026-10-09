@@ -190,7 +190,7 @@ Each line has its test in the named task.
   fails the task and sends nothing; clamp is visible in the journaled request; a patch on a
   non-editable and on a `.git` path is `Denied`, workspace unchanged; deadline kills the CLI.
 
-- [ ] **8. Recovery and crash matrix.** Red test first: the session completes, then the
+- [x] **8. Recovery and crash matrix** (ced6e65, 8c41132, 3786586; the key crash-after-session test already passed on the pre-fix code, kept as a regression guard). **Open:** a cancelled session job sometimes leaves a failure receipt (session FAILED) and sometimes none (UNKNOWN); both end the task as "agent session lost", but the effect state differs. The delay in killing the CLI's grandchildren is, by code reading only, the fake guest's orphans being reaped asynchronously by the container init: confirm on the KVM tier (Task 9).  Red test first: the session completes, then the
   controller crashes at AfterIntent of the `ApplyPatch`; resume applies the journaled patch and
   verifies with no divergence and no resend. In `recover.rs`/`drive`: an open `RunSession` turn does
   not replay; reconcile outstanding `ModelCall`s, kill the job, fail `agent session lost`
