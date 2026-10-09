@@ -122,7 +122,20 @@ fn live_kvm() -> kvm::Kvm {
         std::env::var_os("AGENTOS_KVM_TESTS").is_some(),
         "AGENTOS_LIVE_MODEL_TESTS is set but AGENTOS_KVM_TESTS is not: the agent session runs on the microVM"
     );
-    kvm::require().expect("the live agent session needs the microVM tier")
+    let kvm = kvm::require().expect("the live agent session needs the microVM tier");
+    require_agent_image();
+    kvm
+}
+
+/// The session's guest must be the agent image: its `image.json` id is the contract's profile.
+/// Any other image refuses the protocol or the profile, so this says why first.
+fn require_agent_image() {
+    let id = kvm::configured_image_id();
+    assert_eq!(
+        id.as_deref(),
+        Some(IMAGE_ID),
+        "AGENTOS_GUEST_IMAGE must be the agent image ({IMAGE_ID}), not {id:?} (scripts/acceptance.sh live-agent sets it)"
+    );
 }
 
 /// The contract of the session: the fixture, the agent image, and the capped limits.
@@ -628,6 +641,7 @@ fn canned(content: Value, stop_reason: &str) -> (u16, Vec<u8>) {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_live_agent_harness_runs_offline_against_the_local_fake_api() {
     let Some(kvm) = kvm::require() else { return };
+    require_agent_image();
     let _one = ONE_VM.lock().await;
     let api = serve(Reply::Sequence(vec![
         canned(
@@ -671,6 +685,7 @@ async fn the_live_agent_harness_runs_offline_against_the_local_fake_api() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_live_agent_harness_reports_a_rejection_and_fails() {
     let Some(kvm) = kvm::require() else { return };
+    require_agent_image();
     let _one = ONE_VM.lock().await;
     let rejection = r#"{"type":"error","error":{"type":"invalid_request_error","message":"offline harness: rejected on purpose"}}"#;
     let api = serve(Reply::Sequence(vec![(400, rejection.as_bytes().to_vec())]));
