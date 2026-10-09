@@ -5,6 +5,7 @@ pub mod effect;
 pub mod guest;
 pub mod ids;
 pub mod lease;
+pub mod messages;
 pub mod patchrules;
 pub mod resources;
 pub mod state;
