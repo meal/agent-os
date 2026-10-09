@@ -8,9 +8,12 @@
 #   1. the architecture must be x86_64;
 #   2. the tarball must have the given sha256, hold one release directory without absolute or
 #      `..` paths, and every file must match its SHA256SUMS, which must list every file;
-#   3. /dev/kvm must be readable and writable by this user;
+#   3. /dev/kvm must be a character device readable and writable by this user, and git must
+#      be installed (agentos parses patches with it);
 #   4. cgroup v2 with cpu, memory and pids must be available for the jail (unless
 #      --allow-unjailed);
+#   5. the staged release's own `agentos host-check` must pass: KVM, Firecracker, git and,
+#      unless --allow-unjailed, the jail probe (root, delegable cgroups, the home's filesystem);
 # then the release is staged under PREFIX/.staging-<pid>, moved into PREFIX/VERSION with one
 # rename and PREFIX/current switched with a symlink rename. The same version with the same
 # content is a no-op; with other content it is refused. The home is created only when absent;
@@ -19,8 +22,9 @@
 #
 # Defaults: --prefix $HOME/.local/share/agentos, --home $HOME/.agentos.
 # Test seams, honoured only with AGENTOS_INSTALL_TEST=1: AGENTOS_INSTALL_ARCH (uname -m),
-# AGENTOS_INSTALL_KVM (the KVM device path), AGENTOS_INSTALL_CGROUP (the cgroup v2 root) and
-# AGENTOS_INSTALL_INTERRUPT=1 (exit 9 after staging, before the rename).
+# AGENTOS_INSTALL_KVM (the KVM device path; a regular file passes), AGENTOS_INSTALL_CGROUP (the
+# cgroup v2 root), AGENTOS_INSTALL_GIT (the git command) and AGENTOS_INSTALL_INTERRUPT=1 (exit
+# 9 after staging, before the rename).
 set -eu
 umask 022
 
@@ -45,6 +49,12 @@ self_test() {
     cat > "$top/bin/agentos" <<'FAKE'
 #!/bin/sh
 printf '%s\n' "$*" >> "$AGENTOS_INSTALL_TEST_LOG"
+case "$*" in *host-check*)
+  case "${AGENTOS_INSTALL_TEST_HOSTCHECK:-ok}" in
+    ok) echo '{"jail":"ok"}';;
+    *) echo "{\"jail\":\"${AGENTOS_INSTALL_TEST_HOSTCHECK#fail:}\"}"; exit 1;;
+  esac;;
+esac
 echo '{}'
 FAKE
     chmod 0755 "$top/bin/agentos"
@@ -73,6 +83,10 @@ FAKE
   AGENTOS_INSTALL_KVM="$t/no-kvm" expect_refusal 'KVM is not usable' "$p" "$rel" --sha256 "$(sum "$rel")" --prefix "$p" --home "$h"
   mkdir -p "$t/v1cgroup"
   AGENTOS_INSTALL_CGROUP="$t/v1cgroup" expect_refusal 'cgroup v2 with cpu, memory and pids' "$p" "$rel" --sha256 "$(sum "$rel")" --prefix "$p" --home "$h"
+  AGENTOS_INSTALL_GIT=no-such-git expect_refusal 'git is required' "$p" "$rel" --sha256 "$(sum "$rel")" --prefix "$p" --home "$h"
+  # cgroups present but not delegable: the release's own jail probe refuses.
+  AGENTOS_INSTALL_TEST_HOSTCHECK='fail:jailer unavailable: cannot delegate cpu memory pids' \
+    expect_refusal 'host check failed.*cannot delegate' "$p" "$rel" --sha256 "$(sum "$rel")" --prefix "$p" --home "$h"
   # A release with a file SHA256SUMS does not list, and one whose file does not match.
   cp -r "$t/r1/agentos-1.0.0-x86_64-linux" "$t/bad/agentos-1.0.0-x86_64-linux"
   : > "$t/bad/agentos-1.0.0-x86_64-linux/bin/extra"
@@ -110,6 +124,9 @@ FAKE
   # A fresh home is created; --allow-unjailed installs without cgroup v2.
   AGENTOS_INSTALL_CGROUP="$t/v1cgroup" sh "$0" "$rel" --sha256 "$(sum "$rel")" --prefix "$t/p2" --home "$t/new-home" --allow-unjailed > "$t/out" 2> "$t/err"
   [ -d "$t/new-home" ] && grep -q 'unjailed' "$t/err" || { echo 'self-test: --allow-unjailed failed' >&2; exit 1; }
+  grep -q -- "--home $t/new-home .*--allow-unjailed host-check" "$t/calls" ||
+    { echo 'self-test: the unjailed host check was not asked to allow unjailed use' >&2; exit 1; }
+  expect_refusal 'paths with spaces' "$t/sp ace" "$rel" --sha256 "$(sum "$rel")" --prefix "$t/sp ace" --home "$h"
   echo 'install.sh self-test passed'
 }
 
@@ -127,6 +144,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 [ -n "$want" ] || refuse 'the release checksum is required: --sha256 HEX'
+case "$prefix$home" in *' '*) refuse 'paths with spaces are not supported for --prefix and --home';; esac
 
 # 1. Architecture.
 arch=$(seam AGENTOS_INSTALL_ARCH "$(uname -m)")
@@ -136,10 +154,13 @@ arch=$(seam AGENTOS_INSTALL_ARCH "$(uname -m)")
 got=$(sha256sum "$tarball" | cut -d' ' -f1)
 [ "$got" = "$want" ] || refuse "checksum mismatch: $tarball is $got, expected $want"
 if tar -tzf "$tarball" | grep -Eq '^/|(^|/)\.\.(/|$)'; then refuse "unsafe path in $tarball"; fi
-# 3. KVM.
+# 3. KVM (a character device; the test seam's stand-in is a regular file) and git.
 kvm=$(seam AGENTOS_INSTALL_KVM /dev/kvm)
-{ [ -e "$kvm" ] && [ -r "$kvm" ] && [ -w "$kvm" ]; } ||
-  refuse "KVM is not usable: $kvm must exist and be readable and writable by $(id -un) (enable virtualization; add the user to the kvm group)"
+kind=-c; [ "${AGENTOS_INSTALL_TEST:-}" = 1 ] && kind=-e
+{ [ "$kind" "$kvm" ] && [ -r "$kvm" ] && [ -w "$kvm" ]; } ||
+  refuse "KVM is not usable: $kvm must be a device readable and writable by $(id -un) (enable virtualization; add the user to the kvm group)"
+git=$(seam AGENTOS_INSTALL_GIT git)
+command -v "$git" > /dev/null 2>&1 || refuse 'git is required (agentos parses patches with it); install git'
 # 4. cgroups for the jail.
 cgroup=$(seam AGENTOS_INSTALL_CGROUP /sys/fs/cgroup)
 if [ -z "$unjailed" ]; then
@@ -178,6 +199,13 @@ grep -q "\"version\":\"$version\"" "$top/MANIFEST.json" 2>/dev/null || fail "MAN
 listed=$(cd "$top" && cut -d' ' -f3- SHA256SUMS | sed 's|^\*||' | sort)
 present=$(cd "$top" && find . -type f ! -name SHA256SUMS | sort)
 [ "$listed" = "$present" ] || fail 'a file is not listed in SHA256SUMS'
+# The release's own host check, before anything is activated: the CLI's exact rules.
+check_args="--home $home --firecracker $top/bin/firecracker --jailer $top/bin/jailer"
+[ -z "$unjailed" ] || check_args="$check_args --allow-unjailed"
+# shellcheck disable=SC2086 # the arguments are paths without spaces
+if ! report=$("$top/bin/agentos" $check_args host-check 2>&1); then
+  fail "host check failed: $report"
+fi
 if [ "${AGENTOS_INSTALL_TEST:-}" = 1 ] && [ "${AGENTOS_INSTALL_INTERRUPT:-}" = 1 ]; then exit 9; fi
 dest="$prefix/$version"
 if [ -e "$dest" ]; then

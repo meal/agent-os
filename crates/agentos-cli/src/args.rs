@@ -120,6 +120,13 @@ pub enum Command {
         #[command(subcommand)]
         command: ImageCommand,
     },
+    /// Print the versions this build speaks: guest protocol, model policy and limits, VM
+    /// resources, the analyzer runtime and world, and the Firecracker it expects.
+    Version,
+    /// Check this host for the Firecracker worker (KVM, Firecracker, git, the jail) and print
+    /// a JSON report; exit 1 when a requirement fails (the jail only without
+    /// --allow-unjailed).
+    HostCheck,
     /// Manage the analyzer component registry.
     Component {
         #[command(subcommand)]

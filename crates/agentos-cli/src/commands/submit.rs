@@ -398,7 +398,7 @@ pub async fn submit(
         "profile_digest": profile_digest,
         "model": model.as_ref().map_or_else(|| FAKE_AGENT.to_string(), ModelSpec::recorded),
         "model_policy_version": 1,
-        "model_limits_version": 1,
+        "model_limits_version": agentos_engine::model::policy::LIMITS_VERSION,
         "model_endpoint": match &model {
             Some(ModelSpec::Anthropic(_)) => Some(home.checked_base_url()?
                 .unwrap_or_else(|| agentos_engine::model::anthropic::ANTHROPIC_BASE_URL.into())

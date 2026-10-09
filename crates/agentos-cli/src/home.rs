@@ -601,6 +601,21 @@ impl Home {
 
     /// The jail configuration: the jailer, the jail uid/gid, and the cgroup root `/proc/mounts`
     /// names (the one the probe checks, `collect` cleans and the real jailer writes to).
+    /// The jail probe `submit` runs, over this home's paths (the test hook answers first).
+    pub fn probe_jail(&self) -> Result<Result<(), String>, CliError> {
+        if let Some(answer) = probe_hook(|k| std::env::var(k).ok())? {
+            return Ok(answer);
+        }
+        let root = std::path::absolute(&self.root)?;
+        Ok(jail::probe(
+            &self.jail_config()?,
+            &root.join("jobs"),
+            &root.join("inspect"),
+            &root.join("work"),
+            &self.images_dir(),
+        ))
+    }
+
     fn jail_config(&self) -> std::io::Result<JailConfig> {
         Ok(JailConfig {
             jailer_bin: std::path::absolute(self.jailer_bin())?,

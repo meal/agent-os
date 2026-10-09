@@ -5541,3 +5541,58 @@ fn a_task_without_an_analyzer_exports_no_analysis() {
     assert!(manifest.get("analysis").is_none(), "{manifest}");
     assert!(!bundle.join("analysis").exists());
 }
+
+#[test]
+fn version_reports_what_the_code_speaks() {
+    let cli = Cli::bare();
+    let v = cli.json(&["version"]);
+    assert_eq!(v["agentos"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(v["guest_protocol"], 1);
+    assert_eq!(v["model_policy_version"], 1);
+    assert_eq!(v["model_limits_version"], 1);
+    assert_eq!(v["vm_resources_version"], 1);
+    assert_eq!(v["analyzer_runtime"], "wasmtime 49.0.2");
+    assert_eq!(v["analyzer_world"], "agentos:analyzer/analyzer@1.0.0");
+    assert_eq!(v["firecracker"], "Firecracker v1.17.");
+}
+
+/// The host check reports every requirement; the jail is required unless --allow-unjailed.
+#[test]
+fn host_check_reports_each_requirement_and_fails_on_a_required_one() {
+    let cli = Cli::bare();
+    let check = |extra: &[&str], probe: &str| {
+        let mut args = vec!["--firecracker", "/nonexistent/firecracker"];
+        args.extend_from_slice(extra);
+        args.push("host-check");
+        let out = cli
+            .cmd_as(Mode::Plain, &args)
+            .env("AGENTOS_TEST_WORKERS", "1")
+            .env("AGENTOS_TEST_JAIL_PROBE", probe)
+            .assert()
+            .code(1)
+            .get_output()
+            .clone();
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()
+    };
+    let report = check(&[], "fail:cgroup v2 hierarchy /sys/fs/cgroup is read-only");
+    for key in ["kvm", "firecracker", "git", "jail"] {
+        assert!(report.get(key).is_some(), "{report}");
+    }
+    assert_eq!(report["git"], "ok");
+    assert!(
+        report["firecracker"]
+            .as_str()
+            .unwrap()
+            .contains("/nonexistent/firecracker"),
+        "{report}"
+    );
+    assert_eq!(
+        report["jail"],
+        "cgroup v2 hierarchy /sys/fs/cgroup is read-only"
+    );
+    assert_eq!(report["jail_required"], true);
+    let unjailed = check(&["--allow-unjailed"], "fail:needs root");
+    assert_eq!(unjailed["jail_required"], false);
+    assert_eq!(unjailed["jail"], "needs root");
+    assert_eq!(check(&[], "ok")["jail"], "ok");
+}

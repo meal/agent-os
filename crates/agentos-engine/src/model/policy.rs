@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::time::UNIX_EPOCH;
 
 pub const POLICY_VERSION: u32 = 1;
+/// The model limits version new submissions record.
+pub const LIMITS_VERSION: u32 = 1;
 pub const REQUEST_LIMIT: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -7,13 +7,14 @@
 #   docker compose run --rm test-kvm sh scripts/release.sh VERSION [IMAGE]
 #
 # Runs in test-kvm, which mounts the built guest images (scripts/build-guest-image.sh) and the
-# fetched Firecracker (scripts/fetch-firecracker.sh). IMAGE defaults to python-stdlib-v1.
+# fetched Firecracker (scripts/fetch-firecracker.sh). IMAGE defaults to python-stdlib-py314-v2,
+# the image with a source-built, provenanced kernel.
 set -eu
 REPO=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 cd "$REPO"
 [ "$#" -ge 1 ] && [ "$#" -le 2 ] || { echo 'usage: scripts/release.sh VERSION [IMAGE]' >&2; exit 2; }
 version=$1
-image=${2:-python-stdlib-v1}
+image=${2:-python-stdlib-py314-v2}
 case "$version" in *[!0-9A-Za-z.+-]* | '' | -*) echo "invalid version $version" >&2; exit 2;; esac
 case "$image" in *[!0-9A-Za-z.-]* | '' | -*) echo "invalid image $image" >&2; exit 2;; esac
 fc="$REPO/build/firecracker/v1.17.0"
@@ -21,7 +22,13 @@ fc="$REPO/build/firecracker/v1.17.0"
 [ -f "build/guest-images/$image/image.json" ] || { echo "build the $image guest image first" >&2; exit 1; }
 GIT="git -c safe.directory=$REPO -C $REPO"
 commit=$($GIT rev-parse HEAD)
-if [ -n "$($GIT status --porcelain --untracked-files=no)" ]; then commit="$commit-dirty"; fi
+# A release is built only from a committed tree: no modified and no untracked file (ignored
+# build output is fine), so its commit says exactly what it contains.
+if [ -n "$($GIT status --porcelain)" ]; then
+  echo 'release.sh: the tree has modified or untracked files; commit or remove them first:' >&2
+  $GIT status --porcelain >&2
+  exit 1
+fi
 epoch=$($GIT log -1 --format=%ct)
 
 cargo build --locked --release -q -p agentos-cli --target x86_64-unknown-linux-musl
@@ -44,15 +51,26 @@ digest() { "$stage/bin/agentos" --home "$home" "$1" register "$2" | python3 -c '
 image_digest=$(digest image "$stage/images/$image")
 profile_digest=$(digest profile "$stage/profiles/parser-checks-v1")
 component_digest=$(digest component "$stage/components/repo-analyzer-v1")
-python3 - "$stage/MANIFEST.json" <<PY
+# The versions the code itself reports (protocols, policies, runtimes), the toolchain, and the
+# image's own provenance record.
+"$stage/bin/agentos" version > "$scratch/versions.json"
+rustc --version > "$scratch/rustc"
+python3 - "$stage/MANIFEST.json" "$scratch/versions.json" "$scratch/rustc" "$stage/images/$image/image.json" <<PY
 import json, sys
+out, versions, rustc, image_json = sys.argv[1:]
+image = json.load(open(image_json))
 json.dump({
     "version": "$version", "commit": "$commit", "arch": "x86_64",
     "firecracker": "v1.17.0",
-    "image": {"id": "$image", "digest": "$image_digest"},
+    "rust": open(rustc).read().strip(),
+    "versions": json.load(open(versions)),
+    "image": {"id": "$image", "digest": "$image_digest",
+              "kernel_sha256": image.get("kernel_sha256"),
+              "kernel_build": image.get("kernel_build"),
+              "interpreter": image.get("interpreter")},
     "profile": {"id": "parser-checks-v1", "digest": "$profile_digest"},
     "component": {"id": "repo-analyzer-v1", "digest": "$component_digest"},
-}, open(sys.argv[1], "w"), separators=(",", ":"), sort_keys=True)
+}, open(out, "w"), separators=(",", ":"), sort_keys=True)
 PY
 (cd "$stage" && find . -type f ! -name SHA256SUMS | LC_ALL=C sort | xargs sha256sum > SHA256SUMS)
 mkdir -p build/release

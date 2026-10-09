@@ -2,6 +2,7 @@ mod component;
 mod control;
 mod export;
 mod gc;
+mod host_check;
 mod image;
 mod inspect;
 mod profile;
@@ -84,6 +85,8 @@ pub async fn dispatch(args: Args) -> Result<(), CliError> {
         Command::Image {
             command: ImageCommand::List,
         } => image::list(&home),
+        Command::Version => host_check::version(),
+        Command::HostCheck => host_check::host_check(&home),
         Command::Component {
             command: ComponentCommand::Register { dir },
         } => component::register(&home, &dir),
