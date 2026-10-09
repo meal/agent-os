@@ -14,17 +14,18 @@ use agentos_core::effect::EffectState;
 use agentos_core::ids::{Digest, TaskId};
 use agentos_core::state::TaskState;
 use agentos_engine::agent::{Agent, AgentAction, Observation, SessionAgent};
+use agentos_engine::crash::{CrashHook, CrashPoint, RunOptions};
 use agentos_engine::job::WorkerConfig;
 use agentos_engine::model::fake::FakeProvider;
 use agentos_engine::model::provider::ProviderResult;
-use agentos_engine::runner::run_task;
+use agentos_engine::runner::{EngineError, run_task_with};
 use agentos_engine::supervised::ExecCounts;
 use agentos_engine::workspace::workspace_digest;
 use agentos_store::blob::BlobStore;
 use agentos_store::db::{Db, StoredEvent};
 use common::{
-    FnAgent, copy_dir, create_patch, fake_firecracker_config, fixtures, processes_of_home,
-    routing_over, supervised,
+    FnAgent, assert_no_process_survives, copy_dir, create_patch, fake_firecracker_config, fixtures,
+    processes_of_home, routing_over, supervised,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -191,9 +192,20 @@ impl World {
         SessionAgent::new(argv, vec![], "claude-opus-5-5")
     }
 
-    /// Runs `agent` over the task: the session effects go to the fake guest's session worker,
-    /// the model calls to the fake provider.
-    async fn run(&self, agent: &mut impl Agent) -> TaskState {
+    /// A restarted controller: every database and blob store handle is reopened from disk.
+    fn reopen(&mut self) {
+        self.db = Db::open(&self.path("agentos.db")).unwrap();
+        self.blobs = BlobStore::open(self.path("blobs")).unwrap();
+    }
+
+    /// Runs `agent` over the task with `opts` (a crash hook makes it a kill at that point).
+    /// The session effects go to the fake guest's session worker, the model calls to the fake
+    /// provider.
+    async fn run_with(
+        &self,
+        agent: &mut impl Agent,
+        opts: &RunOptions,
+    ) -> Result<TaskState, EngineError> {
         let worker = WorkerConfig::Firecracker(fake_firecracker_config(self.dir.path()));
         let jobs = supervised(
             &self.path("jobs"),
@@ -209,9 +221,12 @@ impl World {
             &self.counts,
             None,
         );
-        run_task(&self.db, &self.blobs, &exec, agent, &self.task)
-            .await
-            .unwrap()
+        run_task_with(&self.db, &self.blobs, &exec, agent, &self.task, opts).await
+    }
+
+    /// Runs `agent` over the task to its end (no crash).
+    async fn run(&self, agent: &mut impl Agent) -> TaskState {
+        self.run_with(agent, &RunOptions::default()).await.unwrap()
     }
 }
 
@@ -483,4 +498,152 @@ async fn a_task_without_agent_session_fails_before_any_session_job_exists() {
             "no session job"
         );
     }
+}
+
+/// The controller dies after the session finished and its patch was intended: the restarted
+/// controller applies that same patch once, verifies, and never runs the session or a model
+/// call again.
+#[tokio::test]
+async fn a_finished_session_is_not_lost_when_the_controller_dies_at_the_next_intent() {
+    let mut w = World::new(CAPS, 4, 600, vec![answer(), answer()]);
+    let argv = w.cli(&two_calls_and_a_fix());
+    let mut agent = w.session(argv.clone());
+    let hook = CrashHook::at(CrashPoint::AfterIntent, "apply_patch");
+    let err = w
+        .run_with(&mut agent, &RunOptions::crash_with(hook))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::Crashed(CrashPoint::AfterIntent)),
+        "{err:?}"
+    );
+    assert_eq!(
+        w.effects("RunAgentSession")[0].state,
+        EffectState::Completed
+    );
+
+    w.reopen();
+    let mut agent = w.session(argv);
+    assert_eq!(
+        w.run(&mut agent).await,
+        TaskState::Succeeded,
+        "{:?}",
+        w.failed_reason()
+    );
+    let patches = w.effects("ApplyPatch");
+    assert_eq!(patches.len(), 1, "the patch was intended once");
+    assert_eq!(patches[0].state, EffectState::Completed);
+    assert_eq!(w.effects("RunVerification").len(), 1);
+    assert_eq!(w.counts.get("run_agent_session"), 1, "never run again");
+    assert_eq!(w.counts.get("apply_patch"), 1, "the patch was applied once");
+    assert_eq!(w.provider.calls(), 2, "no model call was sent twice");
+    assert_eq!(w.effects("RunAgentSession").len(), 1);
+    let task = w.db.task(&w.task).unwrap();
+    assert_eq!(task.verified_digest, Some(task.workspace_digest));
+    assert_no_process_survives(w.dir.path());
+}
+
+/// The controller dies after the session effect completed and before the next turn was
+/// journaled: the restarted controller rebuilds the session's end from its stored result and
+/// carries on; the session is not started again.
+#[tokio::test]
+async fn a_session_completed_before_the_crash_is_rebuilt_and_not_run_again() {
+    let mut w = World::new(CAPS, 4, 600, vec![answer(), answer()]);
+    let argv = w.cli(&two_calls_and_a_fix());
+    let mut agent = w.session(argv.clone());
+    let hook = CrashHook::at(CrashPoint::AfterComplete, "run_agent_session");
+    let err = w
+        .run_with(&mut agent, &RunOptions::crash_with(hook))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::Crashed(CrashPoint::AfterComplete)),
+        "{err:?}"
+    );
+    assert_eq!(
+        w.effects("RunAgentSession")[0].state,
+        EffectState::Completed
+    );
+
+    w.reopen();
+    let mut agent = w.session(argv);
+    assert_eq!(
+        w.run(&mut agent).await,
+        TaskState::Succeeded,
+        "{:?}",
+        w.failed_reason()
+    );
+    assert_eq!(w.effects("RunAgentSession").len(), 1, "no second session");
+    assert_eq!(w.counts.get("run_agent_session"), 1);
+    assert_eq!(w.provider.calls(), 2);
+    assert_eq!(w.effects("ApplyPatch")[0].state, EffectState::Completed);
+    assert_eq!(w.effects("RunVerification").len(), 1);
+    assert_no_process_survives(w.dir.path());
+}
+
+/// The controller dies while the session runs, just after its first model call was answered
+/// (the response is stored, not yet sent to the CLI). The restarted controller ends the task
+/// as lost, kills the session's job, never sends the answered call again, and counts it used.
+#[tokio::test]
+async fn a_session_killed_while_running_ends_the_task_as_lost_and_the_call_is_not_resent() {
+    // A short deadline: the failing run must not wait for the session's own lease.
+    let mut w = World::new(CAPS, 4, 30, vec![answer()]);
+    let body = r#"{"model":"m","max_tokens":8,"messages":[]}"#;
+    // The CLI waits for the reply that the dead controller never sends.
+    let argv = w.cli(&one_call(body, ""));
+    let mut agent = w.session(argv.clone());
+    let hook = CrashHook::at(CrashPoint::AfterComplete, "model_call");
+    let err = w
+        .run_with(&mut agent, &RunOptions::crash_with(hook))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::Crashed(CrashPoint::AfterComplete)),
+        "{err:?}"
+    );
+    // The kill is a real one: the session is still open, its job still running.
+    assert_eq!(
+        w.effects("RunAgentSession")[0].state,
+        EffectState::Dispatched
+    );
+    assert_eq!(w.effects("ModelCall")[0].state, EffectState::Completed);
+
+    w.reopen();
+    let mut agent = w.session(argv);
+    assert_eq!(w.run(&mut agent).await, TaskState::Failed);
+    assert_eq!(
+        w.failed_reason().as_deref(),
+        Some("agent session lost"),
+        "{:?}",
+        w.events()
+    );
+    assert_eq!(
+        w.provider.calls(),
+        1,
+        "the answered call is never sent again"
+    );
+    assert_eq!(w.counts.get("run_agent_session"), 1, "never run again");
+    assert_eq!(w.effects("ModelCall")[0].state, EffectState::Completed);
+    assert_eq!(
+        w.db.usage_summary(&w.task).unwrap().settled_model_requests,
+        1
+    );
+    // The cancelled job's receipt is not the session's result: the session is lost, not
+    // published as a failure (and never run again).
+    let decisions: Vec<_> = w
+        .events()
+        .into_iter()
+        .filter(|e| e.event_type == "RecoveryDecision" && e.payload["kind"] == "run_agent_session")
+        .map(|e| e.payload["decision"].clone())
+        .collect();
+    assert_eq!(decisions, vec![json!("Unreconcilable")]);
+    assert_eq!(w.effects("RunAgentSession")[0].state, EffectState::Unknown);
+    let session = w.effects("RunAgentSession")[0].effect_id.to_string();
+    assert!(
+        !w.events()
+            .iter()
+            .any(|e| e.event_type == "EffectFailed" && e.payload["effect_id"] == session.as_str()),
+        "the cancelled receipt was not published"
+    );
+    assert_no_process_survives(w.dir.path());
 }

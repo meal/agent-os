@@ -43,8 +43,8 @@
 use std::time::Instant;
 
 use agentos_core::effect::{
-    AttemptId, EffectId, EffectKind, EffectRecord, EffectState, ReceiptVerdict, RetryPolicy,
-    accept_receipt,
+    AttemptId, EffectId, EffectKind, EffectRecord, EffectState, Outcome, ReceiptVerdict,
+    RetryPolicy, accept_receipt,
 };
 use agentos_core::ids::{Digest, TaskId};
 use agentos_core::state::{TaskEvent, TaskState};
@@ -283,6 +283,8 @@ fn payload<E>(cx: &Cx<'_, E>, rec: &EffectRecord) -> Result<Option<Vec<u8>>> {
     match rec.kind {
         EffectKind::ApplyPatch { .. } => Ok(recovered_patch(cx, rec)?.map(String::into_bytes)),
         EffectKind::ModelCall { .. } => journal::model_request_body(cx.blobs, rec),
+        // Never re-dispatched: an open session is lost (see `recover_session`).
+        EffectKind::RunAgentSession { .. } => Ok(None),
         // Issued before the agent's first turn, so the workspace is still the snapshot; the
         // rebuilt request counts only if it is the journaled one.
         EffectKind::AnalyzeSnapshot => {
@@ -328,6 +330,57 @@ async fn use_retained<E: Executor>(
     Ok(false)
 }
 
+/// A session is never run again. One never started (INTENDED) is lost, since no controller
+/// would serve its mailbox. One that started is cancelled and waited for: its completed result
+/// is published if its job left one, otherwise the session is lost. A cancelled job's receipt is
+/// a failure, never published as the session's end.
+async fn recover_session<E: Executor>(
+    cx: &Cx<'_, E>,
+    rec: EffectRecord,
+    report: &mut RecoveryReport,
+    can_dispatch: bool,
+    closing: bool,
+) -> Result<()> {
+    if rec.state == EffectState::Intended {
+        if can_dispatch {
+            return unreconcilable(cx, report, &rec, "intended, never started: lost");
+        }
+        if closing {
+            return abandon(
+                cx,
+                report,
+                &rec,
+                "never started, and the task can no longer start it",
+            );
+        }
+        report.deferred.push(rec.effect_id);
+        return Ok(());
+    }
+    cx.exec.cancel_jobs(std::slice::from_ref(&rec.effect_id));
+    if !can_dispatch && !closing {
+        report.deferred.push(rec.effect_id);
+        return Ok(());
+    }
+    if let JobWait::StillAlive = cx.exec.await_job(&rec.effect_id).await
+        && !cx.exec.fence_job(&rec.effect_id).await
+    {
+        return fence_failed(cx, report, &rec);
+    }
+    if let Some(out) = cx.exec.retained_outcome(&rec.effect_id)
+        && out.receipt.outcome == Outcome::Success
+        && usable(&rec, &out)
+    {
+        decide(cx, report, &rec, Decision::PublishRetained, RETAINED)?;
+        return expect_applied(&rec, finish_attempt(cx, &rec, &out)?);
+    }
+    unreconcilable(
+        cx,
+        report,
+        &rec,
+        "the controller died while the session ran: the session is lost and never run again",
+    )
+}
+
 async fn recover_effect<E: Executor>(
     cx: &Cx<'_, E>,
     rec: EffectRecord,
@@ -339,6 +392,9 @@ async fn recover_effect<E: Executor>(
     // dispatches again.
     let closing = t.state.is_terminal() || t.cancel_requested || cx.closing.is_some();
 
+    if let EffectKind::RunAgentSession { .. } = rec.kind {
+        return recover_session(cx, rec, report, can_dispatch, closing).await;
+    }
     if rec.state != EffectState::Intended && use_retained(cx, &rec, report, RETAINED).await? {
         return Ok(());
     }

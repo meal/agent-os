@@ -304,7 +304,8 @@ fn reason_of(out: &ExecOutcome) -> String {
 
 /// The end of an effect nobody can decide: a DISPATCHED one becomes UNKNOWN (its reservation
 /// `Uncertain`, since it may have run), and a task that is not terminal yet fails with
-/// "unreconcilable effect <id>". Returns the task's state afterwards.
+/// "unreconcilable effect <id>", or "agent session lost" for a session (which is never run
+/// again). Returns the task's state afterwards.
 pub(crate) fn mark_unreconcilable(db: &Db, rec: &EffectRecord) -> Result<TaskState> {
     if rec.state == EffectState::Dispatched {
         db.mark_unknown(&rec.effect_id)?;
@@ -313,11 +314,11 @@ pub(crate) fn mark_unreconcilable(db: &Db, rec: &EffectRecord) -> Result<TaskSta
     if t.state.is_terminal() {
         return Ok(t.state);
     }
-    fail(
-        db,
-        &rec.task_id,
-        &format!("unreconcilable effect {}", rec.effect_id),
-    )
+    let reason = match rec.kind {
+        EffectKind::RunAgentSession { .. } => "agent session lost".to_string(),
+        _ => format!("unreconcilable effect {}", rec.effect_id),
+    };
+    fail(db, &rec.task_id, &reason)
 }
 
 /// Steps 4-6 for an outcome in hand, whether just executed, retained by the executor

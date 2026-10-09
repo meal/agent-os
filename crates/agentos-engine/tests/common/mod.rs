@@ -8,6 +8,7 @@ pub mod procs;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use agentos_core::contract::Contract;
 use agentos_core::effect::{EffectId, EffectRecord};
@@ -417,6 +418,25 @@ pub fn processes_of_home(root: &Path) -> Vec<i32> {
         pids.extend(home_firecrackers(root).into_iter().map(|p| p.pid));
     }
     pids
+}
+
+/// Waits up to 10 s for every process of `root` (its job directories and, in real mode, its
+/// VMs) to be gone, then panics with the survivors. A job's processes are reaped a moment
+/// after its receipt is written, so an instant scan right after the run is not a test of
+/// leftovers.
+pub fn assert_no_process_survives(root: &Path) {
+    let started = Instant::now();
+    loop {
+        let live = processes_of_home(root);
+        if live.is_empty() {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "processes outlived their job: {live:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// A supervised executor running `worker` jobs under `jobs_root` with the real supervisor

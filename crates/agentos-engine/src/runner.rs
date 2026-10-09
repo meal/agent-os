@@ -905,9 +905,18 @@ async fn run_session<E: Executor>(
         )?));
     }
     let after = journal::events_after(db, task, since)?;
-    if journal::intended(&after, "RunAgentSession", None)?.is_some() {
-        // Recovery of an open session is not implemented: a session is never run twice.
-        return Ok(Next::Stop(fail(db, task, "agent session lost")?));
+    if let Some(id) = journal::intended(&after, "RunAgentSession", None)? {
+        // The session was intended before this controller started. Its end is rebuilt from the
+        // stored result when it has one; an open one is never run again: its job is cancelled
+        // and the task ends lost.
+        let rec = db.effect(&id)?;
+        return match rec.state {
+            EffectState::Completed | EffectState::Failed => Ok(session_end(cx, &rec)?),
+            _ => {
+                cx.exec.cancel_jobs(std::slice::from_ref(&id));
+                Ok(Next::Stop(fail(db, task, "agent session lost")?))
+            }
+        };
     }
     if !cx.exec.runs_agent_sessions() {
         return Ok(Next::Stop(fail(
@@ -945,19 +954,22 @@ async fn run_session<E: Executor>(
     let decided = loop {
         tokio::select! {
             done = &mut attempt => break done,
+            // A mailbox error ends the run as a kill would: the session is left open for
+            // recovery, its job is not cancelled and nothing is journaled for it.
             served = &mut serving, if stop.is_none() => {
+                let state = served?;
                 cx.exec.cancel_jobs(std::slice::from_ref(&rec.effect_id));
-                stop = Some(served);
+                stop = Some(state);
             }
         }
     };
-    if let Some(served) = stop {
+    if let Some(state) = stop {
         // The task already stopped: an attempt that failed alongside it (for instance one that
         // raced with recovery over the same effect) changes nothing the stop did not.
         if let Err(e) = &decided {
             tracing::warn!(task_id = %task, error = %e, "the session's attempt failed after the task stopped");
         }
-        return Ok(Next::Stop(served?));
+        return Ok(Next::Stop(state));
     }
     match decided? {
         Attempt::Published(ReceiptVerdict::Apply) => session_end(cx, &db.effect(&rec.effect_id)?),
