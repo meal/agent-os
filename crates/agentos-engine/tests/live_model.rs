@@ -240,28 +240,6 @@ async fn execute_with_artifacts(
     }
 }
 
-/// Panics when `key` occurs in any file under `paths` (decoded response bodies included).
-/// The message names the file and location, never the key.
-fn assert_key_absent(key: &str, paths: &[&Path]) {
-    let mut found = Vec::new();
-    for path in paths {
-        let hits = if path.is_dir() {
-            common::evidence::tree_findings(path, &[key.as_bytes()])
-        } else {
-            common::evidence::file_findings(path, &[key.as_bytes()])
-        };
-        found.extend(
-            hits.into_iter()
-                .filter(|f| f.ends_with("a secret, verbatim")),
-        );
-    }
-    assert!(
-        found.is_empty(),
-        "the API key was written to evidence:\n{}",
-        found.join("\n")
-    );
-}
-
 fn assert_same_replay(run: &Run, replay: &Run) {
     assert_eq!(run.model_calls, replay.model_calls);
     assert_eq!(run.requests, replay.requests);
@@ -333,7 +311,7 @@ fn run_on_thread(live: Live, path: PathBuf) -> Result<(Run, PathBuf), String> {
             Some(&path.with_extension("bundle")),
         ));
         // Before the success report: neither the recording nor the bundle holds the key.
-        assert_key_absent(&key, &[&path, &path.with_extension("bundle")]);
+        live::assert_key_absent(&key, &[&path, &path.with_extension("bundle")]);
         let evidence = serde_json::json!({
             "schema_version": 1, "kind": "live-acceptance", "worker": tier.name(),
             "commit": std::env::var("AGENTOS_EVIDENCE_COMMIT").ok(),
@@ -444,7 +422,7 @@ async fn the_live_harness_runs_offline_against_the_local_fake_api() {
         Some(&bundle),
     )
     .await;
-    assert_key_absent("sk-ant-FAKE-offline-harness-key", &[&path, &bundle]);
+    live::assert_key_absent("sk-ant-FAKE-offline-harness-key", &[&path, &bundle]);
     assert_eq!(run.model_calls, 4, "list, read, patch, verify");
     assert_eq!(api.hits(), 4);
     for r in api.requests() {
@@ -590,9 +568,10 @@ fn the_key_check_fails_on_a_key_in_a_decoded_body_without_printing_it() {
         serde_json::to_vec(&serde_json::json!({ "Response": [bytes, {}] })).unwrap(),
     )
     .unwrap();
-    assert_key_absent("some-other-key", &[&dir.path().join("bundle")]);
-    let panic = std::panic::catch_unwind(|| assert_key_absent(key, &[&dir.path().join("bundle")]))
-        .expect_err("a key in a decoded body fails the check");
+    live::assert_key_absent("some-other-key", &[&dir.path().join("bundle")]);
+    let panic =
+        std::panic::catch_unwind(|| live::assert_key_absent(key, &[&dir.path().join("bundle")]))
+            .expect_err("a key in a decoded body fails the check");
     let message = panic.downcast_ref::<String>().cloned().unwrap_or_default();
     assert!(message.contains("0001-response.json"), "{message}");
     assert!(!message.contains(key), "the message never holds the key");
