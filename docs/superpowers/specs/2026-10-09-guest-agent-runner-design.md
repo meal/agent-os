@@ -1,7 +1,12 @@
 # External agent CLI inside the guest — design
 
-Status: first roadmap item after v0.1 (release candidate v0.1.0-rc5). Design only; nothing is
-implemented.
+Status: implemented on branch `acceptance-evidence` (plan
+[2026-10-09-guest-agent-runner](../plans/2026-10-09-guest-agent-runner.md), evidence in
+`docs/evidence/2026-10-09/`). The open questions below were closed by the plan's Decisions: a
+crash mid-session fails the task ("agent session lost", no resume); changes leave the guest as a
+diff through the existing patch path; the provider stays non-streaming and the proxy replays SSE;
+the host rewrites the model and strips beta-only fields. The live run needed two codec fixes
+(per-message beta fields, thinking signatures) that the original text did not foresee.
 
 ## Goal
 

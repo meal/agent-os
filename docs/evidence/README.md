@@ -122,3 +122,17 @@ resource measurements, and the new component ABI remain separate gates in the ma
 plan. A copied pyenv interpreter plus two identical guest outputs does not prove an
 independent Python source rebuild; that provenance limit remains documented in the
 candidate recipe.
+
+## 2026-10-09: external agent CLI in the guest
+
+The real Claude Code binary as the task's agent inside the microVM, model traffic over vsock
+through the controller (design and plan in `docs/superpowers/`). Image `agent-cli-py314-v1`
+(guest protocol 2).
+
+| Run | Commit | Result |
+| --- | --- | --- |
+| KVM tier, three agent-session tests, both workspace suites with the default and the real worker | `aba71fc`/`fff1c23` | Passed: no NIC and no key, real CLI fixes the fixture, cancel and lease end the session (`agent-session-kvm.md`). |
+| `acceptance.sh live-agent`, attempt 1 | `9105e7e` | **Rejected by the API** (HTTP 400, per-message beta field), one send (`live-agent-attempt-1.md`). |
+| attempt 2 | `0ebb90f` | Call 1 answered; call 2 **rejected** (HTTP 400, thinking block without its signature) (`live-agent-attempt-2.md`). |
+| attempt 3 | `d90b9ba` | **Passed**: `Succeeded`, 5 model calls, protected verification passed (`live-agent-attempt-3.md`, `live-agent-pass/`). |
+

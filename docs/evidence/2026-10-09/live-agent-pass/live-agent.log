@@ -1,0 +1,20 @@
+ Container agentos-acceptance-test-kvm-run-4d8732fed631 Creating 
+ Container agentos-acceptance-test-kvm-run-4d8732fed631 Created 
+   Compiling agentos-engine v0.1.0 (/work/crates/agentos-engine)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.67s
+     Running tests/live_agent_session.rs (target/debug/deps/live_agent_session-b654848c53fcfa93)
+
+running 4 tests
+test the_live_agent_harness_reports_a_rejection_and_fails ... problems of the rejected run: [
+    "the task ended Failed: {\"Failed\":{\"reason\":\"http 400: {\\\"type\\\":\\\"error\\\",\\\"error\\\":{\\\"type\\\":\\\"invalid_request_error\\\",\\\"message\\\":\\\"offline harness: rejected on purpose\\\"}}\"}}",
+]
+ok
+test the_live_agent_harness_runs_offline_against_the_local_fake_api ... ok
+test the_real_cli_fixes_the_parser_in_the_microvm_through_the_real_api ... model: claude-haiku-5-5 (cap 12 requests)
+task: Succeeded
+summary: /evidence/live-agent-1791557593611.summary.json
+ok
+test the_summary_rows_match_the_recording_outcomes ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 24.40s
+

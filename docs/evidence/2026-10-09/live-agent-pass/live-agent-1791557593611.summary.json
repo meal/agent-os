@@ -1,0 +1,122 @@
+{
+  "attempts": [
+    {
+      "attempt": 1,
+      "bytes": 1820,
+      "input_tokens": 4,
+      "outcome": "response",
+      "output_tokens": 166,
+      "request_digest": "23173536f97f869881762b101afed009b7b01708f249879d6ad907a810dd4fde"
+    },
+    {
+      "attempt": 2,
+      "bytes": 831,
+      "input_tokens": 4,
+      "outcome": "response",
+      "output_tokens": 141,
+      "request_digest": "18dd542613d69fda889a077f92c18df81ff0939df5fd9f70c373993248b752e4"
+    },
+    {
+      "attempt": 3,
+      "bytes": 3627,
+      "input_tokens": 4,
+      "outcome": "response",
+      "output_tokens": 690,
+      "request_digest": "49225b1f00a86f52ebc5e4626773c4839a523610d0d5db7d74f638e1f27a806c"
+    },
+    {
+      "attempt": 4,
+      "bytes": 2434,
+      "input_tokens": 4,
+      "outcome": "response",
+      "output_tokens": 307,
+      "request_digest": "9dd00e3b6f0ceb416ecd2c6bc171876143e68755bdf21d04879b4186af3a537d"
+    },
+    {
+      "attempt": 5,
+      "bytes": 1526,
+      "input_tokens": 4,
+      "outcome": "response",
+      "output_tokens": 336,
+      "request_digest": "1e5bfeca53de43560c5c35bb3ea4687a34874012e7b9e4445e30eb1fc50d4a3c"
+    }
+  ],
+  "commit": "d90b9ba08c9ea6713b87f98b08979fc1766ee616",
+  "contract": {
+    "deadline_seconds": 900,
+    "max_output_tokens_per_request": 4096,
+    "model_requests": 12,
+    "worker_memory_mib": 1024
+  },
+  "endpoint": "https://api.anthropic.com",
+  "events": {
+    "ActionUsed": 2,
+    "AgentTurn": 3,
+    "ArtifactRegistered": 15,
+    "CapabilitiesIssued": 1,
+    "CapabilityGranted": 18,
+    "EffectCompleted": 9,
+    "EffectDispatched": 9,
+    "EffectIntended": 9,
+    "SessionModelCall": 5,
+    "Started": 1,
+    "Submitted": 1,
+    "TaskCreated": 1,
+    "VerifyPassed": 1,
+    "VerifyStarted": 1,
+    "WorkspaceUpdated": 2
+  },
+  "failure": null,
+  "image": "agent-cli-py314-v1",
+  "kind": "live-agent-session",
+  "model": "claude-haiku-5-5",
+  "model_calls": [
+    {
+      "effect_id": "24d0c223eacb4b90b915a27889328fde28d66fc236f820f3fc37551ded664100",
+      "request_digest": "23173536f97f869881762b101afed009b7b01708f249879d6ad907a810dd4fde",
+      "request_file": "model/0001-request.json",
+      "response_digest": "3be1146109b5a6f871445b2586be5b64747b6521e02377aa064e55fd55dfb59e",
+      "response_file": "model/0001-response.json",
+      "state": "COMPLETED"
+    },
+    {
+      "effect_id": "740c55e5a880d454823ad47ef1d241c99ea0b890b394d1140c1b720b7629717c",
+      "request_digest": "18dd542613d69fda889a077f92c18df81ff0939df5fd9f70c373993248b752e4",
+      "request_file": "model/0002-request.json",
+      "response_digest": "5f3045a70fa650ffb866ddf46e98591ed8e3c86a8dc10a9976249f9e2e9d51f6",
+      "response_file": "model/0002-response.json",
+      "state": "COMPLETED"
+    },
+    {
+      "effect_id": "4f16cdea145a51229bc7a634eca7aeb382170ea1a95746bdd419071189711a0b",
+      "request_digest": "49225b1f00a86f52ebc5e4626773c4839a523610d0d5db7d74f638e1f27a806c",
+      "request_file": "model/0003-request.json",
+      "response_digest": "79ca5bda7220b1e85e31619b0d7cb4f0a4012ea934f1cdd5a1668b8f2ddf05f5",
+      "response_file": "model/0003-response.json",
+      "state": "COMPLETED"
+    },
+    {
+      "effect_id": "2a016b27bc0d4112ab9764dde290cc0490329fbf59d67ea0fd03191dc888736b",
+      "request_digest": "9dd00e3b6f0ceb416ecd2c6bc171876143e68755bdf21d04879b4186af3a537d",
+      "request_file": "model/0004-request.json",
+      "response_digest": "02484c33d488e3033ac7963694bc4319adc894fd17b8ac5f5ea233d3cb3a1020",
+      "response_file": "model/0004-response.json",
+      "state": "COMPLETED"
+    },
+    {
+      "effect_id": "41481190d60af05be4050a75f1323ffc1f4f75f469e8c211acb64d80d44946d1",
+      "request_digest": "1e5bfeca53de43560c5c35bb3ea4687a34874012e7b9e4445e30eb1fc50d4a3c",
+      "request_file": "model/0005-request.json",
+      "response_digest": "38bdba3056edddf8bfd198728eafdd5c750372a15a20be88ee325067fff1f0c8",
+      "response_file": "model/0005-response.json",
+      "state": "COMPLETED"
+    }
+  ],
+  "problems": [],
+  "schema_version": 1,
+  "state": "Succeeded",
+  "usage": {
+    "input_tokens": 20,
+    "output_tokens": 1640
+  }
+}
