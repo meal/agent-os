@@ -730,7 +730,11 @@ fn a_plain_model_task_records_no_agent_cli_and_its_screen_keeps_the_model_line()
         submitted.get("agent_cli").is_none(),
         "no agent_cli key for a plain model task: {submitted}"
     );
-    assert!(cli.status(&id).get("agent_cli").is_none());
+    assert!(
+        cli.json_as(Mode::Plain, &["status", &id])
+            .get("agent_cli")
+            .is_none()
+    );
 }
 
 #[test]
@@ -6002,4 +6006,282 @@ fn a_host_without_ca_certificates_is_refused_before_a_model_task_exists() {
     let ok = cli.cmd_as(Mode::Plain, &["host-check"]).output().unwrap();
     let report: Value = serde_json::from_slice(&ok.stdout).unwrap();
     assert_eq!(report["tls"], "ok", "{report}");
+}
+
+// Agent CLI sessions end to end: the scripted shell "CLI" runs as the task's agent on the fake
+// guest (AGENTOS_TEST_AGENT_ARGV), its two model calls go through the guest proxy to the fake
+// provider, and its edit is the protected fix.
+
+/// The guest's `curl` of the scripted CLI: one model call, body from `$IN`, reply to `$OUT`.
+const SESSION_CURL: &str = "/usr/bin/curl -fsS -o \"$HOME/$OUT\" -X POST \"$ANTHROPIC_BASE_URL/v1/messages\" -H 'content-type: application/json' --data-binary @\"$HOME/$IN\"";
+
+/// The parser fix, written by the CLI (the same change as `fixtures/parser-repo.fix.patch`).
+const SESSION_FIX: &str = r##"cat > src/parser.py <<'PY'
+def parse_kv(text: str) -> dict:
+    """Parse 'key = value' lines into a dict, skipping blanks and '#' comments."""
+    result = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, _, value = line.partition("=")
+        result[key.strip()] = value.strip()
+    return result
+PY
+"##;
+
+/// Writes the scripted CLI into the scratch dir and returns the `AGENTOS_TEST_AGENT_ARGV` that
+/// runs it. Its two calls carry one and then three messages, so a depth-keyed provider answers
+/// them in order; the fix is written between them.
+fn scripted_cli(cli: &Cli) -> String {
+    let call = |n: u32, messages: &str| {
+        format!(
+            "printf '%s' '{{\"model\":\"claude-opus-4\",\"max_tokens\":8,\"messages\":{messages}}}' > \"$HOME/req{n}.json\"\nIN=req{n}.json\nOUT=reply{n}.json\n{SESSION_CURL}\n"
+        )
+    };
+    let one = r#"[{"role":"user","content":"fix the parser"}]"#;
+    let three = r#"[{"role":"user","content":"fix the parser"},{"role":"assistant","content":"ok"},{"role":"user","content":"again"}]"#;
+    let script = format!("set -eu\n{}{SESSION_FIX}{}", call(1, one), call(2, three));
+    let path = cli.path("scripted-cli.sh");
+    fs::write(&path, script).unwrap();
+    serde_json::to_string(&["/bin/sh", path.to_str().unwrap()]).unwrap()
+}
+
+impl Cli {
+    /// A session task's command on the fake guest with the scripted CLI, the key in the
+    /// environment (the session must never see it).
+    fn session_cmd(&self, argv: &str, args: &[&str]) -> Command {
+        let mut cmd = self.cmd_as(Mode::Fake, args);
+        cmd.env("AGENTOS_TEST_AGENT_ARGV", argv)
+            .env("ANTHROPIC_API_KEY", CANARY);
+        cmd
+    }
+}
+
+/// The task id a crash report names on stderr, checked against `point`.
+fn crashed_task_id(stderr: &[u8], point: &str) -> String {
+    let stderr = String::from_utf8_lossy(stderr).into_owned();
+    let crashed: Value = stderr
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v.get("crashed").is_some())
+        .unwrap_or_else(|| panic!("no crash report on stderr: {stderr}"));
+    assert_eq!(
+        crashed["crashed"],
+        point.split(':').next().unwrap(),
+        "{stderr}"
+    );
+    crashed["task_id"].as_str().unwrap().to_string()
+}
+
+/// The `Failed` reasons of a task, from its journal.
+fn failed_reasons(cli: &Cli, id: &str) -> Vec<String> {
+    cli.events(id)
+        .iter()
+        .filter(|e| e["type"] == "Failed")
+        .filter_map(|e| {
+            e["payload"]["Failed"]["reason"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+#[test]
+fn agent_cli_session_submitted_with_yes_succeeds_on_the_fake_guest_and_exports_clean() {
+    let cli = Cli::bare();
+    cli.register_guest_image();
+    let argv = scripted_cli(&cli);
+    let contract = cli.session_contract(&cli.repo_copy());
+    let done = cli
+        .session_cmd(
+            &argv,
+            &[
+                "submit",
+                &contract,
+                "--yes",
+                "--agent-cli",
+                "claude-code",
+                "--model",
+                &fake_spec("parser-fix.json"),
+            ],
+        )
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let done: Value = serde_json::from_slice(&done).unwrap();
+    assert_eq!(done["state"], "SUCCEEDED", "{done}");
+    let id = done["task_id"].as_str().unwrap();
+    let events = cli.events(id);
+    let types: Vec<&str> = events.iter().filter_map(|e| e["type"].as_str()).collect();
+    assert_eq!(
+        events_of(&events, "SessionModelCall").len(),
+        2,
+        "the CLI's two calls are journaled as session calls: {types:?}"
+    );
+    let intended = |kind: &str| {
+        events_of(&events, "EffectIntended")
+            .into_iter()
+            .filter(|e| e["payload"]["kind"].get(kind).is_some())
+            .count()
+    };
+    assert_eq!(intended("ModelCall"), 2, "{types:?}");
+    assert_eq!(intended("RunAgentSession"), 1, "{types:?}");
+    let status = cli.status(id);
+    assert_eq!(status["agent_cli"], "claude-code", "{status}");
+    assert_eq!(status["model"], "fake:parser-fix.json", "{status}");
+    assert_eq!(
+        status_usage(&status, "settled_model_requests"),
+        2,
+        "{status}"
+    );
+
+    let (dir, manifest) = cli.export(id, "bundle");
+    assert_eq!(
+        manifest["verification_results"][0]["passed"], true,
+        "{manifest}"
+    );
+    assert_eq!(manifest["model"], "fake:parser-fix.json");
+    assert_eq!(
+        manifest["model_calls"].as_array().unwrap().len(),
+        2,
+        "{manifest}"
+    );
+    // The secret scans: the key the environment carried is in no file of the home and no
+    // file of the bundle; the session never sees it.
+    assert_home_free_of(&cli, CANARY, "a session task");
+    for file in walk(&dir) {
+        let bytes = fs::read(&file).unwrap_or_default();
+        assert!(
+            !bytes.windows(CANARY.len()).any(|w| w == CANARY.as_bytes()),
+            "{} carries the key",
+            file.display()
+        );
+    }
+    wait_for_no_home_processes(&cli, std::time::Duration::from_secs(10));
+    assert_no_job_processes(&cli);
+}
+
+#[test]
+fn agent_cli_session_submitted_without_yes_waits_and_resume_runs_it() {
+    let cli = Cli::bare();
+    cli.register_guest_image();
+    let argv = scripted_cli(&cli);
+    let contract = cli.session_contract(&cli.repo_copy());
+    let assert = cli
+        .session_cmd(
+            &argv,
+            &[
+                "submit",
+                &contract,
+                "--agent-cli",
+                "claude-code",
+                "--model",
+                &fake_spec("parser-fix.json"),
+            ],
+        )
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("claude-code session in the microVM, model fake:parser-fix.json"),
+        "{stderr}"
+    );
+    let out: Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+    assert_eq!(out["state"], "READY");
+    let id = out["task_id"].as_str().unwrap().to_string();
+    assert_eq!(cli.status(&id)["state"], "READY");
+    assert_eq!(
+        cli.event_types(&id),
+        vec!["TaskCreated", "Submitted"],
+        "nothing ran before approval"
+    );
+    // A session never takes a patch: resume refuses one, and the task is untouched.
+    cli.cmd_as(
+        Mode::Fake,
+        &[
+            "resume",
+            &id,
+            "--fake-agent-patch",
+            fix_patch().to_str().unwrap(),
+        ],
+    )
+    .env("AGENTOS_TEST_AGENT_ARGV", &argv)
+    .assert()
+    .code(2)
+    .stderr(predicate::str::contains(format!(
+        "task {id} runs an agent CLI session, not the fake agent"
+    )));
+    assert_eq!(cli.status(&id)["state"], "READY");
+
+    let resumed = cli
+        .session_cmd(&argv, &["resume", &id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&resumed).unwrap(),
+        json!({ "task_id": id, "state": "SUCCEEDED" })
+    );
+    assert_eq!(cli.status(&id)["state"], "SUCCEEDED");
+    assert_eq!(events_of(&cli.events(&id), "SessionModelCall").len(), 2);
+    wait_for_no_home_processes(&cli, std::time::Duration::from_secs(10));
+    assert_no_job_processes(&cli);
+}
+
+/// A controller killed after a session's first answered call: `resume` fails the task as
+/// "agent session lost", sends nothing again, and leaves no process.
+#[test]
+fn a_controller_killed_mid_session_is_resumed_as_agent_session_lost_without_a_second_call() {
+    let cli = Cli::bare();
+    cli.register_guest_image();
+    let argv = scripted_cli(&cli);
+    let api = fake_api("parser-fix-direct.json");
+    let contract = cli.session_contract(&cli.repo_copy());
+    let assert = cli
+        .session_cmd(
+            &argv,
+            &[
+                "submit",
+                &contract,
+                "--yes",
+                "--agent-cli",
+                "claude-code",
+                "--model",
+                "anthropic:claude-opus-5-5",
+                "--anthropic-base-url",
+                &api.url(),
+                "--crash-at",
+                "after-complete:model_call",
+            ],
+        )
+        .assert()
+        .code(75);
+    let id = crashed_task_id(&assert.get_output().stderr, "after-complete");
+    assert_eq!(api.hits(), 1, "the first call was answered");
+
+    let resumed = cli
+        .session_cmd(&argv, &["resume", &id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&resumed).unwrap(),
+        json!({ "task_id": id, "state": "FAILED" })
+    );
+    assert_eq!(cli.status(&id)["state"], "FAILED");
+    assert_eq!(
+        failed_reasons(&cli, &id),
+        vec!["agent session lost".to_string()]
+    );
+    assert_eq!(api.hits(), 1, "the answered call is never sent again");
+    wait_for_no_home_processes(&cli, std::time::Duration::from_secs(10));
+    assert_no_job_processes(&cli);
+    assert_home_free_of(&cli, CANARY, "a killed session");
 }
