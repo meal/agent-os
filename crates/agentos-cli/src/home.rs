@@ -59,6 +59,8 @@ const TEST_WORKERS_ENV: &str = "AGENTOS_TEST_WORKERS";
 const FAKE_GUEST_ENV: &str = "AGENTOS_TEST_FAKE_GUEST";
 /// `ok` | `fail:<reason>`: the jail probe's answer, instead of looking at the host.
 const JAIL_PROBE_ENV: &str = "AGENTOS_TEST_JAIL_PROBE";
+/// A JSON array of strings: the argv of an agent CLI session, replacing the preset's.
+const TEST_AGENT_ARGV_ENV: &str = "AGENTOS_TEST_AGENT_ARGV";
 /// Where the cgroup v2 hierarchy is when `/proc/mounts` names none (the probe then refuses).
 const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
@@ -179,6 +181,36 @@ pub fn probe_hook(
                 "{JAIL_PROBE_ENV}={v:?}: expected ok or fail:<reason>"
             ))),
         },
+    }
+}
+
+/// The agent CLI argv test hook: `Ok(None)` unless `AGENTOS_TEST_WORKERS=1` and
+/// `AGENTOS_TEST_AGENT_ARGV` are both set; then the JSON array of strings it holds (a usage
+/// error unless it is a non-empty array of strings). `get` reads the environment.
+pub fn agent_argv_hook(
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<Option<Vec<String>>, CliError> {
+    if get(TEST_WORKERS_ENV).as_deref() != Some("1") {
+        return Ok(None);
+    }
+    let Some(raw) = get(TEST_AGENT_ARGV_ENV) else {
+        return Ok(None);
+    };
+    let bad = || {
+        CliError::usage(format!(
+            "{TEST_AGENT_ARGV_ENV}: expected a non-empty JSON array of strings"
+        ))
+    };
+    match serde_json::from_str::<Value>(&raw) {
+        Ok(Value::Array(items)) if !items.is_empty() => items
+            .into_iter()
+            .map(|v| match v {
+                Value::String(s) => Ok(s),
+                _ => Err(bad()),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+        _ => Err(bad()),
     }
 }
 
@@ -696,6 +728,18 @@ impl Home {
         Ok(self
             .submitted_payload(store, task)?
             .and_then(|p| p["model"].as_str().map(str::to_string)))
+    }
+
+    /// The agent CLI recorded at `task`'s submission (`Submitted.agent_cli`); `None` for a task
+    /// without one.
+    pub fn recorded_agent_cli(
+        &self,
+        store: &Store,
+        task: &TaskId,
+    ) -> Result<Option<String>, CliError> {
+        Ok(self
+            .submitted_payload(store, task)?
+            .and_then(|p| p["agent_cli"].as_str().map(str::to_string)))
     }
 
     /// The Anthropic key: the whole of `--api-key-file` (else `ANTHROPIC_API_KEY`), trimmed;
@@ -1263,6 +1307,51 @@ mod tests {
         assert_eq!(on("maybe").unwrap_err().code, 2);
         assert_eq!(
             probe_hook(env(&[("AGENTOS_TEST_WORKERS", "1")])).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn the_agent_argv_hook_answers_only_with_test_workers() {
+        let env = |pairs: &[(&str, &str)]| {
+            let pairs: Vec<(String, String)> = pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(name, _)| name == k)
+                    .map(|(_, v)| v.clone())
+            }
+        };
+        let argv = r#"["/bin/sh","cli.sh"]"#;
+        assert_eq!(
+            agent_argv_hook(env(&[("AGENTOS_TEST_AGENT_ARGV", argv)])).unwrap(),
+            None,
+            "ignored without AGENTOS_TEST_WORKERS=1"
+        );
+        let on = |v: &str| {
+            agent_argv_hook(env(&[
+                ("AGENTOS_TEST_WORKERS", "1"),
+                ("AGENTOS_TEST_AGENT_ARGV", v),
+            ]))
+        };
+        assert_eq!(
+            on(argv).unwrap(),
+            Some(vec!["/bin/sh".to_string(), "cli.sh".to_string()])
+        );
+        for bad in ["not json", r#"{"0":"/bin/sh"}"#, r#"["/bin/sh", 3]"#, "[]"] {
+            let err = on(bad).unwrap_err();
+            assert_eq!(err.code, 2, "{bad}");
+            assert!(
+                err.message.contains("AGENTOS_TEST_AGENT_ARGV"),
+                "{bad}: {}",
+                err.message
+            );
+        }
+        assert_eq!(
+            agent_argv_hook(env(&[("AGENTOS_TEST_WORKERS", "1")])).unwrap(),
             None
         );
     }

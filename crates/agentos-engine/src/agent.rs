@@ -351,6 +351,43 @@ impl Agent for SessionAgent {
     }
 }
 
+/// Where the Claude Code CLI sits in the guest image (`guest/agent-cli-py314-v1`).
+pub const CLAUDE_CODE_PATH: &str = "/opt/agent-cli/claude";
+
+/// The longest goal passed on argv: one argv entry is limited to 128 KiB by the kernel.
+const GOAL_LIMIT_BYTES: usize = 100_000;
+
+/// The argv of the Claude Code preset for `goal`. The goal is one entry, unchanged; a goal that
+/// would read as an option, is empty, is over [`GOAL_LIMIT_BYTES`] or holds a NUL byte is
+/// refused and never passed on.
+pub fn claude_code_argv(goal: &str) -> Result<Vec<String>, String> {
+    if goal.is_empty() {
+        return Err("the goal is empty; a Claude Code session needs a goal".into());
+    }
+    if goal.starts_with('-') {
+        return Err("the goal starts with '-' and would be read as an option; reword it".into());
+    }
+    if goal.len() > GOAL_LIMIT_BYTES {
+        return Err(format!(
+            "the goal is {} bytes; a Claude Code session accepts at most {GOAL_LIMIT_BYTES} bytes",
+            goal.len()
+        ));
+    }
+    if goal.contains('\0') {
+        return Err("the goal contains a NUL byte".into());
+    }
+    Ok(vec![
+        CLAUDE_CODE_PATH.into(),
+        "-p".into(),
+        goal.into(),
+        "--permission-mode".into(),
+        "bypassPermissions".into(),
+        "--disallowedTools".into(),
+        "WebFetch".into(),
+        "WebSearch".into(),
+    ])
+}
+
 /// A model-chosen tool name is echoed back into JSON only, bounded in length.
 fn bounded_name(name: &str) -> String {
     name.chars().take(64).collect()
@@ -486,6 +523,65 @@ mod tests {
         ] {
             assert_eq!(a.next(&obs), AgentAction::Finish, "{obs:?}");
         }
+    }
+
+    #[test]
+    fn the_claude_code_argv_runs_the_preset_with_the_goal_as_one_entry() {
+        assert_eq!(
+            claude_code_argv("fix the parser").unwrap(),
+            vec![
+                CLAUDE_CODE_PATH.to_string(),
+                "-p".into(),
+                "fix the parser".into(),
+                "--permission-mode".into(),
+                "bypassPermissions".into(),
+                "--disallowedTools".into(),
+                "WebFetch".into(),
+                "WebSearch".into(),
+            ]
+        );
+    }
+
+    #[test]
+    fn shell_metacharacters_and_unicode_reach_argv_unchanged_as_one_entry() {
+        let goal = "say \"hi\" 'there' $(rm -rf /) `id`; echo x && y | z\nsecond line\tzażółć 🚀";
+        let argv = claude_code_argv(goal).unwrap();
+        assert_eq!(argv.len(), 8);
+        assert_eq!(argv[2], goal);
+        assert_eq!(argv[0], CLAUDE_CODE_PATH);
+    }
+
+    #[test]
+    fn an_empty_goal_is_refused() {
+        let err = claude_code_argv("").unwrap_err();
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn a_goal_starting_with_a_dash_is_refused_so_it_cannot_be_read_as_an_option() {
+        for goal in ["-p", "--dangerously-skip-permissions", "-"] {
+            let err = claude_code_argv(goal).unwrap_err();
+            assert!(err.contains("'-'"), "{goal}: {err}");
+        }
+        // A dash inside the goal is ordinary text.
+        assert!(claude_code_argv("fix -x handling").is_ok());
+    }
+
+    #[test]
+    fn a_goal_of_exactly_100_000_bytes_is_accepted_and_one_more_byte_is_refused() {
+        let exact = "a".repeat(100_000);
+        assert_eq!(claude_code_argv(&exact).unwrap()[2].len(), 100_000);
+        let err = claude_code_argv(&"a".repeat(100_001)).unwrap_err();
+        assert!(err.contains("100000"), "{err}");
+        // The limit counts bytes, not characters: 50 000 two-byte characters are 100 000 bytes.
+        assert!(claude_code_argv(&"é".repeat(50_000)).is_ok());
+        assert!(claude_code_argv(&"é".repeat(50_001)).is_err());
+    }
+
+    #[test]
+    fn a_goal_with_a_nul_byte_is_refused() {
+        let err = claude_code_argv("fix\0it").unwrap_err();
+        assert!(err.contains("NUL"), "{err}");
     }
 
     #[test]

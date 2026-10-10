@@ -6,6 +6,7 @@ use clap::builder::FalseyValueParser;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::crash::CrashSpec;
+use crate::drive::AgentCli;
 
 /// Where a task's effects run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -91,6 +92,9 @@ pub enum Command {
         /// Debug: kill this process at an engine crash point, POINT[:KIND][:N].
         #[arg(long, value_name = "POINT[:KIND][:N]")]
         crash_at: Option<CrashSpec>,
+        /// run the task's agent as this coding-agent CLI inside the microVM (claude-code); needs --worker firecracker, --model anthropic:<model>|fake:<transcript> and the agent.session capability in the contract
+        #[arg(long, value_name = "NAME")]
+        agent_cli: Option<AgentCli>,
     },
     /// Show a task's state, digests, usage and outstanding effects.
     Status { id: String },

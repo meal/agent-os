@@ -45,7 +45,13 @@ pub async fn dispatch(args: Args) -> Result<(), CliError> {
             fake_agent_patch,
             model,
             crash_at,
+            agent_cli,
         } => {
+            // Temporary: the flag is parsed but not wired yet. Refused before any file is read
+            // or any state is touched; the submit flow lifts this guard.
+            if agent_cli.is_some() {
+                return Err(CliError::usage("--agent-cli is not wired into submit yet"));
+            }
             submit::submit(
                 &home,
                 &task,

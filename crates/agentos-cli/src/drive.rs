@@ -7,7 +7,9 @@ use std::str::FromStr;
 
 use agentos_core::ids::TaskId;
 use agentos_core::state::{TaskEvent, TaskState};
-use agentos_engine::agent::{Agent, AgentAction, FakeAgent, ModelAgent, Observation};
+use agentos_engine::agent::{
+    Agent, AgentAction, FakeAgent, ModelAgent, Observation, SessionAgent, claude_code_argv,
+};
 use agentos_engine::crash::{CrashPoint, RunOptions};
 use agentos_engine::recover::recover_with;
 use agentos_engine::routing::RoutingExecutor;
@@ -18,7 +20,7 @@ use serde_json::json;
 
 use crate::crash::{CrashSpec, point_name};
 use crate::error::CliError;
-use crate::home::{DriverLock, Home, Store};
+use crate::home::{DriverLock, Home, Store, agent_argv_hook};
 
 /// Exit code of a process killed by `--crash-at`.
 pub const CRASH_EXIT: i32 = 75;
@@ -101,10 +103,39 @@ impl ModelSpec {
     }
 }
 
-/// The agent a task runs: the fake agent over a patch, or the model agent.
+/// The coding-agent CLIs `--agent-cli` names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentCli {
+    /// Claude Code, from the guest image's `/opt/agent-cli/claude`.
+    ClaudeCode,
+}
+
+impl AgentCli {
+    /// The name `--agent-cli` takes and `Submitted.agent_cli` records.
+    pub fn name(self) -> &'static str {
+        match self {
+            AgentCli::ClaudeCode => "claude-code",
+        }
+    }
+}
+
+impl FromStr for AgentCli {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<AgentCli, String> {
+        match s {
+            "claude-code" => Ok(AgentCli::ClaudeCode),
+            _ => Err(format!("unknown agent CLI {s:?}; known: claude-code")),
+        }
+    }
+}
+
+/// The agent a task runs: the fake agent over a patch, the model agent, or a coding-agent CLI
+/// session.
 pub enum Driver {
     Fake(FakeAgent),
     Model(Box<ModelAgent>),
+    Session(Box<SessionAgent>),
 }
 
 impl Agent for Driver {
@@ -112,6 +143,7 @@ impl Agent for Driver {
         match self {
             Driver::Fake(a) => a.next(obs),
             Driver::Model(a) => a.next(obs),
+            Driver::Session(a) => a.next(obs),
         }
     }
 }
@@ -143,6 +175,9 @@ pub fn agent_for(
     task: &TaskId,
     patch_flag: Option<&Path>,
 ) -> Result<Driver, CliError> {
+    if let Some(cli) = home.recorded_agent_cli(store, task)? {
+        return session_for(home, store, task, &cli, patch_flag);
+    }
     let recorded = home.recorded_model(store, task)?;
     let model = match recorded.as_deref() {
         None | Some(FAKE_AGENT) => None,
@@ -176,6 +211,63 @@ pub fn agent_for(
             name,
         )))),
     }
+}
+
+/// The session agent of a task whose `Submitted` recorded an agent CLI. The CLI runs with the
+/// preset argv for the contract's goal (or the test hook's), an empty env, and the model the
+/// task recorded; the recorded CLI and model are re-validated, the journal not being trusted.
+fn session_for(
+    home: &Home,
+    store: &Store,
+    task: &TaskId,
+    recorded: &str,
+    patch_flag: Option<&Path>,
+) -> Result<Driver, CliError> {
+    let cli: AgentCli = recorded.parse().map_err(|_| {
+        CliError::other(format!(
+            "task {task} records an unknown agent CLI {recorded:?}"
+        ))
+    })?;
+    let model = match home.recorded_model(store, task)?.as_deref() {
+        None | Some(FAKE_AGENT) => {
+            return Err(CliError::other(format!(
+                "task {task} records agent CLI {} with no model",
+                cli.name()
+            )));
+        }
+        Some(m) => match m.strip_prefix("anthropic:") {
+            Some(name) => match m.parse::<ModelSpec>() {
+                Ok(ModelSpec::Anthropic(_)) => name.to_string(),
+                _ => {
+                    return Err(CliError::other(format!(
+                        "task {task} records an invalid model {m:?}"
+                    )));
+                }
+            },
+            None if m.starts_with("fake:") => "fake".to_string(),
+            None => {
+                return Err(CliError::other(format!(
+                    "task {task} records an unknown model {m:?}"
+                )));
+            }
+        },
+    };
+    if patch_flag.is_some() {
+        return Err(CliError::usage(format!(
+            "task {task} runs an agent CLI session, not the fake agent"
+        )));
+    }
+    let goal = store.db.contract(task)?.goal;
+    let preset = match cli {
+        AgentCli::ClaudeCode => claude_code_argv(&goal),
+    }
+    .map_err(|e| CliError::usage(format!("task {task}: {e}")))?;
+    let argv = agent_argv_hook(|k| std::env::var(k).ok())?.unwrap_or(preset);
+    Ok(Driver::Session(Box::new(SessionAgent::new(
+        argv,
+        Vec::new(),
+        model,
+    ))))
 }
 
 /// A real process death: no cleanup, no further output.
@@ -274,4 +366,191 @@ pub async fn drive(
         task,
         run_task_with(&store.db, &store.blobs, &exec, &mut agent, task, &opts).await,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentos_core::contract::Contract;
+    use agentos_core::ids::Digest;
+    use agentos_engine::agent::{CLAUDE_CODE_PATH, claude_code_argv};
+    use serde_json::{Value, json};
+
+    const GOAL: &str = "fix the parser";
+
+    /// A home with one task whose contract has `goal` and whose `Submitted` event is `payload`.
+    fn submitted(dir: &Path, goal: &str, payload: Value) -> (Home, Store, TaskId) {
+        let home = Home::new(Some(dir.join("home")), None).unwrap();
+        let store = home.open().unwrap();
+        let contract = Contract::parse(
+            &json!({
+                "goal": goal,
+                "repository": { "source": dir, "revision": "recorded-at-submission" },
+                "profile": "python-stdlib-v1",
+                "editable_paths": ["src/**"],
+                "verification_profile": "parser-checks-v1",
+                "capabilities": ["snapshot.read", "model.request", "agent.session"],
+                "limits": {
+                    "model_requests": 3, "max_output_tokens_per_request": 100, "tool_actions": 3,
+                    "deadline_seconds": 600, "worker_vcpus": 1, "worker_memory_mib": 256
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let task = store
+            .db
+            .create_task(&contract, &Digest::of(b"contract"))
+            .unwrap();
+        store.db.append_audit(&task, "Submitted", &payload).unwrap();
+        (home, store, task)
+    }
+
+    fn start() -> Observation {
+        Observation::Start {
+            files: vec![],
+            workspace: Digest::of(b"ws"),
+        }
+    }
+
+    fn session_payload(model: &str) -> Value {
+        json!({ "agent_cli": "claude-code", "model": model })
+    }
+
+    #[test]
+    fn a_recorded_claude_code_session_runs_the_preset_with_an_empty_env_and_the_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, store, task) = submitted(
+            dir.path(),
+            GOAL,
+            session_payload("anthropic:claude-opus-5-5"),
+        );
+        let mut driver = agent_for(&home, &store, &task, None).unwrap();
+        assert!(matches!(driver, Driver::Session(_)));
+        assert_eq!(
+            driver.next(&start()),
+            AgentAction::RunSession {
+                argv: claude_code_argv(GOAL).unwrap(),
+                env: vec![],
+                model: "claude-opus-5-5".into(),
+            }
+        );
+        assert_eq!(claude_code_argv(GOAL).unwrap()[0], CLAUDE_CODE_PATH);
+    }
+
+    #[test]
+    fn a_fake_transcript_session_is_served_by_the_fake_provider_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, store, task) =
+            submitted(dir.path(), GOAL, session_payload("fake:parser-fix.json"));
+        let mut driver = agent_for(&home, &store, &task, None).unwrap();
+        match driver.next(&start()) {
+            AgentAction::RunSession { model, .. } => assert_eq!(model, "fake"),
+            other => panic!("expected RunSession, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_recorded_agent_cli_is_refused_as_a_recording_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, store, task) = submitted(
+            dir.path(),
+            GOAL,
+            json!({ "agent_cli": "codex", "model": "anthropic:claude-opus-5-5" }),
+        );
+        let err = agent_for(&home, &store, &task, None).err().unwrap();
+        assert_eq!(err.code, 1);
+        assert!(err.message.contains("unknown agent CLI"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_recorded_agent_cli_without_a_real_model_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for payload in [
+            json!({ "agent_cli": "claude-code" }),
+            json!({ "agent_cli": "claude-code", "model": "fake-agent" }),
+        ] {
+            let (home, store, task) = submitted(dir.path(), GOAL, payload.clone());
+            let err = agent_for(&home, &store, &task, None).err().unwrap();
+            assert_eq!(err.code, 1, "{payload}");
+            assert!(
+                err.message.contains("no model"),
+                "{payload}: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn a_patch_flag_for_a_session_task_is_a_usage_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, store, task) = submitted(
+            dir.path(),
+            GOAL,
+            session_payload("anthropic:claude-opus-5-5"),
+        );
+        let err = agent_for(&home, &store, &task, Some(Path::new("missing.diff")))
+            .err()
+            .unwrap();
+        assert_eq!(err.code, 2);
+        assert_eq!(
+            err.message,
+            format!("task {task} runs an agent CLI session, not the fake agent")
+        );
+    }
+
+    #[test]
+    fn a_goal_the_preset_refuses_is_a_usage_error_when_the_session_is_built() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, store, task) = submitted(
+            dir.path(),
+            "-p",
+            session_payload("anthropic:claude-opus-5-5"),
+        );
+        let err = agent_for(&home, &store, &task, None).err().unwrap();
+        assert_eq!(err.code, 2);
+        assert!(err.message.contains("'-'"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_task_without_agent_cli_still_gets_the_model_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, store, task) = submitted(
+            dir.path(),
+            GOAL,
+            json!({ "model": "anthropic:claude-opus-5-5" }),
+        );
+        assert!(matches!(
+            agent_for(&home, &store, &task, None).unwrap(),
+            Driver::Model(_)
+        ));
+    }
+
+    #[test]
+    fn recorded_agent_cli_reads_the_submitted_event_and_is_none_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, store, task) = submitted(
+            dir.path(),
+            GOAL,
+            session_payload("anthropic:claude-opus-5-5"),
+        );
+        assert_eq!(
+            home.recorded_agent_cli(&store, &task).unwrap(),
+            Some("claude-code".into())
+        );
+        let other_dir = tempfile::tempdir().unwrap();
+        let (home, store, task) =
+            submitted(other_dir.path(), GOAL, json!({ "model": "fake-agent" }));
+        assert_eq!(home.recorded_agent_cli(&store, &task).unwrap(), None);
+    }
+
+    #[test]
+    fn the_agent_cli_names_are_exactly_the_known_presets() {
+        assert_eq!("claude-code".parse::<AgentCli>(), Ok(AgentCli::ClaudeCode));
+        assert_eq!(AgentCli::ClaudeCode.name(), "claude-code");
+        for bad in ["", "Claude-Code", "claude", "claude-code ", "codex"] {
+            let err = bad.parse::<AgentCli>().unwrap_err();
+            assert!(err.contains("claude-code"), "{bad:?}: {err}");
+        }
+    }
 }

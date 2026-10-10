@@ -477,6 +477,37 @@ fn run_ok(cmd: &mut StdCommand) {
 }
 
 #[test]
+fn submit_agent_cli_accepts_only_the_known_name_and_is_not_wired_into_submit_yet() {
+    let cli = Cli::bare();
+    // An unknown name is a parse error, reported by clap with the known names.
+    cli.cmd(&["submit", "missing-task.json", "--agent-cli", "codex"])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(predicate::str::contains("unknown agent CLI"))
+        .stderr(predicate::str::contains("claude-code"));
+    // The known name parses, then the temporary guard refuses it before the task file (which
+    // does not exist here) is read, so the refusal is not a read error.
+    cli.cmd(&["submit", "missing-task.json", "--agent-cli", "claude-code"])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(predicate::str::contains(
+            "--agent-cli is not wired into submit yet",
+        ));
+    assert!(
+        !cli.home().join("agentos.db").exists(),
+        "nothing was opened or recorded"
+    );
+    // The flag is documented on submit.
+    cli.cmd(&["submit", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--agent-cli <NAME>"))
+        .stdout(predicate::str::contains("needs --worker firecracker"));
+}
+
+#[test]
 fn invalid_contract_exits_2_with_the_validation_message_and_writes_nothing() {
     let cli = Cli::new();
     let repo = cli.repo_copy();
