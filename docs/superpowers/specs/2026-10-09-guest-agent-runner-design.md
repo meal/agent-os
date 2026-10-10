@@ -6,7 +6,9 @@ Status: implemented on branch `acceptance-evidence` (plan
 crash mid-session fails the task ("agent session lost", no resume); changes leave the guest as a
 diff through the existing patch path; the provider stays non-streaming and the proxy replays SSE;
 the host rewrites the model and strips beta-only fields. The live run needed two codec fixes
-(per-message beta fields, thinking signatures) that the original text did not foresee.
+(per-message beta fields, thinking signatures) that the original text did not foresee. The
+`agentos submit --agent-cli claude-code` entry point is described in the README and was added by
+[the CLI plan](../plans/2026-10-10-cli-agent-session.md).
 
 ## Goal
 

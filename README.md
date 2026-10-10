@@ -728,6 +728,60 @@ The journal has `RecoveryDecision` (`"decision":"Forfeit"`) and `EffectForfeited
 
 No live run was made in this build; there is no live transcript to show.
 
+## Running an agent CLI inside the microVM
+
+`submit --agent-cli claude-code --model SPEC` runs the task's agent as a coding-agent CLI
+(Claude Code) **inside the Firecracker guest** instead of the controller's own five-tool agent.
+The guest still has no network interface and holds no key: a loopback proxy in the guest forwards
+each model request over vsock to the controller, which journals it as a `ModelCall`, checks
+`model.request` and the budget, adds the key on the host and sends it. The CLI works on a scratch
+copy of the workspace; its changes return as one patch that goes through the same patch checks
+and the same protected verification as any other agent's. See
+[the design](docs/superpowers/specs/2026-10-09-guest-agent-runner-design.md).
+
+What you need:
+
+1. **A guest image that carries the CLI.** The CLI binary is Anthropic's (all rights reserved), so
+   no release ships it: you build the image, which downloads the pinned Claude Code from npm and
+   checks it against `guest/agent-cli-py314-v1/agent-cli.lock`:
+
+   ```sh
+   docker compose run --rm kernel-builder sh scripts/build-kernel.sh build/kernels/out --verify
+   docker compose run --rm test-kvm sh scripts/build-guest-image.sh guest/agent-cli-py314-v1 build/guest-images/agent-cli-py314-v1 --verify
+   agentos image register build/guest-images/agent-cli-py314-v1
+   ```
+
+2. **A contract that grants the session:** `capabilities` must list `agent.session` and
+   `model.request` besides the usual `snapshot.read`, `workspace.apply_patch` and
+   `verification.run`, and `guest_image_digest` should pin that image. `limits.model_requests`
+   bounds the number of model requests the CLI may make (it retries on errors, and every retry
+   counts); input tokens are not capped, because each request carries the CLI's own system
+   prompt and tool list.
+3. **The Firecracker worker and a model:** `--worker firecracker`, and `--model
+   anthropic:<model>` (the API key as in [The API key](#the-api-key)) or `--model
+   fake:<transcript>`. Whatever model name the CLI asks for, the controller rewrites it to this one.
+
+```sh
+agentos --worker firecracker --api-key-file ~/.anthropic-key \
+  submit task.json --agent-cli claude-code --model anthropic:claude-haiku-5-5 --yes
+```
+
+`submit` refuses, with exit 2 and nothing written: `--agent-cli` on the host worker (a session
+runs only in a microVM), without `--model`, together with `--fake-agent-patch`, with a contract
+that lacks `agent.session` or `model.request`, or with a goal that is empty, starts with `-`, has
+a NUL byte or is over 100,000 bytes. `resume` rebuilds the session agent from the recorded
+`agent_cli`. A task whose image has no CLI fails with the guest's reason.
+
+Limits: **no session resume**: if the controller dies mid-session, `resume` ends the task as
+"agent session lost" (the model calls already made stay in the journal and are never sent again);
+Claude Code only (subscription logins need a network and cannot work); streaming is replayed from
+a whole response, so the CLI sees a stream but the provider call is not streamed. **What has been
+shown:** the session machinery on a real microVM (`docs/evidence/2026-10-09/agent-session-kvm.md`)
+and one live run of the real CLI against the Anthropic API through the test harness
+(`docs/evidence/2026-10-09/live-agent-attempt-3.md`); the `agentos submit --agent-cli` entry point
+itself is tested end to end on the fake guest only, and has not yet been run on a real microVM or
+against the live API.
+
 ## Home layout
 
 ```text

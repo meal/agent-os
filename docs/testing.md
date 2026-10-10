@@ -261,3 +261,13 @@ waits; reaching a request/action/deadline limit means the task did not fit its
 contract. A protected-check failure means the proposed code did not pass acceptance.
 For KVM refusal, read the preflight reason rather than switching to unjailed mode.
 Keep API keys private and inspect model/code artifacts before sharing them.
+
+## Agent CLI sessions through the `agentos` CLI
+
+`submit --agent-cli claude-code` is tested end to end on the fake guest in
+`crates/agentos-cli/tests/cli.rs` (`agent_cli_*`): a scripted shell "CLI" replaces the preset argv
+through `AGENTOS_TEST_AGENT_ARGV` (honoured only with `AGENTOS_TEST_WORKERS=1`), and the fake
+provider or a local fake Messages API answers its model calls. The real CLI on a microVM is the
+KVM tier (`kvm_agent.rs`, needs the agent image), and the live run is `scripts/acceptance.sh
+live-agent KEY_FILE` (billed).
+

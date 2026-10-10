@@ -60,11 +60,11 @@ never ship the Claude Code binary in a release (Anthropic's, all rights reserved
   enum (`FromStr`, `recorded()`); `--agent-cli` on `submit`; `Driver::Session`; `agent_for`
   builds it from the recorded `agent_cli` plus the recorded model; the test hook; unit tests for
   each rule above. No submit-flow changes yet.
-- [ ] **2. Submit flow, approval screen, end-to-end tests.** The refusals of Decision 4 in
+- [x] **2. Submit flow, approval screen, end-to-end tests** (b3f08ad, 2bc5f5c). The refusals of Decision 4 in
   `validate`; `Submitted.agent_cli`; the approval line; `resume` and recovery through `agent_for`.
   CLI tests on the fake guest with a scripted shell CLI and the fake model provider: submit
   `--yes` ends SUCCEEDED with protected verification; a crash mid-session then `resume` fails
   "agent session lost"; each refusal; `status`/`events` show the agent.
-- [ ] **3. Documentation.** README section (build and register `agent-cli-py314-v1`, contract
+- [x] **3. Documentation.** README section (build and register `agent-cli-py314-v1`, contract
   capabilities, the submit command, limits: no session resume, Claude Code only, the binary is
   yours to build), `docs/testing.md`, the `--help` text, and the design doc's status line.
