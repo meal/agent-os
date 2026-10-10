@@ -18,7 +18,9 @@ use serde_json::json;
 use super::{print, print_state};
 use crate::args::WorkerKind;
 use crate::crash::CrashSpec;
-use crate::drive::{AGENT_PATCH, FAKE_AGENT, ModelSpec, TRANSCRIPT, agent_for, drive};
+use crate::drive::{
+    AGENT_PATCH, AgentCli, FAKE_AGENT, ModelSpec, TRANSCRIPT, agent_for, drive, session_argv,
+};
 use crate::error::CliError;
 use crate::home::{ANALYZER_DIR, Home};
 
@@ -45,6 +47,8 @@ struct Request {
     api_key: Option<ApiKey>,
     /// `None` for the host worker.
     firecracker: Option<FirecrackerRecord>,
+    /// `--agent-cli`: the task's agent runs as this CLI session.
+    agent_cli: Option<AgentCli>,
 }
 
 /// What `Submitted` records about a Firecracker task, decided before anything is written.
@@ -123,16 +127,61 @@ fn host_kernel() -> String {
         .into_owned()
 }
 
+/// `--agent-cli`'s refusals that need no task file: exit 2, before anything is read or written.
+fn check_agent_cli_flags(
+    home: &Home,
+    patch: Option<&Path>,
+    model: Option<&str>,
+) -> Result<(), CliError> {
+    if patch.is_some() {
+        return Err(CliError::usage(
+            "pass either --fake-agent-patch or --agent-cli",
+        ));
+    }
+    if model.is_none() {
+        return Err(CliError::usage(
+            "--agent-cli needs --model anthropic:<model>|fake:<transcript>",
+        ));
+    }
+    if home.worker.unwrap_or(WorkerKind::Host) == WorkerKind::Host {
+        return Err(CliError::usage(
+            "an agent CLI session runs only in a microVM: pass --worker firecracker",
+        ));
+    }
+    Ok(())
+}
+
+/// `--agent-cli`'s refusals about the contract and its goal: the session's capabilities must
+/// be declared, and the preset (or the test hook) must accept the goal.
+fn check_agent_cli_contract(contract: &Contract, cli: AgentCli) -> Result<(), CliError> {
+    let caps = capability_names(contract);
+    for cap in ["agent.session", "model.request"] {
+        if !caps.iter().any(|c| c == cap) {
+            return Err(CliError::usage(format!(
+                "the contract lacks capability {cap:?}, which an agent CLI session needs: add {cap:?} to the contract's capabilities"
+            )));
+        }
+    }
+    session_argv(cli, &contract.goal, |k| std::env::var(k).ok()).map(|_| ())
+}
+
 fn validate(
     home: &Home,
     task: &Path,
     yes: bool,
     patch: Option<&Path>,
     model: Option<&str>,
+    agent_cli: Option<AgentCli>,
 ) -> Result<Request, CliError> {
+    if agent_cli.is_some() {
+        check_agent_cli_flags(home, patch, model)?;
+    }
     let text = fs::read_to_string(task)
         .map_err(|e| CliError::usage(format!("cannot read {}: {e}", task.display())))?;
     let contract = Contract::parse(&text).map_err(|e| CliError::usage(e.to_string()))?;
+    if let Some(cli) = agent_cli {
+        check_agent_cli_contract(&contract, cli)?;
+    }
     let source = Path::new(&contract.repository.source)
         .canonicalize()
         .ok()
@@ -231,6 +280,7 @@ fn validate(
         transcript,
         api_key,
         firecracker,
+        agent_cli,
     })
 }
 
@@ -247,13 +297,16 @@ fn capability_names(contract: &Contract) -> Vec<String> {
         .collect()
 }
 
-/// What the owner approves, on stderr.
+/// What the owner approves, on stderr. `session`: the agent is a CLI session in the microVM,
+/// which needs a guest image that carries the CLI.
+#[allow(clippy::too_many_arguments)]
 fn summarize(
     task: &TaskId,
     contract: &Contract,
     repo: &Digest,
     profile: &Digest,
     agent: &str,
+    session: bool,
     fc: Option<&FirecrackerRecord>,
     endpoint: Option<&str>,
 ) {
@@ -292,6 +345,11 @@ fn summarize(
         );
     }
     eprintln!("  agent:                {agent}");
+    if session {
+        eprintln!(
+            "  guest image:          must carry /opt/agent-cli/claude (build guest/agent-cli-py314-v1)"
+        );
+    }
     if let Some(endpoint) = endpoint {
         eprintln!("  model endpoint:       {endpoint}");
     }
@@ -327,6 +385,7 @@ pub async fn submit(
     yes: bool,
     patch: Option<&Path>,
     model: Option<&str>,
+    agent_cli: Option<AgentCli>,
     crash: Option<&CrashSpec>,
 ) -> Result<(), CliError> {
     let Request {
@@ -339,7 +398,8 @@ pub async fn submit(
         transcript,
         api_key,
         firecracker,
-    } = validate(home, task_file, yes, patch, model)?;
+        agent_cli,
+    } = validate(home, task_file, yes, patch, model, agent_cli)?;
 
     let store = home.open()?;
     let lock = if yes { Some(home.lock()?) } else { None };
@@ -418,6 +478,9 @@ pub async fn submit(
     if let Some(d) = &transcript_digest {
         fields.insert("transcript_digest".into(), json!(d));
     }
+    if let Some(cli) = agent_cli {
+        fields.insert("agent_cli".into(), json!(cli.name()));
+    }
     match &firecracker {
         None => {
             fields.insert("worker".into(), json!(WorkerKind::Host.as_str()));
@@ -435,11 +498,18 @@ pub async fn submit(
     }
     store.db.append_audit(&task, "Submitted", &submitted)?;
     tracing::info!(task_id = %task, %contract_digest, %repo_digest, %profile_digest, "task submitted");
-    let agent = match (&patch, &model, &transcript_digest) {
-        (Some(p), _, _) => format!("{FAKE_AGENT} (patch {})", Digest::of(p.as_bytes())),
-        (None, Some(m), Some(d)) => format!("{} (transcript {d})", m.recorded()),
-        (None, Some(m), None) => m.recorded(),
-        (None, None, _) => "none yet".to_string(),
+    let agent = match (agent_cli, &patch, &model, &transcript_digest) {
+        (Some(cli), _, Some(m), _) => {
+            format!(
+                "{} session in the microVM, model {}",
+                cli.name(),
+                m.recorded()
+            )
+        }
+        (_, Some(p), _, _) => format!("{FAKE_AGENT} (patch {})", Digest::of(p.as_bytes())),
+        (_, None, Some(m), Some(d)) => format!("{} (transcript {d})", m.recorded()),
+        (_, None, Some(m), None) => m.recorded(),
+        (_, None, None, _) => "none yet".to_string(),
     };
     summarize(
         &task,
@@ -447,6 +517,7 @@ pub async fn submit(
         &repo_digest,
         &profile_digest,
         &agent,
+        agent_cli.is_some(),
         firecracker.as_ref(),
         submitted["model_endpoint"].as_str(),
     );

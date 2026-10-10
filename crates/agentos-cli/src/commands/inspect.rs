@@ -57,6 +57,9 @@ pub fn status(home: &Home, task: &TaskId) -> Result<(), CliError> {
     if let Some(jailed) = worker.jailed {
         shown["jailed"] = json!(jailed);
     }
+    if let Some(agent_cli) = home.recorded_agent_cli(&store, task)? {
+        shown["agent_cli"] = json!(agent_cli);
+    }
     print(&shown);
     Ok(())
 }

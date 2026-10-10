@@ -477,7 +477,7 @@ fn run_ok(cmd: &mut StdCommand) {
 }
 
 #[test]
-fn submit_agent_cli_accepts_only_the_known_name_and_is_not_wired_into_submit_yet() {
+fn submit_agent_cli_accepts_only_the_known_name() {
     let cli = Cli::bare();
     // An unknown name is a parse error, reported by clap with the known names.
     cli.cmd(&["submit", "missing-task.json", "--agent-cli", "codex"])
@@ -486,15 +486,13 @@ fn submit_agent_cli_accepts_only_the_known_name_and_is_not_wired_into_submit_yet
         .stdout("")
         .stderr(predicate::str::contains("unknown agent CLI"))
         .stderr(predicate::str::contains("claude-code"));
-    // The known name parses, then the temporary guard refuses it before the task file (which
-    // does not exist here) is read, so the refusal is not a read error.
+    // The known name parses; without --model the refusal comes before the task file (which
+    // does not exist here) is read.
     cli.cmd(&["submit", "missing-task.json", "--agent-cli", "claude-code"])
         .assert()
         .code(2)
         .stdout("")
-        .stderr(predicate::str::contains(
-            "--agent-cli is not wired into submit yet",
-        ));
+        .stderr(predicate::str::contains("--agent-cli needs --model"));
     assert!(
         !cli.home().join("agentos.db").exists(),
         "nothing was opened or recorded"
@@ -505,6 +503,234 @@ fn submit_agent_cli_accepts_only_the_known_name_and_is_not_wired_into_submit_yet
         .success()
         .stdout(predicate::str::contains("--agent-cli <NAME>"))
         .stdout(predicate::str::contains("needs --worker firecracker"));
+}
+
+/// The capabilities an agent CLI session's contract declares.
+const SESSION_CAPS: [&str; 6] = [
+    "snapshot.read",
+    "workspace.apply_patch",
+    "verification.run",
+    "artifact.export",
+    "model.request",
+    "agent.session",
+];
+
+impl Cli {
+    /// A contract with `goal` and exactly `caps`; the file is named by its digest.
+    fn agent_contract(&self, repo: &Path, goal: &str, caps: &[&str]) -> String {
+        let contract = json!({
+            "goal": goal,
+            "repository": { "source": repo, "revision": "recorded-at-submission" },
+            "profile": guest_profile(),
+            "editable_paths": ["src/**"],
+            "verification_profile": "parser-checks-v1",
+            "capabilities": caps,
+            "limits": {
+                "model_requests": 12, "max_output_tokens_per_request": 1000, "tool_actions": 10,
+                "deadline_seconds": 600, "worker_vcpus": 1, "worker_memory_mib": 256
+            }
+        });
+        self.write(
+            &format!(
+                "agent-task-{}.json",
+                Digest::of(contract.to_string().as_bytes())
+            ),
+            &contract.to_string(),
+        )
+    }
+
+    /// The session contract of the fixture repository.
+    fn session_contract(&self, repo: &Path) -> String {
+        self.agent_contract(repo, "fix the parser", &SESSION_CAPS)
+    }
+}
+
+/// Every `--agent-cli` refusal exits 2 with its message, and records nothing: no database, no
+/// task directory.
+#[test]
+fn agent_cli_refusals_exit_2_and_record_nothing() {
+    let cli = Cli::bare();
+    cli.register_guest_image();
+    let repo = cli.repo_copy();
+    let model = fake_spec("parser-fix.json");
+    let patch = fix_patch();
+    let patch = patch.to_str().unwrap();
+    let session = cli.session_contract(&repo);
+    let no_agent = cli.agent_contract(
+        &repo,
+        "fix the parser",
+        &SESSION_CAPS
+            .into_iter()
+            .filter(|c| *c != "agent.session")
+            .collect::<Vec<_>>(),
+    );
+    let no_model = cli.agent_contract(
+        &repo,
+        "fix the parser",
+        &SESSION_CAPS
+            .into_iter()
+            .filter(|c| *c != "model.request")
+            .collect::<Vec<_>>(),
+    );
+    let dash_goal = cli.agent_contract(&repo, "-p", &SESSION_CAPS);
+    let cases: Vec<(Mode, Vec<&str>, &str)> = vec![
+        (
+            Mode::Fake,
+            vec![
+                "submit",
+                &session,
+                "--agent-cli",
+                "claude-code",
+                "--model",
+                &model,
+                "--fake-agent-patch",
+                patch,
+            ],
+            "pass either --fake-agent-patch or --agent-cli",
+        ),
+        (
+            Mode::Fake,
+            vec!["submit", &session, "--agent-cli", "claude-code"],
+            "--agent-cli needs --model",
+        ),
+        (
+            Mode::Plain,
+            vec![
+                "submit",
+                &session,
+                "--agent-cli",
+                "claude-code",
+                "--model",
+                &model,
+            ],
+            "an agent CLI session runs only in a microVM: pass --worker firecracker",
+        ),
+        (
+            Mode::Fake,
+            vec![
+                "submit",
+                &no_agent,
+                "--agent-cli",
+                "claude-code",
+                "--model",
+                &model,
+            ],
+            "lacks capability \"agent.session\"",
+        ),
+        (
+            Mode::Fake,
+            vec![
+                "submit",
+                &no_model,
+                "--agent-cli",
+                "claude-code",
+                "--model",
+                &model,
+            ],
+            "lacks capability \"model.request\"",
+        ),
+        (
+            Mode::Fake,
+            vec![
+                "submit",
+                &dash_goal,
+                "--agent-cli",
+                "claude-code",
+                "--model",
+                &model,
+            ],
+            "starts with '-'",
+        ),
+    ];
+    for (mode, args, message) in cases {
+        cli.cmd_as(mode, &args)
+            .assert()
+            .code(2)
+            .stdout("")
+            .stderr(predicate::str::contains(message));
+    }
+    assert!(
+        !cli.home().join("agentos.db").exists(),
+        "no database was opened"
+    );
+    assert!(
+        fs::read_dir(cli.home().join("tasks"))
+            .map(|d| d.count() == 0)
+            .unwrap_or(true),
+        "no task directory was created"
+    );
+}
+
+#[test]
+fn a_session_task_records_its_agent_cli_and_the_approval_screen_names_the_agent() {
+    let cli = Cli::bare();
+    cli.register_guest_image();
+    let contract = cli.session_contract(&cli.repo_copy());
+    let assert = cli
+        .cmd_as(
+            Mode::Fake,
+            &[
+                "submit",
+                &contract,
+                "--agent-cli",
+                "claude-code",
+                "--model",
+                &fake_spec("parser-fix.json"),
+            ],
+        )
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("claude-code session in the microVM, model fake:parser-fix.json"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("must carry /opt/agent-cli/claude (build guest/agent-cli-py314-v1)"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("model endpoint"),
+        "a fake model has no endpoint line: {stderr}"
+    );
+    let out: Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+    assert_eq!(out["state"], "READY", "without --yes the task waits");
+    let id = out["task_id"].as_str().unwrap();
+    let submitted = cli.submitted(id);
+    assert_eq!(submitted["agent_cli"], "claude-code", "{submitted}");
+    assert_eq!(submitted["model"], "fake:parser-fix.json", "{submitted}");
+    assert_eq!(cli.status(id)["agent_cli"], "claude-code");
+}
+
+#[test]
+fn a_plain_model_task_records_no_agent_cli_and_its_screen_keeps_the_model_line() {
+    let cli = Cli::bare();
+    let contract = cli.model_contract(&cli.repo_copy(), 12, 10);
+    let assert = cli
+        .cmd_as(
+            Mode::Plain,
+            &[
+                "submit",
+                &contract,
+                "--model",
+                &fake_spec("parser-fix.json"),
+            ],
+        )
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert!(!stderr.contains("session in the microVM"), "{stderr}");
+    assert!(!stderr.contains("/opt/agent-cli"), "{stderr}");
+    let id = serde_json::from_slice::<Value>(&assert.get_output().stdout).unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let submitted = cli.submitted(&id);
+    assert!(
+        submitted.get("agent_cli").is_none(),
+        "no agent_cli key for a plain model task: {submitted}"
+    );
+    assert!(cli.status(&id).get("agent_cli").is_none());
 }
 
 #[test]

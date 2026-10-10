@@ -258,16 +258,27 @@ fn session_for(
         )));
     }
     let goal = store.db.contract(task)?.goal;
-    let preset = match cli {
-        AgentCli::ClaudeCode => claude_code_argv(&goal),
-    }
-    .map_err(|e| CliError::usage(format!("task {task}: {e}")))?;
-    let argv = agent_argv_hook(|k| std::env::var(k).ok())?.unwrap_or(preset);
+    let argv = session_argv(cli, &goal, |k| std::env::var(k).ok())?;
     Ok(Driver::Session(Box::new(SessionAgent::new(
         argv,
         Vec::new(),
         model,
     ))))
+}
+
+/// The argv a session of `cli` runs for `goal`: the preset's, or the test hook's when `get` (the
+/// environment) sets one under `AGENTOS_TEST_WORKERS=1`. A refused goal or a malformed hook is
+/// a usage error.
+pub fn session_argv(
+    cli: AgentCli,
+    goal: &str,
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<Vec<String>, CliError> {
+    let preset = match cli {
+        AgentCli::ClaudeCode => claude_code_argv(goal),
+    }
+    .map_err(CliError::usage)?;
+    Ok(agent_argv_hook(get)?.unwrap_or(preset))
 }
 
 /// A real process death: no cleanup, no further output.
@@ -542,6 +553,62 @@ mod tests {
         let (home, store, task) =
             submitted(other_dir.path(), GOAL, json!({ "model": "fake-agent" }));
         assert_eq!(home.recorded_agent_cli(&store, &task).unwrap(), None);
+    }
+
+    #[test]
+    fn the_session_argv_is_the_preset_unless_the_test_hook_is_on() {
+        let with = |pairs: &[(&str, &str)]| {
+            let pairs: Vec<(String, String)> = pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(name, _)| name == k)
+                    .map(|(_, v)| v.clone())
+            }
+        };
+        let hook = r#"["/bin/sh","cli.sh"]"#;
+        let preset = claude_code_argv(GOAL).unwrap();
+        assert_eq!(preset[0], CLAUDE_CODE_PATH);
+        // Without AGENTOS_TEST_WORKERS=1 the hook is ignored, whatever it holds.
+        assert_eq!(
+            session_argv(
+                AgentCli::ClaudeCode,
+                GOAL,
+                with(&[("AGENTOS_TEST_AGENT_ARGV", hook)])
+            )
+            .unwrap(),
+            preset
+        );
+        // With it, the hook's argv replaces the preset's.
+        assert_eq!(
+            session_argv(
+                AgentCli::ClaudeCode,
+                GOAL,
+                with(&[
+                    ("AGENTOS_TEST_WORKERS", "1"),
+                    ("AGENTOS_TEST_AGENT_ARGV", hook)
+                ])
+            )
+            .unwrap(),
+            vec!["/bin/sh".to_string(), "cli.sh".to_string()]
+        );
+        // A malformed hook is a usage error, and so is a goal the preset refuses.
+        let err = session_argv(
+            AgentCli::ClaudeCode,
+            GOAL,
+            with(&[
+                ("AGENTOS_TEST_WORKERS", "1"),
+                ("AGENTOS_TEST_AGENT_ARGV", "x"),
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, 2);
+        let err = session_argv(AgentCli::ClaudeCode, "-p", with(&[])).unwrap_err();
+        assert_eq!(err.code, 2);
+        assert!(err.message.contains("'-'"), "{}", err.message);
     }
 
     #[test]
