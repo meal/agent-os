@@ -1,0 +1,8 @@
+rootfs.squashfs entry lists (unsquashfs -l | sort), release image vs agent image, 2026-10-10:
+  python-stdlib-py314-v3 (the release image): 17138 entries, 0 mentioning "claude" or "agent-cli"
+  agent-cli-py314-v1 (the image the KVM suites ran on): 17140 entries
+only in agent-cli-py314-v1:
+  squashfs-root/opt/agent-cli
+  squashfs-root/opt/agent-cli/claude
+only in python-stdlib-py314-v3: (nothing)
+rootfs.squashfs sizes: v3 143347712 bytes, agent-cli 248602624 bytes.

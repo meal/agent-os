@@ -147,3 +147,15 @@ All at frozen commit `866eb45`, under `2026-10-09/v0.2.0-rc1/`.
 | `alpha-evidence.sh` with the live-model runs skipped | Both deterministic snapshot runs SUCCEEDED, digests equal to rc5's (`alpha/`). |
 | Fresh-clone rebuild | Tarball `241840c6e45b…` identical (`../../releases/v0.2.0-rc1.md`). |
 
+## 2026-10-10: v0.2.0-rc2 release gates (replaces the withdrawn rc1)
+
+All at frozen commit `b7d57bb`, under `2026-10-10/v0.2.0-rc2/`. The release image carries no agent
+CLI (the binary is Anthropic's and is not redistributed).
+
+| Gate | Result |
+| --- | --- |
+| `acceptance.sh kvm` on `agent-cli-py314-v1` (the release image plus the CLI, see `image-diff.txt`) | Passed: identical kernel and image builds, 1163 tests in each suite (`kvm/`). |
+| `smoke-install.sh` on the tarball | Passed: root jailed with kill and resume, unprivileged unjailed (`smoke/`). |
+| `alpha-evidence.sh` with the live-model runs skipped | Both deterministic snapshot runs SUCCEEDED, digests equal to rc5's (`alpha/`). |
+| Fresh-clone rebuild | Tarball `d4d8476ba801…` identical (`../../releases/v0.2.0-rc2.md`). |
+

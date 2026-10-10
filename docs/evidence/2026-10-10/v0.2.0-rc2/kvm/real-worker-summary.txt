@@ -1,0 +1,122 @@
+     Running unittests src/lib.rs (target/debug/deps/agentos_cli-7a15d36524bf933f)
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+     Running unittests src/main.rs (target/debug/deps/agentos-8efbccf34c0a9535)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/cli.rs (target/debug/deps/cli-d141b7b94130dd65)
+test result: ok. 132 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 50.32s
+     Running unittests src/lib.rs (target/debug/deps/agentos_component-1d4dbe064f8541ca)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/runtime.rs (target/debug/deps/runtime-ee9f3a4ddcf5aa19)
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.56s
+     Running unittests src/lib.rs (target/debug/deps/agentos_core-c53fa682696bc26f)
+test result: ok. 130 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+     Running tests/state_props.rs (target/debug/deps/state_props-189fd6df5834f80f)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+     Running tests/workspace_golden.rs (target/debug/deps/workspace_golden-56d466726705de20)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/agentos_engine-6a4477cd3c1e1e11)
+test result: ok. 86 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.52s
+     Running unittests src/bin/agentos-supervisor.rs (target/debug/deps/agentos_supervisor-73ee75cdfcab3ae0)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/agent_session.rs (target/debug/deps/agent_session-6664b51daafc2be8)
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.29s
+     Running tests/analysis.rs (target/debug/deps/analysis-eda13976d8483fb0)
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.48s
+     Running tests/crash_matrix.rs (target/debug/deps/crash_matrix-c297c644a7bdb9a4)
+test result: ok. 67 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 33.73s
+     Running tests/deadline.rs (target/debug/deps/deadline-bbafef5e4ef85cef)
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.31s
+     Running tests/evidence.rs (target/debug/deps/evidence-4ac30cb54a09aad2)
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+     Running tests/executor.rs (target/debug/deps/executor-e2d67168e154cc57)
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.24s
+     Running tests/export.rs (target/debug/deps/export-12fe8a758c1ceca1)
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.48s
+     Running tests/firecracker.rs (target/debug/deps/firecracker-e8b3f15e63ac1aa5)
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.06s
+     Running tests/fixture_sanity.rs (target/debug/deps/fixture_sanity-e23ca7d154e6d229)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+     Running tests/gc.rs (target/debug/deps/gc-d26e7d723857b356)
+test result: ok. 55 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.86s
+     Running tests/guest_protocol.rs (target/debug/deps/guest_protocol-8bab01f9a9a8350e)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+     Running tests/guestlink.rs (target/debug/deps/guestlink-c6234a6a934aacfc)
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.13s
+     Running tests/happy_path.rs (target/debug/deps/happy_path-e9ac981c90e53df7)
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.75s
+     Running tests/inspector.rs (target/debug/deps/inspector-e774143c0ccea414)
+test result: ok. 17 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 3.15s
+     Running tests/jail.rs (target/debug/deps/jail-d4cd20c0474ea5e1)
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s
+     Running tests/job.rs (target/debug/deps/job-e7dbfa7d6d50eb6c)
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.63s
+     Running tests/kvm_agent.rs (target/debug/deps/kvm_agent-4739cd6ae2250fb6)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 71.83s
+     Running tests/kvm_tier.rs (target/debug/deps/kvm_tier-9cd4d2d25c6d7d33)
+test result: ok. 40 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 130.44s
+     Running tests/live_agent_session.rs (target/debug/deps/live_agent_session-7ac0207fbb96ef2a)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.73s
+     Running tests/live_model.rs (target/debug/deps/live_model-d0f87d9ea16985c5)
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.39s
+     Running tests/model_agent.rs (target/debug/deps/model_agent-3de4aa07090007b6)
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.58s
+     Running tests/model_crash_matrix.rs (target/debug/deps/model_crash_matrix-22d9fe837401c09e)
+test result: ok. 55 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 37.36s
+     Running tests/model_executor.rs (target/debug/deps/model_executor-bf1d4b4c88905441)
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+     Running tests/model_flow.rs (target/debug/deps/model_flow-a14ffcb69dcbdbd0)
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.88s
+     Running tests/provider.rs (target/debug/deps/provider-d9203923e4ea1025)
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
+     Running tests/publication.rs (target/debug/deps/publication-699fa43573e92161)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+     Running tests/recover_forfeit.rs (target/debug/deps/recover_forfeit-00040b434590c550)
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+     Running tests/review_deadline_probe.rs (target/debug/deps/review_deadline_probe-7d09cd74f39f97de)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+     Running tests/revoke.rs (target/debug/deps/revoke-8032f1cd9b7848eb)
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.98s
+     Running tests/shadow.rs (target/debug/deps/shadow-6c581b75d900e09a)
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+     Running tests/supervised.rs (target/debug/deps/supervised-896361cd3be71f4e)
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.30s
+     Running tests/supervisor.rs (target/debug/deps/supervisor-1c992c4e54a16ac6)
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.62s
+     Running tests/worker.rs (target/debug/deps/worker-7460e295e226aa5d)
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.11s
+     Running tests/worker_conformance.rs (target/debug/deps/worker_conformance-5651cb8ce0f0e9d8)
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.09s
+     Running tests/workspace.rs (target/debug/deps/workspace-126255c429b25bb6)
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/agentos_guest-6e5941dcb3b21595)
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+     Running unittests src/main.rs (target/debug/deps/agentos_guest-b2a847432043dad5)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/fake_session.rs (target/debug/deps/fake_session-b278598dad0eff06)
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.25s
+     Running tests/handlers.rs (target/debug/deps/handlers-4587fb81f910299a)
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.04s
+     Running tests/reaping.rs (target/debug/deps/reaping-db652507fb79ca15)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.02s
+     Running tests/trampoline.rs (target/debug/deps/trampoline-c1a33e329f36d7eb)
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/agentos_store-049913611788faff)
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     Running tests/caps.rs (target/debug/deps/caps-663dcc341c1995ab)
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+     Running tests/db.rs (target/debug/deps/db-d653a9cab74bcad2)
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+     Running tests/effects.rs (target/debug/deps/effects-cc6408d7855ebc54)
+test result: ok. 63 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+   Doc-tests agentos_cli
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests agentos_component
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests agentos_core
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests agentos_engine
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests agentos_guest
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests agentos_store
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
