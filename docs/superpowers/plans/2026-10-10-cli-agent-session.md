@@ -56,7 +56,7 @@ never ship the Claude Code binary in a release (Anthropic's, all rights reserved
 
 ---
 
-- [ ] **1. Preset, parsing and recording.** `claude_code_argv` with the goal rules; `AgentCli`
+- [x] **1. Preset, parsing and recording** (79305d2). `claude_code_argv` with the goal rules; `AgentCli`
   enum (`FromStr`, `recorded()`); `--agent-cli` on `submit`; `Driver::Session`; `agent_for`
   builds it from the recorded `agent_cli` plus the recorded model; the test hook; unit tests for
   each rule above. No submit-flow changes yet.
