@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use agentos_core::effect::EffectState;
+use agentos_core::effect::{EffectKind, EffectState};
 use agentos_core::ids::TaskId;
 use agentos_core::state::{TaskEvent, TaskState};
 use agentos_engine::recover::recover;
@@ -68,9 +68,20 @@ pub async fn resume(
     }
     let agent = agent_for(home, &store, task, patch)?;
     let lock = home.lock()?;
+    // A session left open by a dead controller is never run again: the engine cancels its job
+    // and fails the task "agent session lost", sending no model request. That needs no
+    // credentials, so it must not be refused for lacking them.
+    let session_lost = store.db.outstanding_effects(task)?.iter().any(|e| {
+        matches!(e.kind, EffectKind::RunAgentSession { .. })
+            && matches!(e.state, EffectState::Intended | EffectState::Dispatched)
+    });
     // Before anything is written: a worker that cannot run (preflight, jail) leaves the task
     // exactly as it was.
-    let exec = home.executor(&store, task, None)?;
+    let exec = if session_lost {
+        home.recovery_executor(&store, task)?
+    } else {
+        home.executor(&store, task, None)?
+    };
     let t = store.db.task(task)?;
     if t.state == TaskState::Paused && !t.cancel_requested {
         // Before recovery, which leaves a paused task's effects untouched.

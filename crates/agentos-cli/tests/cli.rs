@@ -6164,6 +6164,57 @@ fn agent_cli_session_submitted_with_yes_succeeds_on_the_fake_guest_and_exports_c
     assert_no_job_processes(&cli);
 }
 
+/// The Anthropic provider path of a session: the scripted CLI runs to completion against the
+/// fake API, and the key the environment carried is in no file of the home and no file of the
+/// bundle.
+#[test]
+fn agent_cli_session_against_the_anthropic_provider_leaves_the_key_out_of_home_and_bundle() {
+    let cli = Cli::bare();
+    cli.register_guest_image();
+    let argv = scripted_cli(&cli);
+    let api = fake_api("parser-fix.json");
+    let contract = cli.session_contract(&cli.repo_copy());
+    let done = cli
+        .session_cmd(
+            &argv,
+            &[
+                "submit",
+                &contract,
+                "--yes",
+                "--agent-cli",
+                "claude-code",
+                "--model",
+                "anthropic:claude-opus-5-5",
+                "--anthropic-base-url",
+                &api.url(),
+            ],
+        )
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let done: Value = serde_json::from_slice(&done).unwrap();
+    assert_eq!(done["state"], "SUCCEEDED", "{done}");
+    let id = done["task_id"].as_str().unwrap();
+    assert_eq!(api.hits(), 2, "the scripted CLI's two calls were answered");
+
+    let (dir, _manifest) = cli.export(id, "bundle");
+    // The secret scans: the key the environment carried is in no file of the home and no
+    // file of the bundle; the session never sees it.
+    assert_home_free_of(&cli, CANARY, "a session task");
+    for file in walk(&dir) {
+        let bytes = fs::read(&file).unwrap_or_default();
+        assert!(
+            !bytes.windows(CANARY.len()).any(|w| w == CANARY.as_bytes()),
+            "{} carries the key",
+            file.display()
+        );
+    }
+    wait_for_no_home_processes(&cli, std::time::Duration::from_secs(10));
+    assert_no_job_processes(&cli);
+}
+
 #[test]
 fn agent_cli_session_submitted_without_yes_waits_and_resume_runs_it() {
     let cli = Cli::bare();
@@ -6284,4 +6335,51 @@ fn a_controller_killed_mid_session_is_resumed_as_agent_session_lost_without_a_se
     wait_for_no_home_processes(&cli, std::time::Duration::from_secs(10));
     assert_no_job_processes(&cli);
     assert_home_free_of(&cli, CANARY, "a killed session");
+}
+
+/// Recovering a lost session needs no credentials: `resume` without a key still fails the
+/// task as "agent session lost", reaps the job and sends nothing.
+#[test]
+fn a_killed_session_is_recovered_by_resume_without_credentials() {
+    let cli = Cli::bare();
+    cli.register_guest_image();
+    let argv = scripted_cli(&cli);
+    let api = fake_api("parser-fix-direct.json");
+    let contract = cli.session_contract(&cli.repo_copy());
+    let assert = cli
+        .session_cmd(
+            &argv,
+            &[
+                "submit",
+                &contract,
+                "--yes",
+                "--agent-cli",
+                "claude-code",
+                "--model",
+                "anthropic:claude-opus-5-5",
+                "--anthropic-base-url",
+                &api.url(),
+                "--crash-at",
+                "after-complete:model_call",
+            ],
+        )
+        .assert()
+        .code(75);
+    let id = crashed_task_id(&assert.get_output().stderr, "after-complete");
+    assert_eq!(api.hits(), 1, "the first call was answered");
+
+    let mut resume = cli.session_cmd(&argv, &["resume", &id]);
+    resume.env_remove("ANTHROPIC_API_KEY");
+    let resumed = resume.assert().success().get_output().stdout.clone();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&resumed).unwrap(),
+        json!({ "task_id": id, "state": "FAILED" })
+    );
+    assert_eq!(
+        failed_reasons(&cli, &id),
+        vec!["agent session lost".to_string()]
+    );
+    assert_eq!(api.hits(), 1, "nothing is sent again");
+    wait_for_no_home_processes(&cli, std::time::Duration::from_secs(10));
+    assert_no_job_processes(&cli);
 }
