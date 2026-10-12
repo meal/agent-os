@@ -9,4 +9,5 @@ pub mod messages;
 pub mod patchrules;
 pub mod resources;
 pub mod state;
+pub mod workflow;
 pub mod workspace;

@@ -27,6 +27,31 @@ impl fmt::Display for TaskId {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WorkflowId(String);
+
+impl WorkflowId {
+    pub fn new() -> WorkflowId {
+        WorkflowId(uuid::Uuid::now_v7().to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for WorkflowId {
+    fn default() -> Self {
+        WorkflowId::new()
+    }
+}
+
+impl fmt::Display for WorkflowId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("invalid digest: {0}")]
 pub struct DigestError(String);
@@ -75,6 +100,15 @@ mod tests {
     #[test]
     fn task_id_is_unique_uuid_v7() {
         let (a, b) = (TaskId::new(), TaskId::new());
+        assert_ne!(a, b);
+        let u = uuid::Uuid::parse_str(a.as_str()).unwrap();
+        assert_eq!(u.get_version_num(), 7);
+        assert_eq!(a.to_string(), a.as_str());
+    }
+
+    #[test]
+    fn workflow_id_is_unique_uuid_v7() {
+        let (a, b) = (WorkflowId::new(), WorkflowId::new());
         assert_ne!(a, b);
         let u = uuid::Uuid::parse_str(a.as_str()).unwrap();
         assert_eq!(u.get_version_num(), 7);
