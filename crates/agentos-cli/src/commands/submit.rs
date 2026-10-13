@@ -5,13 +5,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use agentos_core::contract::Contract;
+use agentos_core::contract::Limits;
 use agentos_core::guest::{GUEST_MIN_MEMORY_MIB, MAX_VCPUS};
-use agentos_core::ids::{Digest, TaskId};
+use agentos_core::ids::{Digest, TaskId, WorkflowId};
 use agentos_core::resources::VmResources;
 use agentos_engine::firecracker::{check_host_space, firecracker_version};
 use agentos_engine::guestlink::GuestLauncher;
 use agentos_engine::model::fake::Transcript;
 use agentos_engine::model::provider::ApiKey;
+use agentos_engine::routing::RoutingExecutor;
+use agentos_engine::supervised::SupervisedExecutor;
 use agentos_engine::workspace::{copy_tree, workspace_digest};
 use serde_json::{Value, json};
 
@@ -19,7 +22,8 @@ use super::{print, print_state};
 use crate::args::WorkerKind;
 use crate::crash::CrashSpec;
 use crate::drive::{
-    AGENT_PATCH, AgentCli, FAKE_AGENT, ModelSpec, TRANSCRIPT, agent_for, drive, session_argv,
+    AGENT_PATCH, AgentCli, Driver, FAKE_AGENT, ModelSpec, TRANSCRIPT, agent_for, drive,
+    session_argv,
 };
 use crate::error::CliError;
 use crate::home::{ANALYZER_DIR, Home, Store};
@@ -77,6 +81,38 @@ pub(crate) struct Recorded {
     has_agent: bool,
     firecracker: Option<FirecrackerRecord>,
     api_key: Option<ApiKey>,
+}
+
+/// Where [`record_task`] creates the task.
+pub(crate) enum Creation<'a> {
+    /// A task of its own.
+    Task,
+    /// The task of step `idx` of an approved workflow, linked to it in the same transaction.
+    Step {
+        workflow: &'a WorkflowId,
+        idx: usize,
+    },
+}
+
+impl Recorded {
+    /// The executor and the agent the recorded task runs with, built before its approval: a
+    /// host that changed since the checks leaves the task READY.
+    pub(crate) fn runner(
+        self,
+        home: &Home,
+        store: &Store,
+    ) -> Result<(RoutingExecutor<SupervisedExecutor>, Driver), CliError> {
+        let exec = home.executor(store, &self.task, self.api_key)?;
+        let agent = agent_for(home, store, &self.task, None)?;
+        Ok((exec, agent))
+    }
+}
+
+impl Request {
+    /// The approval screen's worker line for this request.
+    pub(crate) fn worker_line(&self) -> String {
+        worker_line(self.firecracker.as_ref())
+    }
 }
 
 /// The Firecracker worker's checks, in order: the contract's limits (exit 2), the guest image
@@ -147,7 +183,7 @@ fn host_kernel() -> String {
 }
 
 /// `--agent-cli`'s refusals that need no task file: exit 2, before anything is read or written.
-fn check_agent_cli_flags(
+pub(crate) fn check_agent_cli_flags(
     home: &Home,
     patch: Option<&Path>,
     model: Option<&str>,
@@ -172,7 +208,7 @@ fn check_agent_cli_flags(
 
 /// `--agent-cli`'s refusals about the contract and its goal: the session's capabilities must
 /// be declared, and the preset (or the test hook) must accept the goal.
-fn check_agent_cli_contract(contract: &Contract, cli: AgentCli) -> Result<(), CliError> {
+pub(crate) fn check_agent_cli_contract(contract: &Contract, cli: AgentCli) -> Result<(), CliError> {
     let caps = capability_names(contract);
     for cap in ["agent.session", "model.request"] {
         if !caps.iter().any(|c| c == cap) {
@@ -315,7 +351,7 @@ pub(crate) fn validate_contract(
     })
 }
 
-fn capability_names(contract: &Contract) -> Vec<String> {
+pub(crate) fn capability_names(contract: &Contract) -> Vec<String> {
     contract
         .capabilities
         .iter()
@@ -341,39 +377,14 @@ fn summarize(
     fc: Option<&FirecrackerRecord>,
     endpoint: Option<&str>,
 ) {
-    let l = &contract.limits;
     eprintln!("task {task} submitted; approve these permissions before it runs:");
     eprintln!("  goal:                 {}", contract.goal);
     eprintln!(
         "  repository:           {} at {repo}",
         contract.repository.source
     );
-    eprintln!(
-        "  capabilities:         {}",
-        capability_names(contract).join(", ")
-    );
-    eprintln!(
-        "  editable paths:       {}",
-        contract.editable_paths.join(", ")
-    );
-    eprintln!(
-        "  acceptance:           protected verification profile {} ({profile})",
-        contract.verification_profile
-    );
-    eprintln!(
-        "  limits:               model_requests={} max_output_tokens_per_request={} tool_actions={} deadline_seconds={} worker_vcpus={} worker_memory_mib={}",
-        l.model_requests,
-        l.max_output_tokens_per_request,
-        l.tool_actions,
-        l.deadline_seconds,
-        l.worker_vcpus,
-        l.worker_memory_mib
-    );
-    if let Some(a) = &contract.analyzer {
-        eprintln!(
-            "  analyzer:             {}@{}, reads the snapshot once before the first turn; its report is exported, never verified",
-            a.id, a.digest
-        );
+    for (label, value) in terms(contract, Some(profile)) {
+        eprintln!("  {:<22}{value}", format!("{label}:"));
     }
     eprintln!("  agent:                {agent}");
     if session {
@@ -384,15 +395,7 @@ fn summarize(
     if let Some(endpoint) = endpoint {
         eprintln!("  model endpoint:       {endpoint}");
     }
-    match fc {
-        None => eprintln!("  worker:               host (not sandboxed)"),
-        Some(fc) => eprintln!(
-            "  worker:               firecracker, guest image {}@{}, {}",
-            fc.image_id,
-            fc.image_digest,
-            if fc.jailed { "jailed" } else { "unjailed" }
-        ),
-    }
+    eprintln!("  worker:               {}", worker_line(fc));
     if let Some(fc) = fc {
         let r = &fc.resources;
         let rates = match (r.bandwidth_mib_s, r.iops) {
@@ -410,12 +413,69 @@ fn summarize(
     }
 }
 
+/// What the owner approves of `contract` besides its goal and repository, one `(label, value)`
+/// per screen line: capabilities, editable paths, acceptance, limits and the analyzer.
+/// `profile` is the recorded profile digest, when there is one yet.
+pub(crate) fn terms(contract: &Contract, profile: Option<&Digest>) -> Vec<(&'static str, String)> {
+    let acceptance = match profile {
+        Some(d) => format!(
+            "protected verification profile {} ({d})",
+            contract.verification_profile
+        ),
+        None => format!(
+            "protected verification profile {}",
+            contract.verification_profile
+        ),
+    };
+    let mut lines = vec![
+        ("capabilities", capability_names(contract).join(", ")),
+        ("editable paths", contract.editable_paths.join(", ")),
+        ("acceptance", acceptance),
+        ("limits", limits_line(&contract.limits)),
+    ];
+    if let Some(a) = &contract.analyzer {
+        lines.push((
+            "analyzer",
+            format!(
+                "{}@{}, reads the snapshot once before the first turn; its report is exported, never verified",
+                a.id, a.digest
+            ),
+        ));
+    }
+    lines
+}
+
+fn limits_line(l: &Limits) -> String {
+    format!(
+        "model_requests={} max_output_tokens_per_request={} tool_actions={} deadline_seconds={} worker_vcpus={} worker_memory_mib={}",
+        l.model_requests,
+        l.max_output_tokens_per_request,
+        l.tool_actions,
+        l.deadline_seconds,
+        l.worker_vcpus,
+        l.worker_memory_mib
+    )
+}
+
+fn worker_line(fc: Option<&FirecrackerRecord>) -> String {
+    match fc {
+        None => "host (not sandboxed)".to_string(),
+        Some(fc) => format!(
+            "firecracker, guest image {}@{}, {}",
+            fc.image_id,
+            fc.image_digest,
+            if fc.jailed { "jailed" } else { "unjailed" }
+        ),
+    }
+}
+
 /// Records the request's inputs immutably as a new task: staging copy, digests, the task row
 /// and its `Submitted` audit event. Prints nothing and neither approves nor runs the task.
 pub(crate) async fn record_task(
     home: &Home,
     store: &Store,
     req: Request,
+    creation: Creation<'_>,
 ) -> Result<Recorded, CliError> {
     let Request {
         mut contract,
@@ -475,7 +535,14 @@ pub(crate) async fn record_task(
     contract.repository.source = source.display().to_string();
     let contract_digest = Digest::of(&serde_json::to_vec(&contract)?);
 
-    let task = store.db.create_task(&contract, &contract_digest)?;
+    let task = match creation {
+        Creation::Task => store.db.create_task(&contract, &contract_digest)?,
+        Creation::Step { workflow, idx } => {
+            store
+                .db
+                .create_step_task(workflow, idx, &contract, &contract_digest)?
+        }
+    };
     fs::rename(staging.keep(), home.task_dir(&task))?;
     let mut submitted = json!({
         "contract_digest": contract_digest,
@@ -564,35 +631,24 @@ pub async fn submit(
 
     let store = home.open()?;
     let lock = if yes { Some(home.lock()?) } else { None };
-    let Recorded {
-        task,
-        contract,
-        repo_digest,
-        profile_digest,
-        agent,
-        submitted,
-        session,
-        has_agent,
-        firecracker,
-        api_key,
-    } = record_task(home, &store, req).await?;
+    let rec = record_task(home, &store, req, Creation::Task).await?;
     summarize(
-        &task,
-        &contract,
-        &repo_digest,
-        &profile_digest,
-        &agent,
-        session,
-        firecracker.as_ref(),
-        submitted["model_endpoint"].as_str(),
+        &rec.task,
+        &rec.contract,
+        &rec.repo_digest,
+        &rec.profile_digest,
+        &rec.agent,
+        rec.session,
+        rec.firecracker.as_ref(),
+        rec.submitted["model_endpoint"].as_str(),
     );
 
-    match lock.filter(|_| has_agent) {
+    let task = rec.task.clone();
+    match lock.filter(|_| rec.has_agent) {
         Some(lock) => {
             // The executor (preflight and jail included) before the approval: a host that
             // changed since the checks above leaves the task READY, not approved.
-            let exec = home.executor(&store, &task, api_key)?;
-            let agent = agent_for(home, &store, &task, None)?;
+            let (exec, agent) = rec.runner(home, &store)?;
             // `--yes` is the owner's approval: issue the task's capability handles.
             store.db.approve_task(&task)?;
             let state = drive(home, &store, &lock, &task, agent, crash, exec).await?;

@@ -10,8 +10,9 @@ pub(crate) mod registry;
 mod revoke;
 mod submit;
 pub mod supervise;
+mod workflow;
 
-use agentos_core::ids::TaskId;
+use agentos_core::ids::{TaskId, WorkflowId};
 use agentos_core::state::TaskState;
 use serde_json::{Value, json};
 
@@ -99,6 +100,7 @@ pub async fn dispatch(args: Args) -> Result<(), CliError> {
             revoke::revoke(&home, &task_id(&id)?, capability.as_deref())
         }
         Command::Export { id, dir } => export::export(&home, &task_id(&id)?, &dir),
+        Command::Workflow { command } => workflow::dispatch(home, command).await,
         Command::Gc {
             dry_run,
             batch_size,
@@ -123,6 +125,15 @@ fn task_arg(command: &Command) -> Option<&str> {
 
 /// Task ids are UUIDs; anything else is refused before it can reach a path.
 fn task_id(id: &str) -> Result<TaskId, CliError> {
+    uuid_id("task", id)
+}
+
+/// Workflow ids are UUIDs too, refused likewise.
+fn workflow_id(id: &str) -> Result<WorkflowId, CliError> {
+    uuid_id("workflow", id)
+}
+
+fn uuid_id<T: serde::de::DeserializeOwned>(what: &str, id: &str) -> Result<T, CliError> {
     let uuid_shaped = id.len() == 36
         && id.chars().enumerate().all(|(i, c)| match i {
             8 | 13 | 18 | 23 => c == '-',
@@ -130,11 +141,11 @@ fn task_id(id: &str) -> Result<TaskId, CliError> {
         });
     if !uuid_shaped {
         return Err(CliError::usage(format!(
-            "invalid task id {id:?}: expected a UUID"
+            "invalid {what} id {id:?}: expected a UUID"
         )));
     }
     serde_json::from_value(Value::String(id.to_string()))
-        .map_err(|e| CliError::usage(format!("invalid task id {id:?}: {e}")))
+        .map_err(|e| CliError::usage(format!("invalid {what} id {id:?}: {e}")))
 }
 
 /// One JSON document on stdout.

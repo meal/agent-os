@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agentos_core::contract::Limits;
-use agentos_core::ids::{Digest, TaskId};
+use agentos_core::ids::{Digest, TaskId, WorkflowId};
 use agentos_core::resources::VmResources;
 use agentos_engine::analysis::AnalysisExecutor;
 use agentos_engine::firecracker::{FirecrackerConfig, preflight};
@@ -446,6 +446,15 @@ impl Home {
 
     pub fn task_dir(&self, task: &TaskId) -> PathBuf {
         self.tasks_dir().join(task.as_str())
+    }
+
+    /// Each workflow's own inputs (step patches, transcript) and its handoffs.
+    pub fn workflows_dir(&self) -> PathBuf {
+        self.root.join("workflows")
+    }
+
+    pub fn workflow_dir(&self, workflow: &WorkflowId) -> PathBuf {
+        self.workflows_dir().join(workflow.as_str())
     }
 
     /// Opens the journal and blob store, creating the home on first use.

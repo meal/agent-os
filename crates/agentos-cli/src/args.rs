@@ -145,6 +145,11 @@ pub enum Command {
     },
     /// Write the export bundle of a finished task to DIR.
     Export { id: String, dir: PathBuf },
+    /// Chains of task contracts run one after the other on one workspace.
+    Workflow {
+        #[command(subcommand)]
+        command: WorkflowCommand,
+    },
     /// Collect proven redundant transient copies; preserve journal, inputs and artifacts.
     Gc {
         /// Report candidates and refusals without deleting task data.
@@ -164,6 +169,45 @@ pub enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorkflowCommand {
+    /// Validate a chain file, record it and its step inputs, show the whole chain for
+    /// approval and, with --yes, run it.
+    Submit {
+        /// The chain (JSON): a name, the first step's repository, and 2 to 8 named steps.
+        chain: PathBuf,
+        /// Approve the whole chain shown and run it now.
+        #[arg(long)]
+        yes: bool,
+        /// Patch text the fake agent applies, one per step in order.
+        #[arg(long, value_name = "FILE")]
+        step_patch: Vec<PathBuf>,
+        /// anthropic:<model> or fake:<transcript file>, for every step; without it the fake
+        /// agent runs (it needs one --step-patch per step).
+        #[arg(long, value_name = "SPEC")]
+        model: Option<String>,
+        /// Run every step's agent as this coding-agent CLI inside the microVM (claude-code).
+        #[arg(long, value_name = "NAME")]
+        agent_cli: Option<AgentCli>,
+        /// Debug: kill this process at an engine crash point, POINT[:KIND][:N].
+        #[arg(long, value_name = "POINT[:KIND][:N]")]
+        crash_at: Option<CrashSpec>,
+    },
+    /// Approve a READY chain, or continue one whose controller died, from its current step.
+    Resume {
+        id: String,
+        /// Debug: kill this process at an engine crash point, POINT[:KIND][:N].
+        #[arg(long, value_name = "POINT[:KIND][:N]")]
+        crash_at: Option<CrashSpec>,
+    },
+    /// Show a chain's state and each step's task.
+    Status { id: String },
+    /// Cancel a chain: no further step starts, and the running step's task is cancelled.
+    Cancel { id: String },
+    /// Write the last step's bundle of a succeeded chain to DIR, with chain.json.
+    Export { id: String, dir: PathBuf },
 }
 
 #[derive(Debug, Subcommand)]

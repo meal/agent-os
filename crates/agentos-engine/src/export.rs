@@ -607,6 +607,12 @@ pub fn export_bundle(
     Ok(written.manifest)
 }
 
+/// The manifest `export_bundle` would write for the finished `task`, after the same checks;
+/// nothing is written or journaled.
+pub fn manifest(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Manifest> {
+    Ok(collect(db, blobs, task)?.manifest)
+}
+
 /// The verified final workspace of a succeeded task, as a base and the patch that turns it
 /// into the result; `handoff::materialize` rebuilds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
