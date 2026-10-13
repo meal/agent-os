@@ -6383,3 +6383,557 @@ fn a_killed_session_is_recovered_by_resume_without_credentials() {
     wait_for_no_home_processes(&cli, std::time::Duration::from_secs(10));
     assert_no_job_processes(&cli);
 }
+
+// ============================================================================================
+// `agentos workflow`: a chain of contracts run one after the other on one workspace.
+// ============================================================================================
+
+mod workflow {
+    use super::*;
+
+    /// A UUID no home knows.
+    const UNKNOWN: &str = "01920000-0000-7000-8000-000000000000";
+
+    impl Cli {
+        /// A chain over `repo` whose steps are `names`, each with the contract of `contract`
+        /// (step 1 as is, later steps without `repository`), as JSON.
+        fn chain_value(&self, repo: &Path, names: &[&str]) -> Value {
+            let template: Value =
+                serde_json::from_str(&fs::read_to_string(self.contract(repo)).unwrap()).unwrap();
+            let steps: Vec<Value> = names
+                .iter()
+                .map(|name| {
+                    let mut c = template.clone();
+                    c.as_object_mut().unwrap().remove("repository");
+                    c["goal"] = json!(format!("{name} the parser"));
+                    json!({ "name": name, "contract": c })
+                })
+                .collect();
+            json!({ "name": "fix-and-review", "repository": template["repository"], "steps": steps })
+        }
+
+        /// Writes a chain file; returns its path.
+        fn write_chain(&self, chain: &Value) -> String {
+            self.write(
+                &format!("chain-{}.json", Digest::of(chain.to_string().as_bytes())),
+                &chain.to_string(),
+            )
+        }
+
+        fn chain(&self, repo: &Path, names: &[&str]) -> String {
+            self.write_chain(&self.chain_value(repo, names))
+        }
+
+        fn wf_status(&self, id: &str) -> Value {
+            self.json(&["workflow", "status", id])
+        }
+
+        /// `(task id, state)` of each step, from `workflow status`.
+        fn wf_tasks(&self, id: &str) -> Vec<(Option<String>, String)> {
+            self.wf_status(id)["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| {
+                    (
+                        s["task_id"].as_str().map(str::to_string),
+                        s["state"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect()
+        }
+
+        /// The comment patch, which applies on the fixed parser too (its hunk is above the
+        /// fix's) and keeps the checks passing there.
+        fn comment_patch(&self) -> String {
+            self.write("comment.patch", COMMENT_PATCH)
+        }
+
+        /// `fix` then `review` with `--yes`: the chain that succeeds.
+        fn run_chain(&self) -> (String, Value) {
+            let chain = self.chain(&self.repo_copy(), &["implement", "review"]);
+            let out = self.json(&[
+                "workflow",
+                "submit",
+                &chain,
+                "--yes",
+                "--step-patch",
+                fix_patch().to_str().unwrap(),
+                "--step-patch",
+                &self.comment_patch(),
+            ]);
+            (out["workflow_id"].as_str().unwrap().to_string(), out)
+        }
+    }
+
+    fn task_ids(steps: &[(Option<String>, String)]) -> Vec<String> {
+        steps.iter().map(|(t, _)| t.clone().unwrap()).collect()
+    }
+
+    /// No workflow was recorded in the home (nothing at all, or only the tier's registry).
+    fn assert_no_workflow(cli: &Cli) {
+        assert_nothing_recorded(cli);
+    }
+
+    #[test]
+    fn a_two_step_chain_runs_and_hands_the_verified_workspace_to_the_second_step() {
+        let cli = Cli::new();
+        let (id, out) = cli.run_chain();
+        assert_eq!(out["state"], "SUCCEEDED", "{out}");
+
+        let steps = cli.wf_tasks(&id);
+        assert_eq!(steps.len(), 2);
+        assert!(steps.iter().all(|(_, s)| s == "SUCCEEDED"), "{steps:?}");
+        let tasks = task_ids(&steps);
+        assert_ne!(tasks[0], tasks[1]);
+        for t in &tasks {
+            assert_eq!(cli.status(t)["state"], "SUCCEEDED");
+            assert_tier_worker(&cli, t);
+        }
+
+        let (_, first) = cli.export(&tasks[0], "first");
+        let submitted = cli.submitted(&tasks[1]);
+        assert_eq!(
+            submitted["repository_digest"], first["final_workspace_digest"],
+            "step 2 starts from step 1's verified workspace"
+        );
+        let (_, second) = cli.export(&tasks[1], "second");
+        assert_eq!(second["base_workspace_digest"], first["verified_digest"]);
+        assert_eq!(
+            fs::read_to_string(
+                cli.home()
+                    .join("tasks")
+                    .join(&tasks[1])
+                    .join("snapshot/src/parser.py")
+            )
+            .unwrap(),
+            fs::read_to_string(cli.path("repo/src/parser.py"))
+                .unwrap()
+                .replace(
+                    "        if not line.strip() or line.startswith(\"#\"):\n",
+                    "        line = line.strip()\n        if not line or line.startswith(\"#\"):\n"
+                )
+                .replace(
+                    "        result[key] = value\n",
+                    "        result[key.strip()] = value.strip()\n"
+                ),
+            "step 2's snapshot is the fixed parser"
+        );
+    }
+
+    #[test]
+    fn workflow_export_writes_chain_json_matching_each_steps_own_export() {
+        let cli = Cli::new();
+        let (id, _) = cli.run_chain();
+        let tasks = task_ids(&cli.wf_tasks(&id));
+        let dir = cli.path("chain-bundle");
+
+        cli.json(&["workflow", "export", &id, dir.to_str().unwrap()]);
+
+        let chain: Value =
+            serde_json::from_slice(&fs::read(dir.join("chain.json")).unwrap()).unwrap();
+        assert_eq!(chain["workflow_id"], id.as_str());
+        assert_eq!(chain["name"], "fix-and-review");
+        assert_eq!(chain["state"], "SUCCEEDED");
+        assert!(
+            chain["spec_digest"].as_str().unwrap().len() == 64,
+            "{chain}"
+        );
+        let steps = chain["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 2);
+        for (i, (step, task)) in steps.iter().zip(&tasks).enumerate() {
+            let (_, own) = cli.export(task, &format!("own-{i}"));
+            assert_eq!(step["idx"], i);
+            assert_eq!(step["name"], ["implement", "review"][i]);
+            assert_eq!(step["task_id"], task.as_str());
+            for field in ["contract_digest", "patch_digest", "verified_digest"] {
+                assert_eq!(step[field], own[field], "{field} of step {i}");
+            }
+        }
+        // The bundle is the last step's.
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["task_id"], tasks[1].as_str());
+        assert_eq!(
+            fs::read_to_string(dir.join("patch.diff")).unwrap(),
+            COMMENT_PATCH
+        );
+    }
+
+    #[test]
+    fn a_failing_first_step_stops_the_chain() {
+        let cli = Cli::new();
+        let chain = cli.chain(&cli.repo_copy(), &["implement", "review"]);
+        let comment = cli.comment_patch();
+        // The comment alone fixes nothing: step 1's verification fails.
+        let out = cli.json(&[
+            "workflow",
+            "submit",
+            &chain,
+            "--yes",
+            "--step-patch",
+            &comment,
+            "--step-patch",
+            &comment,
+        ]);
+        assert_eq!(out["state"], "FAILED", "{out}");
+        let id = out["workflow_id"].as_str().unwrap();
+
+        let status = cli.wf_status(id);
+        assert_eq!(status["state"], "FAILED");
+        assert_eq!(status["failed_step"], "implement");
+        let steps = status["steps"].as_array().unwrap();
+        assert_eq!(steps[0]["state"], "FAILED");
+        assert!(steps[0]["task_id"].is_string());
+        assert_eq!(steps[1]["state"], "SKIPPED");
+        assert!(
+            steps[1].get("task_id").is_none_or(Value::is_null),
+            "{status}"
+        );
+
+        let dir = cli.path("bundle");
+        cli.cmd(&["workflow", "export", id, dir.to_str().unwrap()])
+            .assert()
+            .code(1)
+            .stdout("")
+            .stderr(predicate::str::contains("implement"));
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn workflow_submit_without_yes_issues_no_task_and_resume_approves() {
+        let cli = Cli::new();
+        let chain = cli.chain(&cli.repo_copy(), &["implement", "review"]);
+        let assert = cli
+            .cmd(&[
+                "workflow",
+                "submit",
+                &chain,
+                "--step-patch",
+                fix_patch().to_str().unwrap(),
+                "--step-patch",
+                &cli.comment_patch(),
+            ])
+            .assert()
+            .success();
+        let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+        for shown in [
+            "implement",
+            "implement the parser",
+            "review",
+            "review the parser",
+            "snapshot.read",
+            "src/**",
+            "parser-checks-v1",
+            "tool_actions",
+            "agent:",
+            "worker:",
+            "total budget:",
+            "model_requests=2 tool_actions=20 deadline_seconds=1200",
+        ] {
+            assert!(
+                stderr.contains(shown),
+                "the approval screen shows {shown}: {stderr}"
+            );
+        }
+        let out: Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+        assert_eq!(out["state"], "READY");
+        assert!(
+            out["note"]
+                .as_str()
+                .unwrap()
+                .contains("agentos workflow resume"),
+            "{out}"
+        );
+        let id = out["workflow_id"].as_str().unwrap();
+
+        let status = cli.wf_status(id);
+        assert_eq!(status["state"], "READY");
+        for step in status["steps"].as_array().unwrap() {
+            assert_eq!(step["state"], "PENDING");
+            assert!(step.get("task_id").is_none_or(Value::is_null), "{status}");
+        }
+        assert!(
+            fs::read_dir(cli.home().join("tasks"))
+                .unwrap()
+                .next()
+                .is_none(),
+            "no task before approval"
+        );
+
+        let resumed = cli.json(&["workflow", "resume", id]);
+        assert_eq!(resumed["state"], "SUCCEEDED", "{resumed}");
+        let steps = cli.wf_tasks(id);
+        assert!(steps.iter().all(|(t, s)| t.is_some() && s == "SUCCEEDED"));
+    }
+
+    #[test]
+    fn invalid_chains_exit_2_and_record_nothing() {
+        let cli = Cli::new();
+        let repo = cli.repo_copy();
+        let fix = fix_patch();
+        let fix = fix.to_str().unwrap();
+        let two = cli.chain_value(&repo, &["implement", "review"]);
+        let names: Vec<String> = (0..9).map(|i| format!("s{i}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut with_repo = two.clone();
+        with_repo["steps"][1]["contract"]["repository"] = two["repository"].clone();
+        let mut bad_profile = two.clone();
+        bad_profile["steps"][0]["contract"]["verification_profile"] = json!("no-such-profile");
+        let cases: Vec<(&str, Value, Vec<&str>)> = vec![
+            (
+                "a chain has 2 to 8 steps, got 1",
+                cli.chain_value(&repo, &["implement"]),
+                vec![fix],
+            ),
+            (
+                "a chain has 2 to 8 steps, got 9",
+                cli.chain_value(&repo, &names),
+                vec![fix; 9],
+            ),
+            (
+                "duplicate step name \"implement\"",
+                cli.chain_value(&repo, &["implement", "implement"]),
+                vec![fix, fix],
+            ),
+            (
+                "only the first step sets a repository",
+                with_repo,
+                vec![fix, fix],
+            ),
+            (
+                "verification profile no-such-profile not found",
+                bad_profile,
+                vec![fix, fix],
+            ),
+            (
+                "one --step-patch per step: the chain has 2 steps, got 1",
+                two.clone(),
+                vec![fix],
+            ),
+            (
+                "one --step-patch per step: the chain has 2 steps, got 0",
+                two.clone(),
+                vec![],
+            ),
+        ];
+        for (what, chain, patches) in cases {
+            let file = cli.write_chain(&chain);
+            let mut args = vec!["workflow", "submit", file.as_str(), "--yes"];
+            for p in &patches {
+                args.extend(["--step-patch", p]);
+            }
+            let out = cli.cmd(&args).output().unwrap();
+            assert_eq!(
+                out.status.code(),
+                Some(2),
+                "{what}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.stdout.is_empty(), "{what}");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(stderr.contains(what), "{what}: {stderr}");
+            assert_no_workflow(&cli);
+        }
+        // The fake agent takes no model.
+        let file = cli.write_chain(&two);
+        cli.cmd(&[
+            "workflow",
+            "submit",
+            &file,
+            "--step-patch",
+            fix,
+            "--step-patch",
+            fix,
+            "--model",
+            "anthropic:claude-opus-5-5",
+        ])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(predicate::str::contains(
+            "pass either --step-patch or --model",
+        ));
+        assert_no_workflow(&cli);
+        // A missing chain file.
+        cli.cmd(&[
+            "workflow",
+            "submit",
+            cli.path("nope.json").to_str().unwrap(),
+        ])
+        .assert()
+        .code(2);
+        assert_no_workflow(&cli);
+    }
+
+    #[test]
+    fn workflow_resume_refuses_a_different_worker_and_an_unknown_id() {
+        let cli = Cli::new();
+        let chain = cli.chain(&cli.repo_copy(), &["implement", "review"]);
+        let out = cli.json(&[
+            "workflow",
+            "submit",
+            &chain,
+            "--step-patch",
+            fix_patch().to_str().unwrap(),
+            "--step-patch",
+            &cli.comment_patch(),
+        ]);
+        let id = out["workflow_id"].as_str().unwrap();
+        let (recorded, other) = if fake_mode() || real_mode() {
+            ("firecracker", "host")
+        } else {
+            ("host", "firecracker")
+        };
+        cli.cmd_as(Mode::Plain, &["--worker", other, "workflow", "resume", id])
+            .assert()
+            .code(2)
+            .stdout("")
+            .stderr(predicate::str::contains(format!(
+                "workflow was submitted with worker {recorded}"
+            )));
+        assert_eq!(cli.wf_status(id)["state"], "READY", "nothing ran");
+
+        let dir = cli.path("out");
+        for args in [
+            vec!["workflow", "resume", UNKNOWN],
+            vec!["workflow", "status", UNKNOWN],
+            vec!["workflow", "cancel", UNKNOWN],
+            vec!["workflow", "export", UNKNOWN, dir.to_str().unwrap()],
+        ] {
+            cli.cmd(&args)
+                .assert()
+                .code(1)
+                .stdout("")
+                .stderr(predicate::str::contains(format!(
+                    "unknown workflow {UNKNOWN}"
+                )));
+        }
+        cli.cmd(&["workflow", "status", "../etc"])
+            .assert()
+            .code(2)
+            .stdout("");
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn cancel_before_the_chain_runs_skips_every_step() {
+        let cli = Cli::new();
+        let chain = cli.chain(&cli.repo_copy(), &["implement", "review"]);
+        let out = cli.json(&[
+            "workflow",
+            "submit",
+            &chain,
+            "--step-patch",
+            fix_patch().to_str().unwrap(),
+            "--step-patch",
+            &cli.comment_patch(),
+        ]);
+        let id = out["workflow_id"].as_str().unwrap();
+
+        let cancelled = cli.json(&["workflow", "cancel", id]);
+        assert_eq!(cancelled["state"], "CANCELLED", "{cancelled}");
+        for step in cancelled["steps"].as_array().unwrap() {
+            assert_eq!(step["state"], "SKIPPED");
+            assert!(step.get("task_id").is_none_or(Value::is_null));
+        }
+
+        cli.cmd(&["workflow", "resume", id])
+            .assert()
+            .code(1)
+            .stdout("");
+        let status = cli.wf_status(id);
+        assert_eq!(status["state"], "CANCELLED");
+        assert!(
+            status["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|s| s["state"] == "SKIPPED" && s.get("task_id").is_none_or(Value::is_null))
+        );
+        assert!(
+            fs::read_dir(cli.home().join("tasks"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn each_step_holds_its_own_capability_handles() {
+        let cli = Cli::new();
+        let (id, out) = cli.run_chain();
+        assert_eq!(out["state"], "SUCCEEDED");
+        let tasks = task_ids(&cli.wf_tasks(&id));
+        let prefixes = |task: &str| -> BTreeSet<String> {
+            cli.status(task)["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["handle_prefix"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let (a, b) = (prefixes(&tasks[0]), prefixes(&tasks[1]));
+        assert_eq!(a.len(), 4);
+        assert_eq!(b.len(), 4);
+        assert!(a.is_disjoint(&b), "{a:?} {b:?}");
+        let full: BTreeSet<String> = full_handles(&cli, &tasks[0]).into_iter().collect();
+        assert!(full.is_disjoint(&full_handles(&cli, &tasks[1]).into_iter().collect()));
+
+        cli.json(&["revoke", &tasks[0], "--capability", "artifact.export"]);
+        cli.cmd(&["export", &tasks[0], cli.path("denied").to_str().unwrap()])
+            .assert()
+            .code(1);
+        cli.export(&tasks[1], "allowed");
+        cli.json(&[
+            "workflow",
+            "export",
+            &id,
+            cli.path("chain").to_str().unwrap(),
+        ]);
+    }
+
+    #[test]
+    fn the_test_hook_exits_between_steps_and_resume_creates_the_next_step() {
+        let cli = Cli::new();
+        let chain = cli.chain(&cli.repo_copy(), &["implement", "review"]);
+        let comment = cli.comment_patch();
+        cli.cmd(&[
+            "workflow",
+            "submit",
+            &chain,
+            "--yes",
+            "--step-patch",
+            fix_patch().to_str().unwrap(),
+            "--step-patch",
+            &comment,
+        ])
+        .env("AGENTOS_TEST_WORKFLOW_EXIT_AFTER_STEP", "1")
+        .assert()
+        .code(137);
+        let ids: Vec<String> = fs::read_dir(cli.home().join("workflows"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.starts_with('.'))
+            .collect();
+        assert_eq!(ids.len(), 1, "{ids:?}");
+        let id = &ids[0];
+        let steps = cli.wf_tasks(id);
+        assert_eq!(steps[0].1, "SUCCEEDED");
+        assert_eq!(steps[1], (None, "PENDING".to_string()));
+
+        // Without `--worker`: the chain's recorded worker runs step 2 as it ran step 1.
+        let mode = match Cli::mode() {
+            Mode::Fake => Mode::PlainFake,
+            other => other,
+        };
+        let resumed = cli.json_as(mode, &["workflow", "resume", id]);
+        assert_eq!(resumed["state"], "SUCCEEDED", "{resumed}");
+        let after = cli.wf_tasks(id);
+        assert_eq!(after[0].0, steps[0].0, "step 1 did not run again");
+        for task in task_ids(&after) {
+            assert_tier_worker(&cli, &task);
+        }
+    }
+}
