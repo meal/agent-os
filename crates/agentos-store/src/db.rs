@@ -8,13 +8,14 @@ use agentos_core::ids::{Digest, TaskId};
 use agentos_core::state::{Task, TaskEvent, TaskState, TransitionError, reduce};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-const OWNER: &str = "local-owner";
+pub(crate) const OWNER: &str = "local-owner";
 
 /// Stored in `PRAGMA user_version`. Bump it on every change to [`SCHEMA`] an older build
 /// could misread. A database newer than this build is refused rather than misread; so is an
-/// older one that already holds tables (v0.1 databases are not migrated). 0 with no tables
-/// is a brand-new file.
-pub const SCHEMA_VERSION: i64 = 2;
+/// older one that already holds tables, except version 2, which only lacks the workflow
+/// tables and is upgraded in place (v0.1 databases are not migrated). 0 with no tables is a
+/// brand-new file.
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Event types the store and the engine's state machine own. An audit row may not use
 /// them, so it can never forge a lifecycle event, an effect transition, or a receipt verdict
@@ -52,7 +53,37 @@ const RESERVED_EVENT_TYPES: &[&str] = &[
     "ModelRetryScheduled",
 ];
 
-const SCHEMA: &str = "
+/// Version 3 added these; a version-2 database gets them on their own. A macro because
+/// `concat!` only takes literals.
+macro_rules! workflow_schema {
+    () => {
+        "
+CREATE TABLE IF NOT EXISTS workflows(
+    id TEXT PRIMARY KEY,
+    owner TEXT NOT NULL,
+    spec_digest TEXT NOT NULL,
+    spec_json TEXT NOT NULL,
+    options_json TEXT NOT NULL,
+    approved_ts INTEGER,
+    cancel_requested INTEGER NOT NULL DEFAULT 0,
+    created_ts INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS workflow_steps(
+    workflow_id TEXT NOT NULL REFERENCES workflows(id),
+    idx INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    task_id TEXT UNIQUE REFERENCES tasks(id),
+    skipped INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(workflow_id, idx)
+);
+"
+    };
+}
+
+const WORKFLOW_SCHEMA: &str = workflow_schema!();
+
+const SCHEMA: &str = concat!(
+    "
 CREATE TABLE IF NOT EXISTS tasks(
     id TEXT PRIMARY KEY,
     owner TEXT NOT NULL,
@@ -142,7 +173,9 @@ CREATE TABLE IF NOT EXISTS observations(
     observed_ts INTEGER NOT NULL,
     evidence_ref TEXT
 );
-";
+",
+    workflow_schema!()
+);
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -197,6 +230,8 @@ pub enum DbError {
         "database was created by an older Agent OS; v0.1 databases are not migrated (schema version {found}, this build needs {supported})"
     )]
     OldSchema { found: i64, supported: i64 },
+    #[error("workflow: {0}")]
+    Workflow(String),
     #[error("effect not found: {0}")]
     EffectNotFound(EffectId),
     #[error("effect {effect} cannot move from {from:?} to {to:?}")]
@@ -346,6 +381,43 @@ pub(crate) fn store_task(tx: &Transaction, t: &Task) -> Result<()> {
     Ok(())
 }
 
+/// Inserts a task in its initial state with its `TaskCreated` event, inside the caller's
+/// transaction (`create_task`, `create_step_task`).
+pub(crate) fn insert_task(
+    tx: &Transaction,
+    contract: &Contract,
+    contract_digest: &Digest,
+) -> Result<TaskId> {
+    let id = TaskId::new();
+    // A placeholder base digest by design: the task's ReadSnapshot effect replaces it with
+    // the real workspace digest (WorkspaceUpdated) before any other work. `checkpoint`
+    // stays NULL: journal replay is the checkpoint mechanism. `deadline_ts` is 0 (not
+    // started) until the owner approves the task (`approve_task`).
+    let base = Digest::of(contract.repository.revision.as_bytes());
+    let task = Task::new(id.clone(), base);
+    tx.execute(
+        "INSERT INTO tasks(id, owner, contract_digest, contract_json, state, cancel_requested,
+            workspace_digest, verified_digest, actions_used, step, checkpoint, deadline_ts, created_ts)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, NULL, 0, 0, NULL, 0, ?7)",
+        params![
+            id.as_str(),
+            OWNER,
+            contract_digest.to_string(),
+            serde_json::to_string(contract)?,
+            state_to_str(task.state)?,
+            task.workspace_digest.to_string(),
+            now_ts()
+        ],
+    )?;
+    insert_event(
+        tx,
+        &id,
+        "TaskCreated",
+        &serde_json::json!({ "contract_digest": contract_digest.to_string() }),
+    )?;
+    Ok(id)
+}
+
 impl Db {
     /// The database file, as SQLite opened it; `None` for an in-memory or temporary
     /// database (SQLite reports those with an empty name).
@@ -390,13 +462,17 @@ impl Db {
                 [],
                 |r| r.get(0),
             )?;
-            if has_tasks {
+            if has_tasks && version == 2 {
+                // Version 3 only adds the workflow tables.
+                tx.execute_batch(WORKFLOW_SCHEMA)?;
+            } else if has_tasks {
                 return Err(DbError::OldSchema {
                     found: version,
                     supported: SCHEMA_VERSION,
                 });
+            } else {
+                tx.execute_batch(SCHEMA)?;
             }
-            tx.execute_batch(SCHEMA)?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         tx.commit()?;
@@ -447,35 +523,8 @@ impl Db {
     }
 
     pub fn create_task(&self, contract: &Contract, contract_digest: &Digest) -> Result<TaskId> {
-        let id = TaskId::new();
-        // A placeholder base digest by design: the task's ReadSnapshot effect replaces it with
-        // the real workspace digest (WorkspaceUpdated) before any other work. `checkpoint`
-        // stays NULL: journal replay is the checkpoint mechanism. `deadline_ts` is 0 (not
-        // started) until the owner approves the task (`approve_task`).
-        let base = Digest::of(contract.repository.revision.as_bytes());
-        let task = Task::new(id.clone(), base);
-        let now = now_ts();
         let tx = self.immediate()?;
-        tx.execute(
-            "INSERT INTO tasks(id, owner, contract_digest, contract_json, state, cancel_requested,
-                workspace_digest, verified_digest, actions_used, step, checkpoint, deadline_ts, created_ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, NULL, 0, 0, NULL, 0, ?7)",
-            params![
-                id.as_str(),
-                OWNER,
-                contract_digest.to_string(),
-                serde_json::to_string(contract)?,
-                state_to_str(task.state)?,
-                task.workspace_digest.to_string(),
-                now
-            ],
-        )?;
-        insert_event(
-            &tx,
-            &id,
-            "TaskCreated",
-            &serde_json::json!({ "contract_digest": contract_digest.to_string() }),
-        )?;
+        let id = insert_task(&tx, contract, contract_digest)?;
         tx.commit()?;
         Ok(id)
     }

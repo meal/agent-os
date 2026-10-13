@@ -875,21 +875,21 @@ fn reopening_a_user_version_0_database_with_tables_is_refused() {
 }
 
 #[test]
-fn reopening_a_version_3_database_is_refused() {
+fn reopening_a_version_4_database_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("agentos.db");
     drop(Db::open(&path).unwrap());
     Connection::open(&path)
         .unwrap()
-        .pragma_update(None, "user_version", 3)
+        .pragma_update(None, "user_version", 4)
         .unwrap();
     let err = open_err(&path);
     assert!(
         matches!(
             err,
             DbError::SchemaVersion {
-                found: 3,
-                supported: 2
+                found: 4,
+                supported: 3
             }
         ),
         "{err:?}"
@@ -897,14 +897,14 @@ fn reopening_a_version_3_database_is_refused() {
 }
 
 #[test]
-fn a_fresh_database_gets_version_2() {
-    assert_eq!(SCHEMA_VERSION, 2);
+fn a_fresh_database_gets_version_3() {
+    assert_eq!(SCHEMA_VERSION, 3);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("agentos.db");
     // An empty file at version 0 without tables is a fresh database, not an old one.
     drop(Connection::open(&path).unwrap());
     let db = Db::open(&path).unwrap();
-    assert_eq!(db.pragma_string("user_version").unwrap(), "2");
+    assert_eq!(db.pragma_string("user_version").unwrap(), "3");
     drop(db);
     drop(Db::open(&path).unwrap());
 
