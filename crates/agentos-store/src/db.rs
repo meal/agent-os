@@ -288,7 +288,7 @@ pub(crate) fn state_to_str(s: TaskState) -> Result<String> {
     }
 }
 
-fn state_from_str(s: String) -> Result<TaskState> {
+pub(crate) fn state_from_str(s: String) -> Result<TaskState> {
     Ok(serde_json::from_value(serde_json::Value::String(s))?)
 }
 
