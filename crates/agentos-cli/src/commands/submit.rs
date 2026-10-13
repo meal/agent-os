@@ -16,6 +16,7 @@ use agentos_engine::model::provider::ApiKey;
 use agentos_engine::routing::RoutingExecutor;
 use agentos_engine::supervised::SupervisedExecutor;
 use agentos_engine::workspace::{copy_tree, workspace_digest};
+use agentos_store::db::DbError;
 use serde_json::{Value, json};
 
 use super::{print, print_state};
@@ -83,17 +84,6 @@ pub(crate) struct Recorded {
     api_key: Option<ApiKey>,
 }
 
-/// Where [`record_task`] creates the task.
-pub(crate) enum Creation<'a> {
-    /// A task of its own.
-    Task,
-    /// The task of step `idx` of an approved workflow, linked to it in the same transaction.
-    Step {
-        workflow: &'a WorkflowId,
-        idx: usize,
-    },
-}
-
 impl Recorded {
     /// The executor and the agent the recorded task runs with, built before its approval: a
     /// host that changed since the checks leaves the task READY.
@@ -113,12 +103,22 @@ impl Request {
     pub(crate) fn worker_line(&self) -> String {
         worker_line(self.firecracker.as_ref())
     }
+
+    /// The jail decision of a Firecracker request; `None` for the host worker.
+    pub(crate) fn jailed(&self) -> Option<bool> {
+        self.firecracker.as_ref().map(|fc| fc.jailed)
+    }
 }
 
 /// The Firecracker worker's checks, in order: the contract's limits (exit 2), the guest image
 /// from `contract.profile` and its optional pin (exit 2), the preflight over the registry
-/// entry and the jail decision (exit 1).
-fn check_firecracker(home: &Home, contract: &Contract) -> Result<FirecrackerRecord, CliError> {
+/// entry and the jail decision (exit 1). `recorded_jailed` binds the decision as for a task
+/// resumed later (a workflow step: the decision approved with the chain); `None` decides it.
+fn check_firecracker(
+    home: &Home,
+    contract: &Contract,
+    recorded_jailed: Option<bool>,
+) -> Result<FirecrackerRecord, CliError> {
     let l = &contract.limits;
     if l.worker_vcpus > MAX_VCPUS {
         return Err(CliError::usage(format!(
@@ -142,7 +142,8 @@ fn check_firecracker(home: &Home, contract: &Contract) -> Result<FirecrackerReco
     // The preflight reads only the launcher and the image: the task's own paths do not exist yet.
     let placeholder = std::path::absolute(home.tasks_dir())?;
     let resources = VmResources::resolve(l);
-    let prepared = home.prepare_firecracker(&image, l, &placeholder, None, None, resources)?;
+    let prepared =
+        home.prepare_firecracker(&image, l, &placeholder, None, recorded_jailed, resources)?;
     // Advisory: the images are sparse, so this is what the VMs may still write. The nearest
     // existing directory stands in for a work root that does not exist yet.
     let existing = placeholder
@@ -234,10 +235,11 @@ pub(crate) fn validate(
     let text = fs::read_to_string(task)
         .map_err(|e| CliError::usage(format!("cannot read {}: {e}", task.display())))?;
     let contract = Contract::parse(&text).map_err(|e| CliError::usage(e.to_string()))?;
-    validate_contract(home, contract, yes, patch, model, agent_cli)
+    validate_contract(home, contract, yes, patch, model, agent_cli, None)
 }
 
-/// Everything `validate` checks once the contract is in hand.
+/// Everything `validate` checks once the contract is in hand. `recorded_jailed`: see
+/// [`check_firecracker`].
 pub(crate) fn validate_contract(
     home: &Home,
     contract: Contract,
@@ -245,6 +247,7 @@ pub(crate) fn validate_contract(
     patch: Option<&Path>,
     model: Option<&str>,
     agent_cli: Option<AgentCli>,
+    recorded_jailed: Option<bool>,
 ) -> Result<Request, CliError> {
     if let Some(cli) = agent_cli {
         check_agent_cli_contract(&contract, cli)?;
@@ -335,7 +338,7 @@ pub(crate) fn validate_contract(
     };
     let firecracker = match home.worker.unwrap_or(WorkerKind::Host) {
         WorkerKind::Host => None,
-        WorkerKind::Firecracker => Some(check_firecracker(home, &contract)?),
+        WorkerKind::Firecracker => Some(check_firecracker(home, &contract, recorded_jailed)?),
     };
     Ok(Request {
         contract,
@@ -475,8 +478,41 @@ pub(crate) async fn record_task(
     home: &Home,
     store: &Store,
     req: Request,
-    creation: Creation<'_>,
 ) -> Result<Recorded, CliError> {
+    let created = record_with(home, store, req, |contract, digest| {
+        Ok(Ok(store.db.create_task(contract, digest)?))
+    })
+    .await?;
+    Ok(created.expect("create_task never refuses"))
+}
+
+/// [`record_task`] for the task of step `idx` of an approved workflow, created and linked in
+/// one transaction. `Ok(Err(refusal))` when the store refuses to create it (the chain is being
+/// cancelled, the step is taken or skipped): nothing is recorded then.
+pub(crate) async fn record_step_task(
+    home: &Home,
+    store: &Store,
+    req: Request,
+    workflow: &WorkflowId,
+    idx: usize,
+) -> Result<Result<Recorded, String>, CliError> {
+    record_with(home, store, req, |contract, digest| {
+        match store.db.create_step_task(workflow, idx, contract, digest) {
+            Ok(task) => Ok(Ok(task)),
+            Err(DbError::Workflow(refusal)) => Ok(Err(refusal)),
+            Err(e) => Err(e.into()),
+        }
+    })
+    .await
+}
+
+/// `create` makes the task row, or refuses with a reason.
+async fn record_with(
+    home: &Home,
+    store: &Store,
+    req: Request,
+    create: impl FnOnce(&Contract, &Digest) -> Result<Result<TaskId, String>, CliError>,
+) -> Result<Result<Recorded, String>, CliError> {
     let Request {
         mut contract,
         source,
@@ -535,13 +571,9 @@ pub(crate) async fn record_task(
     contract.repository.source = source.display().to_string();
     let contract_digest = Digest::of(&serde_json::to_vec(&contract)?);
 
-    let task = match creation {
-        Creation::Task => store.db.create_task(&contract, &contract_digest)?,
-        Creation::Step { workflow, idx } => {
-            store
-                .db
-                .create_step_task(workflow, idx, &contract, &contract_digest)?
-        }
+    let task = match create(&contract, &contract_digest)? {
+        Ok(task) => task,
+        Err(refusal) => return Ok(Err(refusal)),
     };
     fs::rename(staging.keep(), home.task_dir(&task))?;
     let mut submitted = json!({
@@ -604,7 +636,7 @@ pub(crate) async fn record_task(
         (_, None, Some(m), None) => m.recorded(),
         (_, None, None, _) => "none yet".to_string(),
     };
-    Ok(Recorded {
+    Ok(Ok(Recorded {
         task,
         contract,
         repo_digest,
@@ -615,7 +647,7 @@ pub(crate) async fn record_task(
         has_agent: patch.is_some() || model.is_some(),
         firecracker,
         api_key,
-    })
+    }))
 }
 
 pub async fn submit(
@@ -631,7 +663,7 @@ pub async fn submit(
 
     let store = home.open()?;
     let lock = if yes { Some(home.lock()?) } else { None };
-    let rec = record_task(home, &store, req, Creation::Task).await?;
+    let rec = record_task(home, &store, req).await?;
     summarize(
         &rec.task,
         &rec.contract,

@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use super::control::{cancel_task, resume_task};
 use super::export::export_task;
 use super::submit::{
-    Creation, RECORDED_AT_SUBMISSION, check_agent_cli_contract, check_agent_cli_flags, record_task,
+    RECORDED_AT_SUBMISSION, check_agent_cli_contract, check_agent_cli_flags, record_step_task,
     terms, validate_contract,
 };
 use super::{print, workflow_id};
@@ -29,7 +29,7 @@ use crate::args::{WorkerKind, WorkflowCommand};
 use crate::crash::CrashSpec;
 use crate::drive::{AgentCli, Driver, FAKE_AGENT, ModelSpec, drive};
 use crate::error::CliError;
-use crate::home::{DriverLock, Home, Store};
+use crate::home::{DriverLock, Home, Store, TEST_WORKERS_ENV};
 
 /// The workflow's own copy of a `fake:` transcript, which every step replays.
 const TRANSCRIPT: &str = "transcript.json";
@@ -218,7 +218,10 @@ async fn submit(
         step_patches.first().map(PathBuf::as_path),
         model,
         agent_cli,
+        None,
     )?;
+    let worker = home.worker.unwrap_or(WorkerKind::Host);
+    let profile_digests = pin_steps(&home, &mut spec, worker)?;
     if let Some(cli) = agent_cli {
         for step in &spec.steps[1..] {
             check_agent_cli_contract(&step.contract, cli)?;
@@ -249,10 +252,13 @@ async fn submit(
         spec.repository.revision = digest.clone();
         spec.steps[0].contract.repository.revision = digest;
     }
-    let worker = home.worker.unwrap_or(WorkerKind::Host);
     let transcript_digest = transcript.as_deref().map(Digest::of);
     let options = json!({
         "worker": worker.as_str(),
+        // The jail decision approved with the chain binds every step, as `Submitted.jailed`
+        // binds a task's later runs.
+        "jailed": first.jailed(),
+        "profile_digests": profile_digests,
         "model": model,
         "agent_cli": agent_cli.map(AgentCli::name),
         "step_patch_digests": patches.iter().map(|p| Digest::of(p.as_bytes())).collect::<Vec<_>>(),
@@ -293,7 +299,7 @@ async fn submit(
     let id = store.db.create_workflow(&spec, &options)?;
     fs::rename(staging.keep(), home.workflow_dir(&id))?;
     tracing::info!(workflow_id = %id, spec_digest = %spec.digest(), "workflow submitted");
-    summarize(&id, &spec, &agent, &first.worker_line());
+    summarize(&id, &spec, &profile_digests, &agent, &first.worker_line());
 
     match lock {
         Some(lock) => {
@@ -311,9 +317,72 @@ async fn submit(
     Ok(())
 }
 
+/// Pins every step's verification profile and, for the Firecracker worker, its guest image to
+/// what they resolve to now, so the approval names exact bytes; returns each step's approved
+/// profile digest. A registry profile is pinned in the contract (and so in the spec digest).
+/// A profile from the legacy `--profiles` directory cannot be (a pin names a registry entry):
+/// its digest is checked when the step starts.
+fn pin_steps(
+    home: &Home,
+    spec: &mut ChainSpec,
+    worker: WorkerKind,
+) -> Result<Vec<Digest>, CliError> {
+    let mut digests = Vec::new();
+    for step in &mut spec.steps {
+        let c = &mut step.contract;
+        let id = c.verification_profile.clone();
+        let digest = match &c.profile_digest {
+            Some(pin) => {
+                home.resolve_profile(&id, Some(pin))?;
+                pin.clone()
+            }
+            None => match home.registry_entries(&id).pop() {
+                Some(entry) => {
+                    c.profile_digest = Some(entry.digest.clone());
+                    entry.digest
+                }
+                None => {
+                    let dir = home.profile_dir(&id)?.ok_or_else(|| {
+                        CliError::usage(format!(
+                            "step {:?}: verification profile {id} not found in the registry {} or in {}",
+                            step.name,
+                            home.registry_dir().display(),
+                            home.profiles.display()
+                        ))
+                    })?;
+                    workspace_digest(&dir)
+                        .map_err(|e| {
+                            CliError::usage(format!("cannot digest {}: {e}", dir.display()))
+                        })?
+                        .to_string()
+                }
+            },
+        };
+        digests.push(
+            Digest::from_hex(&digest).map_err(|e| {
+                CliError::usage(format!("step {:?}: profile digest: {e}", step.name))
+            })?,
+        );
+        if worker == WorkerKind::Firecracker {
+            let image = home
+                .resolve_image(&c.profile, c.guest_image_digest.as_deref())?
+                .ok_or_else(|| {
+                    CliError::usage(format!(
+                        "step {:?}: guest image {} not found in the registry {}; build and register it first",
+                        step.name,
+                        c.profile,
+                        home.images_dir().display()
+                    ))
+                })?;
+            c.guest_image_digest = Some(image.digest);
+        }
+    }
+    Ok(digests)
+}
+
 /// What the owner approves, on stderr: every step's terms, the agent, the worker and the
 /// summed budget.
-fn summarize(id: &WorkflowId, spec: &ChainSpec, agent: &str, worker: &str) {
+fn summarize(id: &WorkflowId, spec: &ChainSpec, profiles: &[Digest], agent: &str, worker: &str) {
     eprintln!(
         "workflow {id} submitted; approve this chain of {} steps before it runs:",
         spec.steps.len()
@@ -322,11 +391,17 @@ fn summarize(id: &WorkflowId, spec: &ChainSpec, agent: &str, worker: &str) {
         "  repository:           {} at {}",
         spec.repository.source, spec.repository.revision
     );
-    for (i, step) in spec.steps.iter().enumerate() {
+    for (i, (step, profile)) in spec.steps.iter().zip(profiles).enumerate() {
         eprintln!("  step {} {}:", i + 1, step.name);
         eprintln!("    goal:                 {}", step.contract.goal);
-        for (label, value) in terms(&step.contract, None) {
+        for (label, value) in terms(&step.contract, Some(profile)) {
             eprintln!("    {:<22}{value}", format!("{label}:"));
+        }
+        if let Some(image) = &step.contract.guest_image_digest {
+            eprintln!(
+                "    guest image:          {}@{image}",
+                step.contract.profile
+            );
         }
     }
     eprintln!("  agent:                {agent}");
@@ -414,7 +489,11 @@ fn submitted(store: &Store, task: &TaskId) -> Result<bool, CliError> {
         .any(|e| e.event_type == "Submitted"))
 }
 
+/// Honoured only with `AGENTOS_TEST_WORKERS=1`, like every test hook.
 fn exit_hook(done: usize) {
+    if std::env::var(TEST_WORKERS_ENV).as_deref() != Ok("1") {
+        return;
+    }
     let wanted = std::env::var(EXIT_AFTER_STEP_ENV)
         .ok()
         .and_then(|v| v.parse::<usize>().ok());
@@ -477,6 +556,36 @@ async fn start_step(
             return Ok(None);
         }
     };
+    // A profile from the legacy `--profiles` directory is not pinned in the contract: it must
+    // still be the one approved (checked again on the recorded copy below).
+    let approved_profile = w.options["profile_digests"][idx]
+        .as_str()
+        .and_then(|d| Digest::from_hex(d).ok())
+        .ok_or_else(|| {
+            CliError::other(format!(
+                "workflow {} has no approved profile digest for step {name:?}",
+                w.id
+            ))
+        })?;
+    let unpinned = contract.profile_digest.is_none();
+    if unpinned {
+        let id = &contract.verification_profile;
+        if let Some(dir) = home.resolve_profile(id, None)? {
+            let found = workspace_digest(&dir)
+                .map_err(|e| CliError::usage(format!("cannot digest {}: {e}", dir.display())))?;
+            if found != approved_profile {
+                return Err(CliError::usage(format!(
+                    "step {name:?}: verification profile {id} changed since the workflow was approved: approved {approved_profile}, found {found}"
+                )));
+            }
+        }
+    }
+    let in_step = |e: CliError| CliError {
+        code: e.code,
+        message: format!("workflow {}, step {name:?}: {}", w.id, e.message),
+    };
+    // The jail decision approved with the chain binds this step as `Submitted.jailed` binds a
+    // task: approved jailed never runs unjailed, approved unjailed stays so without the flag.
     let req = validate_contract(
         home,
         contract,
@@ -484,23 +593,25 @@ async fn start_step(
         inputs.patch.as_deref(),
         inputs.model.as_deref(),
         inputs.agent_cli,
-    )?;
-    let rec = match record_task(
-        home,
-        store,
-        req,
-        Creation::Step {
-            workflow: &w.id,
-            idx,
-        },
+        w.options["jailed"].as_bool(),
     )
-    .await
-    {
+    .map_err(in_step)?;
+    let rec = match record_step_task(home, store, req, &w.id, idx).await? {
         Ok(rec) => rec,
-        // A cancel that landed since the chain was read wins: the step stays skipped.
+        // The store refused: a cancel that landed since the chain was read wins, and the step
+        // stays skipped; any other refusal is an error.
         Err(_) if store.db.workflow(&w.id)?.cancel_requested => return Ok(None),
-        Err(e) => return Err(e),
+        Err(refusal) => return Err(CliError::other(refusal)),
     };
+    if unpinned && rec.profile_digest != approved_profile {
+        // Changed between the check above and the copy: the task never runs on it.
+        let reason = format!(
+            "verification profile changed since the workflow was approved: approved {approved_profile}, recorded {}",
+            rec.profile_digest
+        );
+        store.db.append(&rec.task, &TaskEvent::Failed { reason })?;
+        return Ok(None);
+    }
     if idx > 0 {
         // The task holds its own recorded copy of the handoff.
         fs::remove_dir_all(&handoff_dir)?;

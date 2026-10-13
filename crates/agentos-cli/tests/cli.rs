@@ -6908,6 +6908,7 @@ mod workflow {
             "--step-patch",
             &comment,
         ])
+        .env("AGENTOS_TEST_WORKERS", "1")
         .env("AGENTOS_TEST_WORKFLOW_EXIT_AFTER_STEP", "1")
         .assert()
         .code(137);
@@ -6950,6 +6951,7 @@ mod workflow {
             "--step-patch",
             &cli.comment_patch(),
         ])
+        .env("AGENTOS_TEST_WORKERS", "1")
         .env("AGENTOS_TEST_WORKFLOW_EXIT_AFTER_STEP", "1")
         .assert()
         .code(137);
@@ -7084,5 +7086,271 @@ mod workflow {
             cli.submitted(&first)["repository_source"],
             cli.path("repo").canonicalize().unwrap().to_str().unwrap()
         );
+    }
+
+    /// The one workflow in the home.
+    fn only_workflow(cli: &Cli) -> String {
+        let ids: Vec<String> = fs::read_dir(cli.home().join("workflows"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.starts_with('.'))
+            .collect();
+        assert_eq!(ids.len(), 1, "{ids:?}");
+        ids[0].clone()
+    }
+
+    #[test]
+    fn the_exit_hook_is_ignored_without_the_test_switch() {
+        let cli = Cli::bare();
+        let chain = cli.chain(&cli.repo_copy(), &["implement", "review"]);
+        let out = cli
+            .cmd_as(
+                Mode::Plain,
+                &[
+                    "workflow",
+                    "submit",
+                    &chain,
+                    "--yes",
+                    "--step-patch",
+                    fix_patch().to_str().unwrap(),
+                    "--step-patch",
+                    &cli.comment_patch(),
+                ],
+            )
+            .env("AGENTOS_TEST_WORKFLOW_EXIT_AFTER_STEP", "1")
+            .assert()
+            .success();
+        let out: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+        assert_eq!(out["state"], "SUCCEEDED", "{out}");
+    }
+
+    /// Submits `fix` then `review` on the fake guest with the jail probe answering `probe`,
+    /// stopped by the hook after step 1; returns the workflow id and the submit's stderr.
+    fn fake_chain_stopped_after_step_one(
+        cli: &Cli,
+        probe: &str,
+        extra: &[&str],
+    ) -> (String, String) {
+        let chain = cli.chain(&cli.repo_copy(), &["implement", "review"]);
+        let comment = cli.comment_patch();
+        let fix = fix_patch();
+        let mut args = vec![
+            "workflow",
+            "submit",
+            chain.as_str(),
+            "--yes",
+            "--step-patch",
+            fix.to_str().unwrap(),
+            "--step-patch",
+            comment.as_str(),
+        ];
+        args.extend_from_slice(extra);
+        let assert = cli
+            .cmd_as(Mode::Fake, &args)
+            .env("AGENTOS_TEST_JAIL_PROBE", probe)
+            .env("AGENTOS_TEST_WORKFLOW_EXIT_AFTER_STEP", "1")
+            .assert()
+            .code(137);
+        let id = only_workflow(cli);
+        (id, stderr_of(&assert))
+    }
+
+    #[test]
+    fn a_chain_approved_jailed_never_runs_a_step_unjailed() {
+        let cli = Cli::bare();
+        cli.register_guest_image();
+        let (id, screen) = fake_chain_stopped_after_step_one(&cli, "ok", &[]);
+        assert!(
+            screen.contains(", jailed"),
+            "the screen shows the jail: {screen}"
+        );
+        let first = cli.wf_tasks(&id)[0].0.clone().unwrap();
+        assert_eq!(cli.submitted(&first)["jailed"], true);
+
+        let assert = cli
+            .cmd_as(
+                Mode::PlainFake,
+                &["workflow", "resume", &id, "--allow-unjailed"],
+            )
+            .env("AGENTOS_TEST_JAIL_PROBE", "fail:jailer gone")
+            .assert()
+            .code(1)
+            .stdout("");
+        let stderr = stderr_of(&assert);
+        assert!(stderr.contains("submitted jailed"), "{stderr}");
+        assert!(stderr.contains("jailer gone"), "{stderr}");
+        let steps = cli.wf_tasks(&id);
+        assert_eq!(
+            steps[1],
+            (None, "PENDING".to_string()),
+            "no task for step 2"
+        );
+
+        // Once the jail works again the same chain goes on, jailed.
+        let ok = cli
+            .cmd_as(Mode::PlainFake, &["workflow", "resume", &id])
+            .env("AGENTOS_TEST_JAIL_PROBE", "ok")
+            .assert()
+            .success();
+        let out: Value = serde_json::from_slice(&ok.get_output().stdout).unwrap();
+        assert_eq!(out["state"], "SUCCEEDED", "{out}");
+        for task in task_ids(&cli.wf_tasks(&id)) {
+            assert_eq!(cli.submitted(&task)["jailed"], true);
+        }
+    }
+
+    #[test]
+    fn a_chain_approved_unjailed_resumes_without_the_flag() {
+        let cli = Cli::bare();
+        cli.register_guest_image();
+        let probe = format!("fail:{NEEDS_ROOT}");
+        let (id, screen) = fake_chain_stopped_after_step_one(&cli, &probe, &["--allow-unjailed"]);
+        assert!(screen.contains(", unjailed"), "{screen}");
+
+        let assert = cli
+            .cmd_as(Mode::PlainFake, &["workflow", "resume", &id])
+            .env("AGENTOS_TEST_JAIL_PROBE", &probe)
+            .assert()
+            .success();
+        assert!(
+            !stderr_of(&assert).contains("warning"),
+            "the acknowledgement was given at submit"
+        );
+        let out: Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+        assert_eq!(out["state"], "SUCCEEDED", "{out}");
+        for task in task_ids(&cli.wf_tasks(&id)) {
+            assert_eq!(cli.submitted(&task)["jailed"], false);
+        }
+    }
+
+    #[test]
+    fn every_step_runs_the_guest_image_the_chain_was_approved_with() {
+        let cli = Cli::bare();
+        let approved = cli.register_guest_image();
+        let (id, screen) = fake_chain_stopped_after_step_one(&cli, "ok", &[]);
+        assert!(screen.contains(&approved), "{screen}");
+        // A newer entry under the same id, registered after the approval.
+        let newer = fake_image_dir(&cli, "newer-image", guest_profile(), 0x69);
+        let newer = register_image(&cli, &newer)["digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(newer, approved);
+
+        let ok = cli
+            .cmd_as(Mode::PlainFake, &["workflow", "resume", &id])
+            .env("AGENTOS_TEST_JAIL_PROBE", "ok")
+            .assert()
+            .success();
+        let out: Value = serde_json::from_slice(&ok.get_output().stdout).unwrap();
+        assert_eq!(out["state"], "SUCCEEDED", "{out}");
+        for task in task_ids(&cli.wf_tasks(&id)) {
+            assert_eq!(
+                cli.submitted(&task)["guest_image_digest"],
+                approved.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn every_step_runs_the_registered_profile_the_chain_was_approved_with() {
+        let cli = Cli::new();
+        let profiles = no_legacy(&cli);
+        let approved =
+            register(&cli, &profile_variant(&cli, "p1", "parser-checks-v1", ""))["digest"]
+                .as_str()
+                .unwrap()
+                .to_string();
+        let chain = cli.chain(&cli.repo_copy(), &["implement", "review"]);
+        let assert = cli
+            .cmd_with_profiles(
+                &profiles,
+                &[
+                    "workflow",
+                    "submit",
+                    &chain,
+                    "--step-patch",
+                    fix_patch().to_str().unwrap(),
+                    "--step-patch",
+                    &cli.comment_patch(),
+                ],
+            )
+            .assert()
+            .success();
+        let screen = stderr_of(&assert);
+        assert!(
+            screen.contains(&format!("parser-checks-v1 ({approved})")),
+            "{screen}"
+        );
+        let id = only_workflow(&cli);
+        let newer = register(
+            &cli,
+            &profile_variant(&cli, "p2", "parser-checks-v1", "# v2\n"),
+        )["digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(newer, approved);
+
+        let out = cli.json_with_profiles(&profiles, &["workflow", "resume", &id]);
+        assert_eq!(out["state"], "SUCCEEDED", "{out}");
+        for task in task_ids(&cli.wf_tasks(&id)) {
+            assert_eq!(submitted_profile_digest(&cli, &task), approved);
+        }
+    }
+
+    #[test]
+    fn a_legacy_profile_changed_after_approval_stops_the_chain_until_restored() {
+        let cli = Cli::new();
+        let profiles = cli.path("profiles");
+        copy_tree(&fixtures().join("profiles"), &profiles).unwrap();
+        let check = profiles.join("parser-checks-v1/check_parser.py");
+        let original = fs::read_to_string(&check).unwrap();
+        let chain = cli.chain(&cli.repo_copy(), &["implement", "review"]);
+        let assert = cli
+            .cmd_with_profiles(
+                &profiles,
+                &[
+                    "workflow",
+                    "submit",
+                    &chain,
+                    "--step-patch",
+                    fix_patch().to_str().unwrap(),
+                    "--step-patch",
+                    &cli.comment_patch(),
+                ],
+            )
+            .assert()
+            .success();
+        let approved = workspace_digest(&profiles.join("parser-checks-v1"))
+            .unwrap()
+            .to_string();
+        assert!(stderr_of(&assert).contains(&approved));
+        let id = only_workflow(&cli);
+        fs::write(&check, format!("# changed\n{original}")).unwrap();
+
+        let refused = cli
+            .cmd_with_profiles(&profiles, &["workflow", "resume", &id])
+            .assert()
+            .code(2)
+            .stdout("");
+        let stderr = stderr_of(&refused);
+        assert!(
+            stderr.contains("changed since the workflow was approved"),
+            "{stderr}"
+        );
+        assert!(stderr.contains(&approved), "{stderr}");
+        assert!(
+            cli.wf_tasks(&id).iter().all(|(t, _)| t.is_none()),
+            "no task"
+        );
+
+        fs::write(&check, &original).unwrap();
+        let out = cli.json_with_profiles(&profiles, &["workflow", "resume", &id]);
+        assert_eq!(out["state"], "SUCCEEDED", "{out}");
+        for task in task_ids(&cli.wf_tasks(&id)) {
+            assert_eq!(submitted_profile_digest(&cli, &task), approved);
+        }
     }
 }

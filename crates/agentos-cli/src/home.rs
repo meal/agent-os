@@ -53,7 +53,7 @@ pub const ANALYZER_DIR: &str = "analyzer";
 /// How long a verification check may run (the fixture executor's default).
 const VERIFY_TIMEOUT_SECS: u64 = 60;
 /// Test switches, each honoured only together with `AGENTOS_TEST_WORKERS=1`.
-const TEST_WORKERS_ENV: &str = "AGENTOS_TEST_WORKERS";
+pub(crate) const TEST_WORKERS_ENV: &str = "AGENTOS_TEST_WORKERS";
 /// The Firecracker worker launches the fake guest (`agentos supervise fake-guest`) instead of
 /// Firecracker.
 const FAKE_GUEST_ENV: &str = "AGENTOS_TEST_FAKE_GUEST";
