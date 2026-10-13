@@ -623,9 +623,7 @@ refused. A read is a journaled `read_file` effect that costs a tool action; so i
    records its digest.
 3. The call is a `ModelCall` effect with its own reservation (one model request): `EffectIntended`,
    `EffectDispatched`, then the executor sends **one HTTP request** and retains the answer in
-   `<home>/workflows/<id>/     a chain's recorded inputs: step-N.patch (fake agent) or transcript.json
-                           (`--model fake:`); handoff-N/ only while step N+1 is being created
-<home>/model/<effect>-<attempt>/response.json` before returning. `EffectCompleted` publishes
+   `<home>/model/<effect>-<attempt>/response.json` before returning. `EffectCompleted` publishes
    the response as an artifact, and the next observation carries the response **inline**.
 4. A replay re-derives the request and compares digests; a mismatch fails the task
    (`NondeterministicAgent`).
@@ -875,7 +873,7 @@ $ agentos workflow status 01a13432-5745-72e1-aba2-170a63d088ad
 {"name":"fix-and-comment","state":"SUCCEEDED","steps":[{"idx":0,"name":"implement","state":"SUCCEEDED","task_id":"01a13432-575d-772b-a914-cbc13b81b1d8"},{"idx":1,"name":"comment","state":"SUCCEEDED","task_id":"01a13432-58d6-7080-96a1-0902ad7b16f6"}],"workflow_id":"01a13432-5745-72e1-aba2-170a63d088ad"}
 
 $ agentos workflow export 01a13432-5745-72e1-aba2-170a63d088ad bundle
-{"name":"fix-and-comment","spec_digest":"fd3e6a7a67e279eee593cf6e646cf46539d8a5c95c882ec568b0c75fc14571c6","state":"SUCCEEDED","steps":[{"contract_digest":"7eb774f4e8e4c9aa9527f70c883e3de14aae366f2849ef20d6155d94445358d5","idx":0,"name":"implement","patch_digest":"5128fe0b9134f20b9e50aa2f17eab86244f8836df332d55b128456a4b47e6ff5","task_id":"01a13432-575d-772b-a914-cbc13b81b1d8","verified_digest":"060915eeb9b0caf26efbfdab529c36a9e25359be64e71ae67e6651138a5fec13"},{"contract_digest":"e53ca5df519d1263a9054320b1f7d74c40ef653d70e4e89c02b0c888565d5e01","idx":1,"name":"comment","patch_digest":"a687cbe56a6250ada8b1af803fe617c7ff01c6833ea01e77c355c178b30cba9b","task_id":"01a13432-58d6-7080-96a1-0902ad7b16f6","verified_digest":"cfdc6263b06f57e09776fb2767d59fb0d9ce3e87bf3272e5b769da7d45201e66"}],"workflow_id":"01a13432-5745-72e1-aba2-170a63d088ad"}
+{"name":"fix-and-comment","spec_digest":"fd3e6a7a67e279eee593cf6e646cf46539d8a5c95c882ec568b0c75fc14571c6","state":"SUCCEEDED","steps":[{"base_workspace_digest":"be77aa19c032f85329a9596adfd692252a0c87fd09d337b1873feb6003bdd3b8","contract_digest":"7eb774f4e8e4c9aa9527f70c883e3de14aae366f2849ef20d6155d94445358d5","idx":0,"name":"implement","patch_digest":"5128fe0b9134f20b9e50aa2f17eab86244f8836df332d55b128456a4b47e6ff5","task_id":"01a13432-575d-772b-a914-cbc13b81b1d8","verified_digest":"060915eeb9b0caf26efbfdab529c36a9e25359be64e71ae67e6651138a5fec13"},{"base_workspace_digest":"060915eeb9b0caf26efbfdab529c36a9e25359be64e71ae67e6651138a5fec13","contract_digest":"e53ca5df519d1263a9054320b1f7d74c40ef653d70e4e89c02b0c888565d5e01","idx":1,"name":"comment","patch_digest":"a687cbe56a6250ada8b1af803fe617c7ff01c6833ea01e77c355c178b30cba9b","task_id":"01a13432-58d6-7080-96a1-0902ad7b16f6","verified_digest":"cfdc6263b06f57e09776fb2767d59fb0d9ce3e87bf3272e5b769da7d45201e66"}],"workflow_id":"01a13432-5745-72e1-aba2-170a63d088ad"}
 
 $ ls bundle
 chain.json
@@ -898,13 +896,26 @@ editable paths, acceptance profile (with its digest) and limits, the agent, the 
 stays `READY` and no task exists. `--yes`, or a later `workflow resume`, is the owner's approval of
 the whole chain.
 
-What is approved is exact: `recorded-at-submission` becomes the source's digest at submission, so
-step 1 runs on what was approved however late the chain is resumed; each step's verification profile
-is pinned to the registry entry it resolves to (a profile from the legacy `--profiles` directory
-cannot be pinned, so its digest is checked again when the step starts and a change fails the step);
-on the Firecracker worker each step's guest image is pinned too; the jail decision taken at
-approval binds every step (approved jailed never runs unjailed); and the `--step-patch` files or
-the `fake:` transcript are copied into the home and their digests re-checked before each step. Later
+What the approval binds:
+
+- `recorded-at-submission` becomes the source's digest (and the source its canonical path) at
+  submission, so step 1 runs on that content however late the chain is resumed; a changed source
+  is refused (exit 2) and the chain stays resumable.
+- Each step's verification profile is pinned to the registry entry it resolves to. A profile from
+  the legacy `--profiles` directory cannot be pinned (a pin names a registry entry): its digest is
+  recorded and checked when the step starts, before its handoff is built and again on the staged
+  copy before the step's task exists. A change exits 2, creates nothing, and the chain stays
+  RUNNING and resumable once the profile is restored.
+- On the Firecracker worker each step's guest image is pinned, and the jail decision taken at
+  approval binds every step (approved jailed never runs unjailed; approved unjailed stays so).
+- With `--model anthropic:…` the provider endpoint (`--anthropic-base-url`, normalized) is
+  recorded and shown; every step uses it, and a resume naming another endpoint is refused
+  (exit 2).
+- The `--step-patch` files or the `fake:` transcript are copied into the home with their digests.
+  When a step starts, its file is read once, and those bytes, the ones its task records, must match
+  the approved digest; a missing or changed file fails the chain.
+
+Later
 steps' tasks do not exist yet, so each step's capabilities are issued when its task is created,
 from the approved spec only, and are bound to that one task: a step cannot use another step's
 handles.
@@ -914,9 +925,10 @@ handles.
 When step N succeeds, the controller rebuilds step N+1's input from durable records, not from any
 directory: it takes step N's recorded snapshot, applies step N's accepted patch blobs, checks that
 the result digests to step N's verified `final_workspace_digest`, and stages it as step N+1's
-snapshot, whose `repository.revision` is that digest. A mismatch, or a missing blob, fails the
-chain; so does a changed recorded input. A staging directory left by an earlier attempt is
-deleted and rebuilt, never trusted. Step N's workspace image is never needed, so `agentos gc` may
+snapshot, whose `repository.revision` is that digest. A mismatch, a missing blob, or a staged copy
+that no longer is that digest fails the chain. A staging directory left by an earlier attempt is
+deleted and rebuilt, never trusted, and the staging directory is removed once the step's task has
+recorded its own copy or the attempt stops. Step N's workspace image is never needed, so `agentos gc` may
 collect it between steps.
 
 ### Resume, cancel, export
@@ -926,16 +938,32 @@ collect it between steps.
   task, then goes on. If the controller died after step N succeeded and before step N+1 existed,
   it creates N+1; if N+1 exists, it is continued, never created twice. No step runs twice or is
   skipped. A step task that was created but never recorded as submitted is failed ("step was not
-  completely created"), and so is the chain. A finished chain has nothing to resume (exit 1).
+  completely created"), and so is the chain; one recorded with a profile other than the approved
+  one is not run (exit 2). A finished chain has nothing to resume (exit 1). Continue a chain with
+  `workflow resume`, not `agentos resume <step-task>`: the task command drives that one task and
+  never creates the next step.
 - A failed or cancelled step ends the chain at once: no retry, and the steps that never ran show
   `SKIPPED`. `workflow status` names the `failed_step`.
 - `workflow cancel <id>` stops the chain: no further step task can be created, and a step task
-  still running is cancelled as `agentos cancel` cancels a task. Cancel wins.
+  still running is cancelled as `agentos cancel` cancels a task. If the canceller dies after
+  recording the chain's cancel but before reaching the running step's task, the next
+  `workflow resume` applies that cancel before it drives anything, so the step ends CANCELLED. A
+  step that already reached SUCCEEDED stays so.
 - `workflow export <id> DIR` works only for a `SUCCEEDED` chain (exit 1 otherwise, nothing written).
   `DIR` is the last step's bundle plus `chain.json`, which lists every step's task id,
-  `contract_digest`, `patch_digest` and `verified_digest` in order, with the chain's
-  `spec_digest`, so base to final can be checked. Each step also stays exportable on its own with
+  `contract_digest`, `patch_digest`, `base_workspace_digest` and `verified_digest` in order, with
+  the chain's `spec_digest`, so base to final can be checked: each step's base is the previous
+  step's verified digest. The bundle is written first and `chain.json` after it, so a failure in
+  between leaves a bundle without `chain.json`. Each step also stays exportable on its own with
   `agentos export <task>`.
+
+### Trust boundary
+
+The checks above are against the chain's own records and the registries. The home directory is
+trusted against a concurrent writer running as the same user: such a process can already change
+anything the controller reads. Two such cases are known and deferred: swapping a staged
+`handoff-<i>/` for a symlink while it is copied, and replacing a step task's `tasks/<task>/agent.patch`
+between a controller death and the resume.
 
 ### Limits of v1
 
@@ -949,7 +977,9 @@ task, and the chain, as "agent session lost".
 ## Home layout
 
 ```text
-<home>/agentos.db          journal (SQLite, WAL; PRAGMA user_version = schema version 2)
+<home>/agentos.db          journal (SQLite, WAL; PRAGMA user_version = schema version 3); a
+                           version-2 journal is upgraded in place on first open, one way: the
+                           workflow tables are added, and an older build then refuses it
 <home>/blobs/              content-addressed artifacts (patches, results, evidence)
 <home>/jobs/<effect>-<attempt>/   one directory per effect attempt (see below)
 <home>/work/<task>/ws      task workspaces (host worker)
@@ -969,6 +999,11 @@ task, and the chain, as "agent session lost".
                                 (removed on success; a dead inspector's is collected by the next one)
 <home>/bin/firecracker     optional: the Firecracker binary (default for --firecracker)
 <home>/bin/jailer          optional: the jailer (default: `jailer` next to the Firecracker binary)
+<home>/workflows/<id>/     a chain's recorded inputs, numbered by 0-based step index:
+                           step-<i>.patch (fake agent; step-0.patch is the first step's) or
+                           transcript.json (`--model fake:`); handoff-<i>/ is the staged input
+                           of step index i (handoff-1/ feeds the second step), present only
+                           while that step's task is being created
 <home>/driver.lock         held by the one process driving tasks (running or recovering)
 <home>/profiles/<id>/      legacy profile directories (default for --profiles)
 ```
