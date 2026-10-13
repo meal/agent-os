@@ -5,8 +5,8 @@ use std::fs;
 use std::path::Path;
 
 use crate::export::Handoff;
-use crate::patch::git;
-use crate::workspace::{copy_tree, purge_excluded, workspace_digest};
+use crate::patch::{git, paths_of_file};
+use crate::workspace::{copy_tree, has_excluded_component, purge_excluded, workspace_digest};
 
 /// Copies `snapshot` to `out` (which must not exist), applies the handoff's patch and checks
 /// that the result is the workspace the handoff names. Any failure removes `out`.
@@ -37,6 +37,14 @@ async fn build(snapshot: &Path, h: &Handoff, out: &Path) -> Result<(), String> {
             .map_err(|e| format!("scratch dir: {e}"))?;
         let patch_file = scratch.path().join("handoff.patch");
         fs::write(&patch_file, &h.patch).map_err(|e| format!("cannot write patch: {e}"))?;
+        // The same screening as the fixture executor: unacceptable patch kinds (symlink modes
+        // and the like) and paths the workspace digest does not cover, which could otherwise
+        // leave unaccounted files in `out`. `symlink_on_path` is not needed: a snapshot cannot
+        // contain symlinks, and a patch that creates one is refused by this screening.
+        let paths = paths_of_file(&patch_file, scratch.path()).await?;
+        if let Some(p) = paths.iter().find(|p| has_excluded_component(p)) {
+            return Err(format!("path excluded from the workspace digest: {p}"));
+        }
         // A planted `.git` would make `git apply` honour its repo-local configuration.
         purge_excluded(out).map_err(|e| format!("cannot clean workspace: {e}"))?;
         for args in [&["apply", "--check"][..], &["apply"][..]] {
@@ -53,6 +61,11 @@ async fn build(snapshot: &Path, h: &Handoff, out: &Path) -> Result<(), String> {
                 ));
             }
         }
+    }
+    // Belt and braces: nothing the digest ignores may remain in `out`.
+    let leftovers = purge_excluded(out).map_err(|e| format!("cannot clean workspace: {e}"))?;
+    if let Some(p) = leftovers.first() {
+        return Err(format!("patch left excluded path {p}"));
     }
     let result = workspace_digest(out).map_err(|e| format!("cannot digest workspace: {e}"))?;
     if result != h.final_digest {
@@ -197,5 +210,40 @@ mod tests {
         materialize(&planted, &h, &out).await.unwrap();
 
         assert!(!out.join(".git").exists());
+    }
+
+    fn add_file_patch(path: &str) -> Vec<u8> {
+        format!("--- /dev/null\n+++ b/{path}\n@@ -0,0 +1 @@\n+x\n").into_bytes()
+    }
+
+    #[tokio::test]
+    async fn a_patch_adding_digest_excluded_files_is_refused() {
+        for path in ["src/__pycache__/x.pyc", "src/m.pyc"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (snap, mut h) = setup(dir.path());
+            h.patch = add_file_patch(path);
+            let out = dir.path().join("out");
+
+            let err = materialize(&snap, &h, &out).await.unwrap_err();
+
+            assert!(
+                err.contains("unsupported patch operation") || err.contains("excluded"),
+                "{path}: {err}"
+            );
+            assert!(!out.exists(), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_patch_creating_a_symlink_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (snap, mut h) = setup(dir.path());
+        h.patch = b"diff --git a/ln b/ln\nnew file mode 120000\n--- /dev/null\n+++ b/ln\n@@ -0,0 +1 @@\n+target\n\\ No newline at end of file\n".to_vec();
+        let out = dir.path().join("out");
+
+        let err = materialize(&snap, &h, &out).await.unwrap_err();
+
+        assert!(!err.is_empty());
+        assert!(!out.exists());
     }
 }
