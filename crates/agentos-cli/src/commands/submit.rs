@@ -13,7 +13,7 @@ use agentos_engine::guestlink::GuestLauncher;
 use agentos_engine::model::fake::Transcript;
 use agentos_engine::model::provider::ApiKey;
 use agentos_engine::workspace::{copy_tree, workspace_digest};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::{print, print_state};
 use crate::args::WorkerKind;
@@ -22,7 +22,7 @@ use crate::drive::{
     AGENT_PATCH, AgentCli, FAKE_AGENT, ModelSpec, TRANSCRIPT, agent_for, drive, session_argv,
 };
 use crate::error::CliError;
-use crate::home::{ANALYZER_DIR, Home};
+use crate::home::{ANALYZER_DIR, Home, Store};
 
 /// A `repository.revision` asking submission to record the source's workspace digest.
 pub const RECORDED_AT_SUBMISSION: &str = "recorded-at-submission";
@@ -32,8 +32,8 @@ const GUEST_IMAGE: &str = "fixture-executor-v0";
 const FAKE_FIRECRACKER_VERSION: &str = "fake";
 
 /// The contract and inputs, checked before anything is written.
-struct Request {
-    contract: Contract,
+pub(crate) struct Request {
+    pub(crate) contract: Contract,
     source: PathBuf,
     profile: PathBuf,
     /// Set when the contract names a digest instead of `recorded-at-submission`.
@@ -52,12 +52,31 @@ struct Request {
 }
 
 /// What `Submitted` records about a Firecracker task, decided before anything is written.
-struct FirecrackerRecord {
+pub(crate) struct FirecrackerRecord {
     image_id: String,
     image_digest: Digest,
     version: String,
     jailed: bool,
     resources: VmResources,
+}
+
+/// A task recorded from a [`Request`]: what the summary and the run need.
+pub(crate) struct Recorded {
+    pub(crate) task: TaskId,
+    /// As stored: `repository.revision` is the recorded digest, `source` the canonical path.
+    pub(crate) contract: Contract,
+    pub(crate) repo_digest: Digest,
+    pub(crate) profile_digest: Digest,
+    /// The agent as the summary names it.
+    pub(crate) agent: String,
+    /// The `Submitted` audit payload.
+    pub(crate) submitted: Value,
+    /// The task's agent is a CLI session in the microVM.
+    session: bool,
+    /// Whether the request named an agent (`--fake-agent-patch` or `--model`).
+    has_agent: bool,
+    firecracker: Option<FirecrackerRecord>,
+    api_key: Option<ApiKey>,
 }
 
 /// The Firecracker worker's checks, in order: the contract's limits (exit 2), the guest image
@@ -165,7 +184,7 @@ fn check_agent_cli_contract(contract: &Contract, cli: AgentCli) -> Result<(), Cl
     session_argv(cli, &contract.goal, |k| std::env::var(k).ok()).map(|_| ())
 }
 
-fn validate(
+pub(crate) fn validate(
     home: &Home,
     task: &Path,
     yes: bool,
@@ -179,6 +198,18 @@ fn validate(
     let text = fs::read_to_string(task)
         .map_err(|e| CliError::usage(format!("cannot read {}: {e}", task.display())))?;
     let contract = Contract::parse(&text).map_err(|e| CliError::usage(e.to_string()))?;
+    validate_contract(home, contract, yes, patch, model, agent_cli)
+}
+
+/// Everything `validate` checks once the contract is in hand.
+pub(crate) fn validate_contract(
+    home: &Home,
+    contract: Contract,
+    yes: bool,
+    patch: Option<&Path>,
+    model: Option<&str>,
+    agent_cli: Option<AgentCli>,
+) -> Result<Request, CliError> {
     if let Some(cli) = agent_cli {
         check_agent_cli_contract(&contract, cli)?;
     }
@@ -379,15 +410,13 @@ fn summarize(
     }
 }
 
-pub async fn submit(
+/// Records the request's inputs immutably as a new task: staging copy, digests, the task row
+/// and its `Submitted` audit event. Prints nothing and neither approves nor runs the task.
+pub(crate) async fn record_task(
     home: &Home,
-    task_file: &Path,
-    yes: bool,
-    patch: Option<&Path>,
-    model: Option<&str>,
-    agent_cli: Option<AgentCli>,
-    crash: Option<&CrashSpec>,
-) -> Result<(), CliError> {
+    store: &Store,
+    req: Request,
+) -> Result<Recorded, CliError> {
     let Request {
         mut contract,
         source,
@@ -399,10 +428,7 @@ pub async fn submit(
         api_key,
         firecracker,
         agent_cli,
-    } = validate(home, task_file, yes, patch, model, agent_cli)?;
-
-    let store = home.open()?;
-    let lock = if yes { Some(home.lock()?) } else { None };
+    } = req;
     // Inputs are copied into the home, so the task runs on exactly what was digested here
     // whatever later happens to the source or the profile registry.
     let staging = tempfile::Builder::new()
@@ -511,18 +537,57 @@ pub async fn submit(
         (_, None, Some(m), None) => m.recorded(),
         (_, None, None, _) => "none yet".to_string(),
     };
+    Ok(Recorded {
+        task,
+        contract,
+        repo_digest,
+        profile_digest,
+        agent,
+        submitted,
+        session: agent_cli.is_some(),
+        has_agent: patch.is_some() || model.is_some(),
+        firecracker,
+        api_key,
+    })
+}
+
+pub async fn submit(
+    home: &Home,
+    task_file: &Path,
+    yes: bool,
+    patch: Option<&Path>,
+    model: Option<&str>,
+    agent_cli: Option<AgentCli>,
+    crash: Option<&CrashSpec>,
+) -> Result<(), CliError> {
+    let req = validate(home, task_file, yes, patch, model, agent_cli)?;
+
+    let store = home.open()?;
+    let lock = if yes { Some(home.lock()?) } else { None };
+    let Recorded {
+        task,
+        contract,
+        repo_digest,
+        profile_digest,
+        agent,
+        submitted,
+        session,
+        has_agent,
+        firecracker,
+        api_key,
+    } = record_task(home, &store, req).await?;
     summarize(
         &task,
         &contract,
         &repo_digest,
         &profile_digest,
         &agent,
-        agent_cli.is_some(),
+        session,
         firecracker.as_ref(),
         submitted["model_endpoint"].as_str(),
     );
 
-    match lock.filter(|_| patch.is_some() || model.is_some()) {
+    match lock.filter(|_| has_agent) {
         Some(lock) => {
             // The executor (preflight and jail included) before the approval: a host that
             // changed since the checks above leaves the task READY, not approved.
