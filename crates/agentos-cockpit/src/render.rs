@@ -870,4 +870,24 @@ mod tests {
         app.handle_key(KeyCode::Enter);
         assert!(screen(&app, 100, 6).contains("RUNNING (cancelling)"));
     }
+
+    #[test]
+    fn up_after_the_terminal_grew_moves_at_once() {
+        let body: Vec<String> = (0..40).map(|i| format!("line-{i:02}")).collect();
+        let mut app = payload_app(&body.join("\n"), false);
+        screen(&app, 40, 10);
+        for _ in 0..100 {
+            app.handle_key(KeyCode::PageDown);
+        }
+        // taller: the furthest scroll is now smaller than the one reached
+        let rows = payload_rows(&app, 40, 30);
+        assert!(rows.iter().any(|r| r.contains("line-39")), "{rows:?}");
+        assert!(!rows.iter().any(|r| r.contains("line-13")), "{rows:?}");
+        app.handle_key(KeyCode::Up);
+        let rows = payload_rows(&app, 40, 30);
+        assert!(
+            rows.iter().any(|r| r.contains("line-13")),
+            "one Up shows an earlier line\n{rows:?}"
+        );
+    }
 }

@@ -199,7 +199,11 @@ impl App {
                 }
             },
             KeyCode::Up | KeyCode::Char('k') if matches!(self.screen, Screen::Payload { .. }) => {
-                self.payload_scroll = self.payload_scroll.saturating_sub(1);
+                self.scroll_payload_to(
+                    self.payload_scroll
+                        .min(self.payload_view.get().0)
+                        .saturating_sub(1),
+                );
                 Command::None
             }
             KeyCode::Down | KeyCode::Char('j') if matches!(self.screen, Screen::Payload { .. }) => {
@@ -208,7 +212,11 @@ impl App {
             }
             KeyCode::PageUp if matches!(self.screen, Screen::Payload { .. }) => {
                 let page = self.payload_view.get().1.max(1);
-                self.payload_scroll = self.payload_scroll.saturating_sub(page);
+                self.scroll_payload_to(
+                    self.payload_scroll
+                        .min(self.payload_view.get().0)
+                        .saturating_sub(page),
+                );
                 Command::None
             }
             KeyCode::PageDown if matches!(self.screen, Screen::Payload { .. }) => {
@@ -254,6 +262,8 @@ impl App {
         self.selected = self.selected.min(self.rows().saturating_sub(1));
     }
 
+    /// Scrolls to `rows`, no further than the last draw allowed. Up starts from that bound too,
+    /// so a terminal that grew does not swallow the first presses.
     fn scroll_payload_to(&mut self, rows: u16) {
         self.payload_scroll = rows.min(self.payload_view.get().0);
     }
