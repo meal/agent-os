@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use agentos_core::ids::TaskId;
 use agentos_store::view::{EventPage, View, ViewError};
 use ratatui::DefaultTerminal;
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
 use crate::app::{App, Command, EventUpdate, Frame};
 use crate::render::draw;
@@ -90,7 +90,8 @@ fn base(view: &View) -> Frame {
     }
 }
 
-/// Marks the frame stale with `e` unless an earlier read already did.
+/// Marks the frame stale with `e` unless an earlier read already did. A failed event or
+/// contract read makes the frame stale, while `apply_frame` still applies the rows it carries.
 fn fail(frame: &mut Frame, e: ViewError) {
     if frame.snapshot.is_ok() {
         frame.snapshot = Err(e.to_string());
@@ -179,6 +180,14 @@ enum Step {
 
 fn on_event(app: &mut App, event: &Event) -> Step {
     match event {
+        // Raw mode turns Ctrl-C into a key, so it quits here from every screen.
+        Event::Key(key)
+            if key.kind == KeyEventKind::Press
+                && key.code == KeyCode::Char('c')
+                && key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            Step::Quit
+        }
         Event::Key(key) if key.kind == KeyEventKind::Press => match app.handle_key(key.code) {
             Command::Quit => Step::Quit,
             command => to_request(&command).map_or(Step::Redraw, Step::Send),
@@ -207,9 +216,9 @@ pub fn run(db_path: &Path) -> Result<(), RunError> {
     let worker = thread::spawn(move || serve(view, worker_requests, worker_frames, POLL));
     // The first frame now rather than after a poll.
     let _ = requests.send(Request::Refresh);
-    // `init` also installs a panic hook that restores the terminal.
-    let mut terminal = ratatui::init();
-    let result = ui(&mut terminal, &requests, &frames);
+    // `try_init` also installs a panic hook that restores the terminal. Without a terminal it
+    // fails, possibly after entering raw mode, so restore runs on that path too.
+    let result = ratatui::try_init().and_then(|mut terminal| ui(&mut terminal, &requests, &frames));
     ratatui::restore();
     drop(requests);
     if let Err(panic) = worker.join() {
@@ -225,11 +234,13 @@ fn ui(
 ) -> std::io::Result<()> {
     let mut app = App::new();
     loop {
+        terminal.draw(|f| draw(f, &app))?;
+        let ready = event::poll(TICK)?;
+        // Before the next draw, so a worker gone mid-wait ends the loop without one.
         if !drain(&mut app, frames) {
             return Ok(());
         }
-        terminal.draw(|f| draw(f, &app))?;
-        if !event::poll(TICK)? {
+        if !ready {
             continue;
         }
         match on_event(&mut app, &event::read()?) {
@@ -564,6 +575,47 @@ mod tests {
             on_event(&mut app, &key(KeyCode::Char('q'), KeyEventKind::Press)),
             Step::Quit
         );
+    }
+
+    fn ctrl_c(kind: KeyEventKind) -> Event {
+        Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            kind,
+        ))
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_every_screen_and_a_plain_c_or_a_release_does_not() {
+        let (on_task, id) = crate::app::fixtures::app_on_task(1..=3);
+        let mut on_payload = on_task.clone();
+        on_payload.apply_frame(Frame {
+            payload: Some((id, 3, Some(("x".into(), false)))),
+            ..crate::app::fixtures::good(on_payload.snapshot.clone().unwrap())
+        });
+        assert!(matches!(on_payload.screen, Screen::Payload { .. }));
+        for app in [App::new(), on_task, on_payload] {
+            let screen = app.screen.clone();
+            let mut a = app.clone();
+            assert_eq!(
+                on_event(&mut a, &ctrl_c(KeyEventKind::Press)),
+                Step::Quit,
+                "{screen:?}"
+            );
+            let mut a = app.clone();
+            assert_eq!(
+                on_event(&mut a, &ctrl_c(KeyEventKind::Release)),
+                Step::Redraw,
+                "{screen:?}"
+            );
+            let mut a = app.clone();
+            assert_ne!(
+                on_event(&mut a, &key(KeyCode::Char('c'), KeyEventKind::Press)),
+                Step::Quit,
+                "{screen:?}"
+            );
+            assert_eq!(a.screen, screen, "a plain c changes nothing");
+        }
     }
 
     #[test]
