@@ -18,6 +18,7 @@ tracing = "0.1.44"
 uuid = { version = "1.27.0", features = ["v4", "v7", "serde"] }
 tempfile = "3.27.0"
 proptest = "1.11.0"
+ratatui = "0.30.2"
 rustix = { version = "1.1.5", features = ["process"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 assert_cmd = "2.2.2"

@@ -1,0 +1,10 @@
+[package]
+name = "agentos-cockpit"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+agentos-core = { path = "../agentos-core" }
+agentos-store = { path = "../agentos-store" }
+ratatui.workspace = true
+serde_json.workspace = true
