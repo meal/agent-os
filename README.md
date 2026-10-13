@@ -248,6 +248,7 @@ agentos resume <id>
 agentos events <id>
 agentos export <id> bundle
 agentos revoke <id> --capability artifact.export
+agentos workflow submit|resume|status|cancel|export   # chains of tasks, see "Workflows" below
 ```
 
 `--crash-at POINT[:KIND][:N]` is a debug flag. It really kills the process (exit code 75)
@@ -622,7 +623,9 @@ refused. A read is a journaled `read_file` effect that costs a tool action; so i
    records its digest.
 3. The call is a `ModelCall` effect with its own reservation (one model request): `EffectIntended`,
    `EffectDispatched`, then the executor sends **one HTTP request** and retains the answer in
-   `<home>/model/<effect>-<attempt>/response.json` before returning. `EffectCompleted` publishes
+   `<home>/workflows/<id>/     a chain's recorded inputs: step-N.patch (fake agent) or transcript.json
+                           (`--model fake:`); handoff-N/ only while step N+1 is being created
+<home>/model/<effect>-<attempt>/response.json` before returning. `EffectCompleted` publishes
    the response as an artifact, and the next observation carries the response **inline**.
 4. A replay re-derives the request and compares digests; a mismatch fails the task
    (`NondeterministicAgent`).
@@ -781,6 +784,167 @@ and one live run of the real CLI against the Anthropic API through the test harn
 (`docs/evidence/2026-10-09/live-agent-attempt-3.md`); the `agentos submit --agent-cli` entry point
 itself is tested end to end on the fake guest only, and has not yet been run on a real microVM or
 against the live API.
+
+## Workflows: chained contracts
+
+`agentos workflow` runs a **chain** of task contracts, strictly one after the other, on one
+workspace: step 2 starts from the verified result of step 1 (for example implement, then review).
+Every step is an ordinary task with its own contract, capabilities and limits; the chain is a layer
+above tasks, and the core, the effect journal and the task state machine are unchanged. The whole
+chain is approved once, up front, and then runs unattended. See
+[the design](docs/superpowers/specs/2026-10-12-workflows-as-chained-contracts-design.md).
+
+```sh
+agentos workflow submit chain.json [--yes] --step-patch FILE --step-patch FILE   # fake agent
+agentos workflow submit chain.json [--yes] --model SPEC [--agent-cli claude-code]
+agentos workflow resume <id>        # approve a READY chain, or continue one whose controller died
+agentos workflow status <id>
+agentos workflow cancel <id>
+agentos workflow export <id> bundle
+```
+
+### The chain file
+
+A chain file is JSON: a `name`, the `repository` that feeds step 1, and 2 to 8 `steps` with unique
+names. Each step's `contract` is a task contract (see `task.json` above) and goes through the same
+validation. Steps 2 and later omit `repository` (setting it is an error): their input is the
+previous step's result. `--model`, `--agent-cli` and `--worker` apply to the whole chain.
+
+```json
+{
+  "name": "fix-and-comment",
+  "repository": { "source": "/work/fixtures/parser-repo", "revision": "recorded-at-submission" },
+  "steps": [
+    { "name": "implement",
+      "contract": {
+        "goal": "fix the parser",
+        "profile": "python-stdlib-v1",
+        "editable_paths": ["src/**"],
+        "verification_profile": "parser-checks-v1",
+        "capabilities": ["snapshot.read", "workspace.apply_patch", "verification.run", "artifact.export"],
+        "limits": { "model_requests": 1, "max_output_tokens_per_request": 1000, "tool_actions": 10,
+                    "deadline_seconds": 600, "worker_vcpus": 1, "worker_memory_mib": 256 } } },
+    { "name": "comment",
+      "contract": {
+        "goal": "add a TODO comment to the fixed parser",
+        "profile": "python-stdlib-v1",
+        "editable_paths": ["src/**"],
+        "verification_profile": "parser-checks-v1",
+        "capabilities": ["snapshot.read", "workspace.apply_patch", "verification.run", "artifact.export"],
+        "limits": { "model_requests": 1, "max_output_tokens_per_request": 1000, "tool_actions": 10,
+                    "deadline_seconds": 600, "worker_vcpus": 1, "worker_memory_mib": 256 } } }
+  ]
+}
+```
+
+Below is a real run of that file with the fake agent (`docker compose run --rm test`, host
+worker, a scratch home; the `agentos` invocations omit `--home`; the trailing `ls bundle` is
+the exported directory). `fix.patch` is `fixtures/parser-repo.fix.patch`; `comment.patch` adds one
+`# TODO: handle whitespace` line above `parse_kv` (its hunk applies on the fixed parser too). With
+the fake agent each step applies its own `--step-patch`, in order. The approval screen is on
+stderr, the JSON on stdout:
+
+```text
+$ agentos profile register /work/fixtures/profiles/parser-checks-v1
+{"digest":"9ff584f31b7fef8ac5774ced5c8f1620c27f736b4bdc4d9e03e553df5d8ea12c","id":"parser-checks-v1"}
+
+$ agentos workflow submit chain.json --step-patch fix.patch --step-patch comment.patch
+workflow 01a13432-5745-72e1-aba2-170a63d088ad submitted; approve this chain of 2 steps before it runs:
+  repository:           /work/fixtures/parser-repo at be77aa19c032f85329a9596adfd692252a0c87fd09d337b1873feb6003bdd3b8
+  step 1 implement:
+    goal:                 fix the parser
+    capabilities:         snapshot.read, workspace.apply_patch, verification.run, artifact.export
+    editable paths:       src/**
+    acceptance:           protected verification profile parser-checks-v1 (9ff584f31b7fef8ac5774ced5c8f1620c27f736b4bdc4d9e03e553df5d8ea12c)
+    limits:               model_requests=1 max_output_tokens_per_request=1000 tool_actions=10 deadline_seconds=600 worker_vcpus=1 worker_memory_mib=256
+  step 2 comment:
+    goal:                 add a TODO comment to the fixed parser
+    capabilities:         snapshot.read, workspace.apply_patch, verification.run, artifact.export
+    editable paths:       src/**
+    acceptance:           protected verification profile parser-checks-v1 (9ff584f31b7fef8ac5774ced5c8f1620c27f736b4bdc4d9e03e553df5d8ea12c)
+    limits:               model_requests=1 max_output_tokens_per_request=1000 tool_actions=10 deadline_seconds=600 worker_vcpus=1 worker_memory_mib=256
+  agent:                fake-agent, one patch per step: 5128fe0b9134f20b9e50aa2f17eab86244f8836df332d55b128456a4b47e6ff5, a687cbe56a6250ada8b1af803fe617c7ff01c6833ea01e77c355c178b30cba9b
+  worker:               host (not sandboxed)
+  total budget:         model_requests=2 tool_actions=20 deadline_seconds=1200
+{"note":"not started; run agentos workflow resume 01a13432-5745-72e1-aba2-170a63d088ad","state":"READY","workflow_id":"01a13432-5745-72e1-aba2-170a63d088ad"}
+
+$ agentos workflow resume 01a13432-5745-72e1-aba2-170a63d088ad
+{"name":"fix-and-comment","state":"SUCCEEDED","steps":[{"idx":0,"name":"implement","state":"SUCCEEDED","task_id":"01a13432-575d-772b-a914-cbc13b81b1d8"},{"idx":1,"name":"comment","state":"SUCCEEDED","task_id":"01a13432-58d6-7080-96a1-0902ad7b16f6"}],"workflow_id":"01a13432-5745-72e1-aba2-170a63d088ad"}
+
+$ agentos workflow status 01a13432-5745-72e1-aba2-170a63d088ad
+{"name":"fix-and-comment","state":"SUCCEEDED","steps":[{"idx":0,"name":"implement","state":"SUCCEEDED","task_id":"01a13432-575d-772b-a914-cbc13b81b1d8"},{"idx":1,"name":"comment","state":"SUCCEEDED","task_id":"01a13432-58d6-7080-96a1-0902ad7b16f6"}],"workflow_id":"01a13432-5745-72e1-aba2-170a63d088ad"}
+
+$ agentos workflow export 01a13432-5745-72e1-aba2-170a63d088ad bundle
+{"name":"fix-and-comment","spec_digest":"fd3e6a7a67e279eee593cf6e646cf46539d8a5c95c882ec568b0c75fc14571c6","state":"SUCCEEDED","steps":[{"contract_digest":"7eb774f4e8e4c9aa9527f70c883e3de14aae366f2849ef20d6155d94445358d5","idx":0,"name":"implement","patch_digest":"5128fe0b9134f20b9e50aa2f17eab86244f8836df332d55b128456a4b47e6ff5","task_id":"01a13432-575d-772b-a914-cbc13b81b1d8","verified_digest":"060915eeb9b0caf26efbfdab529c36a9e25359be64e71ae67e6651138a5fec13"},{"contract_digest":"e53ca5df519d1263a9054320b1f7d74c40ef653d70e4e89c02b0c888565d5e01","idx":1,"name":"comment","patch_digest":"a687cbe56a6250ada8b1af803fe617c7ff01c6833ea01e77c355c178b30cba9b","task_id":"01a13432-58d6-7080-96a1-0902ad7b16f6","verified_digest":"cfdc6263b06f57e09776fb2767d59fb0d9ce3e87bf3272e5b769da7d45201e66"}],"workflow_id":"01a13432-5745-72e1-aba2-170a63d088ad"}
+
+$ ls bundle
+chain.json
+evidence
+manifest.json
+patch.diff
+patches
+```
+
+(`workflow submit --yes` approves and runs in one go and prints the `status` JSON at the end.
+`workflow resume` is what approved the chain here.)
+
+### Approval
+
+`submit` checks the whole chain before it writes anything (exit 2 on an invalid chain, a missing
+`--step-patch`, `--model` together with `--step-patch`, and so on), then records the workflow and
+shows one screen on stderr: the repository and its digest, every step's goal, capabilities,
+editable paths, acceptance profile (with its digest) and limits, the agent, the worker, and the
+**summed budget** (`model_requests`, `tool_actions`, `deadline_seconds`). Without `--yes` the chain
+stays `READY` and no task exists. `--yes`, or a later `workflow resume`, is the owner's approval of
+the whole chain.
+
+What is approved is exact: `recorded-at-submission` becomes the source's digest at submission, so
+step 1 runs on what was approved however late the chain is resumed; each step's verification profile
+is pinned to the registry entry it resolves to (a profile from the legacy `--profiles` directory
+cannot be pinned, so its digest is checked again when the step starts and a change fails the step);
+on the Firecracker worker each step's guest image is pinned too; the jail decision taken at
+approval binds every step (approved jailed never runs unjailed); and the `--step-patch` files or
+the `fake:` transcript are copied into the home and their digests re-checked before each step. Later
+steps' tasks do not exist yet, so each step's capabilities are issued when its task is created,
+from the approved spec only, and are bound to that one task: a step cannot use another step's
+handles.
+
+### The handoff
+
+When step N succeeds, the controller rebuilds step N+1's input from durable records, not from any
+directory: it takes step N's recorded snapshot, applies step N's accepted patch blobs, checks that
+the result digests to step N's verified `final_workspace_digest`, and stages it as step N+1's
+snapshot, whose `repository.revision` is that digest. A mismatch, or a missing blob, fails the
+chain; so does a changed recorded input. A staging directory left by an earlier attempt is
+deleted and rebuilt, never trusted. Step N's workspace image is never needed, so `agentos gc` may
+collect it between steps.
+
+### Resume, cancel, export
+
+- `workflow resume <id>` continues from durable state with `--worker` as recorded at submission
+  (another worker is refused, exit 2). It recovers the current step's task as `resume` does for a
+  task, then goes on. If the controller died after step N succeeded and before step N+1 existed,
+  it creates N+1; if N+1 exists, it is continued, never created twice. No step runs twice or is
+  skipped. A step task that was created but never recorded as submitted is failed ("step was not
+  completely created"), and so is the chain. A finished chain has nothing to resume (exit 1).
+- A failed or cancelled step ends the chain at once: no retry, and the steps that never ran show
+  `SKIPPED`. `workflow status` names the `failed_step`.
+- `workflow cancel <id>` stops the chain: no further step task can be created, and a step task
+  still running is cancelled as `agentos cancel` cancels a task. Cancel wins.
+- `workflow export <id> DIR` works only for a `SUCCEEDED` chain (exit 1 otherwise, nothing written).
+  `DIR` is the last step's bundle plus `chain.json`, which lists every step's task id,
+  `contract_digest`, `patch_digest` and `verified_digest` in order, with the chain's
+  `spec_digest`, so base to final can be checked. Each step also stays exportable on its own with
+  `agentos export <task>`.
+
+### Limits of v1
+
+No retries, branching, DAGs, fan-out, manual gates between steps, per-step agents (the agent and
+model are chain-wide) or chain-wide deadline: each step's own `deadline_seconds` is the only time
+bound. Steps run one at a time. A step's patch may only modify existing files, like any task patch.
+`--agent-cli` chains are tested end to end on the fake guest only and have not been run live. A
+session cannot resume (see the limits above), so a controller death mid-session ends that step's
+task, and the chain, as "agent session lost".
 
 ## Home layout
 
