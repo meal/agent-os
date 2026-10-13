@@ -36,14 +36,15 @@ pub fn draw(frame: &mut Frame, app: &App) {
 fn header_line(app: &App, width: u16) -> String {
     let width = usize::from(width);
     let mut line = format!("agentos cockpit · {} items", app.items().len());
+    // STALE comes before the note, so a narrow terminal cuts the note first.
+    if let Some(reason) = &app.stale {
+        line.push_str(&format!(" · STALE: {}", clean(reason, width)));
+    }
     if let Some(snapshot) = &app.snapshot
         && snapshot.more
     {
         let limit = snapshot.tasks.len().max(snapshot.workflows.len());
         line.push_str(&format!(" · showing newest {limit}"));
-    }
-    if let Some(reason) = &app.stale {
-        line.push_str(&format!(" · STALE: {}", clean(reason, width)));
     }
     clean(&line, width)
 }
@@ -69,8 +70,8 @@ fn usage(used: u64, limit: u64) -> String {
     format!("{used}/{limit}")
 }
 
-fn item_row(item: &Item, now: i64) -> Row<'static> {
-    Row::new(vec![
+fn item_cells(item: &Item, now: i64) -> [String; 8] {
+    [
         item.kind.to_string(),
         clean(&item.id.chars().take(8).collect::<String>(), 8),
         clean(&item.name, CELL),
@@ -79,8 +80,12 @@ fn item_row(item: &Item, now: i64) -> Row<'static> {
         usage(item.model_used, item.model_limit),
         usage(item.tool_used, item.tool_limit),
         age(now, item.created_ts),
-    ])
+    ]
 }
+
+const LIST_HEADER: [&str; 8] = [
+    "KIND", "ID", "NAME", "STATE", "STEPS", "MODEL", "TOOLS", "AGE",
+];
 
 fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     let items = app.items();
@@ -88,27 +93,26 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new(EMPTY_HINT).wrap(Wrap { trim: false }), area);
         return;
     }
-    let rows: Vec<Row> = items.iter().map(|i| item_row(i, app.now)).collect();
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(8),
-            Constraint::Length(8),
-            Constraint::Fill(1),
-            Constraint::Length(24),
-            Constraint::Length(5),
-            Constraint::Length(9),
-            Constraint::Length(9),
-            Constraint::Length(5),
-        ],
-    )
-    .header(
-        Row::new([
-            "KIND", "ID", "NAME", "STATE", "STEPS", "MODEL", "TOOLS", "AGE",
-        ])
-        .style(bold()),
-    )
-    .row_highlight_style(reversed());
+    let cells: Vec<[String; 8]> = items.iter().map(|i| item_cells(i, app.now)).collect();
+    // Every column but NAME is as wide as its widest cell, so NAME gets the remainder.
+    let widths: Vec<Constraint> = (0..LIST_HEADER.len())
+        .map(|c| {
+            if c == 2 {
+                return Constraint::Fill(1);
+            }
+            let widest = cells
+                .iter()
+                .map(|row| row[c].chars().count())
+                .chain([LIST_HEADER[c].len()])
+                .max()
+                .unwrap_or(0);
+            Constraint::Length(u16::try_from(widest).unwrap_or(u16::MAX))
+        })
+        .collect();
+    let rows: Vec<Row> = cells.into_iter().map(Row::new).collect();
+    let table = Table::new(rows, widths)
+        .header(Row::new(LIST_HEADER).style(bold()))
+        .row_highlight_style(reversed());
     let mut state = TableState::default().with_selected(Some(app.selected));
     frame.render_stateful_widget(table, area, &mut state);
 }
@@ -373,7 +377,7 @@ mod tests {
     fn task_app() -> App {
         let (mut app, id) = app_on_task(1..=3);
         app.apply_frame(Frame {
-            contract: Some(contract("fix the parser")),
+            contract: Some((id.clone(), contract("fix the parser"))),
             events: Some(EventUpdate::Replace {
                 task: id,
                 rows: events(1..=3),
@@ -423,7 +427,7 @@ mod tests {
             s => panic!("{s:?}"),
         };
         app.apply_frame(Frame {
-            contract: Some(contract(hostile)),
+            contract: Some((id.clone(), contract(hostile))),
             events: Some(EventUpdate::Replace {
                 task: id,
                 rows: events(1..=1),
@@ -581,7 +585,7 @@ mod tests {
             s => panic!("{s:?}"),
         };
         app.apply_frame(Frame {
-            contract: Some(contract(&goal)),
+            contract: Some((id.clone(), contract(&goal))),
             events: Some(EventUpdate::Replace {
                 task: id,
                 rows: events(1..=2),
@@ -595,8 +599,71 @@ mod tests {
                 assert!(line.chars().count() <= w as usize, "{line}");
             }
         }
-        // a wide char never straddles the right edge: the buffer holds whole cells only
-        let buf = buffer(&app, 61, 15);
-        assert_eq!(buf.area.width, 61);
+    }
+
+    #[test]
+    fn wide_characters_never_straddle_cells_and_the_cut_is_visible() {
+        let goal = "日".repeat(300);
+        let app = app_with(vec![task(&goal, 1, None)], vec![]);
+        for w in [61u16, 100, 600] {
+            let buf = buffer(&app, w, 4);
+            let mut seen = 0;
+            for y in 0..4 {
+                let mut x = 0;
+                while x < w {
+                    if buf[(x, y)].symbol() == "日" {
+                        assert!(x + 1 < w, "a wide char straddles the right edge at {w}");
+                        assert_ne!(buf[(x + 1, y)].symbol(), "日", "overlapping wide cells");
+                        seen += 1;
+                        x += 2;
+                    } else {
+                        x += 1;
+                    }
+                }
+            }
+            assert!(seen > 0, "the goal is shown at width {w}");
+            assert!(
+                seen <= 199,
+                "clean cut the goal at 199 chars plus an ellipsis"
+            );
+        }
+        let wide = buffer(&app, 600, 4);
+        let mut row = String::new();
+        let mut x = 0;
+        while x < 600 {
+            let symbol = wide[(x, 2)].symbol();
+            row.push_str(symbol);
+            x += if symbol == "日" { 2 } else { 1 };
+        }
+        assert_eq!(row.matches('日').count(), 199, "{row}");
+        assert!(row.contains("日…"), "the cut ends with an ellipsis\n{row}");
+    }
+
+    #[test]
+    fn stale_survives_a_narrow_header_and_the_cut_note_goes_first() {
+        let mut app = app_with(vec![task("a", 1, None)], vec![]);
+        app.snapshot.as_mut().unwrap().more = true;
+        app.stale = Some("database is locked".into());
+        let out = screen(&app, 60, 3);
+        let header = out.lines().next().unwrap();
+        assert!(header.contains("STALE"), "{header}");
+        assert!(!header.contains("showing newest"), "{header}");
+    }
+
+    #[test]
+    fn at_80_columns_a_30_character_goal_is_shown_in_full() {
+        let goal = "0123456789abcdefghijklmnopqrst";
+        assert_eq!(goal.len(), 30);
+        let out = screen(
+            &app_with(vec![task(goal, 1, None), task("other", 2, None)], vec![]),
+            80,
+            6,
+        );
+        assert!(out.contains(goal), "{out}");
+        // a cancelling task widens STATE; the row still draws, NAME just gets less
+        let mut t = task(goal, 1, None);
+        t.cancel_requested = true;
+        let out = screen(&app_with(vec![t], vec![]), 80, 6);
+        assert!(out.contains("RUNNING (cancelling)"), "{out}");
     }
 }

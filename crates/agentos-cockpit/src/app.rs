@@ -52,7 +52,7 @@ pub struct Frame {
     pub snapshot: Result<Snapshot, String>,
     pub now: i64,
     pub events: Option<EventUpdate>,
-    pub contract: Option<Contract>,
+    pub contract: Option<(TaskId, Contract)>,
     pub payload: Option<(TaskId, u64, Option<PayloadText>)>,
 }
 
@@ -231,8 +231,8 @@ impl App {
         if let Some(update) = frame.events {
             self.apply_events(update);
         }
-        if let Some(contract) = frame.contract
-            && matches!(self.screen, Screen::Task(_))
+        if let Some((task, contract)) = frame.contract
+            && self.open_task_id() == Some(&task)
         {
             self.contract = Some(contract);
         }
@@ -258,24 +258,34 @@ impl App {
         match update {
             EventUpdate::Replace { rows, .. } => {
                 self.events = rows;
-                self.selected = self.events.len().saturating_sub(1);
+                *self.event_selection() = self.events.len().saturating_sub(1);
             }
             EventUpdate::Append { rows, .. } => {
-                let at_tail = self.selected + 1 >= self.events.len();
+                let len = self.events.len();
+                let at_tail = *self.event_selection() + 1 >= len;
                 let last = self.events.last().map_or(0, |e| e.seq);
                 self.events
                     .extend(rows.into_iter().filter(|e| e.seq > last));
                 if at_tail {
-                    self.selected = self.events.len().saturating_sub(1);
+                    *self.event_selection() = self.events.len().saturating_sub(1);
                 }
             }
             EventUpdate::Prepend { rows, .. } => {
                 let first = self.events.first().map_or(u64::MAX, |e| e.seq);
                 let mut rows: Vec<EventRow> = rows.into_iter().filter(|e| e.seq < first).collect();
-                self.selected += rows.len();
+                *self.event_selection() += rows.len();
                 rows.append(&mut self.events);
                 self.events = rows;
             }
+        }
+    }
+
+    /// The selected event index: live on the task screen, saved in the back stack while the
+    /// payload screen covers it.
+    fn event_selection(&mut self) -> &mut usize {
+        match (&self.screen, self.back.last_mut()) {
+            (Screen::Payload { .. }, Some((_, saved))) => saved,
+            _ => &mut self.selected,
         }
     }
 }
@@ -730,11 +740,99 @@ mod tests {
 
     #[test]
     fn a_contract_frame_is_kept_on_the_task_screen() {
-        let (mut app, _) = app_on_task(1..=1);
+        let (mut app, id) = app_on_task(1..=1);
         app.apply_frame(Frame {
-            contract: Some(contract("the goal")),
+            contract: Some((id, contract("the goal"))),
             ..good(app.snapshot.clone().unwrap())
         });
         assert_eq!(app.contract.unwrap().goal, "the goal");
+    }
+
+    #[test]
+    fn a_contract_for_another_task_is_ignored() {
+        let a = task("task a", 20, None);
+        let b = task("task b", 10, None);
+        let (a_id, b_id) = (a.id.clone(), b.id.clone());
+        let mut app = App::new();
+        app.apply_frame(good(snap(vec![a, b], vec![])));
+        // newest first: a is selected
+        assert_eq!(
+            app.handle_key(KeyCode::Enter),
+            Command::Watch(Some(a_id.clone()))
+        );
+        app.handle_key(KeyCode::Esc);
+        app.handle_key(KeyCode::Down);
+        assert_eq!(
+            app.handle_key(KeyCode::Enter),
+            Command::Watch(Some(b_id.clone()))
+        );
+        // A's contract arrives late
+        app.apply_frame(Frame {
+            contract: Some((a_id, contract("A's goal"))),
+            ..good(app.snapshot.clone().unwrap())
+        });
+        assert!(app.contract.is_none(), "B must not show A's contract");
+        app.apply_frame(Frame {
+            contract: Some((b_id, contract("B's goal"))),
+            ..good(app.snapshot.clone().unwrap())
+        });
+        assert_eq!(app.contract.unwrap().goal, "B's goal");
+    }
+
+    #[test]
+    fn a_contract_arriving_on_the_payload_screen_is_kept_for_the_task() {
+        let (mut app, id) = app_on_task(1..=3);
+        app.apply_frame(Frame {
+            payload: Some((id.clone(), 3, Some(("x".into(), false)))),
+            ..good(app.snapshot.clone().unwrap())
+        });
+        assert!(matches!(app.screen, Screen::Payload { .. }));
+        app.apply_frame(Frame {
+            contract: Some((id, contract("late goal"))),
+            ..good(app.snapshot.clone().unwrap())
+        });
+        app.handle_key(KeyCode::Esc);
+        assert!(matches!(app.screen, Screen::Task(_)));
+        assert_eq!(app.contract.unwrap().goal, "late goal");
+    }
+
+    #[test]
+    fn events_arriving_on_the_payload_screen_shift_the_saved_task_selection() {
+        let (mut app, id) = app_on_task(5..=7);
+        app.handle_key(KeyCode::Up); // seq 6
+        app.apply_frame(Frame {
+            payload: Some((id.clone(), 6, Some(("x".into(), false)))),
+            ..good(app.snapshot.clone().unwrap())
+        });
+        app.apply_frame(Frame {
+            events: Some(EventUpdate::Prepend {
+                task: id.clone(),
+                rows: events(3..=4),
+                total: 5,
+            }),
+            ..good(app.snapshot.clone().unwrap())
+        });
+        app.handle_key(KeyCode::Esc);
+        assert_eq!(
+            app.events[app.selected].seq, 6,
+            "prepend shifted the saved selection"
+        );
+        // append while on payload, with the newest event selected: back follows the tail
+        app.handle_key(KeyCode::Down);
+        assert_eq!(app.events[app.selected].seq, 7);
+        app.apply_frame(Frame {
+            payload: Some((id.clone(), 7, Some(("x".into(), false)))),
+            ..good(app.snapshot.clone().unwrap())
+        });
+        app.apply_frame(Frame {
+            events: Some(EventUpdate::Append {
+                task: id,
+                rows: events(8..=9),
+                total: 7,
+            }),
+            ..good(app.snapshot.clone().unwrap())
+        });
+        app.handle_key(KeyCode::Esc);
+        assert_eq!(app.events[app.selected].seq, 9);
     }
 }
