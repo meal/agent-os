@@ -11,7 +11,7 @@ use agentos_core::ids::{Digest, TaskId};
 use agentos_core::state::{TaskEvent, TaskState};
 use agentos_engine::agent::{AgentAction, FakeAgent};
 use agentos_engine::executor::EffectRequest;
-use agentos_engine::export::{ExportError, Manifest, export_bundle};
+use agentos_engine::export::{ExportError, Manifest, export_bundle, handoff};
 use agentos_engine::runner::run_task;
 use agentos_engine::workspace::{copy_tree, workspace_digest};
 use common::{Env, HookExec, comment_patch, fix_patch};
@@ -532,4 +532,39 @@ async fn a_bundle_lists_model_requests_and_responses() {
     // Reads are not exported; patches and evidence are as for any task.
     assert_eq!(manifest.patches.len(), 2);
     assert_eq!(manifest.verification_results.len(), 2);
+}
+
+#[tokio::test]
+async fn a_handoff_carries_the_bundle_patch_and_final_digest() {
+    let env = Env::new(10);
+    let mut agent = FakeAgent::scripted(vec![
+        AgentAction::ApplyPatch(comment_patch()),
+        AgentAction::ApplyPatch(fix_patch()),
+        AgentAction::Verify,
+        AgentAction::Finish,
+    ]);
+    assert_eq!(run(&env, &env.task, &mut agent).await, TaskState::Succeeded);
+    let out_root = tempfile::tempdir().unwrap();
+    let bundle = out_root.path().join("bundle");
+    let manifest = export(&env, &env.task, &bundle).unwrap();
+    let events_before = env.events().len();
+
+    let h = handoff(&env.db, &env.blobs, &env.task).unwrap();
+
+    assert_eq!(h.patch, fs::read(bundle.join("patch.diff")).unwrap());
+    assert_eq!(Some(h.final_digest), manifest.final_workspace_digest);
+    assert_eq!(Some(h.base), manifest.base_workspace_digest);
+    assert_eq!(h.final_digest, env.ws_digest());
+    assert_eq!(env.events().len(), events_before, "journals nothing");
+}
+
+#[tokio::test]
+async fn a_failed_task_has_no_handoff() {
+    let env = Env::new(10);
+    let mut agent = FakeAgent::from_fixture_patch(comment_patch());
+    assert_eq!(run(&env, &env.task, &mut agent).await, TaskState::Failed);
+
+    let err = handoff(&env.db, &env.blobs, &env.task).unwrap_err();
+
+    assert!(matches!(err, ExportError::NotSucceeded(TaskState::Failed)));
 }

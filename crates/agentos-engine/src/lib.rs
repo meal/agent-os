@@ -7,6 +7,7 @@ pub mod firecracker;
 pub mod fixture;
 pub mod gc;
 pub mod guestlink;
+pub mod handoff;
 pub mod jail;
 pub mod job;
 mod journal;

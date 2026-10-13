@@ -42,6 +42,8 @@ use crate::runner::EngineError;
 pub enum ExportError {
     #[error("task is {}, only finished tasks can be exported", .0.label())]
     NotTerminal(TaskState),
+    #[error("task is {}, only a succeeded task has a handoff", .0.label())]
+    NotSucceeded(TaskState),
     #[error("destination {0} exists and is not an empty directory")]
     DestinationNotEmpty(PathBuf),
     #[error("destination {0} has no parent directory")]
@@ -603,6 +605,37 @@ pub fn export_bundle(
     });
     db.append_audit(task, "Exported", &payload)?;
     Ok(written.manifest)
+}
+
+/// The verified final workspace of a succeeded task, as a base and the patch that turns it
+/// into the result; `handoff::materialize` rebuilds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Handoff {
+    pub base: Digest,
+    pub final_digest: Digest,
+    pub patch: Vec<u8>,
+}
+
+/// The handoff of a `SUCCEEDED` task. Runs the same checks as `export_bundle` (every digest
+/// is re-verified from the stored bytes) and journals nothing; any other state is refused.
+pub fn handoff(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Handoff> {
+    let state = db.task(task)?.state;
+    if state != TaskState::Succeeded {
+        return Err(if state.is_terminal() {
+            ExportError::NotSucceeded(state)
+        } else {
+            ExportError::NotTerminal(state)
+        });
+    }
+    let c = collect(db, blobs, task)?;
+    let need = |d: Option<Digest>, what: &str| {
+        d.ok_or_else(|| inconsistent(format!("succeeded task has no {what} workspace digest")))
+    };
+    Ok(Handoff {
+        base: need(c.manifest.base_workspace_digest, "base")?,
+        final_digest: need(c.manifest.final_workspace_digest, "final")?,
+        patch: c.patch_diff,
+    })
 }
 
 #[derive(Debug)]
