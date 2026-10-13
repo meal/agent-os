@@ -4,13 +4,13 @@ use agentos_core::effect::{EffectKind, EffectState};
 use agentos_core::ids::TaskId;
 use agentos_core::state::{TaskEvent, TaskState};
 use agentos_engine::recover::recover;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::{print, print_state};
 use crate::crash::CrashSpec;
 use crate::drive::{agent_for, drive};
 use crate::error::CliError;
-use crate::home::Home;
+use crate::home::{DriverLock, Home, Store};
 
 /// Pauses a RUNNING or WAITING task. Works while another process drives it: the runner
 /// stops at its next step.
@@ -46,9 +46,26 @@ pub async fn resume(
     crash: Option<&CrashSpec>,
 ) -> Result<(), CliError> {
     let store = home.open()?;
-    home.model_endpoint(&store, task)?;
+    let state = resume_task(home, &store, None, task, patch, crash).await?;
+    print_state(task, state);
+    Ok(())
+}
+
+/// [`resume`] without the output: the task's state once it is driven as far as it goes.
+/// `held` is the driver lock when the caller already holds it (a workflow run); otherwise
+/// it is taken here, only where it is needed.
+pub(crate) async fn resume_task(
+    home: &Home,
+    store: &Store,
+    held: Option<&DriverLock>,
+    task: &TaskId,
+    patch: Option<&Path>,
+    crash: Option<&CrashSpec>,
+) -> Result<TaskState, CliError> {
+    home.model_endpoint(store, task)?;
     agentos_engine::model::policy::versions(&store.db, task)?;
     let t = store.db.task(task)?;
+    let owned;
     if t.state.is_terminal() {
         // A task that ended with effects still in flight (left by an older build or a
         // failure path) gets them decided; otherwise this only reports.
@@ -58,16 +75,27 @@ pub async fn resume(
             .iter()
             .any(|e| matches!(e.state, EffectState::Intended | EffectState::Dispatched));
         if in_flight {
-            let lock = home.lock()?;
-            let exec = home.recovery_executor(&store, task)?;
+            let lock = match held {
+                Some(lock) => lock,
+                None => {
+                    owned = home.lock()?;
+                    &owned
+                }
+            };
+            let exec = home.recovery_executor(store, task)?;
             lock.driving(task)?;
             recover(&store.db, &store.blobs, &exec, task).await?;
         }
-        print_state(task, t.state);
-        return Ok(());
+        return Ok(t.state);
     }
-    let agent = agent_for(home, &store, task, patch)?;
-    let lock = home.lock()?;
+    let agent = agent_for(home, store, task, patch)?;
+    let lock = match held {
+        Some(lock) => lock,
+        None => {
+            owned = home.lock()?;
+            &owned
+        }
+    };
     // A session left open by a dead controller is never run again: the engine cancels its job
     // and fails the task "agent session lost", sending no model request. That needs no
     // credentials, so it must not be refused for lacking them.
@@ -78,9 +106,9 @@ pub async fn resume(
     // Before anything is written: a worker that cannot run (preflight, jail) leaves the task
     // exactly as it was.
     let exec = if session_lost {
-        home.recovery_executor(&store, task)?
+        home.recovery_executor(store, task)?
     } else {
-        home.executor(&store, task, None)?
+        home.executor(store, task, None)?
     };
     let t = store.db.task(task)?;
     if t.state == TaskState::Paused && !t.cancel_requested {
@@ -91,13 +119,11 @@ pub async fn resume(
         // Resuming a READY task is the owner's approval: issue its capability handles.
         store.db.approve_task(task)?;
     }
-    let state = if t.state.is_terminal() {
-        t.state
+    if t.state.is_terminal() {
+        Ok(t.state)
     } else {
-        drive(home, &store, &lock, task, agent, crash, exec).await?
-    };
-    print_state(task, state);
-    Ok(())
+        drive(home, store, lock, task, agent, crash, exec).await
+    }
 }
 
 /// Requests cancellation and completes it here after reconciling in-flight effects, unless
@@ -105,12 +131,21 @@ pub async fn resume(
 /// (if it is driving this task) reaches its next step, or the next `resume`/`cancel` of it.
 pub async fn cancel(home: &Home, task: &TaskId) -> Result<(), CliError> {
     let store = home.open()?;
+    print(&cancel_task(home, &store, task).await?);
+    Ok(())
+}
+
+/// [`cancel`] without the output: the JSON document `cancel` prints.
+pub(crate) async fn cancel_task(
+    home: &Home,
+    store: &Store,
+    task: &TaskId,
+) -> Result<Value, CliError> {
     let t = store.db.task(task)?;
     if t.state.is_terminal() {
-        print(
-            &json!({ "task_id": task, "state": t.state.label(), "note": "already finished; nothing to cancel" }),
+        return Ok(
+            json!({ "task_id": task, "state": t.state.label(), "note": "already finished; nothing to cancel" }),
         );
-        return Ok(());
     }
     // The intent and the stop come first, whatever the worker's state: a job that outlived
     // its controller must not run to its lease because the worker cannot start again.
@@ -119,7 +154,7 @@ pub async fn cancel(home: &Home, task: &TaskId) -> Result<(), CliError> {
     }
     // Running jobs are asked to stop first, whoever drives the task, so the reconciliation
     // below (or the driver's) does not wait out their leases.
-    super::revoke::cancel_running_jobs(home, &store, task, None)?;
+    super::revoke::cancel_running_jobs(home, store, task, None)?;
     let Some(lock) = home.try_lock()? else {
         let state = store.db.task(task)?.state;
         let note = if home.driven_task().as_deref() == Some(task.as_str()) {
@@ -130,10 +165,9 @@ pub async fn cancel(home: &Home, task: &TaskId) -> Result<(), CliError> {
                 "another agentos process is driving tasks; the cancel completes on the next `agentos resume {task}` or `agentos cancel {task}`"
             )
         };
-        print(
-            &json!({ "task_id": task, "state": state.label(), "cancel_requested": true, "note": note }),
+        return Ok(
+            json!({ "task_id": task, "state": state.label(), "cancel_requested": true, "note": note }),
         );
-        return Ok(());
     };
     lock.driving(task)?;
     let t = store.db.task(task)?;
@@ -144,7 +178,7 @@ pub async fn cancel(home: &Home, task: &TaskId) -> Result<(), CliError> {
             // Reconciles in-flight effects and completes the cancel once none is in flight.
             // Reconciling needs the worker (preflight, recorded jail). If it cannot run, the
             // cancel stays requested and completes on a later resume or cancel.
-            let exec = home.recovery_executor(&store, task).map_err(|e| {
+            let exec = home.recovery_executor(store, task).map_err(|e| {
                 CliError {
                     code: e.code,
                     message: format!(
@@ -155,6 +189,5 @@ pub async fn cancel(home: &Home, task: &TaskId) -> Result<(), CliError> {
             recover(&store.db, &store.blobs, &exec, task).await?;
         }
     }
-    print_state(task, store.db.task(task)?.state);
-    Ok(())
+    Ok(json!({ "task_id": task, "state": store.db.task(task)?.state.label() }))
 }
