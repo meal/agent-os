@@ -1,0 +1,103 @@
+# Read-only cockpit — design
+
+Status: draft for review, 2026-10-13. Next roadmap item after workflows as chained contracts
+(`main` tip a627d2b). Later item, out of scope here: fan-out.
+
+## Purpose
+
+An overview of everything in one agent-os home directory. `agentos cockpit` opens a full-screen
+terminal UI that lists every workflow and task with its state and cost, and lets the owner open
+one to see its steps or its events. It never changes state.
+
+## Decisions (agreed 2026-10-13)
+
+1. **Purpose:** overview of everything (a list of all tasks and workflows, with drill-in).
+2. **Form:** terminal UI (ratatui), no server, no ports; works over SSH.
+3. **Drill-in:** summary plus events. Not the effect journal, grants, diffs or verification output.
+4. **Architecture:** a read-only store view plus a separate TUI crate (`agentos-cockpit`).
+
+Rejected: the TUI inside `agentos-cli` (pulls a terminal framework into the CLI crate and is
+harder to test alone), and reusing the normal `Store` handle while promising not to write
+(read-only would be a convention, and the normal open migrates and can lock).
+
+## Non-goals (v1)
+
+Actions or approvals (pause, cancel, resume), a network or web surface, the effect journal,
+capability grants, patch diffs, verification output, search, filters, sorting options, a
+multi-home view, and notifications.
+
+## 1. Read path (store)
+
+- `Db::open_read_only(path)` opens the same SQLite file with `SQLITE_OPEN_READ_ONLY` and
+  `PRAGMA query_only=ON`. It takes no home lock and runs no migration and no `journal_mode`
+  change.
+- It refuses a database whose `user_version` is not the current `SCHEMA_VERSION`, with a message
+  that names the fix (run any other agentos command to upgrade). It never migrates.
+- It sets a short `busy_timeout`. WAL lets it read while a controller writes. A busy read is the
+  caller's problem to retry (see "Refresh").
+- New queries on `Db`, each returning a small row struct, each limited (default 500, newest
+  first):
+  - `task_rows()`: id, state, goal, limits, usage counts, created time, and the workflow step it
+    belongs to, if any.
+  - `workflow_rows()`: id, name, step names with task ids, and the cancel flag.
+  - `event_rows(task, after_seq, limit)`: seq, type and ts only (no payload).
+  - `event_payload(task, seq)`: one event's stored payload.
+- A workflow's state is the existing `derive_state` over its steps' task states. The cockpit has
+  no second implementation of state.
+- Test: open read-only, assert every write attempt fails, and assert that a write made on another
+  connection after the open is visible to the reader.
+
+## 2. TUI (`agentos-cockpit`)
+
+- The crate depends on `agentos-store` and `agentos-core` for types, and on `ratatui` 0.30.2
+  (current at 2026-10-13). It does not depend on `agentos-engine` or any controller code.
+- `agentos cockpit` in the CLI is a thin wrapper: resolve the home directory, open the read-only
+  view, call `agentos_cockpit::run`. If stdout is not a terminal it exits 2 with a clear message.
+- **List screen:** one table of workflows and tasks, newest first. Columns: kind, id, name or
+  goal, state, step progress (workflow only), used versus limit for model requests and tool
+  actions, and age. A task that belongs to a workflow step appears under its workflow, not as a
+  separate top-level row.
+- **Detail screen:** a workflow shows its steps with task state and budget. A task shows its
+  contract terms and a scrolling list of events (seq, type, time).
+- **Keys:** up/down and j/k move, Enter opens, Esc or q goes back or quits, `p` shows the raw
+  payload of the selected event, `r` forces a refresh. No key performs an action.
+- **Refresh:** a background thread polls about once a second and sends frames over a channel, so
+  the UI never blocks on SQLite. A failed or busy read keeps the last frame and marks the header
+  "stale".
+- **Safe rendering:** every string from the store has control characters and escape sequences
+  stripped before it is drawn, so a hostile goal or event type cannot move the cursor or inject
+  terminal escapes. Long lines are truncated.
+- **Payloads:** `agentos events` prints payloads as stored, with no redaction. The cockpit
+  therefore shows no payload in the list or by default. `p` shows one event's payload, capped in
+  size and sanitized as above. The README says payloads are shown as stored and may contain task
+  content.
+
+## 3. Errors and limits
+
+- Missing or unreadable home: exit 2 with the path and the reason. A missing home is never
+  created.
+- Wrong schema version: refuse (section 1).
+- Empty home: show "no tasks or workflows yet" with the `submit` and `workflow submit` hints.
+- The terminal is restored on any exit, including a panic and Ctrl-C. A resize redraws.
+- Large homes: the list shows the newest 500 rows and the header says when more exist. Events
+  load in pages of 200 as the view scrolls.
+- Ages use the host clock and are display only.
+
+## Testing
+
+All through `docker compose run --rm test ...`.
+
+- Store: read-only open refuses writes, refuses another schema version, sees later writes from
+  another connection, and each list query respects its limit and order.
+- Rendering: ratatui `TestBackend` snapshots over a fixture home for the list, workflow detail,
+  task detail, an empty home, and a stale frame.
+- Sanitizer: unit tests feed escape sequences, C0/C1 controls and very long lines through it.
+- CLI: `agentos cockpit` exits 2 when stdout is not a terminal, and when the home is missing.
+- Key handling: a test sends every key and asserts none opens a write path (the cockpit holds
+  only the read-only handle, so this is also checked by the type it is given).
+- No live run: the cockpit only reads local state.
+
+## Documentation
+
+A short "Cockpit" section in the README: how to start it, the keys, what is shown, and the
+payload note.
