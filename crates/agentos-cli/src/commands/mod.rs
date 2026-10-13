@@ -1,3 +1,4 @@
+mod cockpit;
 mod component;
 mod control;
 mod export;
@@ -59,6 +60,7 @@ pub async fn dispatch(args: Args) -> Result<(), CliError> {
             )
             .await
         }
+        Command::Cockpit => cockpit::cockpit(&home),
         Command::Status { id } => inspect::status(&home, &task_id(&id)?),
         Command::Events { id } => inspect::events(&home, &task_id(&id)?),
         Command::Pause { id } => control::pause(&home, &task_id(&id)?),

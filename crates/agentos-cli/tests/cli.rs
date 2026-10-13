@@ -1777,6 +1777,28 @@ fn supervise_subcommands_are_hidden_from_help() {
 }
 
 #[test]
+fn cockpit_needs_a_terminal() {
+    let cli = Cli::bare();
+    cli.cmd(&["cockpit"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("needs a terminal"));
+    assert!(!cli.home().exists(), "nothing was created");
+}
+
+#[test]
+fn cockpit_with_no_database_is_refused_and_creates_nothing() {
+    // stdout is not a terminal in tests, so the terminal check fires first; the missing
+    // database case is covered where the terminal is available: call the library entry
+    // point directly.
+    let cli = Cli::bare();
+    let path = cli.home().join("agentos.db");
+    let err = agentos_cockpit::run(&path).unwrap_err();
+    assert!(err.to_string().contains("no agent-os database"));
+    assert!(!cli.home().exists(), "nothing was created");
+}
+
+#[test]
 fn home_has_no_receipts_dir() {
     let cli = Cli::new();
     let contract = cli.contract(&cli.repo_copy());

@@ -28,14 +28,17 @@ multi-home view, and notifications.
 
 ## 1. Read path (store)
 
-- `Db::open_read_only(path)` opens the same SQLite file with `SQLITE_OPEN_READ_ONLY` and
-  `PRAGMA query_only=ON`. It takes no home lock and runs no migration and no `journal_mode`
-  change.
+- `View::open(path)` opens the same SQLite file with `SQLITE_OPEN_READ_ONLY` and
+  `PRAGMA query_only=ON`. `View` is a separate type from `Db`, because `Db` has write methods and
+  the cockpit must not be able to call them. It takes no home lock and runs no migration and no
+  `journal_mode` change. It never creates the home or the database file (a missing file is
+  `ViewError::Missing`); opening a WAL database read-only may create empty `-wal`/`-shm` side
+  files next to it when no controller is running (SQLite behaviour).
 - It refuses a database whose `user_version` is not the current `SCHEMA_VERSION`, with a message
   that names the fix (run any other agentos command to upgrade). It never migrates.
-- It sets a short `busy_timeout`. WAL lets it read while a controller writes. A busy read is the
+- `View` sets a short `busy_timeout`. WAL lets it read while a controller writes. A busy read is the
   caller's problem to retry (see "Refresh").
-- New queries on `Db`, each returning a small row struct, each limited (default 500, newest
+- New queries on `View`, each returning a small row struct, each limited (default 500, newest
   first):
   - `task_rows()`: id, state, goal, limits, usage counts, created time, and the workflow step it
     belongs to, if any.
@@ -59,17 +62,19 @@ multi-home view, and notifications.
   separate top-level row.
 - **Detail screen:** a workflow shows its steps with task state and budget. A task shows its
   contract terms and a scrolling list of events (seq, type, time).
-- **Keys:** up/down and j/k move, Enter opens, Esc or q goes back or quits, `p` shows the raw
-  payload of the selected event, `r` forces a refresh. No key performs an action.
-- **Refresh:** a background thread polls about once a second and sends frames over a channel, so
+- **Keys:** up/down and j/k move, Enter opens, Esc or q goes back or quits, Ctrl-C quits, `p` shows the
+  raw payload of the selected event, `r` forces a refresh. No key performs an action.
+- **Refresh:** a background thread polls about once a second and sends frames over a channel;
+  contract frames carry the task id they belong to, and frames for a task that is not open are
+  ignored, so
   the UI never blocks on SQLite. A failed or busy read keeps the last frame and marks the header
   "stale".
 - **Safe rendering:** every string from the store has control characters and escape sequences
   stripped before it is drawn, so a hostile goal or event type cannot move the cursor or inject
   terminal escapes. Long lines are truncated.
 - **Payloads:** `agentos events` prints payloads as stored, with no redaction. The cockpit
-  therefore shows no payload in the list or by default. `p` shows one event's payload, capped in
-  size and sanitized as above. The README says payloads are shown as stored and may contain task
+  therefore shows no payload in the list or by default. `p` shows one event's payload once, capped at
+  65,536 chars and sanitized as above. The README says payloads are shown as stored and may contain task
   content.
 
 ## 3. Errors and limits
@@ -78,9 +83,10 @@ multi-home view, and notifications.
   created.
 - Wrong schema version: refuse (section 1).
 - Empty home: show "no tasks or workflows yet" with the `submit` and `workflow submit` hints.
-- The terminal is restored on any exit, including a panic and Ctrl-C. A resize redraws.
-- Large homes: the list shows the newest 500 rows and the header says when more exist. Events
-  load in pages of 200 as the view scrolls.
+- The terminal is restored on any exit, including a panic. Ctrl-C quits, as do `q` and Esc on the list. A resize redraws.
+- Large homes: the list shows the newest 500 rows and the header says when more exist. A task's events
+  show the latest 200; when the selection reaches the top, an older page of 200 loads, and new
+  events are appended on refresh.
 - Ages use the host clock and are display only.
 
 ## Testing

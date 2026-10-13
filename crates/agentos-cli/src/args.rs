@@ -96,6 +96,8 @@ pub enum Command {
         #[arg(long, value_name = "NAME")]
         agent_cli: Option<AgentCli>,
     },
+    /// Read-only overview of every task and workflow.
+    Cockpit,
     /// Show a task's state, digests, usage and outstanding effects.
     Status { id: String },
     /// Print a task's journal, one JSON event per line.

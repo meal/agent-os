@@ -974,6 +974,38 @@ bound. Steps run one at a time. A step's patch may only modify existing files, l
 session cannot resume (see the limits above), so a controller death mid-session ends that step's
 task, and the chain, as "agent session lost".
 
+## Cockpit: a read-only overview
+
+```bash
+agentos --home <dir> cockpit
+```
+
+A full-screen terminal UI listing every workflow and task in the home, newest first, with state,
+budget use and age. It needs a terminal on stdout (exit 2 otherwise).
+
+| Key | Action |
+|---|---|
+| `Up`/`Down`, `j`/`k` | move the selection |
+| `Enter` | open the selected workflow (its steps) or task (its terms and events) |
+| `Esc` | go back; on the list, quit |
+| `q`, `Ctrl-C` | quit |
+| `p` | show the selected event's payload |
+| `r` | refresh now |
+
+A task shows its contract terms and its latest 200 events; reaching the top of the list loads an
+older page of 200, and new events are appended on refresh. The screen refreshes about once a
+second; a "stale" header means the last read failed and the frame shown is the previous one.
+
+The cockpit only reads. It opens the database read-only, never writes to it, never migrates it
+and never takes the home lock, so it can run beside a live controller. It never creates the home
+or the database file; a missing database is refused with exit 2. A read-only open of a WAL
+database may create empty `-wal`/`-shm` side files next to it when no controller is running (a
+SQLite behaviour). It refuses a database of another schema version and tells you to run any other
+`agentos` command to upgrade it.
+
+Payloads are shown only on `p`, once, as stored (capped at 65,536 characters, control characters
+stripped). Like `agentos events`, nothing is redacted, so a payload may contain task content.
+
 ## Home layout
 
 ```text
