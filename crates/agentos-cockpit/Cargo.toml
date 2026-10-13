@@ -6,7 +6,8 @@ version.workspace = true
 [dependencies]
 agentos-core = { path = "../agentos-core" }
 agentos-store = { path = "../agentos-store" }
-ratatui.workspace = true
+# `Paragraph::line_count`, so the payload screen knows how far it can scroll.
+ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 serde_json.workspace = true
 thiserror.workspace = true
 

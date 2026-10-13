@@ -1,7 +1,9 @@
 use agentos_core::ids::{TaskId, WorkflowId};
 use agentos_core::state::TaskState;
-use agentos_core::workflow::display_label;
-use agentos_store::view::Snapshot;
+use agentos_core::workflow::{WorkflowState, display_label};
+use agentos_store::view::{Snapshot, StepView, WorkflowRow};
+
+use crate::sanitize::clean;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Key {
@@ -25,8 +27,8 @@ pub struct Item {
     pub created_ts: i64,
 }
 
-/// Workflows and tasks without a workflow, newest first. A workflow's step tasks appear only
-/// through their workflow.
+/// Workflows and tasks without a workflow, newest first. A snapshot holds no step task: those
+/// appear only through their workflow.
 pub fn items(snapshot: &Snapshot) -> Vec<Item> {
     let workflows = snapshot.workflows.iter().map(|w| {
         let done = w
@@ -39,38 +41,34 @@ pub fn items(snapshot: &Snapshot) -> Vec<Item> {
             kind: "workflow",
             id: w.id.to_string(),
             name: w.name.clone(),
-            state: display_label(w.state(), w.approved).to_string(),
+            state: workflow_label(w),
             progress: format!("{done}/{}", w.steps.len()),
-            model_used: w.steps.iter().map(|s| s.model_used).sum(),
-            model_limit: w.steps.iter().map(|s| u64::from(s.model_limit)).sum(),
-            tool_used: w.steps.iter().map(|s| s.tool_used).sum(),
-            tool_limit: w.steps.iter().map(|s| u64::from(s.tool_limit)).sum(),
+            model_used: total(w, |s| s.model_used),
+            model_limit: total(w, |s| u64::from(s.model_limit)),
+            tool_used: total(w, |s| s.tool_used),
+            tool_limit: total(w, |s| u64::from(s.tool_limit)),
             created_ts: w.created_ts,
         }
     });
-    let tasks = snapshot
-        .tasks
-        .iter()
-        .filter(|t| t.workflow.is_none())
-        .map(|t| {
-            let mut state = t.state.label().to_string();
-            if t.cancel_requested && !t.state.is_terminal() {
-                state.push_str(" (cancelling)");
-            }
-            Item {
-                key: Key::Task(t.id.clone()),
-                kind: "task",
-                id: t.id.to_string(),
-                name: t.goal.clone(),
-                state,
-                progress: String::new(),
-                model_used: t.model_used,
-                model_limit: u64::from(t.model_limit),
-                tool_used: t.tool_used,
-                tool_limit: u64::from(t.tool_limit),
-                created_ts: t.created_ts,
-            }
-        });
+    let tasks = snapshot.tasks.iter().map(|t| {
+        let mut state = t.state.label().to_string();
+        if t.cancel_requested && !t.state.is_terminal() {
+            state.push_str(" (cancelling)");
+        }
+        Item {
+            key: Key::Task(t.id.clone()),
+            kind: "task",
+            id: t.id.to_string(),
+            name: t.goal.clone(),
+            state,
+            progress: String::new(),
+            model_used: t.model_used,
+            model_limit: u64::from(t.model_limit),
+            tool_used: t.tool_used,
+            tool_limit: u64::from(t.tool_limit),
+            created_ts: t.created_ts,
+        }
+    });
     let mut all: Vec<Item> = workflows.chain(tasks).collect();
     all.sort_by(|a, b| {
         b.created_ts
@@ -78,6 +76,91 @@ pub fn items(snapshot: &Snapshot) -> Vec<Item> {
             .then_with(|| a.id.cmp(&b.id))
     });
     all
+}
+
+/// A workflow's state, saying so while a cancel is on its way, as a task's does.
+pub fn workflow_label(w: &WorkflowRow) -> String {
+    let state = w.state();
+    let mut label = display_label(state, w.approved).to_string();
+    if w.cancel_requested && state == WorkflowState::Running {
+        label.push_str(" (cancelling)");
+    }
+    label
+}
+
+/// One budget figure summed over a workflow's steps; it saturates rather than overflows.
+fn total(w: &WorkflowRow, figure: impl Fn(&StepView) -> u64) -> u64 {
+    w.steps
+        .iter()
+        .fold(0u64, |sum, s| sum.saturating_add(figure(s)))
+}
+
+/// A payload as display lines, each cleaned: laid out one value per line when it is JSON,
+/// as stored otherwise (a payload cut short is no longer JSON).
+pub fn payload_lines(text: &str) -> Vec<String> {
+    let pretty = pretty_json(text);
+    pretty
+        .as_deref()
+        .unwrap_or(text)
+        .split('\n')
+        .map(|l| clean(l, usize::MAX))
+        .collect()
+}
+
+/// `text` re-indented, two spaces a level, when it parses as JSON. It works on the text, not a
+/// parsed value, so keys keep their stored order and numbers their stored digits.
+fn pretty_json(text: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(text).ok()?;
+    let mut out = String::with_capacity(text.len() * 2);
+    let mut depth = 0usize;
+    let (mut in_string, mut escaped) = (false, false);
+    let newline = |out: &mut String, depth: usize| {
+        out.push('\n');
+        out.push_str(&"  ".repeat(depth));
+    };
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            '{' | '[' => {
+                out.push(c);
+                while chars.next_if(|c| c.is_ascii_whitespace()).is_some() {}
+                match chars.next_if(|c| matches!(c, '}' | ']')) {
+                    Some(close) => out.push(close),
+                    None => {
+                        depth += 1;
+                        newline(&mut out, depth);
+                    }
+                }
+            }
+            '}' | ']' => {
+                depth = depth.saturating_sub(1);
+                newline(&mut out, depth);
+                out.push(c);
+            }
+            ',' => {
+                out.push(c);
+                newline(&mut out, depth);
+            }
+            ':' => out.push_str(": "),
+            c if c.is_ascii_whitespace() => {}
+            c => out.push(c),
+        }
+    }
+    Some(out)
 }
 
 /// How long ago `ts` was, as `5s`, `3m`, `2h` or `4d`.
@@ -94,7 +177,7 @@ pub fn age(now: i64, ts: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentos_store::view::{StepView, TaskRow, WorkflowRow};
+    use agentos_store::view::TaskRow;
 
     #[test]
     fn age_picks_the_largest_whole_unit() {
@@ -105,7 +188,7 @@ mod tests {
         assert_eq!(age(5, 10), "0s");
     }
 
-    fn task(state: TaskState, created_ts: i64, workflow: Option<(WorkflowId, usize)>) -> TaskRow {
+    fn task(state: TaskState, created_ts: i64) -> TaskRow {
         TaskRow {
             id: TaskId::new(),
             state,
@@ -116,7 +199,6 @@ mod tests {
             model_used: 1,
             tool_used: 2,
             created_ts,
-            workflow,
         }
     }
 
@@ -156,26 +238,22 @@ mod tests {
             tasks,
             workflows,
             more: false,
+            skipped: 0,
         }
     }
 
     #[test]
     fn items_merge_workflows_and_loose_tasks_newest_first() {
-        let wf_id = WorkflowId::new();
-        let step_task = task(TaskState::Succeeded, 150, Some((wf_id.clone(), 0)));
-        let old = task(TaskState::Running, 100, None);
-        let new = task(TaskState::Failed, 300, None);
-        let mut wf = workflow(
+        let step_task = task(TaskState::Succeeded, 150);
+        let old = task(TaskState::Running, 100);
+        let new = task(TaskState::Failed, 300);
+        let wf = workflow(
             200,
             false,
             false,
             vec![step(0, Some(&step_task)), step(1, None)],
         );
-        wf.id = wf_id;
-        let snap = snapshot(
-            vec![new.clone(), step_task.clone(), old.clone()],
-            vec![wf.clone()],
-        );
+        let snap = snapshot(vec![new.clone(), old.clone()], vec![wf.clone()]);
 
         let items = items(&snap);
 
@@ -209,9 +287,9 @@ mod tests {
 
     #[test]
     fn ties_break_by_id_and_a_cancelling_task_says_so() {
-        let mut a = task(TaskState::Running, 5, None);
+        let mut a = task(TaskState::Running, 5);
         a.cancel_requested = true;
-        let mut done = task(TaskState::Cancelled, 5, None);
+        let mut done = task(TaskState::Cancelled, 5);
         done.cancel_requested = true;
         let items = items(&snapshot(vec![a.clone(), done.clone()], vec![]));
         let ids: Vec<_> = items.iter().map(|i| i.id.clone()).collect();
@@ -228,5 +306,61 @@ mod tests {
         };
         assert_eq!(state(&a), "RUNNING (cancelling)");
         assert_eq!(state(&done), "CANCELLED");
+    }
+
+    #[test]
+    fn a_workflow_being_cancelled_says_so_until_it_ends() {
+        let t = task(TaskState::Running, 1);
+        let mut wf = workflow(5, true, false, vec![step(0, Some(&t))]);
+        wf.cancel_requested = true;
+        assert_eq!(
+            items(&snapshot(vec![], vec![wf.clone()]))[0].state,
+            "RUNNING (cancelling)"
+        );
+        wf.steps[0].task_state = Some(TaskState::Cancelled);
+        assert_eq!(items(&snapshot(vec![], vec![wf]))[0].state, "CANCELLED");
+    }
+
+    #[test]
+    fn workflow_budgets_saturate_instead_of_overflowing() {
+        let mut big = step(0, None);
+        big.model_used = u64::MAX;
+        big.tool_used = u64::MAX - 1;
+        let mut more = step(1, None);
+        more.model_used = 5;
+        more.tool_used = 5;
+        let wf = workflow(1, true, false, vec![big, more]);
+        let item = &items(&snapshot(vec![], vec![wf]))[0];
+        assert_eq!((item.model_used, item.tool_used), (u64::MAX, u64::MAX));
+        assert_eq!((item.model_limit, item.tool_limit), (6, 8));
+    }
+
+    #[test]
+    fn json_payloads_are_laid_out_one_value_per_line_in_stored_order() {
+        let lines = payload_lines(
+            r#"{"z":1,"a":[true,{}],"s":"x,\"y\":{z}","e":[],"n":12345678901234567890}"#,
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "{",
+                "  \"z\": 1,",
+                "  \"a\": [",
+                "    true,",
+                "    {}",
+                "  ],",
+                "  \"s\": \"x,\\\"y\\\":{z}\",",
+                "  \"e\": [],",
+                "  \"n\": 12345678901234567890",
+                "}",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_payload_that_is_not_json_or_was_cut_is_shown_raw() {
+        assert_eq!(payload_lines("plain, text: {x}"), vec!["plain, text: {x}"]);
+        assert_eq!(payload_lines(r#"{"a": [1, 2"#), vec![r#"{"a": [1, 2"#]);
+        assert_eq!(payload_lines("two\nlines\x1b"), vec!["two", "lines"]);
     }
 }

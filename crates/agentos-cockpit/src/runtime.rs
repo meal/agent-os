@@ -1,7 +1,6 @@
 //! The cockpit's two threads: a worker that is the only reader of the store, and the terminal
 //! loop that turns keys into requests and frames into screens.
 
-use std::path::Path;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -26,8 +25,6 @@ const TICK: Duration = Duration::from_millis(100);
 
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
-    #[error(transparent)]
-    View(#[from] ViewError),
     #[error("terminal: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -207,10 +204,9 @@ fn drain(app: &mut App, frames: &Receiver<Frame>) -> bool {
     }
 }
 
-/// Opens the store before touching the terminal, so a missing database or another schema
-/// is reported on a normal screen. Nothing here creates a file.
-pub fn run(db_path: &Path) -> Result<(), RunError> {
-    let view = View::open(db_path)?;
+/// Runs the cockpit over an open `view`. The caller opens it before touching the terminal, so
+/// a missing database or another schema is reported on a normal screen.
+pub fn run(view: View) -> Result<(), RunError> {
     let (requests, worker_requests) = mpsc::channel();
     let (worker_frames, frames) = mpsc::channel();
     let worker = thread::spawn(move || serve(view, worker_requests, worker_frames, POLL));
@@ -220,11 +216,18 @@ pub fn run(db_path: &Path) -> Result<(), RunError> {
     // fails, possibly after entering raw mode, so restore runs on that path too.
     let result = ratatui::try_init().and_then(|mut terminal| ui(&mut terminal, &requests, &frames));
     ratatui::restore();
+    stop(requests, frames, worker);
+    Ok(result?)
+}
+
+/// Ends the worker and waits for it. The frame receiver goes first, so the worker's next send
+/// fails and it stops after the read in hand instead of working through its queue.
+fn stop(requests: Sender<Request>, frames: Receiver<Frame>, worker: thread::JoinHandle<()>) {
+    drop(frames);
     drop(requests);
     if let Err(panic) = worker.join() {
         std::panic::resume_unwind(panic);
     }
-    Ok(result?)
 }
 
 fn ui(
@@ -294,22 +297,24 @@ mod tests {
             .expect("a frame in time")
     }
 
-    fn frame_with_events(frames: &Receiver<Frame>) -> Frame {
+    /// The first frame that `wanted` accepts, within one 5 s deadline for the whole wait.
+    fn first_frame(frames: &Receiver<Frame>, wanted: impl Fn(&Frame) -> bool) -> Frame {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let f = next(frames);
-            if f.events.is_some() {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let f = frames.recv_timeout(left).expect("the wanted frame in time");
+            if wanted(&f) {
                 return f;
             }
         }
     }
 
+    fn frame_with_events(frames: &Receiver<Frame>) -> Frame {
+        first_frame(frames, |f| f.events.is_some())
+    }
+
     fn frame_with_payload(frames: &Receiver<Frame>) -> Frame {
-        loop {
-            let f = next(frames);
-            if f.payload.is_some() {
-                return f;
-            }
-        }
+        first_frame(frames, |f| f.payload.is_some())
     }
 
     fn task_with_notes(dir: &tempfile::TempDir, notes: usize) -> (Db, std::path::PathBuf, TaskId) {
@@ -487,42 +492,21 @@ mod tests {
     #[test]
     fn a_failed_snapshot_is_sent_as_an_error_and_the_worker_keeps_going() {
         let dir = tempfile::tempdir().unwrap();
-        let (_db, path, id) = task_with_notes(&dir, 0);
+        let (_db, path, _id) = task_with_notes(&dir, 0);
         let (requests, frames, worker) = start(&path);
         let conn = rusqlite::Connection::open(&path).unwrap();
-        let set = |json: &str| {
-            conn.execute(
-                "UPDATE tasks SET contract_json = ?1 WHERE id = ?2",
-                [json, id.as_str()],
-            )
-            .unwrap()
-        };
-        set("not json");
-        let reason = loop {
-            if let Err(reason) = next(&frames).snapshot {
-                break reason;
-            }
-        };
-        assert!(reason.contains("corrupt"), "{reason}");
-        set(CONTRACT_JSON);
-        loop {
-            if next(&frames).snapshot.is_ok() {
-                break;
-            }
-        }
+        // A corrupt row is skipped, so a failed read needs the schema to go wrong.
+        conn.execute_batch("ALTER TABLE usage RENAME TO usage_away")
+            .unwrap();
+        let reason = first_frame(&frames, |f| f.snapshot.is_err())
+            .snapshot
+            .unwrap_err();
+        assert!(reason.contains("usage"), "{reason}");
+        conn.execute_batch("ALTER TABLE usage_away RENAME TO usage")
+            .unwrap();
+        first_frame(&frames, |f| f.snapshot.is_ok());
         drop(requests);
         worker.join().unwrap();
-    }
-
-    #[test]
-    fn a_missing_database_is_reported_and_not_created() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("agentos.db");
-        assert!(matches!(
-            run(&path),
-            Err(RunError::View(ViewError::Missing(p))) if p == path
-        ));
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]
@@ -589,6 +573,7 @@ mod tests {
     fn ctrl_c_quits_from_every_screen_and_a_plain_c_or_a_release_does_not() {
         let (on_task, id) = crate::app::fixtures::app_on_task(1..=3);
         let mut on_payload = on_task.clone();
+        on_payload.handle_key(KeyCode::Char('p'));
         on_payload.apply_frame(Frame {
             payload: Some((id, 3, Some(("x".into(), false)))),
             ..crate::app::fixtures::good(on_payload.snapshot.clone().unwrap())
@@ -620,13 +605,14 @@ mod tests {
 
     #[test]
     fn opening_a_task_sends_watch_and_leaving_it_sends_watch_none() {
-        let t = crate::app::fixtures::task("g", 1, None);
+        let t = crate::app::fixtures::task("g", 1);
         let id = t.id.clone();
         let mut app = App::new();
         app.apply_frame(crate::app::fixtures::good(agentos_store::view::Snapshot {
             tasks: vec![t],
             workflows: vec![],
             more: false,
+            skipped: 0,
         }));
         assert_eq!(
             on_event(&mut app, &key(KeyCode::Enter, KeyEventKind::Press)),
@@ -646,10 +632,11 @@ mod tests {
         assert!(drain(&mut app, &rx), "nothing waiting, worker alive");
         let snap = |n: usize| agentos_store::view::Snapshot {
             tasks: (0..n)
-                .map(|i| crate::app::fixtures::task("g", i as i64, None))
+                .map(|i| crate::app::fixtures::task("g", i as i64))
                 .collect(),
             workflows: vec![],
             more: false,
+            skipped: 0,
         };
         tx.send(crate::app::fixtures::good(snap(1))).unwrap();
         tx.send(crate::app::fixtures::good(snap(2))).unwrap();
@@ -657,5 +644,35 @@ mod tests {
         assert_eq!(app.items().len(), 2, "the last frame wins");
         drop(tx);
         assert!(!drain(&mut app, &rx));
+    }
+
+    #[test]
+    fn stopping_does_not_wait_for_the_queued_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, path, id) = task_with_notes(&dir, 0);
+        for _ in 0..300 {
+            db.create_task(
+                &agentos_core::contract::Contract::parse(CONTRACT_JSON).unwrap(),
+                &agentos_core::ids::Digest::of(CONTRACT_JSON.as_bytes()),
+            )
+            .unwrap();
+        }
+        let (requests, frames, worker) = start(&path);
+        // Reads enough for minutes, and a sender kept elsewhere: only the dropped frame
+        // receiver can end the worker early.
+        for _ in 0..100_000 {
+            requests.send(Request::Payload(id.clone(), 1)).unwrap();
+        }
+        let elsewhere = requests.clone();
+        let (done, stopped) = mpsc::channel();
+        std::thread::spawn(move || {
+            stop(requests, frames, worker);
+            let _ = done.send(());
+        });
+        assert!(
+            stopped.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the worker ended without working through its queue"
+        );
+        drop(elsewhere);
     }
 }

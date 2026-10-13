@@ -1,9 +1,11 @@
+use std::cell::Cell;
+
 use agentos_core::contract::Contract;
 use agentos_core::ids::{TaskId, WorkflowId};
 use agentos_store::view::{EventRow, Snapshot};
 use ratatui::crossterm::event::KeyCode;
 
-use crate::model::{Item, Key, items};
+use crate::model::{Item, Key, items, payload_lines};
 
 /// A payload's text and whether it was cut.
 pub type PayloadText = (String, bool);
@@ -60,6 +62,9 @@ pub struct Frame {
 pub struct App {
     pub screen: Screen,
     pub selected: usize,
+    /// The list's selected item. Rows move as items arrive, so the list keeps its selection by
+    /// key and `selected` follows it. The list is always at the bottom of the back stack.
+    list_key: Option<Key>,
     pub snapshot: Option<Snapshot>,
     /// `Some(reason)` after a failed read; the last good snapshot stays on screen.
     pub stale: Option<String>,
@@ -68,6 +73,15 @@ pub struct App {
     pub contract: Option<Contract>,
     /// The open payload's text and whether it was cut.
     pub payload: Option<PayloadText>,
+    /// The open payload as display lines: pretty-printed when it is JSON, each line cleaned.
+    pub payload_lines: Vec<String>,
+    /// How many rows the payload is scrolled down.
+    pub payload_scroll: u16,
+    /// The furthest the payload can scroll and one page of it, as the last draw measured them
+    /// (only the draw knows the width the text wraps to).
+    pub payload_view: Cell<(u16, u16)>,
+    /// The payload `p` asked for; only its answer opens the payload screen.
+    pending_payload: Option<(TaskId, u64)>,
     pub now: i64,
     /// The screens left behind and the selection each had, so back restores it.
     back: Vec<(Screen, usize)>,
@@ -84,12 +98,17 @@ impl App {
         App {
             screen: Screen::List,
             selected: 0,
+            list_key: None,
             snapshot: None,
             stale: None,
             events: Vec::new(),
             event_total: 0,
             contract: None,
             payload: None,
+            payload_lines: Vec::new(),
+            payload_scroll: 0,
+            payload_view: Cell::new((0, 0)),
+            pending_payload: None,
             now: 0,
             back: Vec::new(),
         }
@@ -114,14 +133,39 @@ impl App {
         }
     }
 
+    /// Keeps `selected` on a row. On the list it follows `list_key`; an item that is gone
+    /// leaves the selection at the same row, or the last one.
     fn clamp(&mut self) {
-        self.selected = self.selected.min(self.rows().saturating_sub(1));
+        if self.screen != Screen::List {
+            self.selected = self.selected.min(self.rows().saturating_sub(1));
+            return;
+        }
+        let items = self.items();
+        match self
+            .list_key
+            .as_ref()
+            .and_then(|k| items.iter().position(|i| &i.key == k))
+        {
+            Some(row) => self.selected = row,
+            None => {
+                self.selected = self.selected.min(items.len().saturating_sub(1));
+                self.list_key = items.get(self.selected).map(|i| i.key.clone());
+            }
+        }
+    }
+
+    /// After a move on the list, the item now selected.
+    fn select_row(&mut self) {
+        if self.screen == Screen::List {
+            self.list_key = self.items().get(self.selected).map(|i| i.key.clone());
+        }
     }
 
     fn open(&mut self, screen: Screen) {
         let from = std::mem::replace(&mut self.screen, screen);
         self.back.push((from, self.selected));
         self.selected = 0;
+        self.pending_payload = None;
     }
 
     fn go_back(&mut self) {
@@ -135,6 +179,8 @@ impl App {
             self.contract = None;
         }
         self.payload = None;
+        self.payload_lines.clear();
+        self.pending_payload = None;
         self.clamp();
     }
 
@@ -152,6 +198,24 @@ impl App {
                     Command::None
                 }
             },
+            KeyCode::Up | KeyCode::Char('k') if matches!(self.screen, Screen::Payload { .. }) => {
+                self.payload_scroll = self.payload_scroll.saturating_sub(1);
+                Command::None
+            }
+            KeyCode::Down | KeyCode::Char('j') if matches!(self.screen, Screen::Payload { .. }) => {
+                self.scroll_payload_to(self.payload_scroll.saturating_add(1));
+                Command::None
+            }
+            KeyCode::PageUp if matches!(self.screen, Screen::Payload { .. }) => {
+                let page = self.payload_view.get().1.max(1);
+                self.payload_scroll = self.payload_scroll.saturating_sub(page);
+                Command::None
+            }
+            KeyCode::PageDown if matches!(self.screen, Screen::Payload { .. }) => {
+                let page = self.payload_view.get().1.max(1);
+                self.scroll_payload_to(self.payload_scroll.saturating_add(page));
+                Command::None
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 if let Screen::Task(task) = &self.screen
                     && self.selected == 0
@@ -161,28 +225,42 @@ impl App {
                     return Command::Older(task.clone(), first.seq);
                 }
                 self.selected = self.selected.saturating_sub(1);
+                self.select_row();
                 Command::None
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.selected = self.selected.saturating_add(1);
-                self.clamp();
+                self.clamp_row();
+                self.select_row();
                 Command::None
             }
             KeyCode::Enter => self.enter(),
             KeyCode::Char('p') => match &self.screen {
-                Screen::Task(task) => self
-                    .events
-                    .get(self.selected)
-                    .map_or(Command::None, |e| Command::Payload(task.clone(), e.seq)),
+                Screen::Task(task) => match self.events.get(self.selected) {
+                    Some(e) => {
+                        self.pending_payload = Some((task.clone(), e.seq));
+                        Command::Payload(task.clone(), e.seq)
+                    }
+                    None => Command::None,
+                },
                 _ => Command::None,
             },
             _ => Command::None,
         }
     }
 
+    /// `selected` kept on a row of the current screen, by index alone.
+    fn clamp_row(&mut self) {
+        self.selected = self.selected.min(self.rows().saturating_sub(1));
+    }
+
+    fn scroll_payload_to(&mut self, rows: u16) {
+        self.payload_scroll = rows.min(self.payload_view.get().0);
+    }
+
     fn enter(&mut self) -> Command {
         match self.screen.clone() {
-            Screen::List => match self.items().get(self.selected).map(|i| i.key.clone()) {
+            Screen::List => match self.list_key.clone() {
                 Some(Key::Workflow(id)) => {
                     self.open(Screen::Workflow(id));
                     Command::None
@@ -237,9 +315,15 @@ impl App {
             self.contract = Some(contract);
         }
         if let Some((task, seq, text)) = frame.payload
+            && self.pending_payload.as_ref() == Some(&(task.clone(), seq))
             && self.screen == Screen::Task(task.clone())
         {
+            self.payload_lines = text
+                .as_ref()
+                .map_or_else(Vec::new, |(t, _)| payload_lines(t));
             self.payload = text;
+            self.payload_scroll = 0;
+            self.payload_view.set((0, 0));
             self.open(Screen::Payload { task, seq });
         }
         self.clamp();
@@ -297,7 +381,7 @@ pub(crate) mod fixtures {
     use agentos_core::state::TaskState;
     use agentos_store::view::{StepView, TaskRow, WorkflowRow};
 
-    pub fn task(goal: &str, created_ts: i64, workflow: Option<(WorkflowId, usize)>) -> TaskRow {
+    pub fn task(goal: &str, created_ts: i64) -> TaskRow {
         TaskRow {
             id: TaskId::new(),
             state: TaskState::Running,
@@ -308,7 +392,6 @@ pub(crate) mod fixtures {
             model_used: 1,
             tool_used: 2,
             created_ts,
-            workflow,
         }
     }
 
@@ -376,13 +459,14 @@ pub(crate) mod fixtures {
 
     /// An app on a task screen with `seqs` as its events, the last one selected.
     pub fn app_on_task(seqs: std::ops::RangeInclusive<u64>) -> (App, TaskId) {
-        let t = task("a goal", 10, None);
+        let t = task("a goal", 10);
         let id = t.id.clone();
         let mut app = App::new();
         app.apply_frame(good(Snapshot {
             tasks: vec![t],
             workflows: vec![],
             more: false,
+            skipped: 0,
         }));
         assert_eq!(
             app.handle_key(KeyCode::Enter),
@@ -414,6 +498,7 @@ mod tests {
             tasks,
             workflows: wfs,
             more: false,
+            skipped: 0,
         }
     }
 
@@ -449,15 +534,15 @@ mod tests {
     /// One app per screen, each with data behind it, plus an empty one.
     fn apps_on_every_screen() -> Vec<App> {
         let mut apps = vec![App::new()];
-        let t = task("loose", 50, None);
-        let st = task("in wf", 40, None);
+        let t = task("loose", 50);
+        let st = task("in wf", 40);
         let mut wf = workflow(
             "chain",
             60,
             vec![step(0, "s0", Some(&st)), step(1, "s1", None)],
         );
         wf.steps[0].task_id = Some(st.id.clone());
-        let s = snap(vec![t, st], vec![wf]);
+        let s = snap(vec![t], vec![wf]);
         let mut list = App::new();
         list.apply_frame(good(s.clone()));
         apps.push(list.clone());
@@ -468,6 +553,7 @@ mod tests {
         apps.push(on_wf);
         let (mut on_task, id) = app_on_task(1..=3);
         apps.push(on_task.clone());
+        on_task.handle_key(KeyCode::Char('p'));
         on_task.apply_frame(Frame {
             payload: Some((id, 3, Some(("body".into(), false)))),
             ..good(on_task.snapshot.clone().unwrap())
@@ -500,7 +586,7 @@ mod tests {
 
     #[test]
     fn enter_opens_a_loose_task_and_watches_it_and_esc_goes_back() {
-        let t = task("loose", 50, None);
+        let t = task("loose", 50);
         let id = t.id.clone();
         let mut app = App::new();
         app.apply_frame(good(snap(vec![t], vec![])));
@@ -524,7 +610,7 @@ mod tests {
 
     #[test]
     fn esc_on_a_task_opened_from_a_workflow_returns_to_that_workflow() {
-        let st = task("in wf", 40, None);
+        let st = task("in wf", 40);
         let wf = workflow(
             "chain",
             60,
@@ -532,7 +618,7 @@ mod tests {
         );
         let wf_id = wf.id.clone();
         let mut app = App::new();
-        app.apply_frame(good(snap(vec![st.clone()], vec![wf])));
+        app.apply_frame(good(snap(vec![], vec![wf])));
         assert_eq!(app.handle_key(KeyCode::Enter), Command::None);
         assert_eq!(app.screen, Screen::Workflow(wf_id.clone()));
         // step 0 has no task: Enter does nothing
@@ -577,10 +663,7 @@ mod tests {
         }
         assert_eq!(app.selected, 2);
         let mut list = App::new();
-        list.apply_frame(good(snap(
-            vec![task("a", 1, None), task("b", 2, None)],
-            vec![],
-        )));
+        list.apply_frame(good(snap(vec![task("a", 1), task("b", 2)], vec![])));
         for _ in 0..10 {
             list.handle_key(KeyCode::Char('j'));
         }
@@ -594,13 +677,13 @@ mod tests {
     fn selection_is_clamped_when_the_list_shrinks() {
         let mut app = App::new();
         app.apply_frame(good(snap(
-            vec![task("a", 1, None), task("b", 2, None), task("c", 3, None)],
+            vec![task("a", 1), task("b", 2), task("c", 3)],
             vec![],
         )));
         app.handle_key(KeyCode::Down);
         app.handle_key(KeyCode::Down);
         assert_eq!(app.selected, 2);
-        app.apply_frame(good(snap(vec![task("a", 1, None)], vec![])));
+        app.apply_frame(good(snap(vec![task("a", 1)], vec![])));
         assert_eq!(app.selected, 0);
     }
 
@@ -621,7 +704,7 @@ mod tests {
 
     #[test]
     fn p_without_events_does_nothing() {
-        let t = task("g", 1, None);
+        let t = task("g", 1);
         let mut app = App::new();
         app.apply_frame(good(snap(vec![t], vec![])));
         app.handle_key(KeyCode::Enter);
@@ -634,6 +717,7 @@ mod tests {
     fn a_payload_frame_opens_the_payload_screen_and_esc_returns_to_the_task() {
         let (mut app, id) = app_on_task(1..=3);
         app.handle_key(KeyCode::Up);
+        app.handle_key(KeyCode::Char('p'));
         app.apply_frame(Frame {
             payload: Some((id.clone(), 2, Some(("{}".into(), true)))),
             ..good(app.snapshot.clone().unwrap())
@@ -665,7 +749,7 @@ mod tests {
     #[test]
     fn a_failed_frame_keeps_the_snapshot_and_marks_stale_and_a_good_one_clears_it() {
         let mut app = App::new();
-        app.apply_frame(good(snap(vec![task("a", 1, None)], vec![])));
+        app.apply_frame(good(snap(vec![task("a", 1)], vec![])));
         app.apply_frame(Frame {
             snapshot: Err("database is locked".into()),
             now: 200,
@@ -676,10 +760,7 @@ mod tests {
         assert_eq!(app.stale.as_deref(), Some("database is locked"));
         assert_eq!(app.snapshot.as_ref().unwrap().tasks.len(), 1);
         assert_eq!(app.now, 200);
-        app.apply_frame(good(snap(
-            vec![task("a", 1, None), task("b", 2, None)],
-            vec![],
-        )));
+        app.apply_frame(good(snap(vec![task("a", 1), task("b", 2)], vec![])));
         assert!(app.stale.is_none());
         assert_eq!(app.items().len(), 2);
     }
@@ -750,8 +831,8 @@ mod tests {
 
     #[test]
     fn a_contract_for_another_task_is_ignored() {
-        let a = task("task a", 20, None);
-        let b = task("task b", 10, None);
+        let a = task("task a", 20);
+        let b = task("task b", 10);
         let (a_id, b_id) = (a.id.clone(), b.id.clone());
         let mut app = App::new();
         app.apply_frame(good(snap(vec![a, b], vec![])));
@@ -782,6 +863,7 @@ mod tests {
     #[test]
     fn a_contract_arriving_on_the_payload_screen_is_kept_for_the_task() {
         let (mut app, id) = app_on_task(1..=3);
+        app.handle_key(KeyCode::Char('p'));
         app.apply_frame(Frame {
             payload: Some((id.clone(), 3, Some(("x".into(), false)))),
             ..good(app.snapshot.clone().unwrap())
@@ -800,6 +882,7 @@ mod tests {
     fn events_arriving_on_the_payload_screen_shift_the_saved_task_selection() {
         let (mut app, id) = app_on_task(5..=7);
         app.handle_key(KeyCode::Up); // seq 6
+        app.handle_key(KeyCode::Char('p'));
         app.apply_frame(Frame {
             payload: Some((id.clone(), 6, Some(("x".into(), false)))),
             ..good(app.snapshot.clone().unwrap())
@@ -820,6 +903,7 @@ mod tests {
         // append while on payload, with the newest event selected: back follows the tail
         app.handle_key(KeyCode::Down);
         assert_eq!(app.events[app.selected].seq, 7);
+        app.handle_key(KeyCode::Char('p'));
         app.apply_frame(Frame {
             payload: Some((id.clone(), 7, Some(("x".into(), false)))),
             ..good(app.snapshot.clone().unwrap())
@@ -834,5 +918,121 @@ mod tests {
         });
         app.handle_key(KeyCode::Esc);
         assert_eq!(app.events[app.selected].seq, 9);
+    }
+
+    fn opened(app: &App) -> Option<Key> {
+        match &app.screen {
+            Screen::Task(id) => Some(Key::Task(id.clone())),
+            Screen::Workflow(id) => Some(Key::Workflow(id.clone())),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn the_selection_follows_its_item_when_a_newer_one_arrives_on_top() {
+        let a = task("a", 10);
+        let b = task("b", 20);
+        let mut app = App::new();
+        app.apply_frame(good(snap(vec![b.clone(), a.clone()], vec![])));
+        app.handle_key(KeyCode::Down);
+        assert_eq!(app.items()[app.selected].key, Key::Task(a.id.clone()));
+        let newer = task("newer", 30);
+        app.apply_frame(good(snap(vec![newer, b.clone(), a.clone()], vec![])));
+        assert_eq!(
+            app.selected, 2,
+            "a moved down a row and the selection with it"
+        );
+        app.handle_key(KeyCode::Enter);
+        assert_eq!(opened(&app), Some(Key::Task(a.id.clone())));
+    }
+
+    #[test]
+    fn going_back_finds_the_item_that_was_selected_even_if_rows_moved() {
+        let a = task("a", 10);
+        let b = task("b", 20);
+        let mut app = App::new();
+        app.apply_frame(good(snap(vec![b.clone(), a.clone()], vec![])));
+        app.handle_key(KeyCode::Down);
+        app.handle_key(KeyCode::Enter);
+        assert_eq!(opened(&app), Some(Key::Task(a.id.clone())));
+        let newer = task("newer", 30);
+        app.apply_frame(good(snap(
+            vec![newer.clone(), b.clone(), a.clone()],
+            vec![],
+        )));
+        app.handle_key(KeyCode::Esc);
+        assert_eq!(app.screen, Screen::List);
+        assert_eq!(app.items()[app.selected].key, Key::Task(a.id.clone()));
+        app.handle_key(KeyCode::Enter);
+        assert_eq!(opened(&app), Some(Key::Task(a.id)));
+    }
+
+    #[test]
+    fn a_selected_item_that_goes_away_leaves_the_nearest_row_selected() {
+        let (a, b, c) = (task("a", 10), task("b", 20), task("c", 30));
+        let mut app = App::new();
+        app.apply_frame(good(snap(vec![c.clone(), b.clone(), a.clone()], vec![])));
+        app.handle_key(KeyCode::Down);
+        assert_eq!(app.items()[app.selected].key, Key::Task(b.id.clone()));
+        app.apply_frame(good(snap(vec![c.clone(), a.clone()], vec![])));
+        assert_eq!(app.items()[app.selected].key, Key::Task(a.id.clone()));
+        app.apply_frame(good(snap(vec![c.clone()], vec![])));
+        assert_eq!(app.selected, 0);
+        app.apply_frame(good(snap(vec![], vec![])));
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.handle_key(KeyCode::Enter), Command::None);
+        // a new item after that is selectable again
+        app.apply_frame(good(snap(vec![b.clone()], vec![])));
+        app.handle_key(KeyCode::Enter);
+        assert_eq!(opened(&app), Some(Key::Task(b.id)));
+    }
+
+    #[test]
+    fn a_payload_answer_for_a_request_left_behind_is_ignored() {
+        let (mut app, id) = app_on_task(1..=3);
+        assert_eq!(
+            app.handle_key(KeyCode::Char('p')),
+            Command::Payload(id.clone(), 3)
+        );
+        app.handle_key(KeyCode::Esc);
+        app.handle_key(KeyCode::Enter);
+        assert_eq!(app.screen, Screen::Task(id.clone()));
+        app.apply_frame(Frame {
+            payload: Some((id.clone(), 3, Some(("old".into(), false)))),
+            ..good(app.snapshot.clone().unwrap())
+        });
+        assert_eq!(
+            app.screen,
+            Screen::Task(id),
+            "the old answer reopens nothing"
+        );
+        assert!(app.payload.is_none());
+    }
+
+    #[test]
+    fn only_the_answer_to_the_pending_payload_request_opens_it() {
+        let (mut app, id) = app_on_task(1..=3);
+        let answer = |app: &mut App, seq| {
+            app.apply_frame(Frame {
+                payload: Some((id.clone(), seq, Some(("body".into(), false)))),
+                ..good(app.snapshot.clone().unwrap())
+            });
+        };
+        answer(&mut app, 3);
+        assert!(matches!(app.screen, Screen::Task(_)), "nothing was asked");
+        app.handle_key(KeyCode::Char('p'));
+        answer(&mut app, 2);
+        assert!(matches!(app.screen, Screen::Task(_)), "another seq");
+        answer(&mut app, 3);
+        assert_eq!(
+            app.screen,
+            Screen::Payload {
+                task: id.clone(),
+                seq: 3
+            }
+        );
+        app.handle_key(KeyCode::Esc);
+        answer(&mut app, 3);
+        assert!(matches!(app.screen, Screen::Task(_)), "answered once");
     }
 }

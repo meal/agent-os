@@ -990,21 +990,32 @@ budget use and age. It needs a terminal on stdout (exit 2 otherwise).
 | `Esc` | go back; on the list, quit |
 | `q`, `Ctrl-C` | quit |
 | `p` | show the selected event's payload |
+| `Up`/`Down`, `j`/`k`, `PgUp`/`PgDn` | on a payload, scroll it |
 | `r` | refresh now |
 
-A task shows its contract terms and its latest 200 events; reaching the top of the list loads an
+The list holds the newest 500 items, workflows and tasks outside any workflow counted together
+(a workflow's step tasks appear only inside it); when there are more, the header says "showing
+newest N". The selection stays on its item as new ones arrive above it. A row whose stored values
+cannot be read is left out, and the header counts it ("N unreadable rows skipped"). Until the first
+read arrives the list says "loading…".
+
+A task shows its contract terms (repository, profile, editable paths, verification profile,
+capabilities and every limit) and its latest 200 events; reaching the top of the list loads an
 older page of 200, and new events are appended on refresh. The screen refreshes about once a
 second; a "stale" header means the last read failed and the frame shown is the previous one.
 
 The cockpit only reads. It opens the database read-only, never writes to it, never migrates it
 and never takes the home lock, so it can run beside a live controller. It never creates the home
-or the database file; a missing database is refused with exit 2. A read-only open of a WAL
+or the database file; a missing database, or one it cannot open (the reason is given), is
+refused with exit 2. A read-only open of a WAL
 database may create empty `-wal`/`-shm` side files next to it when no controller is running (a
 SQLite behaviour). It refuses a database of another schema version and tells you to run any other
 `agentos` command to upgrade it.
 
-Payloads are shown only on `p`, once, as stored (capped at 65,536 characters, control characters
-stripped). Like `agentos events`, nothing is redacted, so a payload may contain task content.
+Payloads are shown only on `p`, once, as stored (capped at 65,536 characters, control and
+format characters stripped). A JSON payload is laid out one value per line, keys in their stored
+order; a payload cut by the cap, or one that is not JSON, is shown as it is. Like `agentos
+events`, nothing is redacted, so a payload may contain task content.
 
 ## Home layout
 

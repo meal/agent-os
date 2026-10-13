@@ -40,9 +40,14 @@ multi-home view, and notifications.
   caller's problem to retry (see "Refresh").
 - New queries on `View`, each returning a small row struct, each limited (default 500, newest
   first):
-  - `task_rows()`: id, state, goal, limits, usage counts, created time, and the workflow step it
-    belongs to, if any.
-  - `workflow_rows()`: id, name, step names with task ids, and the cancel flag.
+  - `task_rows()`: id, state, goal, limits, usage counts and created time of tasks outside any
+    workflow (a step task is read through its workflow, so step tasks never crowd loose tasks
+    out of the window).
+  - `workflow_rows()`: id, name, step names with task ids and states, and the cancel flag. All
+    steps of the windowed workflows come from one query, and usage is summed once per snapshot.
+  - The snapshot keeps the newest `limit` of the two lists together and says when it cut
+    anything. A row whose stored values cannot be parsed is skipped and counted, so one corrupt
+    row does not blank the list.
   - `event_rows(task, after_seq, limit)`: seq, type and ts only (no payload).
   - `event_payload(task, seq)`: one event's stored payload.
 - A workflow's state is the existing `derive_state` over its steps' task states. The cockpit has
@@ -63,7 +68,10 @@ multi-home view, and notifications.
 - **Detail screen:** a workflow shows its steps with task state and budget. A task shows its
   contract terms and a scrolling list of events (seq, type, time).
 - **Keys:** up/down and j/k move, Enter opens, Esc or q goes back or quits, Ctrl-C quits, `p` shows the
-  raw payload of the selected event, `r` forces a refresh. No key performs an action.
+  raw payload of the selected event, `r` forces a refresh. On a payload, up/down, j/k and
+  PgUp/PgDn scroll it. No key performs an action. The list keeps its selection by item, not by
+  row, so items arriving above it do not move it; only the answer to the payload request last
+  made from the open task opens a payload.
 - **Refresh:** a background thread polls about once a second and sends frames over a channel;
   contract frames carry the task id they belong to, and frames for a task that is not open are
   ignored, so
@@ -74,17 +82,22 @@ multi-home view, and notifications.
   terminal escapes. Long lines are truncated.
 - **Payloads:** `agentos events` prints payloads as stored, with no redaction. The cockpit
   therefore shows no payload in the list or by default. `p` shows one event's payload once, capped at
-  65,536 chars and sanitized as above. The README says payloads are shown as stored and may contain task
+  65,536 chars and sanitized as above (control and format characters, and U+2028/U+2029, are
+  dropped). A JSON payload is re-indented one value per line, keeping its key order and digits;
+  a payload cut by the cap, or not JSON, is shown raw. The README says payloads are shown as stored and may contain task
   content.
 
 ## 3. Errors and limits
 
 - Missing or unreadable home: exit 2 with the path and the reason. A missing home is never
-  created.
+  created. The database is opened before the terminal check, so these refusals do not need a
+  terminal.
 - Wrong schema version: refuse (section 1).
 - Empty home: show "no tasks or workflows yet" with the `submit` and `workflow submit` hints.
+  Before the first read the list says "loading…"; if that read failed it shows the reason.
 - The terminal is restored on any exit, including a panic. Ctrl-C quits, as do `q` and Esc on the list. A resize redraws.
-- Large homes: the list shows the newest 500 rows and the header says when more exist. A task's events
+- Large homes: the list shows the newest 500 items (workflows and loose tasks together) and the
+  header says "showing newest N" when more exist, and how many unreadable rows were skipped. A task's events
   show the latest 200; when the selection reaches the top, an older page of 200 loads, and new
   events are appended on refresh.
 - Ages use the host clock and are display only.

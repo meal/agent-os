@@ -1,4 +1,3 @@
-use agentos_core::workflow::display_label;
 use agentos_store::view::{StepView, WorkflowRow};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -7,7 +6,7 @@ use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap};
 
 use crate::app::{App, Screen};
-use crate::model::{Item, age};
+use crate::model::{Item, age, workflow_label};
 use crate::sanitize::clean;
 
 const EMPTY_HINT: &str =
@@ -40,11 +39,13 @@ fn header_line(app: &App, width: u16) -> String {
     if let Some(reason) = &app.stale {
         line.push_str(&format!(" · STALE: {}", clean(reason, width)));
     }
-    if let Some(snapshot) = &app.snapshot
-        && snapshot.more
-    {
-        let limit = snapshot.tasks.len().max(snapshot.workflows.len());
-        line.push_str(&format!(" · showing newest {limit}"));
+    if let Some(snapshot) = &app.snapshot {
+        if snapshot.skipped > 0 {
+            line.push_str(&format!(" · {} unreadable rows skipped", snapshot.skipped));
+        }
+        if snapshot.more {
+            line.push_str(&format!(" · showing newest {}", app.items().len()));
+        }
     }
     clean(&line, width)
 }
@@ -54,7 +55,7 @@ fn footer_text(screen: &Screen) -> &'static str {
         Screen::List => "↑↓ move · Enter open · r refresh · q quit",
         Screen::Workflow(_) => "↑↓ move · Enter open · Esc back · r refresh · q back",
         Screen::Task(_) => "↑↓ move · Esc back · p payload · r refresh · q back",
-        Screen::Payload { .. } => "Esc back · r refresh · q back",
+        Screen::Payload { .. } => "↑↓ scroll · PgUp/PgDn page · Esc back · r refresh · q back",
     }
 }
 
@@ -88,6 +89,15 @@ const LIST_HEADER: [&str; 8] = [
 ];
 
 fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
+    if app.snapshot.is_none() {
+        // Nothing read yet: say why rather than call the home empty.
+        let text = match &app.stale {
+            Some(reason) => format!("could not read the database: {}", clean(reason, CELL)),
+            None => "loading…".to_string(),
+        };
+        frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), area);
+        return;
+    }
     let items = app.items();
     if items.is_empty() {
         frame.render_widget(Paragraph::new(EMPTY_HINT).wrap(Wrap { trim: false }), area);
@@ -145,7 +155,7 @@ fn draw_workflow(frame: &mut Frame, app: &App, id: &agentos_core::ids::WorkflowI
     let title = format!(
         "{} · {}",
         clean(&workflow.name, CELL),
-        display_label(workflow.state(), workflow.approved)
+        workflow_label(workflow)
     );
     let rows: Vec<Row> = workflow.steps.iter().map(step_row).collect();
     let table = Table::new(
@@ -182,16 +192,44 @@ fn draw_task(frame: &mut Frame, app: &App, area: Rect) {
     ))];
     match &app.contract {
         Some(c) => {
-            lines.push(Line::from(format!("profile: {}", clean(&c.profile, width))));
+            let field =
+                |name: &str, value: &str| Line::from(clean(&format!("{name}: {value}"), width));
+            let repo = &c.repository;
+            lines.push(field(
+                "repository",
+                &format!("{} @ {}", repo.source, repo.revision),
+            ));
+            lines.push(field("profile", &c.profile));
+            lines.push(field("editable", &c.editable_paths.join(", ")));
+            lines.push(field("verification", &c.verification_profile));
             let caps: Vec<String> = c.capabilities.iter().map(|k| format!("{k:?}")).collect();
-            lines.push(Line::from(format!(
-                "capabilities: {}",
-                clean(&caps.join(", "), width)
-            )));
-            lines.push(Line::from(format!(
-                "limits: model_requests {} · tool_actions {} · deadline_seconds {}",
-                c.limits.model_requests, c.limits.tool_actions, c.limits.deadline_seconds
-            )));
+            lines.push(field("capabilities", &caps.join(", ")));
+            let l = &c.limits;
+            let limits = [
+                format!("model_requests {}", l.model_requests),
+                format!(
+                    "max_output_tokens_per_request {}",
+                    l.max_output_tokens_per_request
+                ),
+                format!("tool_actions {}", l.tool_actions),
+                format!("deadline_seconds {}", l.deadline_seconds),
+            ];
+            lines.push(field("limits", &limits.join(" · ")));
+            let mut worker = vec![
+                format!("worker_vcpus {}", l.worker_vcpus),
+                format!("worker_memory_mib {}", l.worker_memory_mib),
+            ];
+            for (name, value) in [
+                ("worker_disk_mib", l.worker_disk_mib),
+                ("worker_scratch_mib", l.worker_scratch_mib),
+                ("worker_disk_bandwidth_mib_s", l.worker_disk_bandwidth_mib_s),
+                ("worker_disk_iops", l.worker_disk_iops),
+            ] {
+                if let Some(v) = value {
+                    worker.push(format!("{name} {v}"));
+                }
+            }
+            lines.push(field("worker", &worker.join(" · ")));
         }
         None => lines.push(Line::from("loading contract…")),
     }
@@ -231,10 +269,11 @@ fn draw_payload(frame: &mut Frame, app: &App, seq: u64, area: Rect) {
         if truncated { " (truncated)" } else { "" }
     );
     let text = match &app.payload {
-        // Line breaks are the payload's own layout; each line is cleaned on its own.
-        Some((text, _)) => Text::from(
-            text.split('\n')
-                .map(|l| Line::from(clean(l, usize::MAX)))
+        // Already split into lines (pretty-printed when JSON) and cleaned when it arrived.
+        Some(_) => Text::from(
+            app.payload_lines
+                .iter()
+                .map(|l| Line::from(l.as_str()))
                 .collect::<Vec<_>>(),
         ),
         None => Text::from("no payload"),
@@ -242,7 +281,11 @@ fn draw_payload(frame: &mut Frame, app: &App, seq: u64, area: Rect) {
     let paragraph = Paragraph::new(text)
         .block(Block::bordered().title(title))
         .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, area);
+    // The rows the wrapped text needs, borders included, against the rows there are.
+    let rows = paragraph.line_count(area.width.saturating_sub(2));
+    let max = u16::try_from(rows.saturating_sub(usize::from(area.height))).unwrap_or(u16::MAX);
+    app.payload_view.set((max, area.height.saturating_sub(2)));
+    frame.render_widget(paragraph.scroll((app.payload_scroll.min(max), 0)), area);
 }
 
 #[cfg(test)]
@@ -284,6 +327,7 @@ mod tests {
             tasks,
             workflows: wfs,
             more: false,
+            skipped: 0,
         }));
         app
     }
@@ -302,17 +346,15 @@ mod tests {
 
     #[test]
     fn the_list_shows_a_workflow_and_a_task_but_not_the_workflows_step_task() {
-        let mut step_task = task("hidden step goal", 150, None);
+        let mut step_task = task("hidden step goal", 150);
         step_task.state = agentos_core::state::TaskState::Succeeded;
         let wf = workflow(
             "my-chain",
             200,
             vec![step(0, "a", Some(&step_task)), step(1, "b", None)],
         );
-        let mut st = step_task.clone();
-        st.workflow = Some((wf.id.clone(), 0));
-        let loose = task("loose goal", 100, None);
-        let out = screen(&app_with(vec![st, loose], vec![wf]), 120, 12);
+        let loose = task("loose goal", 100);
+        let out = screen(&app_with(vec![loose], vec![wf]), 120, 12);
         for want in [
             "KIND",
             "STATE",
@@ -334,7 +376,7 @@ mod tests {
 
     #[test]
     fn the_header_says_when_the_snapshot_is_cut_or_stale() {
-        let mut app = app_with(vec![task("a", 1, None)], vec![]);
+        let mut app = app_with(vec![task("a", 1)], vec![]);
         app.snapshot.as_mut().unwrap().more = true;
         let out = screen(&app, 120, 5);
         assert!(out.contains("showing newest 1"), "{out}");
@@ -345,7 +387,7 @@ mod tests {
 
     #[test]
     fn the_workflow_detail_shows_each_steps_name_and_pending() {
-        let mut t = task("g", 1, None);
+        let mut t = task("g", 1);
         t.state = agentos_core::state::TaskState::Succeeded;
         let mut skipped = step(2, "gamma", None);
         skipped.skipped = true;
@@ -418,7 +460,7 @@ mod tests {
     #[test]
     fn hostile_text_is_neutralised_in_the_list_and_the_detail() {
         let hostile = "fix \x1b[31m\nparser \u{202e}ok";
-        let t = task(hostile, 1, None);
+        let t = task(hostile, 1);
         let mut app = app_with(vec![t], vec![]);
         let list = buffer(&app, 100, 8);
         app.handle_key(KeyCode::Enter);
@@ -465,6 +507,7 @@ mod tests {
             Screen::Task(id) => id.clone(),
             s => panic!("{s:?}"),
         };
+        app.handle_key(KeyCode::Char('p'));
         app.apply_frame(Frame {
             payload: Some((id, 3, Some((text.into(), truncated)))),
             ..good(app.snapshot.clone().unwrap())
@@ -474,9 +517,9 @@ mod tests {
 
     #[test]
     fn a_truncated_payload_says_so() {
-        let out = screen(&payload_app("{\"a\": 1}", true), 100, 10);
+        let out = screen(&payload_app("{\"a\": [1, 2", true), 100, 10);
         assert!(out.contains("event 3 payload (truncated)"), "{out}");
-        assert!(out.contains("{\"a\": 1}"), "{out}");
+        assert!(out.contains("{\"a\": [1, 2"), "cut short, shown raw\n{out}");
         let out = screen(&payload_app("{}", false), 100, 10);
         assert!(out.contains("event 3 payload"), "{out}");
         assert!(!out.contains("truncated"), "{out}");
@@ -504,6 +547,7 @@ mod tests {
             Screen::Task(id) => id.clone(),
             s => panic!("{s:?}"),
         };
+        app.handle_key(KeyCode::Char('p'));
         app.apply_frame(Frame {
             payload: Some((id, 3, None)),
             ..good(app.snapshot.clone().unwrap())
@@ -516,7 +560,7 @@ mod tests {
     fn tiny_and_huge_areas_do_not_panic_on_any_screen() {
         let apps = [
             app_with(vec![], vec![]),
-            app_with(vec![task("g", 1, None)], vec![]),
+            app_with(vec![task("g", 1)], vec![]),
             {
                 let mut a = app_with(vec![], vec![workflow("w", 1, vec![step(0, "s", None)])]);
                 a.handle_key(KeyCode::Enter);
@@ -542,9 +586,7 @@ mod tests {
 
     #[test]
     fn six_hundred_items_draw_and_the_selection_stays_visible() {
-        let tasks: Vec<_> = (0..600)
-            .map(|i| task(&format!("goal-{i:03}"), i, None))
-            .collect();
+        let tasks: Vec<_> = (0..600).map(|i| task(&format!("goal-{i:03}"), i)).collect();
         let mut app = app_with(tasks, vec![]);
         for _ in 0..599 {
             app.handle_key(KeyCode::Down);
@@ -557,9 +599,7 @@ mod tests {
         );
         let top = screen(
             &app_with(
-                (0..600)
-                    .map(|i| task(&format!("goal-{i:03}"), i, None))
-                    .collect(),
+                (0..600).map(|i| task(&format!("goal-{i:03}"), i)).collect(),
                 vec![],
             ),
             120,
@@ -571,7 +611,7 @@ mod tests {
     #[test]
     fn three_hundred_wide_characters_fit_within_the_area() {
         let goal = "日".repeat(300);
-        let mut app = app_with(vec![task(&goal, 1, None)], vec![]);
+        let mut app = app_with(vec![task(&goal, 1)], vec![]);
         for (w, h) in [(60u16, 8u16), (20, 5), (101, 8)] {
             let out = screen(&app, w, h);
             assert_eq!(out.lines().count(), h as usize);
@@ -604,7 +644,7 @@ mod tests {
     #[test]
     fn wide_characters_never_straddle_cells_and_the_cut_is_visible() {
         let goal = "日".repeat(300);
-        let app = app_with(vec![task(&goal, 1, None)], vec![]);
+        let app = app_with(vec![task(&goal, 1)], vec![]);
         for w in [61u16, 100, 600] {
             let buf = buffer(&app, w, 4);
             let mut seen = 0;
@@ -641,7 +681,7 @@ mod tests {
 
     #[test]
     fn stale_survives_a_narrow_header_and_the_cut_note_goes_first() {
-        let mut app = app_with(vec![task("a", 1, None)], vec![]);
+        let mut app = app_with(vec![task("a", 1)], vec![]);
         app.snapshot.as_mut().unwrap().more = true;
         app.stale = Some("database is locked".into());
         let out = screen(&app, 60, 3);
@@ -655,15 +695,179 @@ mod tests {
         let goal = "0123456789abcdefghijklmnopqrst";
         assert_eq!(goal.len(), 30);
         let out = screen(
-            &app_with(vec![task(goal, 1, None), task("other", 2, None)], vec![]),
+            &app_with(vec![task(goal, 1), task("other", 2)], vec![]),
             80,
             6,
         );
         assert!(out.contains(goal), "{out}");
         // a cancelling task widens STATE; the row still draws, NAME just gets less
-        let mut t = task(goal, 1, None);
+        let mut t = task(goal, 1);
         t.cancel_requested = true;
         let out = screen(&app_with(vec![t], vec![]), 80, 6);
         assert!(out.contains("RUNNING (cancelling)"), "{out}");
+    }
+
+    fn payload_rows(app: &App, w: u16, h: u16) -> Vec<String> {
+        screen(app, w, h).lines().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn a_json_payload_is_pretty_printed_over_several_lines() {
+        let out = screen(
+            &payload_app(r#"{"first":1,"second":{"x":true}}"#, false),
+            60,
+            12,
+        );
+        let row = |needle: &str| out.lines().position(|l| l.contains(needle)).unwrap();
+        assert!(row("\"first\": 1") < row("\"second\": {"), "{out}");
+        assert!(row("\"second\": {") < row("\"x\": true"), "{out}");
+    }
+
+    #[test]
+    fn a_long_payload_scrolls_with_the_arrow_and_page_keys() {
+        let body: Vec<String> = (0..40).map(|i| format!("line-{i:02}")).collect();
+        let mut app = payload_app(&body.join("\n"), false);
+        let rows = payload_rows(&app, 40, 10);
+        assert!(rows.iter().any(|r| r.contains("line-00")), "{rows:?}");
+        assert!(!rows.iter().any(|r| r.contains("line-20")), "{rows:?}");
+        for _ in 0..3 {
+            app.handle_key(KeyCode::Down);
+        }
+        app.handle_key(KeyCode::Char('j'));
+        let rows = payload_rows(&app, 40, 10);
+        assert!(rows.iter().any(|r| r.contains("line-04")), "{rows:?}");
+        assert!(!rows.iter().any(|r| r.contains("line-03")), "{rows:?}");
+        app.handle_key(KeyCode::Up);
+        app.handle_key(KeyCode::Char('k'));
+        let rows = payload_rows(&app, 40, 10);
+        assert!(rows.iter().any(|r| r.contains("line-02")), "{rows:?}");
+        // a page is the payload's inner height: 10 rows less header, footer and borders
+        app.handle_key(KeyCode::PageDown);
+        let rows = payload_rows(&app, 40, 10);
+        assert!(rows.iter().any(|r| r.contains("line-08")), "{rows:?}");
+        for _ in 0..100 {
+            app.handle_key(KeyCode::PageDown);
+        }
+        let rows = payload_rows(&app, 40, 10);
+        assert!(
+            rows.iter().any(|r| r.contains("line-39")),
+            "the end is reachable\n{rows:?}"
+        );
+        app.handle_key(KeyCode::Up);
+        let rows = payload_rows(&app, 40, 10);
+        assert!(
+            rows.iter().any(|r| r.contains("line-33")),
+            "one Up moves back at once\n{rows:?}"
+        );
+        for _ in 0..100 {
+            app.handle_key(KeyCode::PageUp);
+        }
+        let rows = payload_rows(&app, 40, 10);
+        assert!(rows.iter().any(|r| r.contains("line-00")), "{rows:?}");
+        assert!(
+            rows.last().unwrap().contains("PgUp"),
+            "the footer names the scroll keys"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_single_line_payload_scrolls_too() {
+        let mut app = payload_app(&format!("{}END", "x".repeat(2000)), false);
+        assert!(!screen(&app, 40, 10).contains("END"));
+        for _ in 0..200 {
+            app.handle_key(KeyCode::Down);
+        }
+        assert!(screen(&app, 40, 10).contains("END"));
+    }
+
+    #[test]
+    fn a_new_payload_opens_at_its_top() {
+        let body: Vec<String> = (0..40).map(|i| format!("line-{i:02}")).collect();
+        let mut app = payload_app(&body.join("\n"), false);
+        screen(&app, 40, 10);
+        for _ in 0..10 {
+            app.handle_key(KeyCode::Down);
+        }
+        assert!(!screen(&app, 40, 10).contains("line-00"));
+        app.handle_key(KeyCode::Esc);
+        app.handle_key(KeyCode::Char('p'));
+        let id = match &app.screen {
+            Screen::Task(id) => id.clone(),
+            s => panic!("{s:?}"),
+        };
+        app.apply_frame(Frame {
+            payload: Some((id, 3, Some((body.join("\n"), false)))),
+            ..good(app.snapshot.clone().unwrap())
+        });
+        assert!(screen(&app, 40, 10).contains("line-00"));
+    }
+
+    #[test]
+    fn before_the_first_read_the_list_says_loading_and_a_failed_first_read_says_why() {
+        let app = App::new();
+        let out = screen(&app, 100, 6);
+        assert!(out.contains("loading…"), "{out}");
+        assert!(!out.contains("no tasks or workflows yet"), "{out}");
+        let mut app = App::new();
+        app.apply_frame(Frame {
+            snapshot: Err("database is locked".into()),
+            now: 1,
+            events: None,
+            contract: None,
+            payload: None,
+        });
+        let out = screen(&app, 100, 6);
+        assert!(!out.contains("no tasks or workflows yet"), "{out}");
+        let body: Vec<&str> = out.lines().skip(1).collect();
+        assert!(
+            body.iter().any(|l| l.contains("database is locked")),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn the_header_counts_unreadable_rows() {
+        let mut app = app_with(vec![task("a", 1)], vec![]);
+        app.snapshot.as_mut().unwrap().skipped = 3;
+        let out = screen(&app, 120, 5);
+        assert!(out.contains("3 unreadable rows skipped"), "{out}");
+    }
+
+    #[test]
+    fn the_header_says_how_many_items_the_cut_shows() {
+        let mut app = app_with(
+            vec![task("a", 1), task("b", 2)],
+            vec![workflow("w", 3, vec![step(0, "s", None)])],
+        );
+        app.snapshot.as_mut().unwrap().more = true;
+        let out = screen(&app, 120, 5);
+        assert!(out.contains("showing newest 3"), "{out}");
+    }
+
+    #[test]
+    fn the_task_detail_shows_the_whole_contract() {
+        let out = screen(&task_app(), 140, 20);
+        for want in [
+            "repository: /repo @ main",
+            "editable: src",
+            "verification: cargo",
+            "max_output_tokens_per_request 100",
+            "worker_vcpus 1",
+            "worker_memory_mib 512",
+        ] {
+            assert!(out.contains(want), "missing {want}\n{out}");
+        }
+    }
+
+    #[test]
+    fn a_cancelling_workflow_says_so_in_its_detail() {
+        let t = task("g", 1);
+        let mut wf = workflow("chain", 5, vec![step(0, "alpha", Some(&t))]);
+        wf.approved = true;
+        wf.cancel_requested = true;
+        let mut app = app_with(vec![], vec![wf]);
+        assert!(screen(&app, 100, 6).contains("RUNNING (cancelling)"));
+        app.handle_key(KeyCode::Enter);
+        assert!(screen(&app, 100, 6).contains("RUNNING (cancelling)"));
     }
 }

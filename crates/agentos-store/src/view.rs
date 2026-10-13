@@ -1,6 +1,7 @@
 //! A read-only window onto the store for the cockpit. `View` is a separate type from `Db`
 //! so that nothing reachable from it can write.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -23,6 +24,11 @@ pub struct View {
 pub enum ViewError {
     #[error("no agent-os database at {0}")]
     Missing(PathBuf),
+    #[error("cannot open {}: {source}", path.display())]
+    Open {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error(
         "database schema version {found} is not {expected}; run any other agentos command to upgrade it"
     )]
@@ -40,6 +46,8 @@ pub struct Snapshot {
     pub tasks: Vec<TaskRow>,
     pub workflows: Vec<WorkflowRow>,
     pub more: bool,
+    /// Rows left out because a stored value in them could not be read.
+    pub skipped: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -53,7 +61,6 @@ pub struct TaskRow {
     pub model_used: u64,
     pub tool_used: u64,
     pub created_ts: i64,
-    pub workflow: Option<(WorkflowId, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -109,14 +116,8 @@ pub enum EventPage {
     After(u64),
 }
 
-/// Per-task usage the way `usage_totals` in `effects.rs` counts it: settled rows count what
-/// they settled, released rows nothing, every other row what it reserved.
-const USAGE: &str = "(SELECT task_id,
-        SUM(CASE WHEN status = 'Settled' THEN COALESCE(settled_model_requests, 0)
-                 WHEN status = 'Released' THEN 0 ELSE reserved_model_requests END) AS m,
-        SUM(CASE WHEN status = 'Settled' THEN COALESCE(settled_tool_actions, 0)
-                 WHEN status = 'Released' THEN 0 ELSE reserved_tool_actions END) AS a
-      FROM usage GROUP BY task_id)";
+/// Model requests and tool actions used, by task id.
+type Usage = HashMap<String, (u64, u64)>;
 
 fn corrupt<E: std::fmt::Display>(what: &str) -> impl FnOnce(E) -> ViewError + '_ {
     move |e| ViewError::Corrupt(format!("{what}: {e}"))
@@ -136,9 +137,22 @@ fn state_of(s: String) -> Result<TaskState> {
 
 impl View {
     pub fn open(path: &Path) -> Result<View> {
-        if !path.is_file() {
-            return Err(ViewError::Missing(path.to_path_buf()));
+        let refused = |source| ViewError::Open {
+            path: path.to_path_buf(),
+            source,
+        };
+        match std::fs::metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ViewError::Missing(path.to_path_buf()));
+            }
+            Err(e) => return Err(refused(e)),
+            Ok(m) if !m.is_file() => {
+                return Err(refused(std::io::Error::other("not a regular file")));
+            }
+            Ok(_) => {}
         }
+        // SQLite's open error only says it cannot open; a plain open says why.
+        std::fs::File::open(path).map_err(refused)?;
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -162,19 +176,34 @@ impl View {
         )?)
     }
 
-    /// The newest `limit` tasks and workflows, read in one transaction so they agree.
+    /// The newest `limit` items, workflows and tasks outside any workflow together, read in
+    /// one transaction so they agree. A step task is read through its workflow.
     pub fn snapshot(&self, limit: usize) -> Result<Snapshot> {
         let tx = self.read()?;
         let fetch = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
-        let mut tasks = task_rows(&tx, fetch)?;
-        let mut workflows = workflow_rows(&tx, fetch)?;
-        let more = tasks.len() > limit || workflows.len() > limit;
-        tasks.truncate(limit);
-        workflows.truncate(limit);
+        let mut skipped = 0;
+        let usage = usage(&tx)?;
+        let (mut tasks, task_reads) = task_rows(&tx, fetch, &usage, &mut skipped)?;
+        let (mut workflows, workflow_reads) = workflow_rows(&tx, fetch, &usage, &mut skipped)?;
+        // Both are newest first: keep the newest `limit` of the two together.
+        let (mut t, mut w) = (0, 0);
+        while t + w < limit {
+            match (tasks.get(t), workflows.get(w)) {
+                (Some(task), Some(wf)) if task.created_ts >= wf.created_ts => t += 1,
+                (_, Some(_)) => w += 1,
+                (Some(_), None) => t += 1,
+                (None, None) => break,
+            }
+        }
+        let more =
+            task_reads > limit || workflow_reads > limit || tasks.len() > t || workflows.len() > w;
+        tasks.truncate(t);
+        workflows.truncate(w);
         Ok(Snapshot {
             tasks,
             workflows,
             more,
+            skipped,
         })
     }
 
@@ -196,6 +225,7 @@ impl View {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let (sql, bound) = match page {
             EventPage::Latest => (
+                // `?3 = ?3` only uses the bound: rusqlite refuses a parameter the SQL never reads.
                 "SELECT seq, type, ts FROM events WHERE task_id = ?1 AND ?3 = ?3
                  ORDER BY seq DESC LIMIT ?2",
                 0,
@@ -267,15 +297,70 @@ impl View {
     }
 }
 
-fn task_rows(tx: &Transaction, fetch: i64) -> Result<Vec<TaskRow>> {
-    let mut stmt = tx.prepare(&format!(
-        "SELECT t.id, t.state, t.cancel_requested, t.contract_json, t.created_ts,
-                COALESCE(u.m, 0), COALESCE(u.a, 0), ws.workflow_id, ws.idx
+#[cfg(test)]
+thread_local! {
+    /// Statements a snapshot prepared on this thread; tests read it to bound the query count.
+    static PREPARED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn prepare<'a>(tx: &'a Transaction, sql: &str) -> Result<rusqlite::Statement<'a>> {
+    #[cfg(test)]
+    PREPARED.with(|n| n.set(n.get() + 1));
+    Ok(tx.prepare(sql)?)
+}
+
+/// Per-task usage the way `usage_totals` in `effects.rs` counts it: settled rows count what
+/// they settled, released rows nothing, every other row what it reserved.
+fn usage(tx: &Transaction) -> Result<Usage> {
+    let mut stmt = prepare(
+        tx,
+        "SELECT task_id,
+            SUM(CASE WHEN status = 'Settled' THEN COALESCE(settled_model_requests, 0)
+                     WHEN status = 'Released' THEN 0 ELSE reserved_model_requests END),
+            SUM(CASE WHEN status = 'Settled' THEN COALESCE(settled_tool_actions, 0)
+                     WHEN status = 'Released' THEN 0 ELSE reserved_tool_actions END)
+         FROM usage GROUP BY task_id",
+    )?;
+    let raw = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    raw.into_iter()
+        .map(|(task, m, a)| Ok((task, (count("model usage", m)?, count("tool usage", a)?))))
+        .collect()
+}
+
+/// Rows that parse, keeping count of those that do not.
+fn readable<T>(rows: impl Iterator<Item = Result<T>>, skipped: &mut usize) -> Vec<T> {
+    rows.filter_map(|row| match row {
+        Ok(row) => Some(row),
+        Err(_) => {
+            *skipped += 1;
+            None
+        }
+    })
+    .collect()
+}
+
+/// The newest `fetch` tasks outside any workflow, and how many rows were read.
+fn task_rows(
+    tx: &Transaction,
+    fetch: i64,
+    usage: &Usage,
+    skipped: &mut usize,
+) -> Result<(Vec<TaskRow>, usize)> {
+    let mut stmt = prepare(
+        tx,
+        "SELECT t.id, t.state, t.cancel_requested, t.contract_json, t.created_ts
          FROM tasks t
-         LEFT JOIN {USAGE} u ON u.task_id = t.id
-         LEFT JOIN workflow_steps ws ON ws.task_id = t.id
-         ORDER BY t.created_ts DESC, t.rowid DESC LIMIT ?1"
-    ))?;
+         WHERE NOT EXISTS (SELECT 1 FROM workflow_steps ws WHERE ws.task_id = t.id)
+         ORDER BY t.created_ts DESC, t.rowid DESC LIMIT ?1",
+    )?;
     let raw = stmt
         .query_map([fetch], |r| {
             Ok((
@@ -284,43 +369,44 @@ fn task_rows(tx: &Transaction, fetch: i64) -> Result<Vec<TaskRow>> {
                 r.get::<_, bool>(2)?,
                 r.get::<_, String>(3)?,
                 r.get::<_, i64>(4)?,
-                r.get::<_, i64>(5)?,
-                r.get::<_, i64>(6)?,
-                r.get::<_, Option<String>>(7)?,
-                r.get::<_, Option<i64>>(8)?,
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    raw.into_iter()
-        .map(
-            |(id, state, cancel_requested, contract, created_ts, m, a, wf, idx)| {
-                let contract: Contract =
-                    serde_json::from_str(&contract).map_err(corrupt("contract"))?;
-                let workflow = match (wf, idx) {
-                    (Some(wf), Some(idx)) => {
-                        Some((id_of("workflow id", wf)?, count("step index", idx)?))
-                    }
-                    _ => None,
-                };
-                Ok(TaskRow {
-                    id: id_of("task id", id)?,
-                    state: state_of(state)?,
-                    cancel_requested,
-                    goal: contract.goal,
-                    model_limit: contract.limits.model_requests,
-                    tool_limit: contract.limits.tool_actions,
-                    model_used: count("model usage", m)?,
-                    tool_used: count("tool usage", a)?,
-                    created_ts,
-                    workflow,
-                })
-            },
-        )
-        .collect()
+    let reads = raw.len();
+    let rows = raw
+        .into_iter()
+        .map(|(id, state, cancel_requested, contract, created_ts)| {
+            let contract: Contract =
+                serde_json::from_str(&contract).map_err(corrupt("contract"))?;
+            let (model_used, tool_used) = usage.get(&id).copied().unwrap_or_default();
+            Ok(TaskRow {
+                id: id_of("task id", id)?,
+                state: state_of(state)?,
+                cancel_requested,
+                goal: contract.goal,
+                model_limit: contract.limits.model_requests,
+                tool_limit: contract.limits.tool_actions,
+                model_used,
+                tool_used,
+                created_ts,
+            })
+        });
+    Ok((readable(rows, skipped), reads))
 }
 
-fn workflow_rows(tx: &Transaction, fetch: i64) -> Result<Vec<WorkflowRow>> {
-    let mut stmt = tx.prepare(
+/// One `workflow_steps` row joined to its task's state.
+type StepRaw = (i64, String, Option<String>, bool, Option<String>);
+
+/// The newest `fetch` workflows with their steps, and how many workflow rows were read.
+fn workflow_rows(
+    tx: &Transaction,
+    fetch: i64,
+    usage: &Usage,
+    skipped: &mut usize,
+) -> Result<(Vec<WorkflowRow>, usize)> {
+    const WINDOW: &str = "SELECT id FROM workflows ORDER BY created_ts DESC, rowid DESC LIMIT ?1";
+    let mut stmt = prepare(
+        tx,
         "SELECT id, spec_json, options_json, approved_ts IS NOT NULL, cancel_requested, created_ts
          FROM workflows ORDER BY created_ts DESC, rowid DESC LIMIT ?1",
     )?;
@@ -336,51 +422,62 @@ fn workflow_rows(tx: &Transaction, fetch: i64) -> Result<Vec<WorkflowRow>> {
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    raw.into_iter()
-        .map(
-            |(id, spec, options, approved, cancel_requested, created_ts)| {
-                let spec: ChainSpec =
-                    serde_json::from_str(&spec).map_err(corrupt("workflow spec"))?;
-                let options: Value =
-                    serde_json::from_str(&options).map_err(corrupt("workflow options"))?;
-                let steps = step_views(tx, &id, &spec)?;
-                Ok(WorkflowRow {
-                    id: id_of("workflow id", id)?,
-                    name: spec.name,
-                    approved,
-                    cancel_requested,
-                    failed: options.get("failure").is_some(),
-                    created_ts,
-                    steps,
-                })
-            },
-        )
-        .collect()
+    // Every step of every windowed workflow in one read, grouped here.
+    let mut stmt = prepare(
+        tx,
+        &format!(
+            "SELECT ws.workflow_id, ws.idx, ws.name, ws.task_id, ws.skipped, t.state
+             FROM workflow_steps ws
+             LEFT JOIN tasks t ON t.id = ws.task_id
+             WHERE ws.workflow_id IN ({WINDOW})
+             ORDER BY ws.workflow_id, ws.idx"
+        ),
+    )?;
+    let mut steps: HashMap<String, Vec<StepRaw>> = HashMap::new();
+    for row in stmt.query_map([fetch], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            (
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, bool>(4)?,
+                r.get::<_, Option<String>>(5)?,
+            ),
+        ))
+    })? {
+        let (workflow, step) = row?;
+        steps.entry(workflow).or_default().push(step);
+    }
+    let reads = raw.len();
+    let rows = raw.into_iter().map(
+        |(id, spec, options, approved, cancel_requested, created_ts)| {
+            let spec: ChainSpec = serde_json::from_str(&spec).map_err(corrupt("workflow spec"))?;
+            let options: Value =
+                serde_json::from_str(&options).map_err(corrupt("workflow options"))?;
+            let steps = step_views(&id, &spec, steps.remove(&id).unwrap_or_default(), usage)?;
+            Ok(WorkflowRow {
+                id: id_of("workflow id", id)?,
+                name: spec.name,
+                approved,
+                cancel_requested,
+                failed: options.get("failure").is_some(),
+                created_ts,
+                steps,
+            })
+        },
+    );
+    Ok((readable(rows, skipped), reads))
 }
 
-fn step_views(tx: &Transaction, workflow: &str, spec: &ChainSpec) -> Result<Vec<StepView>> {
-    let mut stmt = tx.prepare(&format!(
-        "SELECT ws.idx, ws.name, ws.task_id, ws.skipped, t.state, COALESCE(u.m, 0), COALESCE(u.a, 0)
-         FROM workflow_steps ws
-         LEFT JOIN tasks t ON t.id = ws.task_id
-         LEFT JOIN {USAGE} u ON u.task_id = ws.task_id
-         WHERE ws.workflow_id = ?1 ORDER BY ws.idx"
-    ))?;
-    let raw = stmt
-        .query_map([workflow], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, Option<String>>(2)?,
-                r.get::<_, bool>(3)?,
-                r.get::<_, Option<String>>(4)?,
-                r.get::<_, i64>(5)?,
-                r.get::<_, i64>(6)?,
-            ))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+fn step_views(
+    workflow: &str,
+    spec: &ChainSpec,
+    raw: Vec<StepRaw>,
+    usage: &Usage,
+) -> Result<Vec<StepView>> {
     raw.into_iter()
-        .map(|(idx, name, task, skipped, state, m, a)| {
+        .map(|(idx, name, task, skipped, state)| {
             let idx: usize = count("step index", idx)?;
             let limits = &spec
                 .steps
@@ -390,6 +487,10 @@ fn step_views(tx: &Transaction, workflow: &str, spec: &ChainSpec) -> Result<Vec<
                 })?
                 .contract
                 .limits;
+            let (model_used, tool_used) = task
+                .as_ref()
+                .and_then(|t| usage.get(t).copied())
+                .unwrap_or_default();
             Ok(StepView {
                 idx,
                 name,
@@ -398,8 +499,8 @@ fn step_views(tx: &Transaction, workflow: &str, spec: &ChainSpec) -> Result<Vec<
                 task_state: state.map(state_of).transpose()?,
                 model_limit: limits.model_requests,
                 tool_limit: limits.tool_actions,
-                model_used: count("model usage", m)?,
-                tool_used: count("tool usage", a)?,
+                model_used,
+                tool_used,
             })
         })
         .collect()
@@ -558,7 +659,10 @@ mod tests {
             .create_step_task(&id, 0, &s.steps[0].contract, &s.digest())
             .unwrap();
         let snap = view.snapshot(10).unwrap();
-        assert_eq!(snap.tasks[0].workflow, Some((id.clone(), 0)));
+        assert!(
+            snap.tasks.is_empty(),
+            "a step task is read through its workflow"
+        );
         let w = &snap.workflows[0];
         assert!(w.approved);
         assert_eq!(w.steps[0].task_id.as_ref(), Some(&task));
@@ -641,5 +745,231 @@ mod tests {
         assert_eq!(text.chars().count(), 10);
         assert!(truncated);
         assert!(view.payload(&id, total + 1, 10).unwrap().is_none());
+    }
+
+    /// Rows written straight into the tables in one transaction, each with its own created time.
+    struct Seed {
+        conn: rusqlite::Connection,
+    }
+
+    impl Seed {
+        fn new(path: &Path) -> Seed {
+            Db::open(path).unwrap();
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("BEGIN").unwrap();
+            Seed { conn }
+        }
+
+        fn task(&self, ts: i64) -> String {
+            let id = TaskId::new().to_string();
+            self.conn
+                .execute(
+                    "INSERT INTO tasks(id, owner, contract_digest, contract_json, state,
+                        cancel_requested, workspace_digest, actions_used, step, deadline_ts,
+                        created_ts)
+                     VALUES(?1, 'o', 'd', ?2, 'Running', 0, 'w', 0, 0, 0, ?3)",
+                    params![id, serde_json::to_string(&testing::contract()).unwrap(), ts],
+                )
+                .unwrap();
+            id
+        }
+
+        /// A two-step workflow; with `tasks`, each step has a task created just after it.
+        fn workflow(&self, ts: i64, tasks: bool) -> String {
+            let id = WorkflowId::new().to_string();
+            self.conn
+                .execute(
+                    "INSERT INTO workflows(id, owner, spec_digest, spec_json, options_json,
+                        approved_ts, created_ts)
+                     VALUES(?1, 'o', 'd', ?2, '{}', ?3, ?3)",
+                    params![id, serde_json::to_string(&spec(2)).unwrap(), ts],
+                )
+                .unwrap();
+            for idx in 0..2 {
+                let task = tasks.then(|| self.task(ts + 1 + idx));
+                self.conn
+                    .execute(
+                        "INSERT INTO workflow_steps(workflow_id, idx, name, task_id)
+                         VALUES(?1, ?2, ?3, ?4)",
+                        params![id, idx, format!("step-{idx}"), task],
+                    )
+                    .unwrap();
+            }
+            id
+        }
+
+        fn done(self) {
+            self.conn.execute_batch("COMMIT").unwrap();
+        }
+    }
+
+    #[test]
+    fn step_tasks_do_not_crowd_loose_tasks_out_of_the_window() {
+        let (_dir, path) = home();
+        let seed = Seed::new(&path);
+        let loose: Vec<_> = (0..10).map(|i| seed.task(i)).collect();
+        for i in 0..300 {
+            seed.workflow(100 + 10 * i, true);
+        }
+        seed.done();
+        let snap = View::open(&path).unwrap().snapshot(500).unwrap();
+        let got: Vec<_> = snap.tasks.iter().map(|t| t.id.to_string()).collect();
+        assert_eq!(got.len(), 10, "no step task is a row");
+        assert!(loose.iter().all(|l| got.contains(l)), "every loose task");
+        assert_eq!(snap.workflows.len(), 300);
+        assert!(!snap.more, "310 items fit in 500");
+        assert!(snap.workflows.iter().all(|w| {
+            w.steps.len() == 2
+                && w.steps
+                    .iter()
+                    .all(|s| s.task_state == Some(TaskState::Running))
+        }));
+    }
+
+    #[test]
+    fn a_step_task_whose_workflow_is_outside_the_window_is_not_a_row() {
+        let (_dir, path) = home();
+        let seed = Seed::new(&path);
+        seed.workflow(1, true); // its step tasks are created at 2 and 3
+        let newest = seed.workflow(10, false);
+        seed.done();
+        let snap = View::open(&path).unwrap().snapshot(1).unwrap();
+        assert!(snap.tasks.is_empty(), "{:?}", snap.tasks);
+        assert_eq!(
+            snap.workflows
+                .iter()
+                .map(|w| w.id.to_string())
+                .collect::<Vec<_>>(),
+            vec![newest]
+        );
+        assert!(snap.more);
+    }
+
+    #[test]
+    fn the_merged_list_holds_at_most_limit_items_the_newest_overall() {
+        let (_dir, path) = home();
+        let seed = Seed::new(&path);
+        for i in 0..500 {
+            seed.task(2 * i);
+            seed.workflow(2 * i + 1, false);
+        }
+        seed.done();
+        let snap = View::open(&path).unwrap().snapshot(500).unwrap();
+        assert_eq!(snap.tasks.len() + snap.workflows.len(), 500);
+        assert!(snap.more);
+        let oldest_kept = snap
+            .tasks
+            .iter()
+            .map(|t| t.created_ts)
+            .chain(snap.workflows.iter().map(|w| w.created_ts))
+            .min()
+            .unwrap();
+        assert_eq!(oldest_kept, 500, "times 500..=999 are the newest 500");
+        let exact = View::open(&path).unwrap().snapshot(1000).unwrap();
+        assert_eq!(exact.tasks.len() + exact.workflows.len(), 1000);
+        assert!(!exact.more);
+    }
+
+    #[test]
+    fn a_snapshot_runs_a_fixed_number_of_statements_however_many_workflows() {
+        let (_dir, path) = home();
+        let seed = Seed::new(&path);
+        for i in 0..200 {
+            seed.workflow(10 * i, true);
+        }
+        seed.done();
+        let view = View::open(&path).unwrap();
+        PREPARED.with(|n| n.set(0));
+        let snap = view.snapshot(500).unwrap();
+        assert_eq!(snap.workflows.len(), 200);
+        // the usage aggregate, the loose tasks, the workflows and all their steps
+        assert_eq!(PREPARED.with(|n| n.get()), 4);
+    }
+
+    #[test]
+    fn a_row_that_cannot_be_read_is_skipped_and_counted() {
+        let (_dir, path) = home();
+        let seed = Seed::new(&path);
+        let good = seed.task(1);
+        let bad_contract = seed.task(2);
+        let bad_state = seed.task(3);
+        let good_wf = seed.workflow(4, true);
+        let bad_spec = seed.workflow(10, false);
+        let bad_step = seed.workflow(20, true);
+        let conn = &seed.conn;
+        conn.execute(
+            "UPDATE tasks SET contract_json = 'not json' WHERE id = ?1",
+            [&bad_contract],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET state = 'Exploded' WHERE id = ?1",
+            [&bad_state],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE workflows SET spec_json = '{' WHERE id = ?1",
+            [&bad_spec],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE workflow_steps SET idx = -1 WHERE workflow_id = ?1 AND idx = 1",
+            [&bad_step],
+        )
+        .unwrap();
+        seed.done();
+        let snap = View::open(&path).unwrap().snapshot(500).unwrap();
+        assert_eq!(
+            snap.tasks
+                .iter()
+                .map(|t| t.id.to_string())
+                .collect::<Vec<_>>(),
+            vec![good]
+        );
+        assert_eq!(
+            snap.workflows
+                .iter()
+                .map(|w| w.id.to_string())
+                .collect::<Vec<_>>(),
+            vec![good_wf]
+        );
+        assert_eq!(snap.skipped, 4);
+    }
+
+    #[test]
+    fn a_database_that_exists_but_cannot_be_opened_is_an_open_error_with_the_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        // the home is a regular file: the path below it is not "missing", it cannot be reached
+        let home = dir.path().join("home");
+        std::fs::write(&home, "").unwrap();
+        let path = home.join("agentos.db");
+        let err = View::open(&path).err().expect("refused");
+        assert!(
+            matches!(&err, ViewError::Open { path: p, .. } if p == &path),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "{err}"
+        );
+        // a directory where the database should be
+        let path = dir.path().join("agentos.db");
+        std::fs::create_dir(&path).unwrap();
+        assert!(matches!(View::open(&path), Err(ViewError::Open { .. })));
+    }
+
+    #[test]
+    fn an_unreadable_database_is_an_open_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, path) = home();
+        Db::open(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&path).is_ok() {
+            eprintln!("skipped: permissions do not bind this user (root)");
+            return;
+        }
+        let err = View::open(&path).err().expect("refused");
+        assert!(matches!(&err, ViewError::Open { .. }), "{err}");
+        assert!(err.to_string().contains("ermission denied"), "{err}");
     }
 }

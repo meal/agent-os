@@ -1776,26 +1776,77 @@ fn supervise_subcommands_are_hidden_from_help() {
     assert!(!String::from_utf8_lossy(&out).contains("supervise"));
 }
 
+/// The names in `dir`, sorted.
+fn listing(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
 #[test]
 fn cockpit_needs_a_terminal() {
+    // A home with a database, so the open succeeds and the terminal check is what refuses.
     let cli = Cli::bare();
+    std::fs::create_dir_all(cli.home()).unwrap();
+    drop(agentos_store::db::Db::open(&cli.home().join("agentos.db")).unwrap());
     cli.cmd(&["cockpit"])
         .assert()
         .code(2)
         .stderr(predicate::str::contains("needs a terminal"));
-    assert!(!cli.home().exists(), "nothing was created");
+    // A read-only open of a WAL database may add its empty side files, nothing else.
+    let mut found = listing(&cli.home());
+    found.retain(|n| n != "agentos.db-wal" && n != "agentos.db-shm");
+    assert_eq!(found, vec!["agentos.db"], "nothing else was created");
 }
 
 #[test]
 fn cockpit_with_no_database_is_refused_and_creates_nothing() {
-    // stdout is not a terminal in tests, so the terminal check fires first; the missing
-    // database case is covered where the terminal is available: call the library entry
-    // point directly.
     let cli = Cli::bare();
     let path = cli.home().join("agentos.db");
-    let err = agentos_cockpit::run(&path).unwrap_err();
-    assert!(err.to_string().contains("no agent-os database"));
+    cli.cmd(&["cockpit"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("no agent-os database"))
+        .stderr(predicate::str::contains(path.to_str().unwrap()));
     assert!(!cli.home().exists(), "nothing was created");
+}
+
+#[test]
+fn cockpit_refuses_another_schema_version() {
+    let cli = Cli::bare();
+    std::fs::create_dir_all(cli.home()).unwrap();
+    let path = cli.home().join("agentos.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+    }
+    let before = std::fs::read(&path).unwrap();
+    cli.cmd(&["cockpit"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("schema version 2"));
+    assert_eq!(std::fs::read(&path).unwrap(), before, "not migrated");
+    assert_eq!(listing(&cli.home()), vec!["agentos.db"]);
+}
+
+#[test]
+fn cockpit_on_a_home_it_cannot_reach_says_where_and_why() {
+    // The home is a regular file, so the database path below it cannot be reached.
+    let cli = Cli::bare();
+    std::fs::write(cli.home(), "").unwrap();
+    let path = cli.home().join("agentos.db");
+    cli.cmd(&["cockpit"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(format!(
+            "cannot open {}",
+            path.display()
+        )))
+        .stderr(predicate::str::contains("Not a directory"));
+    assert!(cli.home().is_file(), "left as it was");
 }
 
 #[test]
