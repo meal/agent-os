@@ -40,7 +40,10 @@ dependencies = [
  "agentos-core",
  "agentos-store",
  "ratatui",
+ "rusqlite",
  "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

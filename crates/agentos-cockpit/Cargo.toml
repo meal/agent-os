@@ -8,3 +8,8 @@ agentos-core = { path = "../agentos-core" }
 agentos-store = { path = "../agentos-store" }
 ratatui.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true
+tempfile.workspace = true
