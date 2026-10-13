@@ -180,6 +180,29 @@ pub fn derive_state(steps: &[StepStatus]) -> WorkflowState {
     WorkflowState::Running
 }
 
+/// The chain's state. `failed` is a failure the store recorded without any step showing it
+/// (`fail_workflow`: a handoff could not be built); it fails the chain at its first skipped
+/// step, or at the last step if none is skipped.
+pub fn state_of_steps(steps: &[StepStatus], failed: bool) -> WorkflowState {
+    if failed {
+        let step = steps
+            .iter()
+            .position(|s| *s == StepStatus::Skipped)
+            .unwrap_or(steps.len().saturating_sub(1));
+        return WorkflowState::Failed { step };
+    }
+    derive_state(steps)
+}
+
+/// `READY` for a chain that is not approved yet, else the state's own label.
+pub fn display_label(state: WorkflowState, approved: bool) -> &'static str {
+    if state == WorkflowState::Running && !approved {
+        "READY"
+    } else {
+        state.label()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,5 +334,46 @@ mod tests {
             WorkflowState::Cancelled { step: 1 }
         );
         assert_eq!(WorkflowState::Failed { step: 0 }.label(), "FAILED");
+    }
+
+    #[test]
+    fn a_recorded_failure_fails_the_chain_at_its_first_skipped_step() {
+        let steps = [
+            StepStatus::Task(TaskState::Succeeded),
+            StepStatus::Skipped,
+            StepStatus::Skipped,
+        ];
+        assert_eq!(
+            state_of_steps(&steps, true),
+            WorkflowState::Failed { step: 1 }
+        );
+    }
+
+    #[test]
+    fn a_recorded_failure_without_a_skipped_step_fails_the_last_one() {
+        let steps = [StepStatus::Task(TaskState::Succeeded), StepStatus::Pending];
+        assert_eq!(
+            state_of_steps(&steps, true),
+            WorkflowState::Failed { step: 1 }
+        );
+    }
+
+    #[test]
+    fn without_a_recorded_failure_the_state_is_derived() {
+        let steps = [StepStatus::Task(TaskState::Succeeded), StepStatus::Pending];
+        assert_eq!(state_of_steps(&steps, false), WorkflowState::Running);
+    }
+
+    #[test]
+    fn a_running_chain_nobody_approved_is_ready() {
+        assert_eq!(display_label(WorkflowState::Running, false), "READY");
+        assert_eq!(
+            display_label(WorkflowState::Running, true),
+            WorkflowState::Running.label()
+        );
+        assert_eq!(
+            display_label(WorkflowState::Succeeded, false),
+            WorkflowState::Succeeded.label()
+        );
     }
 }

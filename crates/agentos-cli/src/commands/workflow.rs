@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use agentos_core::ids::{Digest, TaskId, WorkflowId};
 use agentos_core::state::{TaskEvent, TaskState};
-use agentos_core::workflow::{ChainSpec, StepStatus, WorkflowState, derive_state};
+use agentos_core::workflow::{ChainSpec, StepStatus, WorkflowState, display_label, state_of_steps};
 use agentos_engine::export::{handoff, manifest};
 use agentos_engine::handoff::materialize;
 use agentos_engine::model::anthropic::ANTHROPIC_BASE_URL;
@@ -137,25 +137,13 @@ fn state_of(
             None => StepStatus::Pending,
         });
     }
-    let state = match w.options.get("failure") {
-        Some(_) => WorkflowState::Failed {
-            step: steps
-                .iter()
-                .position(|s| *s == StepStatus::Skipped)
-                .unwrap_or(steps.len() - 1),
-        },
-        None => derive_state(&steps),
-    };
+    let state = state_of_steps(&steps, w.options.get("failure").is_some());
     Ok((state, steps))
 }
 
 /// `READY` for a chain not approved yet, else the derived state's label.
 fn label(w: &WorkflowRecord, state: WorkflowState) -> &'static str {
-    if state == WorkflowState::Running && !w.approved {
-        "READY"
-    } else {
-        state.label()
-    }
+    display_label(state, w.approved)
 }
 
 /// What `workflow status` prints. A step that never got a task in a finished chain is
