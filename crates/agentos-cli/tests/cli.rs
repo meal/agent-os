@@ -7595,6 +7595,11 @@ mod workflow {
             );
             assert_eq!(api.hits(), 0);
         }
+        // Commands that never contact the model ignore a stale override.
+        cli.cmd(&["workflow", "status", &id])
+            .env("AGENTOS_ANTHROPIC_BASE_URL", "http://127.0.0.1:1")
+            .assert()
+            .success();
         // No flag: every step uses the approved endpoint.
         cli.cmd(&["workflow", "resume", &id])
             .env("ANTHROPIC_API_KEY", CANARY)
@@ -7606,6 +7611,32 @@ mod workflow {
         for task in steps.iter().filter_map(|(t, _)| t.as_ref()) {
             assert_eq!(cli.submitted(task)["model_endpoint"], api.url());
         }
+    }
+
+    #[test]
+    fn cancel_ignores_a_stale_model_endpoint_override() {
+        let cli = Cli::new();
+        let file = cli.write_chain(&cli.chain_value(&cli.repo_copy(), &["implement", "review"]));
+        let fix = fix_patch();
+        let comment = cli.comment_patch();
+        cli.cmd(&[
+            "workflow",
+            "submit",
+            &file,
+            "--step-patch",
+            fix.to_str().unwrap(),
+            "--step-patch",
+            comment.as_str(),
+            "--anthropic-base-url",
+            "http://127.0.0.1:2",
+        ])
+        .assert()
+        .success();
+        let id = only_workflow(&cli);
+        cli.cmd(&["workflow", "cancel", &id])
+            .args(["--anthropic-base-url", "http://127.0.0.1:1"])
+            .assert()
+            .success();
     }
 
     #[test]

@@ -68,7 +68,7 @@ pub async fn dispatch(home: Home, command: WorkflowCommand) -> Result<(), CliErr
             resume(home, &workflow_id(&id)?, crash_at.as_ref()).await
         }
         WorkflowCommand::Status { id } => {
-            let (_, store, w) = open(home, &workflow_id(&id)?)?;
+            let (_, store, w) = open(home, &workflow_id(&id)?, false)?;
             print(&status(&store, &w)?);
             Ok(())
         }
@@ -79,7 +79,11 @@ pub async fn dispatch(home: Home, command: WorkflowCommand) -> Result<(), CliErr
 
 /// The store and the workflow, with `home.worker` set to the worker recorded at submission;
 /// a `--worker` naming another one is refused (exit 2).
-fn open(mut home: Home, id: &WorkflowId) -> Result<(Home, Store, WorkflowRecord), CliError> {
+fn open(
+    mut home: Home,
+    id: &WorkflowId,
+    gate_endpoint: bool,
+) -> Result<(Home, Store, WorkflowRecord), CliError> {
     let store = home.open()?;
     let w = store.db.workflow(id).map_err(|e| match e {
         DbError::Workflow(_) => CliError::other(format!("unknown workflow {id}")),
@@ -102,11 +106,13 @@ fn open(mut home: Home, id: &WorkflowId) -> Result<(Home, Store, WorkflowRecord)
     }
     home.worker = Some(recorded);
     // Every step uses the endpoint approved with the chain, as a task uses its recorded one;
-    // an override naming another is refused before anything else happens.
+    // an override naming another is refused before anything else happens. Only commands that
+    // may contact the model gate on it; `status`, `cancel` and `export` must always work.
     if let Some(endpoint) = w.options["model_endpoint"].as_str() {
-        if home
-            .checked_base_url()?
-            .is_some_and(|requested| requested.trim_end_matches('/') != endpoint)
+        if gate_endpoint
+            && home
+                .checked_base_url()?
+                .is_some_and(|requested| requested.trim_end_matches('/') != endpoint)
         {
             return Err(CliError::usage(
                 "provider override differs from the recorded endpoint; submit a new workflow to change providers",
@@ -460,7 +466,7 @@ fn summarize(
 }
 
 async fn resume(home: Home, id: &WorkflowId, crash: Option<&CrashSpec>) -> Result<(), CliError> {
-    let (home, store, w) = open(home, id)?;
+    let (home, store, w) = open(home, id, true)?;
     // A cancel whose canceller died before it reached the running step is applied first, so
     // the step cannot run on to SUCCEEDED; a step still live then finishes its cancel below.
     reconcile_cancel(&store, &w)?;
@@ -785,7 +791,7 @@ fn step_inputs(
 /// Stops the chain: no further step starts, and a step task still running is cancelled as
 /// `agentos cancel` cancels a task.
 async fn cancel(home: Home, id: &WorkflowId) -> Result<(), CliError> {
-    let (home, store, _) = open(home, id)?;
+    let (home, store, _) = open(home, id, false)?;
     store.db.request_workflow_cancel(id)?;
     // Read after the request: from now on no step task can be created, so this is every one.
     let w = store.db.workflow(id)?;
@@ -801,7 +807,7 @@ async fn cancel(home: Home, id: &WorkflowId) -> Result<(), CliError> {
 /// The last step's bundle of a succeeded chain, plus `chain.json`: every step's task and
 /// digests in order.
 fn export(home: Home, id: &WorkflowId, dir: &Path) -> Result<(), CliError> {
-    let (_, store, w) = open(home, id)?;
+    let (_, store, w) = open(home, id, false)?;
     let (state, _) = state_of(&store, &w)?;
     match state {
         WorkflowState::Succeeded => {}
