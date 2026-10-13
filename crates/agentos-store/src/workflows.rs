@@ -224,6 +224,36 @@ impl Db {
         tx.commit()?;
         Ok(())
     }
+
+    /// Fails the chain where no step task can carry the failure (the handoff to the next step
+    /// could not be built): steps without a task are skipped for good, and `reason` is kept as
+    /// the options' `failure`. The first reason stands.
+    pub fn fail_workflow(&self, id: &WorkflowId, reason: &str) -> Result<()> {
+        let tx = self.immediate()?;
+        flags(&tx, id)?;
+        let options: String = tx.query_row(
+            "SELECT options_json FROM workflows WHERE id = ?1",
+            [id.as_str()],
+            |r| r.get(0),
+        )?;
+        let mut options: Value = serde_json::from_str(&options)?;
+        let Some(fields) = options.as_object_mut() else {
+            return refuse(format!("workflow {id} has options that are not an object"));
+        };
+        fields
+            .entry("failure")
+            .or_insert_with(|| Value::String(reason.to_string()));
+        tx.execute(
+            "UPDATE workflows SET options_json = ?2 WHERE id = ?1",
+            params![id.as_str(), serde_json::to_string(&options)?],
+        )?;
+        tx.execute(
+            "UPDATE workflow_steps SET skipped = 1 WHERE workflow_id = ?1 AND task_id IS NULL",
+            [id.as_str()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -436,6 +466,41 @@ mod tests {
         assert_eq!(task_count(&db), 1);
         // Cancelling again changes nothing.
         db.request_workflow_cancel(&id).unwrap();
+    }
+
+    #[test]
+    fn fail_skips_the_steps_without_a_task_and_keeps_the_first_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(&dir);
+        let s = spec(3);
+        let id = db
+            .create_workflow(&s, &json!({ "worker": "host" }))
+            .unwrap();
+        db.approve_workflow(&id).unwrap();
+        let d = s.digest();
+        let t0 = db
+            .create_step_task(&id, 0, &s.steps[0].contract, &d)
+            .unwrap();
+        set_state(&db, &t0, TaskState::Succeeded);
+
+        db.fail_workflow(&id, "handoff result mismatch").unwrap();
+
+        let w = db.workflow(&id).unwrap();
+        assert_eq!(
+            w.options,
+            json!({ "worker": "host", "failure": "handoff result mismatch" })
+        );
+        assert!(!w.cancel_requested);
+        assert!(!w.steps[0].skipped && w.steps[0].task_id.as_ref() == Some(&t0));
+        assert!(w.steps[1].skipped && w.steps[2].skipped);
+        refused(db.create_step_task(&id, 1, &s.steps[1].contract, &d));
+        assert_eq!(task_count(&db), 1);
+        db.fail_workflow(&id, "another reason").unwrap();
+        assert_eq!(
+            db.workflow(&id).unwrap().options["failure"],
+            "handoff result mismatch"
+        );
+        refused(db.fail_workflow(&agentos_core::ids::WorkflowId::new(), "x"));
     }
 
     #[test]
