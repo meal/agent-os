@@ -742,3 +742,78 @@ fn export(home: Home, id: &WorkflowId, dir: &Path) -> Result<(), CliError> {
     print(&chain);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn chain(source: &Path) -> ChainSpec {
+        let contract = json!({
+            "goal": "fix the parser", "profile": "python-stdlib-v1", "editable_paths": ["src/**"],
+            "verification_profile": "parser-checks-v1",
+            "capabilities": ["snapshot.read", "workspace.apply_patch", "verification.run", "artifact.export"],
+            "limits": { "model_requests": 3, "max_output_tokens_per_request": 100, "tool_actions": 4,
+                        "deadline_seconds": 600, "worker_vcpus": 1, "worker_memory_mib": 256 }
+        });
+        let steps: Vec<_> = ["implement", "review"]
+            .iter()
+            .map(|name| json!({ "name": name, "contract": contract }))
+            .collect();
+        ChainSpec::parse(
+            &json!({
+                "name": "chain",
+                "repository": { "source": source, "revision": "recorded-at-submission" },
+                "steps": steps
+            })
+            .to_string(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_step_task_without_a_submitted_event_fails_the_chain_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(Some(dir.path().join("home")), None).unwrap();
+        let store = home.open().unwrap();
+        let spec = chain(dir.path());
+        let id = store.db.create_workflow(&spec, &json!({})).unwrap();
+        store.db.approve_workflow(&id).unwrap();
+        // The controller died after linking step 1's task, before recording its submission.
+        let contract = &spec.steps[0].contract;
+        let task = store
+            .db
+            .create_step_task(&id, 0, contract, &Digest::of(b"contract"))
+            .unwrap();
+        assert!(!submitted(&store, &task).unwrap());
+        let lock = home.lock().unwrap();
+
+        run_workflow(&home, &store, &lock, &id, None).await.unwrap();
+
+        let w = store.db.workflow(&id).unwrap();
+        assert_eq!(w.steps[0].task_id.as_ref(), Some(&task));
+        assert_eq!(w.steps[1].task_id, None, "no second task");
+        let t = store.db.task(&task).unwrap();
+        assert_eq!(t.state, TaskState::Failed);
+        let failed: Vec<_> = store
+            .db
+            .events(&task)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == "Failed")
+            .collect();
+        assert_eq!(failed.len(), 1);
+        assert!(
+            failed[0].payload.to_string().contains(NOT_CREATED),
+            "{:?}",
+            failed[0]
+        );
+        let (state, _) = state_of(&store, &w).unwrap();
+        assert_eq!(state, WorkflowState::Failed { step: 0 });
+
+        // Running again changes nothing: the failed task is not failed twice.
+        run_workflow(&home, &store, &lock, &id, None).await.unwrap();
+        assert_eq!(store.db.events(&task).unwrap().len(), 2);
+        assert_eq!(store.db.workflow(&id).unwrap().steps[1].task_id, None);
+    }
+}

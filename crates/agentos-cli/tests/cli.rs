@@ -7353,4 +7353,180 @@ mod workflow {
             assert_eq!(submitted_profile_digest(&cli, &task), approved);
         }
     }
+
+    /// `workflow submit --yes` with `extra` args and the exit hook / test workers switched on
+    /// when `hook` is set; returns the assert for the caller to check the exit code of.
+    fn submit_chain_with(
+        cli: &Cli,
+        extra: &[&str],
+        hook: Option<&str>,
+    ) -> assert_cmd::assert::Assert {
+        let chain = cli.chain(&cli.repo_copy(), &["implement", "review"]);
+        let comment = cli.comment_patch();
+        let fix = fix_patch();
+        let mut args = vec![
+            "workflow",
+            "submit",
+            chain.as_str(),
+            "--yes",
+            "--step-patch",
+            fix.to_str().unwrap(),
+            "--step-patch",
+            comment.as_str(),
+        ];
+        args.extend_from_slice(extra);
+        let mut cmd = cli.cmd(&args);
+        if let Some(step) = hook {
+            cmd.env("AGENTOS_TEST_WORKERS", "1")
+                .env("AGENTOS_TEST_WORKFLOW_EXIT_AFTER_STEP", step);
+        }
+        cmd.assert()
+    }
+
+    /// The mode a bare `workflow resume` runs in (the chain records its worker).
+    fn resume_mode() -> Mode {
+        match Cli::mode() {
+            Mode::Fake => Mode::PlainFake,
+            other => other,
+        }
+    }
+
+    fn assert_one_task_per_step(cli: &Cli, id: &str) -> Vec<String> {
+        let steps = cli.wf_tasks(id);
+        assert_eq!(steps.len(), 2);
+        let tasks = task_ids(&steps);
+        assert_ne!(tasks[0], tasks[1]);
+        assert_eq!(task_dirs(cli), 2, "exactly one task per step");
+        for t in &tasks {
+            let types = cli.event_types(t);
+            assert_eq!(
+                types.iter().filter(|e| *e == "TaskCreated").count(),
+                1,
+                "{t}: {types:?}"
+            );
+            assert_eq!(types.iter().filter(|e| *e == "Submitted").count(), 1);
+            assert_tier_worker(cli, t);
+        }
+        tasks
+    }
+
+    #[test]
+    fn a_crash_mid_first_step_resumes_to_one_task_per_step() {
+        let cli = Cli::new();
+        submit_chain_with(&cli, &["--crash-at", "after-dispatch:apply_patch"], None).code(75);
+        let id = only_workflow(&cli);
+        let steps = cli.wf_tasks(&id);
+        let first = steps[0].0.clone().expect("step 1 has its task");
+        assert!(!TERMINAL.contains(&steps[0].1.as_str()), "{steps:?}");
+        assert_eq!(steps[1], (None, "PENDING".to_string()));
+
+        let resumed = cli.json_as(resume_mode(), &["workflow", "resume", &id]);
+        assert_eq!(resumed["state"], "SUCCEEDED", "{resumed}");
+        let tasks = assert_one_task_per_step(&cli, &id);
+        assert_eq!(tasks[0], first, "step 1 kept its task");
+        assert!(cli.wf_tasks(&id).iter().all(|(_, s)| s == "SUCCEEDED"));
+    }
+
+    #[test]
+    fn a_crash_between_the_steps_resumes_without_rerunning_step_one() {
+        let cli = Cli::new();
+        let chain = cli.chain(&cli.repo_copy(), &["implement", "review"]);
+        let (id, first) = stopped_after_step_one(&cli, &chain);
+        let steps = cli.wf_tasks(&id);
+        assert_eq!(steps[0].1, "SUCCEEDED");
+        assert_eq!(
+            steps[1],
+            (None, "PENDING".to_string()),
+            "no task for step 2"
+        );
+        assert_eq!(task_dirs(&cli), 1);
+        let before = cli.event_types(&first);
+        assert_eq!(before.iter().filter(|e| *e == "VerifyPassed").count(), 1);
+
+        let resumed = cli.json_as(resume_mode(), &["workflow", "resume", &id]);
+        assert_eq!(resumed["state"], "SUCCEEDED", "{resumed}");
+        let tasks = assert_one_task_per_step(&cli, &id);
+        assert_eq!(tasks[0], first);
+        assert_eq!(
+            cli.event_types(&first),
+            before,
+            "step 1's events are untouched, exactly one VerifyPassed"
+        );
+    }
+
+    #[test]
+    fn a_crash_mid_second_step_resumes_the_same_task() {
+        let cli = Cli::new();
+        let chain = cli.chain(&cli.repo_copy(), &["implement", "review"]);
+        // `:N` counts passes within one task's run, so step 2 is reached through the hook:
+        // step 1 done, then a resume that is killed in step 2's patch job.
+        let (id, first) = stopped_after_step_one(&cli, &chain);
+        let first_events = cli.event_types(&first);
+        cli.cmd_as(
+            resume_mode(),
+            &[
+                "workflow",
+                "resume",
+                &id,
+                "--crash-at",
+                "after-dispatch:apply_patch",
+            ],
+        )
+        .assert()
+        .code(75);
+        let steps = cli.wf_tasks(&id);
+        assert_eq!(steps[0].1, "SUCCEEDED");
+        let second = steps[1].0.clone().expect("step 2 has its task");
+        assert!(!TERMINAL.contains(&steps[1].1.as_str()), "{steps:?}");
+
+        let resumed = cli.json_as(resume_mode(), &["workflow", "resume", &id]);
+        assert_eq!(resumed["state"], "SUCCEEDED", "{resumed}");
+        let tasks = assert_one_task_per_step(&cli, &id);
+        assert_eq!(
+            tasks,
+            [first.clone(), second],
+            "both steps kept their tasks"
+        );
+        assert_eq!(cli.event_types(&first), first_events);
+    }
+
+    #[test]
+    fn gc_between_the_steps_does_not_break_the_handoff() {
+        let cli = Cli::new();
+        let chain = cli.chain(&cli.repo_copy(), &["implement", "review"]);
+        let (id, first) = stopped_after_step_one(&cli, &chain);
+        let work = cli.home().join("work").join(&first);
+        if !real_mode() {
+            assert!(work.exists(), "step 1's workspace exists before gc");
+        }
+
+        let report = cli.json(&["gc"]);
+        assert!(
+            report["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["status"] == "deleted"),
+            "gc collected step 1's finished work: {report}"
+        );
+        if !real_mode() {
+            assert!(
+                !work
+                    .join(if fake_mode() { "workspace" } else { "ws" })
+                    .exists(),
+                "step 1's workspace image is gone"
+            );
+        }
+
+        let resumed = cli.json_as(resume_mode(), &["workflow", "resume", &id]);
+        assert_eq!(resumed["state"], "SUCCEEDED", "{resumed}");
+        let tasks = assert_one_task_per_step(&cli, &id);
+        assert_eq!(tasks[0], first);
+        let (_, one) = cli.export(&tasks[0], "one");
+        assert_eq!(
+            cli.submitted(&tasks[1])["repository_digest"],
+            one["final_workspace_digest"],
+            "step 2 still starts from step 1's verified workspace"
+        );
+    }
 }
