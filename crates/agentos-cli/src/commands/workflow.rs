@@ -235,10 +235,14 @@ async fn submit(
         ),
         _ => None,
     };
-    // `recorded-at-submission` means this submission: the approved chain names the source's
-    // digest now, so step 1 runs on what was approved however late the chain is resumed.
+    // The approved chain names the source by its canonical path, so a later `resume` from
+    // another directory finds it; and `recorded-at-submission` means this submission: the
+    // chain names the source's digest now, so step 1 runs on what was approved however late
+    // the chain is resumed.
+    let source = Path::new(&spec.repository.source).canonicalize()?;
+    spec.repository.source = source.display().to_string();
+    spec.steps[0].contract.repository.source = spec.repository.source.clone();
     if spec.repository.revision == RECORDED_AT_SUBMISSION {
-        let source = Path::new(&spec.repository.source).canonicalize()?;
         let digest = workspace_digest(&source)
             .map_err(|e| CliError::usage(format!("cannot digest {}: {e}", source.display())))?
             .to_string();
@@ -560,8 +564,10 @@ fn step_inputs(
 /// Stops the chain: no further step starts, and a step task still running is cancelled as
 /// `agentos cancel` cancels a task.
 async fn cancel(home: Home, id: &WorkflowId) -> Result<(), CliError> {
-    let (home, store, w) = open(home, id)?;
+    let (home, store, _) = open(home, id)?;
     store.db.request_workflow_cancel(id)?;
+    // Read after the request: from now on no step task can be created, so this is every one.
+    let w = store.db.workflow(id)?;
     for task in w.steps.iter().filter_map(|s| s.task_id.as_ref()) {
         if !store.db.task(task)?.state.is_terminal() {
             cancel_task(&home, &store, task).await?;
