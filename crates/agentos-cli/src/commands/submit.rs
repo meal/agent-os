@@ -104,6 +104,16 @@ impl Request {
         worker_line(self.firecracker.as_ref())
     }
 
+    /// The digest of the fake agent's patch, as read once here and recorded.
+    pub(crate) fn patch_digest(&self) -> Option<Digest> {
+        self.patch.as_ref().map(|p| Digest::of(p.as_bytes()))
+    }
+
+    /// The digest of the `fake:` transcript, as read once here and recorded.
+    pub(crate) fn transcript_digest(&self) -> Option<Digest> {
+        self.transcript.as_deref().map(Digest::of)
+    }
+
     /// The jail decision of a Firecracker request; `None` for the host worker.
     pub(crate) fn jailed(&self) -> Option<bool> {
         self.firecracker.as_ref().map(|fc| fc.jailed)
@@ -479,40 +489,60 @@ pub(crate) async fn record_task(
     store: &Store,
     req: Request,
 ) -> Result<Recorded, CliError> {
-    let created = record_with(home, store, req, |contract, digest| {
+    let created = record_with(home, store, req, None, |contract, digest| {
         Ok(Ok(store.db.create_task(contract, digest)?))
     })
     .await?;
-    Ok(created.expect("create_task never refuses"))
+    created.map_err(|refusal| match refusal {
+        StepRefusal::Source(m) => CliError::usage(m),
+        StepRefusal::Store(m) | StepRefusal::Profile(m) => CliError::other(m),
+    })
+}
+
+/// Why a workflow step's task was not recorded; nothing of it was then.
+pub(crate) enum StepRefusal {
+    /// The store refused to create it (the chain is being cancelled, the step is taken or
+    /// skipped).
+    Store(String),
+    /// The staged verification profile is not the one the workflow approved.
+    Profile(String),
+    /// The staged copy of the source is not the revision it was validated at.
+    Source(String),
 }
 
 /// [`record_task`] for the task of step `idx` of an approved workflow, created and linked in
-/// one transaction. `Ok(Err(refusal))` when the store refuses to create it (the chain is being
-/// cancelled, the step is taken or skipped): nothing is recorded then.
+/// one transaction, on exactly the `approved_profile`.
 pub(crate) async fn record_step_task(
     home: &Home,
     store: &Store,
     req: Request,
     workflow: &WorkflowId,
     idx: usize,
-) -> Result<Result<Recorded, String>, CliError> {
-    record_with(home, store, req, |contract, digest| {
-        match store.db.create_step_task(workflow, idx, contract, digest) {
+    approved_profile: Digest,
+) -> Result<Result<Recorded, StepRefusal>, CliError> {
+    record_with(
+        home,
+        store,
+        req,
+        Some(approved_profile),
+        |contract, digest| match store.db.create_step_task(workflow, idx, contract, digest) {
             Ok(task) => Ok(Ok(task)),
-            Err(DbError::Workflow(refusal)) => Ok(Err(refusal)),
+            Err(DbError::Workflow(refusal)) => Ok(Err(StepRefusal::Store(refusal))),
             Err(e) => Err(e.into()),
-        }
-    })
+        },
+    )
     .await
 }
 
-/// `create` makes the task row, or refuses with a reason.
+/// `create` makes the task row, or refuses. `approved_profile`: the staged profile must be
+/// exactly this one, checked before the task exists.
 async fn record_with(
     home: &Home,
     store: &Store,
     req: Request,
-    create: impl FnOnce(&Contract, &Digest) -> Result<Result<TaskId, String>, CliError>,
-) -> Result<Result<Recorded, String>, CliError> {
+    approved_profile: Option<Digest>,
+    create: impl FnOnce(&Contract, &Digest) -> Result<Result<TaskId, StepRefusal>, CliError>,
+) -> Result<Result<Recorded, StepRefusal>, CliError> {
     let Request {
         mut contract,
         source,
@@ -556,10 +586,16 @@ async fn record_with(
             )));
         }
     }
+    if let Some(approved) = approved_profile.filter(|d| *d != profile_digest) {
+        return Ok(Err(StepRefusal::Profile(format!(
+            "verification profile {} changed since the workflow was approved: approved {approved}, found {profile_digest}",
+            contract.verification_profile
+        ))));
+    }
     if expected_revision.is_some_and(|d| d != repo_digest) {
-        return Err(CliError::usage(format!(
+        return Ok(Err(StepRefusal::Source(format!(
             "repository source changed while it was recorded (now {repo_digest})"
-        )));
+        ))));
     }
     if let Some(p) = &patch {
         fs::write(staging.path().join(AGENT_PATCH), p)?;

@@ -6546,10 +6546,20 @@ mod workflow {
             assert_eq!(step["idx"], i);
             assert_eq!(step["name"], ["implement", "review"][i]);
             assert_eq!(step["task_id"], task.as_str());
-            for field in ["contract_digest", "patch_digest", "verified_digest"] {
+            for field in [
+                "contract_digest",
+                "patch_digest",
+                "verified_digest",
+                "base_workspace_digest",
+            ] {
                 assert_eq!(step[field], own[field], "{field} of step {i}");
             }
         }
+        // Base to final can be checked: each step starts from the previous one's verified result.
+        assert_eq!(
+            steps[1]["base_workspace_digest"],
+            steps[0]["verified_digest"]
+        );
         // The bundle is the last step's.
         let manifest: Value =
             serde_json::from_slice(&fs::read(dir.join("manifest.json")).unwrap()).unwrap();
@@ -7528,5 +7538,221 @@ mod workflow {
             one["final_workspace_digest"],
             "step 2 still starts from step 1's verified workspace"
         );
+    }
+
+    // ---- final review fixes ----
+
+    #[test]
+    fn a_resumed_chain_keeps_the_approved_model_endpoint() {
+        let cli = Cli::new();
+        let api = fake_api("parser-fix-direct.json");
+        let mut chain = cli.chain_value(&cli.repo_copy(), &["implement", "review"]);
+        for step in chain["steps"].as_array_mut().unwrap() {
+            let c = &mut step["contract"];
+            c["capabilities"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("model.request"));
+            c["limits"]["model_requests"] = json!(12);
+        }
+        let file = cli.write_chain(&chain);
+        let assert = cli
+            .cmd(&[
+                "workflow",
+                "submit",
+                &file,
+                "--model",
+                "anthropic:x",
+                "--anthropic-base-url",
+                &format!("{}/", api.url()),
+            ])
+            .assert()
+            .success();
+        let screen = stderr_of(&assert);
+        assert!(
+            screen.contains(&format!("model endpoint:       {}\n", api.url())),
+            "the screen names the normalized endpoint: {screen}"
+        );
+        let id = only_workflow(&cli);
+        for environment in [false, true] {
+            let mut command = cli.cmd(&["workflow", "resume", &id]);
+            if environment {
+                command.env("AGENTOS_ANTHROPIC_BASE_URL", "http://127.0.0.1:1");
+            } else {
+                command.args(["--anthropic-base-url", "http://127.0.0.1:1"]);
+            }
+            command
+                .env("ANTHROPIC_API_KEY", CANARY)
+                .assert()
+                .code(2)
+                .stdout("")
+                .stderr(predicate::str::contains(
+                    "differs from the recorded endpoint",
+                ));
+            assert!(
+                cli.wf_tasks(&id).iter().all(|(t, _)| t.is_none()),
+                "nothing ran"
+            );
+            assert_eq!(api.hits(), 0);
+        }
+        // No flag: every step uses the approved endpoint.
+        cli.cmd(&["workflow", "resume", &id])
+            .env("ANTHROPIC_API_KEY", CANARY)
+            .assert()
+            .success();
+        let steps = cli.wf_tasks(&id);
+        assert_eq!(steps[0].1, "SUCCEEDED", "{steps:?}");
+        assert!(api.hits() >= 4);
+        for task in steps.iter().filter_map(|(t, _)| t.as_ref()) {
+            assert_eq!(cli.submitted(task)["model_endpoint"], api.url());
+        }
+    }
+
+    #[test]
+    fn a_legacy_profile_changed_before_a_later_step_leaves_the_chain_resumable() {
+        let cli = Cli::new();
+        let profiles = cli.path("profiles");
+        copy_tree(&fixtures().join("profiles"), &profiles).unwrap();
+        let check = profiles.join("parser-checks-v1/check_parser.py");
+        let original = fs::read_to_string(&check).unwrap();
+        let chain = cli.chain(&cli.repo_copy(), &["implement", "review"]);
+        cli.cmd_with_profiles(
+            &profiles,
+            &[
+                "workflow",
+                "submit",
+                &chain,
+                "--yes",
+                "--step-patch",
+                fix_patch().to_str().unwrap(),
+                "--step-patch",
+                &cli.comment_patch(),
+            ],
+        )
+        .env("AGENTOS_TEST_WORKERS", "1")
+        .env("AGENTOS_TEST_WORKFLOW_EXIT_AFTER_STEP", "1")
+        .assert()
+        .code(137);
+        let id = only_workflow(&cli);
+        fs::write(&check, format!("# changed\n{original}")).unwrap();
+
+        let refused = cli
+            .cmd_with_profiles(&profiles, &["workflow", "resume", &id])
+            .assert()
+            .code(2)
+            .stdout("");
+        assert!(
+            stderr_of(&refused).contains("changed since the workflow was approved"),
+            "{}",
+            stderr_of(&refused)
+        );
+        assert_eq!(cli.wf_tasks(&id)[1], (None, "PENDING".to_string()));
+        assert!(
+            !cli.home()
+                .join("workflows")
+                .join(&id)
+                .join("handoff-1")
+                .exists(),
+            "no handoff is left behind"
+        );
+        assert_eq!(task_dirs(&cli), 1);
+
+        fs::write(&check, &original).unwrap();
+        let out = cli.json_with_profiles(&profiles, &["workflow", "resume", &id]);
+        assert_eq!(out["state"], "SUCCEEDED", "{out}");
+    }
+
+    #[test]
+    fn a_step_task_recorded_with_another_profile_is_not_run() {
+        let cli = Cli::new();
+        let chain = cli.chain(&cli.repo_copy(), &["implement", "review"]);
+        let (id, _) = stopped_after_step_one(&cli, &chain);
+        cli.cmd_as(
+            resume_mode(),
+            &[
+                "workflow",
+                "resume",
+                &id,
+                "--crash-at",
+                "after-dispatch:apply_patch",
+            ],
+        )
+        .assert()
+        .code(75);
+        let second = cli.wf_tasks(&id)[1].0.clone().unwrap();
+        // The step task's record names a profile the chain never approved.
+        rusqlite::Connection::open(cli.home().join("agentos.db"))
+            .unwrap()
+            .execute(
+                "UPDATE events SET payload=json_set(payload, '$.profile_digest', ?2)
+                 WHERE task_id=?1 AND type='Submitted'",
+                rusqlite::params![second, "0".repeat(64)],
+            )
+            .unwrap();
+        let before = cli.events(&second);
+        let refused = cli
+            .cmd_as(resume_mode(), &["workflow", "resume", &id])
+            .assert()
+            .code(2);
+        assert!(
+            stderr_of(&refused).contains("not the one the workflow approved"),
+            "{}",
+            stderr_of(&refused)
+        );
+        assert_eq!(cli.events(&second), before, "the task did not run");
+    }
+
+    #[test]
+    fn a_cancel_whose_task_request_was_lost_still_wins_on_resume() {
+        let cli = Cli::new();
+        let chain = cli.chain(&cli.repo_copy(), &["implement", "review"]);
+        let (id, _) = stopped_after_step_one(&cli, &chain);
+        cli.cmd_as(
+            resume_mode(),
+            &[
+                "workflow",
+                "resume",
+                &id,
+                "--crash-at",
+                "after-dispatch:apply_patch",
+            ],
+        )
+        .assert()
+        .code(75);
+        let second = cli.wf_tasks(&id)[1].0.clone().unwrap();
+        assert_eq!(cli.status(&second)["state"], "RUNNING");
+        // The canceller died after committing the chain's flag, before cancelling the task.
+        let db = agentos_store::db::Db::open(&cli.home().join("agentos.db")).unwrap();
+        db.request_workflow_cancel(&serde_json::from_value(json!(id)).unwrap())
+            .unwrap();
+        drop(db);
+
+        let out = cli.json_as(resume_mode(), &["workflow", "resume", &id]);
+        assert_eq!(out["state"], "CANCELLED", "{out}");
+        assert_eq!(cli.status(&second)["state"], "CANCELLED");
+        assert!(
+            cli.event_types(&second)
+                .iter()
+                .any(|t| t == "CancelRequested")
+        );
+        cli.cmd(&["workflow", "resume", &id]).assert().code(1);
+    }
+
+    #[test]
+    fn a_missing_recorded_step_patch_fails_the_chain() {
+        let cli = Cli::new();
+        let chain = cli.chain(&cli.repo_copy(), &["implement", "review"]);
+        let (id, _) = stopped_after_step_one(&cli, &chain);
+        fs::remove_file(cli.home().join("workflows").join(&id).join("step-1.patch")).unwrap();
+
+        let out = cli.json(&["workflow", "resume", &id]);
+        assert_eq!(out["state"], "FAILED", "{out}");
+        assert_eq!(out["failed_step"], "review");
+        assert!(
+            out["failure"].as_str().unwrap().contains("step-1.patch"),
+            "{out}"
+        );
+        assert_eq!(task_dirs(&cli), 1);
+        cli.cmd(&["workflow", "resume", &id]).assert().code(1);
     }
 }

@@ -11,6 +11,7 @@ use agentos_core::state::{TaskEvent, TaskState};
 use agentos_core::workflow::{ChainSpec, StepStatus, WorkflowState, derive_state};
 use agentos_engine::export::{handoff, manifest};
 use agentos_engine::handoff::materialize;
+use agentos_engine::model::anthropic::ANTHROPIC_BASE_URL;
 use agentos_engine::routing::RoutingExecutor;
 use agentos_engine::supervised::SupervisedExecutor;
 use agentos_engine::workspace::workspace_digest;
@@ -21,8 +22,8 @@ use serde_json::{Value, json};
 use super::control::{cancel_task, resume_task};
 use super::export::export_task;
 use super::submit::{
-    RECORDED_AT_SUBMISSION, check_agent_cli_contract, check_agent_cli_flags, record_step_task,
-    terms, validate_contract,
+    RECORDED_AT_SUBMISSION, StepRefusal, check_agent_cli_contract, check_agent_cli_flags,
+    record_step_task, terms, validate_contract,
 };
 use super::{print, workflow_id};
 use crate::args::{WorkerKind, WorkflowCommand};
@@ -100,6 +101,19 @@ fn open(mut home: Home, id: &WorkflowId) -> Result<(Home, Store, WorkflowRecord)
         )));
     }
     home.worker = Some(recorded);
+    // Every step uses the endpoint approved with the chain, as a task uses its recorded one;
+    // an override naming another is refused before anything else happens.
+    if let Some(endpoint) = w.options["model_endpoint"].as_str() {
+        if home
+            .checked_base_url()?
+            .is_some_and(|requested| requested.trim_end_matches('/') != endpoint)
+        {
+            return Err(CliError::usage(
+                "provider override differs from the recorded endpoint; submit a new workflow to change providers",
+            ));
+        }
+        home.anthropic_base_url = Some(endpoint.to_string());
+    }
     Ok((home, store, w))
 }
 
@@ -253,6 +267,16 @@ async fn submit(
         spec.steps[0].contract.repository.revision = digest;
     }
     let transcript_digest = transcript.as_deref().map(Digest::of);
+    // The provider endpoint is approved with the chain, normalized as `Submitted` records it.
+    let model_endpoint = match &model_spec {
+        Some(ModelSpec::Anthropic(_)) => Some(
+            home.checked_base_url()?
+                .unwrap_or_else(|| ANTHROPIC_BASE_URL.into())
+                .trim_end_matches('/')
+                .to_string(),
+        ),
+        _ => None,
+    };
     let options = json!({
         "worker": worker.as_str(),
         // The jail decision approved with the chain binds every step, as `Submitted.jailed`
@@ -263,6 +287,7 @@ async fn submit(
         "agent_cli": agent_cli.map(AgentCli::name),
         "step_patch_digests": patches.iter().map(|p| Digest::of(p.as_bytes())).collect::<Vec<_>>(),
         "transcript_digest": transcript_digest,
+        "model_endpoint": model_endpoint,
     });
     let agent = match (agent_cli, &model_spec) {
         (Some(cli), Some(m)) => format!(
@@ -299,7 +324,14 @@ async fn submit(
     let id = store.db.create_workflow(&spec, &options)?;
     fs::rename(staging.keep(), home.workflow_dir(&id))?;
     tracing::info!(workflow_id = %id, spec_digest = %spec.digest(), "workflow submitted");
-    summarize(&id, &spec, &profile_digests, &agent, &first.worker_line());
+    summarize(
+        &id,
+        &spec,
+        &profile_digests,
+        &agent,
+        model_endpoint.as_deref(),
+        &first.worker_line(),
+    );
 
     match lock {
         Some(lock) => {
@@ -382,7 +414,14 @@ fn pin_steps(
 
 /// What the owner approves, on stderr: every step's terms, the agent, the worker and the
 /// summed budget.
-fn summarize(id: &WorkflowId, spec: &ChainSpec, profiles: &[Digest], agent: &str, worker: &str) {
+fn summarize(
+    id: &WorkflowId,
+    spec: &ChainSpec,
+    profiles: &[Digest],
+    agent: &str,
+    endpoint: Option<&str>,
+    worker: &str,
+) {
     eprintln!(
         "workflow {id} submitted; approve this chain of {} steps before it runs:",
         spec.steps.len()
@@ -405,6 +444,9 @@ fn summarize(id: &WorkflowId, spec: &ChainSpec, profiles: &[Digest], agent: &str
         }
     }
     eprintln!("  agent:                {agent}");
+    if let Some(endpoint) = endpoint {
+        eprintln!("  model endpoint:       {endpoint}");
+    }
     eprintln!("  worker:               {worker}");
     let sum = |f: &dyn Fn(&agentos_core::contract::Limits) -> u64| -> u64 {
         spec.steps.iter().map(|s| f(&s.contract.limits)).sum()
@@ -419,8 +461,15 @@ fn summarize(id: &WorkflowId, spec: &ChainSpec, profiles: &[Digest], agent: &str
 
 async fn resume(home: Home, id: &WorkflowId, crash: Option<&CrashSpec>) -> Result<(), CliError> {
     let (home, store, w) = open(home, id)?;
+    // A cancel whose canceller died before it reached the running step is applied first, so
+    // the step cannot run on to SUCCEEDED; a step still live then finishes its cancel below.
+    reconcile_cancel(&store, &w)?;
     let (state, _) = state_of(&store, &w)?;
-    if state != WorkflowState::Running {
+    let mut live = false;
+    for task in w.steps.iter().filter_map(|s| s.task_id.as_ref()) {
+        live |= !store.db.task(task)?.state.is_terminal();
+    }
+    if state != WorkflowState::Running && !live {
         return Err(CliError::other(format!(
             "workflow {id} is {}; nothing to resume",
             state.label()
@@ -447,6 +496,7 @@ pub(crate) async fn run_workflow(
     let n = store.db.workflow(id)?.steps.len();
     for idx in 0..n {
         let w = store.db.workflow(id)?;
+        reconcile_cancel(store, &w)?;
         let step = &w.steps[idx];
         let state = match &step.task_id {
             Some(task) if !submitted(store, task)? => {
@@ -458,7 +508,19 @@ pub(crate) async fn run_workflow(
                     store.db.append(task, &TaskEvent::Failed { reason })?.state
                 }
             }
-            Some(task) => resume_task(home, store, Some(lock), task, None, crash).await?,
+            Some(task) => {
+                // A step task runs only on the profile the chain approved.
+                let approved = approved_profile(&w, idx)?;
+                if !store.db.task(task)?.state.is_terminal()
+                    && recorded_profile(store, task)?.as_deref() != Some(&approved.to_string())
+                {
+                    return Err(CliError::usage(format!(
+                        "workflow {id}, step {:?}: task {task} was recorded with a verification profile that is not the one the workflow approved ({approved})",
+                        step.name
+                    )));
+                }
+                resume_task(home, store, Some(lock), task, None, crash).await?
+            }
             None => {
                 if step.skipped || w.cancel_requested {
                     return Ok(());
@@ -479,6 +541,44 @@ pub(crate) async fn run_workflow(
         }
     }
     Ok(())
+}
+
+/// A chain being cancelled has every live step task's cancel requested: the cancel may have
+/// committed the chain's flag and then died before it reached the task.
+fn reconcile_cancel(store: &Store, w: &WorkflowRecord) -> Result<(), CliError> {
+    if !w.cancel_requested {
+        return Ok(());
+    }
+    for task in w.steps.iter().filter_map(|s| s.task_id.as_ref()) {
+        let t = store.db.task(task)?;
+        if !t.state.is_terminal() && !t.cancel_requested {
+            store.db.append(task, &TaskEvent::CancelRequested)?;
+        }
+    }
+    Ok(())
+}
+
+/// The profile digest `task`'s `Submitted` recorded.
+fn recorded_profile(store: &Store, task: &TaskId) -> Result<Option<String>, CliError> {
+    Ok(store
+        .db
+        .events(task)?
+        .into_iter()
+        .find(|e| e.event_type == "Submitted")
+        .and_then(|e| e.payload["profile_digest"].as_str().map(str::to_string)))
+}
+
+/// The verification profile digest approved for step `idx`.
+fn approved_profile(w: &WorkflowRecord, idx: usize) -> Result<Digest, CliError> {
+    w.options["profile_digests"][idx]
+        .as_str()
+        .and_then(|d| Digest::from_hex(d).ok())
+        .ok_or_else(|| {
+            CliError::other(format!(
+                "workflow {} has no approved profile digest for step {:?}",
+                w.id, w.steps[idx].name
+            ))
+        })
 }
 
 fn submitted(store: &Store, task: &TaskId) -> Result<bool, CliError> {
@@ -505,9 +605,21 @@ fn exit_hook(done: usize) {
 
 type Started = (TaskId, RoutingExecutor<SupervisedExecutor>, Driver);
 
+/// Removes a staged handoff whatever happens: the step's task holds its own recorded copy, and
+/// a later attempt rebuilds it.
+struct Staged(PathBuf);
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Creates step `idx`'s task from the approved spec, on the previous step's handoff for a
 /// later step, and builds its executor and agent (before its approval, as `submit` does).
-/// `None` when the chain was failed here (no handoff, changed inputs) or cancelled meanwhile.
+/// `None` when the chain was failed here (no handoff, changed or missing recorded inputs) or
+/// cancelled meanwhile. A changed verification profile is refused (exit 2) and leaves the
+/// chain as it was.
 async fn start_step(
     home: &Home,
     store: &Store,
@@ -517,12 +629,42 @@ async fn start_step(
     let dir = home.workflow_dir(&w.id);
     let name = &w.spec.steps[idx].name;
     let mut contract = w.spec.steps[idx].contract.clone();
-    let handoff_dir = dir.join(format!("handoff-{idx}"));
+    let in_step = |e: CliError| CliError {
+        code: e.code,
+        message: format!("workflow {}, step {name:?}: {}", w.id, e.message),
+    };
+    let fail = |reason: String| -> Result<Option<Started>, CliError> {
+        tracing::warn!(workflow_id = %w.id, %reason, "workflow failed");
+        store.db.fail_workflow(&w.id, &reason)?;
+        Ok(None)
+    };
+    let inputs = match step_inputs(&dir, w, idx)? {
+        Ok(inputs) => inputs,
+        Err(reason) => return fail(reason),
+    };
+    // A profile from the legacy `--profiles` directory is not pinned in the contract: it must
+    // still be the one approved, checked here before any handoff is built and again on the
+    // staged copy before the task exists.
+    let approved = approved_profile(w, idx)?;
+    if contract.profile_digest.is_none() {
+        let id = &contract.verification_profile;
+        if let Some(dir) = home.resolve_profile(id, None)? {
+            let found = workspace_digest(&dir)
+                .map_err(|e| CliError::usage(format!("cannot digest {}: {e}", dir.display())))?;
+            if found != approved {
+                return Err(in_step(CliError::usage(format!(
+                    "verification profile {id} changed since the workflow was approved: approved {approved}, found {found}"
+                ))));
+            }
+        }
+    }
+    let mut staged = None;
     if idx > 0 {
         let prev = w.steps[idx - 1].task_id.as_ref().ok_or_else(|| {
             CliError::other(format!("workflow {}: step {} has no task", w.id, idx - 1))
         })?;
         fs::create_dir_all(&dir)?;
+        let handoff_dir = dir.join(format!("handoff-{idx}"));
         // A directory left by an earlier attempt is never trusted: it is rebuilt.
         match fs::symlink_metadata(&handoff_dir) {
             Ok(m) if m.is_dir() => fs::remove_dir_all(&handoff_dir)?,
@@ -540,50 +682,11 @@ async fn start_step(
             Ok(digest) => {
                 contract.repository.source = handoff_dir.display().to_string();
                 contract.repository.revision = digest.to_string();
+                staged = Some(Staged(handoff_dir));
             }
-            Err(reason) => {
-                let reason = format!("handoff to step {name:?} failed: {reason}");
-                tracing::warn!(workflow_id = %w.id, %reason, "workflow failed");
-                store.db.fail_workflow(&w.id, &reason)?;
-                return Ok(None);
-            }
+            Err(reason) => return fail(format!("handoff to step {name:?} failed: {reason}")),
         }
     }
-    let inputs = match step_inputs(&dir, w, idx)? {
-        Ok(inputs) => inputs,
-        Err(reason) => {
-            store.db.fail_workflow(&w.id, &reason)?;
-            return Ok(None);
-        }
-    };
-    // A profile from the legacy `--profiles` directory is not pinned in the contract: it must
-    // still be the one approved (checked again on the recorded copy below).
-    let approved_profile = w.options["profile_digests"][idx]
-        .as_str()
-        .and_then(|d| Digest::from_hex(d).ok())
-        .ok_or_else(|| {
-            CliError::other(format!(
-                "workflow {} has no approved profile digest for step {name:?}",
-                w.id
-            ))
-        })?;
-    let unpinned = contract.profile_digest.is_none();
-    if unpinned {
-        let id = &contract.verification_profile;
-        if let Some(dir) = home.resolve_profile(id, None)? {
-            let found = workspace_digest(&dir)
-                .map_err(|e| CliError::usage(format!("cannot digest {}: {e}", dir.display())))?;
-            if found != approved_profile {
-                return Err(CliError::usage(format!(
-                    "step {name:?}: verification profile {id} changed since the workflow was approved: approved {approved_profile}, found {found}"
-                )));
-            }
-        }
-    }
-    let in_step = |e: CliError| CliError {
-        code: e.code,
-        message: format!("workflow {}, step {name:?}: {}", w.id, e.message),
-    };
     // The jail decision approved with the chain binds this step as `Submitted.jailed` binds a
     // task: approved jailed never runs unjailed, approved unjailed stays so without the flag.
     let req = validate_contract(
@@ -596,26 +699,35 @@ async fn start_step(
         w.options["jailed"].as_bool(),
     )
     .map_err(in_step)?;
-    let rec = match record_step_task(home, store, req, &w.id, idx).await? {
+    // The bytes just read are the ones recorded: they must be the approved ones.
+    if inputs.patch.is_some()
+        && req.patch_digest().map(|d| d.to_string()).as_deref()
+            != w.options["step_patch_digests"][idx].as_str()
+    {
+        return fail(format!("recorded {} changed", step_patch(idx)));
+    }
+    if inputs.transcript
+        && req.transcript_digest().map(|d| d.to_string()).as_deref()
+            != w.options["transcript_digest"].as_str()
+    {
+        return fail(format!("recorded {TRANSCRIPT} changed"));
+    }
+    let rec = match record_step_task(home, store, req, &w.id, idx, approved).await? {
         Ok(rec) => rec,
-        // The store refused: a cancel that landed since the chain was read wins, and the step
-        // stays skipped; any other refusal is an error.
-        Err(_) if store.db.workflow(&w.id)?.cancel_requested => return Ok(None),
-        Err(refusal) => return Err(CliError::other(refusal)),
+        // A cancel that landed since the chain was read wins, and the step stays skipped; any
+        // other refusal by the store is an error.
+        Err(StepRefusal::Store(_)) if store.db.workflow(&w.id)?.cancel_requested => {
+            return Ok(None);
+        }
+        Err(StepRefusal::Store(refusal)) => return Err(CliError::other(refusal)),
+        Err(StepRefusal::Profile(refusal)) => return Err(in_step(CliError::usage(refusal))),
+        // The handoff changed after it was verified: the chain cannot go on from it.
+        Err(StepRefusal::Source(refusal)) if idx > 0 => {
+            return fail(format!("handoff to step {name:?} failed: {refusal}"));
+        }
+        Err(StepRefusal::Source(refusal)) => return Err(in_step(CliError::usage(refusal))),
     };
-    if unpinned && rec.profile_digest != approved_profile {
-        // Changed between the check above and the copy: the task never runs on it.
-        let reason = format!(
-            "verification profile changed since the workflow was approved: approved {approved_profile}, recorded {}",
-            rec.profile_digest
-        );
-        store.db.append(&rec.task, &TaskEvent::Failed { reason })?;
-        return Ok(None);
-    }
-    if idx > 0 {
-        // The task holds its own recorded copy of the handoff.
-        fs::remove_dir_all(&handoff_dir)?;
-    }
+    drop(staged);
     let task = rec.task.clone();
     let (exec, agent) = rec.runner(home, store)?;
     Ok(Some((task, exec, agent)))
@@ -626,11 +738,13 @@ async fn start_step(
 struct Inputs {
     patch: Option<PathBuf>,
     model: Option<String>,
+    /// The model replays the workflow's `fake:` transcript.
+    transcript: bool,
     agent_cli: Option<AgentCli>,
 }
 
-/// The step's recorded inputs, which must still be the files whose digests were approved;
-/// `Ok(Err(reason))` when one changed.
+/// The step's recorded inputs; `Ok(Err(reason))` when one is missing. `validate_contract`
+/// reads each once, and those bytes are checked against the approved digests.
 fn step_inputs(
     dir: &Path,
     w: &WorkflowRecord,
@@ -642,32 +756,28 @@ fn step_inputs(
         .map(str::parse::<AgentCli>)
         .transpose()
         .map_err(|e| CliError::other(format!("workflow {}: {e}", w.id)))?;
-    let unchanged = |file: &Path, recorded: &Value| -> Result<bool, CliError> {
-        let bytes = fs::read(file).map_err(|e| {
-            CliError::other(format!("cannot read recorded {}: {e}", file.display()))
-        })?;
-        Ok(recorded.as_str() == Some(Digest::of(&bytes).to_string().as_str()))
-    };
-    let (patch, model) = match o["model"].as_str() {
+    let present = |file: &Path| file.is_file();
+    let (patch, model, transcript) = match o["model"].as_str() {
         None => {
             let patch = dir.join(step_patch(idx));
-            if !unchanged(&patch, &o["step_patch_digests"][idx])? {
-                return Ok(Err(format!("recorded {} changed", step_patch(idx))));
+            if !present(&patch) {
+                return Ok(Err(format!("recorded {} is missing", step_patch(idx))));
             }
-            (Some(patch), None)
+            (Some(patch), None, false)
         }
         Some(m) if m.starts_with("fake:") => {
             let transcript = dir.join(TRANSCRIPT);
-            if !unchanged(&transcript, &o["transcript_digest"])? {
-                return Ok(Err(format!("recorded {TRANSCRIPT} changed")));
+            if !present(&transcript) {
+                return Ok(Err(format!("recorded {TRANSCRIPT} is missing")));
             }
-            (None, Some(format!("fake:{}", transcript.display())))
+            (None, Some(format!("fake:{}", transcript.display())), true)
         }
-        Some(m) => (None, Some(m.to_string())),
+        Some(m) => (None, Some(m.to_string()), false),
     };
     Ok(Ok(Inputs {
         patch,
         model,
+        transcript,
         agent_cli,
     }))
 }
@@ -724,6 +834,7 @@ fn export(home: Home, id: &WorkflowId, dir: &Path) -> Result<(), CliError> {
             "contract_digest": m.contract_digest,
             "patch_digest": m.patch_digest,
             "verified_digest": m.verified_digest,
+            "base_workspace_digest": m.base_workspace_digest,
         }));
         last = Some(task);
     }

@@ -88,6 +88,12 @@ impl ChainSpec {
             let obj = value.as_object_mut().ok_or_else(|| {
                 WorkflowError::Invalid(format!("step {:?}: contract must be an object", s.name))
             })?;
+            if i == 0 && obj.contains_key("repository") {
+                return Err(WorkflowError::Invalid(format!(
+                    "step {:?}: the first step starts from the chain's top-level repository; remove its own",
+                    s.name
+                )));
+            }
             if i > 0 && obj.contains_key("repository") {
                 return Err(WorkflowError::Invalid(format!(
                     "step {:?}: only the first step sets a repository; this one starts from the previous step's result",
@@ -253,6 +259,17 @@ mod tests {
         ] {
             assert!(ChainSpec::parse(&text).is_err(), "{what} must be refused");
         }
+    }
+
+    #[test]
+    fn a_first_step_with_its_own_repository_is_refused() {
+        let mut with_repo = contract("g");
+        with_repo["repository"] = json!({ "source": "/x", "revision": "recorded-at-submission" });
+        let e = ChainSpec::parse(&chain(vec![("a", with_repo), ("b", contract("g"))])).unwrap_err();
+        assert!(
+            e.to_string().contains("the chain's top-level repository"),
+            "{e}"
+        );
     }
 
     #[test]

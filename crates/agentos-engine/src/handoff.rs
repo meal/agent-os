@@ -212,8 +212,13 @@ mod tests {
         assert!(!out.join(".git").exists());
     }
 
+    /// A git-format patch creating `path`: an operation the screening accepts, so only the
+    /// exclusion guard stands between it and the workspace.
     fn add_file_patch(path: &str) -> Vec<u8> {
-        format!("--- /dev/null\n+++ b/{path}\n@@ -0,0 +1 @@\n+x\n").into_bytes()
+        format!(
+            "diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1 @@\n+x\n"
+        )
+        .into_bytes()
     }
 
     #[tokio::test]
@@ -227,7 +232,7 @@ mod tests {
             let err = materialize(&snap, &h, &out).await.unwrap_err();
 
             assert!(
-                err.contains("unsupported patch operation") || err.contains("excluded"),
+                err.contains(&format!("path excluded from the workspace digest: {path}")),
                 "{path}: {err}"
             );
             assert!(!out.exists(), "{path}");
