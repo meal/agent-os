@@ -127,6 +127,9 @@ enum Mode {
     /// No `--worker` flag, but the fake-guest switches (`AGENTOS_TEST_WORKERS=1`,
     /// `AGENTOS_TEST_FAKE_GUEST=1`): later commands on a Firecracker task.
     PlainFake,
+    /// `PlainFake` with the jail probe answering `ok`: later commands on a task the fake-jail
+    /// tier submitted as jailed (`AGENTOS_TEST_JAIL=fake`).
+    PlainFakeJailed,
     /// `--worker firecracker` over the fake guest.
     Fake,
     /// `--worker firecracker --firecracker $AGENTOS_FIRECRACKER --jailer $AGENTOS_JAILER`:
@@ -224,12 +227,15 @@ impl Cli {
                 .arg("--jailer")
                 .arg(&kvm.jailer_bin);
         }
-        if matches!(mode, Mode::Fake | Mode::PlainFake) {
+        if matches!(mode, Mode::Fake | Mode::PlainFake | Mode::PlainFakeJailed) {
             cmd.env("AGENTOS_TEST_WORKERS", "1")
                 .env("AGENTOS_TEST_FAKE_GUEST", "1");
         }
         // The tier's jail setting applies to the tier's own commands only.
         if tier && mode == Mode::Fake && test_jail_fake() {
+            cmd.env("AGENTOS_TEST_JAIL_PROBE", "ok");
+        }
+        if mode == Mode::PlainFakeJailed {
             cmd.env("AGENTOS_TEST_JAIL_PROBE", "ok");
         }
         cmd.args(args);
@@ -7008,11 +7014,7 @@ mod workflow {
         assert_eq!(steps[1], (None, "PENDING".to_string()));
 
         // Without `--worker`: the chain's recorded worker runs step 2 as it ran step 1.
-        let mode = match Cli::mode() {
-            Mode::Fake => Mode::PlainFake,
-            other => other,
-        };
-        let resumed = cli.json_as(mode, &["workflow", "resume", id]);
+        let resumed = cli.json_as(resume_mode(), &["workflow", "resume", id]);
         assert_eq!(resumed["state"], "SUCCEEDED", "{resumed}");
         let after = cli.wf_tasks(id);
         assert_eq!(after[0].0, steps[0].0, "step 1 did not run again");
@@ -7469,6 +7471,7 @@ mod workflow {
     /// The mode a bare `workflow resume` runs in (the chain records its worker).
     fn resume_mode() -> Mode {
         match Cli::mode() {
+            Mode::Fake if test_jail_fake() => Mode::PlainFakeJailed,
             Mode::Fake => Mode::PlainFake,
             other => other,
         }
