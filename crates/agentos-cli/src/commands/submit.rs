@@ -109,6 +109,16 @@ impl Request {
         self.patch.as_ref().map(|p| Digest::of(p.as_bytes()))
     }
 
+    /// The patch as read and checked here.
+    pub(crate) fn patch(&self) -> Option<&str> {
+        self.patch.as_deref()
+    }
+
+    /// The `fake:` transcript as read and parsed here.
+    pub(crate) fn transcript(&self) -> Option<&[u8]> {
+        self.transcript.as_deref()
+    }
+
     /// The digest of the `fake:` transcript, as read once here and recorded.
     pub(crate) fn transcript_digest(&self) -> Option<Digest> {
         self.transcript.as_deref().map(Digest::of)
@@ -194,15 +204,17 @@ fn host_kernel() -> String {
 }
 
 /// `--agent-cli`'s refusals that need no task file: exit 2, before anything is read or written.
+/// `patch_flag` names the command's own fake agent patch flag.
 pub(crate) fn check_agent_cli_flags(
     home: &Home,
+    patch_flag: &str,
     patch: Option<&Path>,
     model: Option<&str>,
 ) -> Result<(), CliError> {
     if patch.is_some() {
-        return Err(CliError::usage(
-            "pass either --fake-agent-patch or --agent-cli",
-        ));
+        return Err(CliError::usage(format!(
+            "pass either {patch_flag} or --agent-cli"
+        )));
     }
     if model.is_none() {
         return Err(CliError::usage(
@@ -240,7 +252,7 @@ pub(crate) fn validate(
     agent_cli: Option<AgentCli>,
 ) -> Result<Request, CliError> {
     if agent_cli.is_some() {
-        check_agent_cli_flags(home, patch, model)?;
+        check_agent_cli_flags(home, "--fake-agent-patch", patch, model)?;
     }
     let text = fs::read_to_string(task)
         .map_err(|e| CliError::usage(format!("cannot read {}: {e}", task.display())))?;

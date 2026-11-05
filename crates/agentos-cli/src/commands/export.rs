@@ -3,7 +3,7 @@ use std::path::Path;
 use agentos_core::broker::Resource;
 use agentos_core::contract::Capability;
 use agentos_core::ids::TaskId;
-use agentos_engine::export::{Manifest, export_bundle};
+use agentos_engine::export::{Manifest, export_bundle_with};
 use agentos_store::db::DbError;
 
 use super::print;
@@ -19,6 +19,16 @@ pub fn export(home: &Home, task: &TaskId, dir: &Path) -> Result<(), CliError> {
 
 /// [`export`] without the output: the manifest of the bundle written to `dir`.
 pub(crate) fn export_task(store: &Store, task: &TaskId, dir: &Path) -> Result<Manifest, CliError> {
+    export_task_with(store, task, dir, &[])
+}
+
+/// `export_task`, with `extra` top-level files written atomically with the bundle.
+pub(crate) fn export_task_with(
+    store: &Store,
+    task: &TaskId,
+    dir: &Path,
+    extra: &[(&str, &[u8])],
+) -> Result<Manifest, CliError> {
     // The broker decides, and the decision is journaled, before anything is read or written.
     // A task that is not finished cannot be exported whatever it holds: the export itself
     // says so (it also covers a task that was never approved, which has no handles).
@@ -36,5 +46,11 @@ pub(crate) fn export_task(store: &Store, task: &TaskId, dir: &Path) -> Result<Ma
             Err(e) => return Err(e.into()),
         }
     }
-    Ok(export_bundle(&store.db, &store.blobs, task, dir)?)
+    Ok(export_bundle_with(
+        &store.db,
+        &store.blobs,
+        task,
+        dir,
+        extra,
+    )?)
 }

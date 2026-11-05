@@ -926,7 +926,9 @@ When step N succeeds, the controller rebuilds step N+1's input from durable reco
 directory: it takes step N's recorded snapshot, applies step N's accepted patch blobs, checks that
 the result digests to step N's verified `final_workspace_digest`, and stages it as step N+1's
 snapshot, whose `repository.revision` is that digest. A mismatch, a missing blob, or a staged copy
-that no longer is that digest fails the chain. A staging directory left by an earlier attempt is
+that no longer is that digest fails the chain. A failure of the machine on the way (a database or
+disk error, git that cannot be started, an unreadable snapshot) is an error (exit 1) that leaves
+the chain as it was, for `workflow resume` to try again. A staging directory left by an earlier attempt is
 deleted and rebuilt, never trusted, and the staging directory is removed once the step's task has
 recorded its own copy or the attempt stops. Step N's workspace image is never needed, so `agentos gc` may
 collect it between steps.
@@ -953,8 +955,8 @@ collect it between steps.
   `DIR` is the last step's bundle plus `chain.json`, which lists every step's task id,
   `contract_digest`, `patch_digest`, `base_workspace_digest` and `verified_digest` in order, with
   the chain's `spec_digest`, so base to final can be checked: each step's base is the previous
-  step's verified digest. The bundle is written first and `chain.json` after it, so a failure in
-  between leaves a bundle without `chain.json`. Each step also stays exportable on its own with
+  step's verified digest. `chain.json` is staged with the bundle and they appear together, so a
+  failed export leaves `DIR` as it was. Each step also stays exportable on its own with
   `agentos export <task>`.
 
 ### Trust boundary

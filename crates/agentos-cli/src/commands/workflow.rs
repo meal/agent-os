@@ -2,15 +2,15 @@
 //! Every step is an ordinary task. It is created only once the previous step has succeeded,
 //! from the approved chain alone, on the previous step's verified result (its handoff).
 
-use std::fs::{self, File};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use agentos_core::ids::{Digest, TaskId, WorkflowId};
 use agentos_core::state::{TaskEvent, TaskState};
 use agentos_core::workflow::{ChainSpec, StepStatus, WorkflowState, display_label, state_of_steps};
-use agentos_engine::export::{handoff, manifest};
-use agentos_engine::handoff::materialize;
+use agentos_engine::export::{ExportError, handoff, manifest};
+use agentos_engine::handoff::{HandoffError, materialize};
 use agentos_engine::model::anthropic::ANTHROPIC_BASE_URL;
 use agentos_engine::routing::RoutingExecutor;
 use agentos_engine::supervised::SupervisedExecutor;
@@ -20,7 +20,7 @@ use agentos_store::workflows::WorkflowRecord;
 use serde_json::{Value, json};
 
 use super::control::{cancel_task, resume_task};
-use super::export::export_task;
+use super::export::export_task_with;
 use super::submit::{
     RECORDED_AT_SUBMISSION, StepRefusal, check_agent_cli_contract, check_agent_cli_flags,
     record_step_task, terms, validate_contract,
@@ -36,6 +36,8 @@ use crate::home::{DriverLock, Home, Store, TEST_WORKERS_ENV};
 const TRANSCRIPT: &str = "transcript.json";
 /// Test hook: exit 137 once step N (1-based) has succeeded, before the next step's task exists.
 const EXIT_AFTER_STEP_ENV: &str = "AGENTOS_TEST_WORKFLOW_EXIT_AFTER_STEP";
+/// Test hook: exit 137 once a submission's inputs are in place, before the workflow is recorded.
+const EXIT_BEFORE_RECORD_ENV: &str = "AGENTOS_TEST_WORKFLOW_EXIT_BEFORE_RECORD";
 /// How a step task that was created but never recorded as submitted ends.
 const NOT_CREATED: &str = "step was not completely created";
 
@@ -199,7 +201,12 @@ async fn submit(
     let mut spec = ChainSpec::parse(&text).map_err(|e| CliError::usage(e.to_string()))?;
     let n = spec.steps.len();
     if agent_cli.is_some() {
-        check_agent_cli_flags(&home, step_patches.first().map(PathBuf::as_path), model)?;
+        check_agent_cli_flags(
+            &home,
+            "--step-patch",
+            step_patches.first().map(PathBuf::as_path),
+            model,
+        )?;
     }
     if model.is_some() {
         if !step_patches.is_empty() {
@@ -211,13 +218,6 @@ async fn submit(
             step_patches.len()
         )));
     }
-    let patches = step_patches
-        .iter()
-        .map(|p| {
-            fs::read_to_string(p)
-                .map_err(|e| CliError::usage(format!("cannot read {}: {e}", p.display())))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
     // Step 1 is checked in full; the later steps' input does not exist yet.
     let first = validate_contract(
         &home,
@@ -228,6 +228,14 @@ async fn submit(
         agent_cli,
         None,
     )?;
+    // Step 1's patch is the one `validate_contract` read and checked: never read it twice.
+    let mut patches: Vec<String> = first.patch().map(str::to_string).into_iter().collect();
+    for p in step_patches.iter().skip(1) {
+        patches.push(
+            fs::read_to_string(p)
+                .map_err(|e| CliError::usage(format!("cannot read {}: {e}", p.display())))?,
+        );
+    }
     let worker = home.worker.unwrap_or(WorkerKind::Host);
     let profile_digests = pin_steps(&home, &mut spec, worker)?;
     if let Some(cli) = agent_cli {
@@ -239,13 +247,8 @@ async fn submit(
         .map(str::parse::<ModelSpec>)
         .transpose()
         .map_err(CliError::usage)?;
-    let transcript = match &model_spec {
-        Some(ModelSpec::Fake(path)) => Some(
-            fs::read(path)
-                .map_err(|e| CliError::usage(format!("cannot read {}: {e}", path.display())))?,
-        ),
-        _ => None,
-    };
+    // The transcript `validate_contract` read and parsed, not a second read of the file.
+    let transcript = first.transcript().map(<[u8]>::to_vec);
     // The approved chain names the source by its canonical path, so a later `resume` from
     // another directory finds it; and `recorded-at-submission` means this submission: the
     // chain names the source's digest now, so step 1 runs on what was approved however late
@@ -315,8 +318,18 @@ async fn submit(
     if let Some(bytes) = &transcript {
         fs::write(staging.path().join(TRANSCRIPT), bytes)?;
     }
-    let id = store.db.create_workflow(&spec, &options)?;
-    fs::rename(staging.keep(), home.workflow_dir(&id))?;
+    // The inputs are in place before the row that names them exists: a crash in between
+    // leaves a directory no workflow refers to, never a workflow without its inputs. A failed
+    // rename leaves `staging` to be removed on drop.
+    let id = WorkflowId::new();
+    let dest = home.workflow_dir(&id);
+    fs::rename(staging.path(), &dest)?;
+    let _ = staging.keep();
+    test_exit(EXIT_BEFORE_RECORD_ENV, "exited_before_record");
+    if let Err(e) = store.db.create_workflow_as(&id, &spec, &options) {
+        let _ = fs::remove_dir_all(&dest);
+        return Err(e.into());
+    }
     tracing::info!(workflow_id = %id, spec_digest = %spec.digest(), "workflow submitted");
     summarize(
         &id,
@@ -597,6 +610,16 @@ fn exit_hook(done: usize) {
     }
 }
 
+/// Exits 137 when `env` is `1`; honoured only with `AGENTOS_TEST_WORKERS=1`.
+fn test_exit(env: &str, what: &str) {
+    if std::env::var(TEST_WORKERS_ENV).as_deref() == Ok("1")
+        && std::env::var(env).as_deref() == Ok("1")
+    {
+        eprintln!("{}", json!({ what: true }));
+        std::process::exit(137);
+    }
+}
+
 type Started = (TaskId, RoutingExecutor<SupervisedExecutor>, Driver);
 
 /// Removes a staged handoff whatever happens: the step's task holds its own recorded copy, and
@@ -611,9 +634,10 @@ impl Drop for Staged {
 
 /// Creates step `idx`'s task from the approved spec, on the previous step's handoff for a
 /// later step, and builds its executor and agent (before its approval, as `submit` does).
-/// `None` when the chain was failed here (no handoff, changed or missing recorded inputs) or
-/// cancelled meanwhile. A changed verification profile is refused (exit 2) and leaves the
-/// chain as it was.
+/// `None` when the chain was failed here (a handoff that does not rebuild the verified
+/// workspace, changed or missing recorded inputs) or cancelled meanwhile. A changed
+/// verification profile is refused (exit 2), and an I/O or database failure is an error (exit
+/// 1); both leave the chain as it was.
 async fn start_step(
     home: &Home,
     store: &Store,
@@ -670,7 +694,14 @@ async fn start_step(
             Ok(h) => materialize(&home.task_dir(prev).join("snapshot"), &h, &handoff_dir)
                 .await
                 .map(|()| h.final_digest),
-            Err(e) => Err(e.to_string()),
+            // A blob that is gone is a lost record, not a passing failure.
+            Err(ExportError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
+                Err(HandoffError::Mismatch(format!("io: {e}")))
+            }
+            Err(e @ (ExportError::Db(_) | ExportError::Io(_))) => {
+                Err(HandoffError::Io(e.to_string()))
+            }
+            Err(e) => Err(HandoffError::Mismatch(e.to_string())),
         };
         match built {
             Ok(digest) => {
@@ -678,7 +709,16 @@ async fn start_step(
                 contract.repository.revision = digest.to_string();
                 staged = Some(Staged(handoff_dir));
             }
-            Err(reason) => return fail(format!("handoff to step {name:?} failed: {reason}")),
+            // Only a handoff that does not rebuild the verified workspace ends the chain; a
+            // failure of the machine on the way leaves it as it was, for `resume` to retry.
+            Err(HandoffError::Mismatch(reason)) => {
+                return fail(format!("handoff to step {name:?} failed: {reason}"));
+            }
+            Err(HandoffError::Io(reason)) => {
+                return Err(in_step(CliError::other(format!(
+                    "cannot build the handoff yet: {reason}; resume the workflow to try again"
+                ))));
+            }
         }
     }
     // The jail decision approved with the chain binds this step as `Submitted.jailed` binds a
@@ -840,10 +880,9 @@ fn export(home: Home, id: &WorkflowId, dir: &Path) -> Result<(), CliError> {
         "steps": steps,
     });
     let last = last.ok_or_else(|| CliError::other(format!("workflow {id} has no steps")))?;
-    export_task(&store, last, dir)?;
-    let mut f = File::create_new(dir.join("chain.json"))?;
-    f.write_all(&serde_json::to_vec_pretty(&chain)?)?;
-    f.sync_all()?;
+    // `chain.json` is written with the bundle, so the export appears whole or not at all.
+    let chain_json = serde_json::to_vec_pretty(&chain)?;
+    export_task_with(&store, last, dir, &[("chain.json", &chain_json)])?;
     print(&chain);
     Ok(())
 }

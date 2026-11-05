@@ -119,11 +119,11 @@ fn tick(view: &View, watched: Option<&mut Watched>) -> Frame {
 /// The latest page the first time, then whatever came after the last delivered seq.
 fn follow(view: &View, w: &mut Watched) -> Result<Option<EventUpdate>, ViewError> {
     let page = w.last.map_or(EventPage::Latest, EventPage::After);
-    let rows = view.events(&w.task, page, PAGE)?;
+    // The page and the total come from one read, so the count matches the rows delivered.
+    let (rows, total) = view.events_and_count(&w.task, page, PAGE)?;
     if w.last.is_some() && rows.is_empty() {
         return Ok(None);
     }
-    let total = view.event_count(&w.task)?;
     let task = w.task.clone();
     let first = w.last.is_none();
     w.last = Some(rows.last().map_or(w.last.unwrap_or(0), |r| r.seq));
@@ -136,9 +136,7 @@ fn follow(view: &View, w: &mut Watched) -> Result<Option<EventUpdate>, ViewError
 
 fn older(view: &View, task: TaskId, before: u64) -> Frame {
     let mut frame = base(view);
-    let read = view
-        .events(&task, EventPage::Before(before), PAGE)
-        .and_then(|rows| Ok((rows, view.event_count(&task)?)));
+    let read = view.events_and_count(&task, EventPage::Before(before), PAGE);
     match read {
         Ok((rows, _)) if rows.is_empty() => {}
         Ok((rows, total)) => frame.events = Some(EventUpdate::Prepend { task, rows, total }),

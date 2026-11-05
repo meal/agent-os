@@ -263,6 +263,8 @@ struct Contents {
     evidence: BTreeMap<Digest, Vec<u8>>,
     /// `analysis/report.json`.
     analysis_report: Option<Vec<u8>>,
+    /// Top-level files the caller adds to the bundle (`export_bundle_with`).
+    extra: Vec<(String, Vec<u8>)>,
 }
 
 fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
@@ -544,6 +546,7 @@ fn collect(db: &Db, blobs: &BlobStore, task: &TaskId) -> Result<Contents> {
         model_files,
         evidence,
         analysis_report,
+        extra: Vec::new(),
     })
 }
 
@@ -597,7 +600,24 @@ pub fn export_bundle(
     task: &TaskId,
     out_dir: &Path,
 ) -> Result<Manifest> {
-    let written = write_bundle(collect(db, blobs, task)?, out_dir, &|_| Ok(()))?;
+    export_bundle_with(db, blobs, task, out_dir, &[])
+}
+
+/// `export_bundle`, with `extra` files (top-level names, none of the bundle's own) written
+/// into the same staged directory, so they appear together with the bundle or not at all.
+pub fn export_bundle_with(
+    db: &Db,
+    blobs: &BlobStore,
+    task: &TaskId,
+    out_dir: &Path,
+    extra: &[(&str, &[u8])],
+) -> Result<Manifest> {
+    let mut contents = collect(db, blobs, task)?;
+    contents.extra = extra
+        .iter()
+        .map(|(name, bytes)| ((*name).to_string(), bytes.to_vec()))
+        .collect();
+    let written = write_bundle(contents, out_dir, &|_| Ok(()))?;
     let payload = serde_json::json!({
         "manifest_digest": written.manifest_digest,
         "dir": out_dir.display().to_string(),
@@ -693,6 +713,22 @@ fn write_bundle(contents: Contents, out_dir: &Path, before: BeforeWrite) -> Resu
     if let Some(report) = &contents.analysis_report {
         files.push(("analysis/report.json".into(), report));
     }
+    for (name, bytes) in &contents.extra {
+        let reserved = [
+            "manifest.json",
+            "patch.diff",
+            "patches",
+            "evidence",
+            "model",
+            "analysis",
+        ];
+        if name.contains('/') || reserved.contains(&name.as_str()) {
+            return Err(inconsistent(format!(
+                "extra bundle file {name:?} is not allowed"
+            )));
+        }
+        files.push((name.clone(), bytes));
+    }
     let manifest_json = serde_json::to_vec_pretty(&contents.manifest).map_err(DbError::from)?;
     files.push(("manifest.json".into(), &manifest_json));
     write_checked(root, &files, before)?;
@@ -767,6 +803,7 @@ mod tests {
             model_files: Vec::new(),
             analysis_report: None,
             evidence,
+            extra: Vec::new(),
         }
     }
 
@@ -834,5 +871,46 @@ mod tests {
             serde_json::from_slice(&fs::read(out.join("manifest.json")).unwrap()).unwrap();
         assert_eq!(on_disk, manifest);
         assert_eq!(names(root.path()), vec!["bundle"]);
+    }
+
+    #[test]
+    fn an_extra_file_is_part_of_the_bundle_or_nothing_is_written() {
+        let root = tempfile::tempdir().unwrap();
+        let out = root.path().join("bundle");
+        let mut with_chain = contents();
+        with_chain.extra = vec![("chain.json".into(), b"{}".to_vec())];
+        let fail_on_chain = |rel: &str| match rel {
+            "chain.json" => Err(io::Error::other("disk full")),
+            _ => Ok(()),
+        };
+
+        let err = write_bundle(with_chain, &out, &fail_on_chain).unwrap_err();
+        assert!(matches!(err, ExportError::Io(_)), "{err:?}");
+        assert!(
+            names(root.path()).is_empty(),
+            "no bundle without chain.json"
+        );
+
+        let mut with_chain = contents();
+        with_chain.extra = vec![("chain.json".into(), b"{}".to_vec())];
+        let written = write_bundle(with_chain, &out, &|_| Ok(())).unwrap();
+        assert_eq!(written.files, 6);
+        assert_eq!(fs::read(out.join("chain.json")).unwrap(), b"{}");
+    }
+
+    #[test]
+    fn an_extra_file_may_not_replace_or_nest_in_the_bundle() {
+        for name in ["manifest.json", "patch.diff", "evidence", "sub/chain.json"] {
+            let root = tempfile::tempdir().unwrap();
+            let out = root.path().join("bundle");
+            let mut c = contents();
+            c.extra = vec![(name.into(), b"{}".to_vec())];
+            let err = write_bundle(c, &out, &|_| Ok(())).unwrap_err();
+            assert!(
+                matches!(err, ExportError::Inconsistent(_)),
+                "{name}: {err:?}"
+            );
+            assert!(names(root.path()).is_empty(), "{name}");
+        }
     }
 }

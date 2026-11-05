@@ -5,14 +5,27 @@ use std::fs;
 use std::path::Path;
 
 use crate::export::Handoff;
-use crate::patch::{git, paths_of_file};
+use crate::patch::{PathsError, git, paths_of_file};
 use crate::workspace::{copy_tree, has_excluded_component, purge_excluded, workspace_digest};
+
+/// Why a handoff could not be materialized.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum HandoffError {
+    /// The recorded handoff does not rebuild the verified workspace: trying again cannot help.
+    #[error("{0}")]
+    Mismatch(String),
+    /// The machine failed on the way (I/O, running git): a later attempt may succeed.
+    #[error("{0}")]
+    Io(String),
+}
+
+use HandoffError::{Io, Mismatch};
 
 /// Copies `snapshot` to `out` (which must not exist), applies the handoff's patch and checks
 /// that the result is the workspace the handoff names. Any failure removes `out`.
-pub async fn materialize(snapshot: &Path, h: &Handoff, out: &Path) -> Result<(), String> {
+pub async fn materialize(snapshot: &Path, h: &Handoff, out: &Path) -> Result<(), HandoffError> {
     if fs::symlink_metadata(out).is_ok() {
-        return Err(format!("handoff destination {} exists", out.display()));
+        return Err(Io(format!("handoff destination {} exists", out.display())));
     }
     let built = build(snapshot, h, out).await;
     if built.is_err() {
@@ -21,58 +34,65 @@ pub async fn materialize(snapshot: &Path, h: &Handoff, out: &Path) -> Result<(),
     built
 }
 
-async fn build(snapshot: &Path, h: &Handoff, out: &Path) -> Result<(), String> {
-    copy_tree(snapshot, out).map_err(|e| format!("cannot copy snapshot: {e}"))?;
-    let base = workspace_digest(out).map_err(|e| format!("cannot digest workspace: {e}"))?;
+async fn build(snapshot: &Path, h: &Handoff, out: &Path) -> Result<(), HandoffError> {
+    copy_tree(snapshot, out).map_err(|e| Io(format!("cannot copy snapshot: {e}")))?;
+    let base = workspace_digest(out).map_err(|e| Io(format!("cannot digest workspace: {e}")))?;
     if base != h.base {
-        return Err(format!(
+        return Err(Mismatch(format!(
             "handoff base mismatch: expected {}, snapshot is {base}",
             h.base
-        ));
+        )));
     }
     if !h.patch.is_empty() {
         // The patch file lives next to, never inside, the workspace.
         let parent = out.parent().filter(|p| !p.as_os_str().is_empty());
         let scratch = tempfile::tempdir_in(parent.unwrap_or(Path::new(".")))
-            .map_err(|e| format!("scratch dir: {e}"))?;
+            .map_err(|e| Io(format!("scratch dir: {e}")))?;
         let patch_file = scratch.path().join("handoff.patch");
-        fs::write(&patch_file, &h.patch).map_err(|e| format!("cannot write patch: {e}"))?;
+        fs::write(&patch_file, &h.patch).map_err(|e| Io(format!("cannot write patch: {e}")))?;
         // The same screening as the fixture executor: unacceptable patch kinds (symlink modes
         // and the like) and paths the workspace digest does not cover, which could otherwise
         // leave unaccounted files in `out`. `symlink_on_path` is not needed: a snapshot cannot
         // contain symlinks, and a patch that creates one is refused by this screening.
-        let paths = paths_of_file(&patch_file, scratch.path()).await?;
+        let paths = paths_of_file(&patch_file, scratch.path())
+            .await
+            .map_err(|e| match e {
+                PathsError::Git(m) => Io(m),
+                PathsError::Refused(m) => Mismatch(m),
+            })?;
         if let Some(p) = paths.iter().find(|p| has_excluded_component(p)) {
-            return Err(format!("path excluded from the workspace digest: {p}"));
+            return Err(Mismatch(format!(
+                "path excluded from the workspace digest: {p}"
+            )));
         }
         // A planted `.git` would make `git apply` honour its repo-local configuration.
-        purge_excluded(out).map_err(|e| format!("cannot clean workspace: {e}"))?;
+        purge_excluded(out).map_err(|e| Io(format!("cannot clean workspace: {e}")))?;
         for args in [&["apply", "--check"][..], &["apply"][..]] {
             let res = git(out)
                 .args(args)
                 .arg(&patch_file)
                 .output()
                 .await
-                .map_err(|e| format!("cannot run git: {e}"))?;
+                .map_err(|e| Io(format!("cannot run git: {e}")))?;
             if !res.status.success() {
-                return Err(format!(
+                return Err(Mismatch(format!(
                     "patch does not apply: {}",
                     String::from_utf8_lossy(&res.stderr).trim()
-                ));
+                )));
             }
         }
     }
     // Belt and braces: nothing the digest ignores may remain in `out`.
-    let leftovers = purge_excluded(out).map_err(|e| format!("cannot clean workspace: {e}"))?;
+    let leftovers = purge_excluded(out).map_err(|e| Io(format!("cannot clean workspace: {e}")))?;
     if let Some(p) = leftovers.first() {
-        return Err(format!("patch left excluded path {p}"));
+        return Err(Mismatch(format!("patch left excluded path {p}")));
     }
-    let result = workspace_digest(out).map_err(|e| format!("cannot digest workspace: {e}"))?;
+    let result = workspace_digest(out).map_err(|e| Io(format!("cannot digest workspace: {e}")))?;
     if result != h.final_digest {
-        return Err(format!(
+        return Err(Mismatch(format!(
             "handoff result mismatch: expected {}, got {result}",
             h.final_digest
-        ));
+        )));
     }
     Ok(())
 }
@@ -84,7 +104,7 @@ mod tests {
 
     use agentos_core::ids::Digest;
 
-    use super::materialize;
+    use super::{HandoffError, materialize};
     use crate::export::Handoff;
     use crate::workspace::workspace_digest;
 
@@ -147,6 +167,9 @@ mod tests {
 
         let err = materialize(&snap, &h, &out).await.unwrap_err();
 
+        assert!(matches!(err, HandoffError::Mismatch(_)), "{err:?}");
+        let err = err.to_string();
+
         assert!(err.contains("handoff result mismatch"), "{err}");
         assert!(!out.exists());
     }
@@ -159,6 +182,9 @@ mod tests {
         let out = dir.path().join("out");
 
         let err = materialize(&snap, &h, &out).await.unwrap_err();
+
+        assert!(matches!(err, HandoffError::Mismatch(_)), "{err:?}");
+        let err = err.to_string();
 
         assert!(err.contains("handoff base mismatch"), "{err}");
         assert!(!out.exists());
@@ -173,7 +199,24 @@ mod tests {
 
         let err = materialize(&snap, &h, &out).await.unwrap_err();
 
+        assert!(matches!(err, HandoffError::Mismatch(_)), "{err:?}");
+        let err = err.to_string();
+
         assert!(err.contains("patch does not apply"), "{err}");
+        assert!(!out.exists());
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_that_cannot_be_read_is_an_io_error_not_a_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (snap, h) = setup(dir.path());
+        fs::remove_dir_all(&snap).unwrap();
+        let out = dir.path().join("out");
+
+        let err = materialize(&snap, &h, &out).await.unwrap_err();
+
+        assert!(matches!(err, HandoffError::Io(_)), "{err:?}");
+        assert!(err.to_string().contains("cannot copy snapshot"), "{err}");
         assert!(!out.exists());
     }
 
@@ -186,6 +229,9 @@ mod tests {
         fs::write(out.join("keep"), "mine").unwrap();
 
         let err = materialize(&snap, &h, &out).await.unwrap_err();
+
+        assert!(matches!(err, HandoffError::Io(_)), "{err:?}");
+        let err = err.to_string();
 
         assert!(err.contains("exists"), "{err}");
         assert_eq!(fs::read_to_string(out.join("keep")).unwrap(), "mine");
@@ -231,8 +277,10 @@ mod tests {
 
             let err = materialize(&snap, &h, &out).await.unwrap_err();
 
+            assert!(matches!(err, HandoffError::Mismatch(_)), "{path}: {err:?}");
             assert!(
-                err.contains(&format!("path excluded from the workspace digest: {path}")),
+                err.to_string()
+                    .contains(&format!("path excluded from the workspace digest: {path}")),
                 "{path}: {err}"
             );
             assert!(!out.exists(), "{path}");
@@ -248,7 +296,7 @@ mod tests {
 
         let err = materialize(&snap, &h, &out).await.unwrap_err();
 
-        assert!(!err.is_empty());
+        assert!(matches!(err, HandoffError::Mismatch(_)), "{err:?}");
         assert!(!out.exists());
     }
 }

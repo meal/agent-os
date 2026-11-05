@@ -6856,6 +6856,33 @@ mod workflow {
     }
 
     #[test]
+    fn workflow_submit_names_its_own_patch_flag_when_refusing_agent_cli() {
+        let cli = Cli::new();
+        let chain = cli.chain(&cli.repo_copy(), &["implement", "review"]);
+        let comment = cli.comment_patch();
+        cli.cmd(&[
+            "workflow",
+            "submit",
+            &chain,
+            "--agent-cli",
+            "claude-code",
+            "--model",
+            "anthropic:x",
+            "--step-patch",
+            fix_patch().to_str().unwrap(),
+            "--step-patch",
+            &comment,
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "pass either --step-patch or --agent-cli",
+        ))
+        .stderr(predicate::str::contains("--fake-agent-patch").not());
+        assert_no_workflow(&cli);
+    }
+
+    #[test]
     fn workflow_resume_refuses_a_different_worker_and_an_unknown_id() {
         let cli = Cli::new();
         let chain = cli.chain(&cli.repo_copy(), &["implement", "review"]);
@@ -7099,6 +7126,72 @@ mod workflow {
             .code(1)
             .stderr(predicate::str::contains("review"));
         cli.cmd(&["workflow", "resume", &id]).assert().code(1);
+    }
+
+    #[test]
+    fn a_handoff_the_machine_could_not_build_leaves_the_chain_resumable() {
+        let cli = Cli::new();
+        let chain = cli.chain(&cli.repo_copy(), &["implement", "review"]);
+        let (id, first) = stopped_after_step_one(&cli, &chain);
+        // Step 1's snapshot cannot be read for now: an I/O failure, not a wrong handoff.
+        let snapshot = cli.home().join("tasks").join(&first).join("snapshot");
+        let aside = cli.path("snapshot-aside");
+        fs::rename(&snapshot, &aside).unwrap();
+
+        cli.cmd(&["workflow", "resume", &id])
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains("cannot copy snapshot"))
+            .stderr(predicate::str::contains("resume the workflow to try again"));
+        let status = cli.wf_status(&id);
+        assert_eq!(status["state"], "RUNNING", "{status}");
+        assert!(status.get("failure").is_none(), "{status}");
+        assert_eq!(task_dirs(&cli), 1, "no task for step 2");
+        assert!(
+            !cli.home()
+                .join("workflows")
+                .join(&id)
+                .join("handoff-1")
+                .exists()
+        );
+
+        fs::rename(&aside, &snapshot).unwrap();
+        let out = cli.json(&["workflow", "resume", &id]);
+        assert_eq!(out["state"], "SUCCEEDED", "{out}");
+        let steps = cli.wf_tasks(&id);
+        assert_eq!(
+            steps[0].0.as_deref(),
+            Some(first.as_str()),
+            "step 1 did not run again"
+        );
+    }
+
+    #[test]
+    fn a_handoff_whose_blobs_are_gone_fails_the_chain() {
+        let cli = Cli::new();
+        let chain = cli.chain(&cli.repo_copy(), &["implement", "review"]);
+        let (id, _) = stopped_after_step_one(&cli, &chain);
+        // Every stored blob is lost: a lost record, which no retry brings back.
+        fn remove_files(dir: &Path) {
+            for e in fs::read_dir(dir).unwrap().flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    remove_files(&path);
+                } else {
+                    fs::remove_file(&path).unwrap();
+                }
+            }
+        }
+        remove_files(&cli.home().join("blobs"));
+
+        let out = cli.json(&["workflow", "resume", &id]);
+        assert_eq!(out["state"], "FAILED", "{out}");
+        assert_eq!(out["failed_step"], "review");
+        assert!(
+            out["failure"].as_str().unwrap().contains("handoff"),
+            "{out}"
+        );
+        assert_eq!(task_dirs(&cli), 1, "no task for step 2");
     }
 
     #[test]
@@ -7843,6 +7936,50 @@ mod workflow {
                 .any(|t| t == "CancelRequested")
         );
         cli.cmd(&["workflow", "resume", &id]).assert().code(1);
+    }
+
+    #[test]
+    fn a_submit_killed_before_recording_leaves_no_workflow_without_its_inputs() {
+        let cli = Cli::new();
+        let chain = cli.chain(&cli.repo_copy(), &["implement", "review"]);
+        let fix = fix_patch();
+        let comment = cli.comment_patch();
+        let submit = [
+            "workflow",
+            "submit",
+            chain.as_str(),
+            "--yes",
+            "--step-patch",
+            fix.to_str().unwrap(),
+            "--step-patch",
+            &comment,
+        ];
+        cli.cmd(&submit)
+            .env("AGENTOS_TEST_WORKERS", "1")
+            .env("AGENTOS_TEST_WORKFLOW_EXIT_BEFORE_RECORD", "1")
+            .assert()
+            .code(137);
+
+        // The inputs reached their final place; no staging directory is left behind.
+        let names: Vec<String> = fs::read_dir(cli.home().join("workflows"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert!(!names[0].starts_with('.'), "{names:?}");
+        let dir = cli.home().join("workflows").join(&names[0]);
+        assert!(dir.join("step-0.patch").is_file());
+        assert!(dir.join("step-1.patch").is_file());
+        // No workflow was recorded, so none can miss its inputs.
+        cli.cmd(&["workflow", "status", &names[0]])
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains("unknown workflow"));
+
+        // The next submission is unaffected.
+        let out = cli.json(&submit);
+        assert_eq!(out["state"], "SUCCEEDED", "{out}");
     }
 
     #[test]

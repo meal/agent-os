@@ -68,6 +68,18 @@ impl Db {
     /// approves it (`approve_workflow`).
     pub fn create_workflow(&self, spec: &ChainSpec, options: &Value) -> Result<WorkflowId> {
         let id = WorkflowId::new();
+        self.create_workflow_as(&id, spec, options)?;
+        Ok(id)
+    }
+
+    /// Records the chain under an id chosen beforehand, so the files it needs can be in place
+    /// before the row that refers to them exists.
+    pub fn create_workflow_as(
+        &self,
+        id: &WorkflowId,
+        spec: &ChainSpec,
+        options: &Value,
+    ) -> Result<()> {
         let tx = self.immediate()?;
         tx.execute(
             "INSERT INTO workflows(id, owner, spec_digest, spec_json, options_json, approved_ts,
@@ -89,7 +101,7 @@ impl Db {
             )?;
         }
         tx.commit()?;
-        Ok(id)
+        Ok(())
     }
 
     /// Records the owner's approval of the whole chain. The first approval's time stands.

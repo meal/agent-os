@@ -222,58 +222,24 @@ impl View {
 
     /// Events in ascending `seq` order.
     pub fn events(&self, task: &TaskId, page: EventPage, limit: usize) -> Result<Vec<EventRow>> {
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let (sql, bound) = match page {
-            EventPage::Latest => (
-                // `?3 = ?3` only uses the bound: rusqlite refuses a parameter the SQL never reads.
-                "SELECT seq, type, ts FROM events WHERE task_id = ?1 AND ?3 = ?3
-                 ORDER BY seq DESC LIMIT ?2",
-                0,
-            ),
-            EventPage::Before(s) => (
-                "SELECT seq, type, ts FROM events WHERE task_id = ?1 AND seq < ?3
-                 ORDER BY seq DESC LIMIT ?2",
-                i64::try_from(s).unwrap_or(i64::MAX),
-            ),
-            EventPage::After(s) => (
-                "SELECT seq, type, ts FROM events WHERE task_id = ?1 AND seq > ?3
-                 ORDER BY seq ASC LIMIT ?2",
-                i64::try_from(s).unwrap_or(i64::MAX),
-            ),
-        };
-        let mut stmt = self.conn.prepare(sql)?;
-        let raw = stmt
-            .query_map(params![task.as_str(), limit, bound], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
-                ))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let mut rows = raw
-            .into_iter()
-            .map(|(seq, event_type, ts)| {
-                Ok(EventRow {
-                    seq: count("event seq", seq)?,
-                    event_type,
-                    ts,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if !matches!(page, EventPage::After(_)) {
-            rows.reverse();
-        }
-        Ok(rows)
+        events_in(&self.conn, task, page, limit)
     }
 
     pub fn event_count(&self, task: &TaskId) -> Result<u64> {
-        let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM events WHERE task_id = ?1",
-            [task.as_str()],
-            |r| r.get(0),
-        )?;
-        count("event count", n)
+        event_count_in(&self.conn, task)
+    }
+
+    /// `events` and the task's event count, read in one transaction so they agree.
+    pub fn events_and_count(
+        &self,
+        task: &TaskId,
+        page: EventPage,
+        limit: usize,
+    ) -> Result<(Vec<EventRow>, u64)> {
+        let tx = self.read()?;
+        let rows = events_in(&tx, task, page, limit)?;
+        let total = event_count_in(&tx, task)?;
+        Ok((rows, total))
     }
 
     /// The payload of event `seq` cut to `max_chars` characters, and whether it was cut.
@@ -295,6 +261,67 @@ impl View {
             )
             .optional()?)
     }
+}
+
+/// Events in ascending `seq` order.
+fn events_in(
+    conn: &Connection,
+    task: &TaskId,
+    page: EventPage,
+    limit: usize,
+) -> Result<Vec<EventRow>> {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let (sql, bound) = match page {
+        EventPage::Latest => (
+            // `?3 = ?3` only uses the bound: rusqlite refuses a parameter the SQL never reads.
+            "SELECT seq, type, ts FROM events WHERE task_id = ?1 AND ?3 = ?3
+             ORDER BY seq DESC LIMIT ?2",
+            0,
+        ),
+        EventPage::Before(s) => (
+            "SELECT seq, type, ts FROM events WHERE task_id = ?1 AND seq < ?3
+             ORDER BY seq DESC LIMIT ?2",
+            i64::try_from(s).unwrap_or(i64::MAX),
+        ),
+        EventPage::After(s) => (
+            "SELECT seq, type, ts FROM events WHERE task_id = ?1 AND seq > ?3
+             ORDER BY seq ASC LIMIT ?2",
+            i64::try_from(s).unwrap_or(i64::MAX),
+        ),
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let raw = stmt
+        .query_map(params![task.as_str(), limit, bound], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut rows = raw
+        .into_iter()
+        .map(|(seq, event_type, ts)| {
+            Ok(EventRow {
+                seq: count("event seq", seq)?,
+                event_type,
+                ts,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if !matches!(page, EventPage::After(_)) {
+        rows.reverse();
+    }
+    Ok(rows)
+}
+
+fn event_count_in(conn: &Connection, task: &TaskId) -> Result<u64> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE task_id = ?1",
+        [task.as_str()],
+        |r| r.get(0),
+    )?;
+    count("event count", n)
 }
 
 #[cfg(test)]
@@ -728,6 +755,12 @@ mod tests {
         }
         let view = View::open(&path).unwrap();
         let total = view.event_count(&id).unwrap();
+        let (page, counted) = view.events_and_count(&id, EventPage::Latest, 2).unwrap();
+        assert_eq!(counted, total);
+        assert_eq!(
+            page.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            [total - 1, total]
+        );
         let latest = view.events(&id, EventPage::Latest, 2).unwrap();
         assert_eq!(latest.len(), 2);
         assert_eq!(latest[1].seq, total, "ascending, ending at the newest");
