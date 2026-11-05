@@ -136,6 +136,17 @@ pub enum StepStatus {
     Skipped,
 }
 
+impl StepStatus {
+    /// A step's status from its task's state (if it has a task) and its skipped flag.
+    pub fn of(task: Option<TaskState>, skipped: bool) -> StepStatus {
+        match (task, skipped) {
+            (Some(state), _) => StepStatus::Task(state),
+            (None, true) => StepStatus::Skipped,
+            (None, false) => StepStatus::Pending,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkflowState {
     Running,
@@ -356,6 +367,17 @@ mod tests {
             state_of_steps(&steps, true),
             WorkflowState::Failed { step: 1 }
         );
+    }
+
+    #[test]
+    fn a_step_status_comes_from_its_task_then_its_skipped_flag() {
+        use crate::state::TaskState;
+        assert_eq!(
+            StepStatus::of(Some(TaskState::Succeeded), true),
+            StepStatus::Task(TaskState::Succeeded)
+        );
+        assert_eq!(StepStatus::of(None, true), StepStatus::Skipped);
+        assert_eq!(StepStatus::of(None, false), StepStatus::Pending);
     }
 
     #[test]

@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS workflows(
     options_json TEXT NOT NULL,
     approved_ts INTEGER,
     cancel_requested INTEGER NOT NULL DEFAULT 0,
+    failure TEXT,
     created_ts INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS workflow_steps(

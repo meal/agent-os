@@ -27,6 +27,8 @@ pub struct WorkflowRecord {
     pub options: Value,
     pub approved: bool,
     pub cancel_requested: bool,
+    /// Why the chain was failed where no step task could carry it (`fail_workflow`).
+    pub failure: Option<String>,
     pub steps: Vec<StepRow>,
 }
 
@@ -120,7 +122,8 @@ impl Db {
         let tx = self.read()?;
         let row = tx
             .query_row(
-                "SELECT spec_digest, spec_json, options_json, approved_ts IS NOT NULL, cancel_requested
+                "SELECT spec_digest, spec_json, options_json, approved_ts IS NOT NULL, cancel_requested,
+                    failure
                  FROM workflows WHERE id = ?1",
                 [id.as_str()],
                 |r| {
@@ -130,11 +133,12 @@ impl Db {
                         r.get::<_, String>(2)?,
                         r.get::<_, bool>(3)?,
                         r.get::<_, bool>(4)?,
+                        r.get::<_, Option<String>>(5)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((digest, spec, options, approved, cancel_requested)) = row else {
+        let Some((digest, spec, options, approved, cancel_requested, failure)) = row else {
             return refuse(format!("workflow {id} not found"));
         };
         let mut stmt = tx.prepare(
@@ -165,6 +169,7 @@ impl Db {
             options: serde_json::from_str(&options)?,
             approved,
             cancel_requested,
+            failure,
             steps,
         })
     }
@@ -239,25 +244,13 @@ impl Db {
 
     /// Fails the chain where no step task can carry the failure (the handoff to the next step
     /// could not be built): steps without a task are skipped for good, and `reason` is kept as
-    /// the options' `failure`. The first reason stands.
+    /// the workflow's `failure`. The first reason stands; the approved options are untouched.
     pub fn fail_workflow(&self, id: &WorkflowId, reason: &str) -> Result<()> {
         let tx = self.immediate()?;
         flags(&tx, id)?;
-        let options: String = tx.query_row(
-            "SELECT options_json FROM workflows WHERE id = ?1",
-            [id.as_str()],
-            |r| r.get(0),
-        )?;
-        let mut options: Value = serde_json::from_str(&options)?;
-        let Some(fields) = options.as_object_mut() else {
-            return refuse(format!("workflow {id} has options that are not an object"));
-        };
-        fields
-            .entry("failure")
-            .or_insert_with(|| Value::String(reason.to_string()));
         tx.execute(
-            "UPDATE workflows SET options_json = ?2 WHERE id = ?1",
-            params![id.as_str(), serde_json::to_string(&options)?],
+            "UPDATE workflows SET failure = COALESCE(failure, ?2) WHERE id = ?1",
+            params![id.as_str(), reason],
         )?;
         tx.execute(
             "UPDATE workflow_steps SET skipped = 1 WHERE workflow_id = ?1 AND task_id IS NULL",
@@ -498,9 +491,11 @@ mod tests {
         db.fail_workflow(&id, "handoff result mismatch").unwrap();
 
         let w = db.workflow(&id).unwrap();
+        assert_eq!(w.failure.as_deref(), Some("handoff result mismatch"));
         assert_eq!(
             w.options,
-            json!({ "worker": "host", "failure": "handoff result mismatch" })
+            json!({ "worker": "host" }),
+            "approved options unchanged"
         );
         assert!(!w.cancel_requested);
         assert!(!w.steps[0].skipped && w.steps[0].task_id.as_ref() == Some(&t0));
@@ -509,8 +504,8 @@ mod tests {
         assert_eq!(task_count(&db), 1);
         db.fail_workflow(&id, "another reason").unwrap();
         assert_eq!(
-            db.workflow(&id).unwrap().options["failure"],
-            "handoff result mismatch"
+            db.workflow(&id).unwrap().failure.as_deref(),
+            Some("handoff result mismatch")
         );
         refused(db.fail_workflow(&agentos_core::ids::WorkflowId::new(), "x"));
     }

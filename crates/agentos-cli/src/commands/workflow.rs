@@ -133,19 +133,11 @@ fn state_of(
 ) -> Result<(WorkflowState, Vec<StepStatus>), CliError> {
     let mut steps = Vec::new();
     for s in &w.steps {
-        steps.push(match &s.task_id {
-            Some(task) => StepStatus::Task(store.db.task(task)?.state),
-            None if s.skipped => StepStatus::Skipped,
-            None => StepStatus::Pending,
-        });
+        let task = s.task_id.as_ref().map(|t| store.db.task(t)).transpose()?;
+        steps.push(StepStatus::of(task.map(|t| t.state), s.skipped));
     }
-    let state = state_of_steps(&steps, w.options.get("failure").is_some());
+    let state = state_of_steps(&steps, w.failure.is_some());
     Ok((state, steps))
-}
-
-/// `READY` for a chain not approved yet, else the derived state's label.
-fn label(w: &WorkflowRecord, state: WorkflowState) -> &'static str {
-    display_label(state, w.approved)
 }
 
 /// What `workflow status` prints. A step that never got a task in a finished chain is
@@ -174,14 +166,14 @@ fn status(store: &Store, w: &WorkflowRecord) -> Result<Value, CliError> {
     let mut out = json!({
         "workflow_id": w.id,
         "name": w.spec.name,
-        "state": label(w, state),
+        "state": display_label(state, w.approved),
         "steps": steps,
     });
     if let WorkflowState::Failed { step } = state {
         out["failed_step"] = json!(w.steps[step].name);
     }
-    if let Some(reason) = w.options.get("failure") {
-        out["failure"] = reason.clone();
+    if let Some(reason) = &w.failure {
+        out["failure"] = json!(reason);
     }
     Ok(out)
 }
@@ -506,28 +498,32 @@ pub(crate) async fn run_workflow(
         reconcile_cancel(store, &w)?;
         let step = &w.steps[idx];
         let state = match &step.task_id {
-            Some(task) if !submitted(store, task)? => {
-                let t = store.db.task(task)?;
-                if t.state.is_terminal() {
-                    t.state
-                } else {
-                    let reason = NOT_CREATED.to_string();
-                    store.db.append(task, &TaskEvent::Failed { reason })?.state
+            // One read of the journal answers both whether the task was submitted and with
+            // which profile.
+            Some(task) => match home.submitted_payload(store, task)? {
+                None => {
+                    let t = store.db.task(task)?;
+                    if t.state.is_terminal() {
+                        t.state
+                    } else {
+                        let reason = NOT_CREATED.to_string();
+                        store.db.append(task, &TaskEvent::Failed { reason })?.state
+                    }
                 }
-            }
-            Some(task) => {
-                // A step task runs only on the profile the chain approved.
-                let approved = approved_profile(&w, idx)?;
-                if !store.db.task(task)?.state.is_terminal()
-                    && recorded_profile(store, task)?.as_deref() != Some(&approved.to_string())
-                {
-                    return Err(CliError::usage(format!(
-                        "workflow {id}, step {:?}: task {task} was recorded with a verification profile that is not the one the workflow approved ({approved})",
-                        step.name
-                    )));
+                Some(submitted) => {
+                    // A step task runs only on the profile the chain approved.
+                    let approved = approved_profile(&w, idx)?;
+                    if !store.db.task(task)?.state.is_terminal()
+                        && submitted["profile_digest"].as_str() != Some(&approved.to_string())
+                    {
+                        return Err(CliError::usage(format!(
+                            "workflow {id}, step {:?}: task {task} was recorded with a verification profile that is not the one the workflow approved ({approved})",
+                            step.name
+                        )));
+                    }
+                    resume_task(home, store, Some(lock), task, None, crash).await?
                 }
-                resume_task(home, store, Some(lock), task, None, crash).await?
-            }
+            },
             None => {
                 if step.skipped || w.cancel_requested {
                     return Ok(());
@@ -565,16 +561,6 @@ fn reconcile_cancel(store: &Store, w: &WorkflowRecord) -> Result<(), CliError> {
     Ok(())
 }
 
-/// The profile digest `task`'s `Submitted` recorded.
-fn recorded_profile(store: &Store, task: &TaskId) -> Result<Option<String>, CliError> {
-    Ok(store
-        .db
-        .events(task)?
-        .into_iter()
-        .find(|e| e.event_type == "Submitted")
-        .and_then(|e| e.payload["profile_digest"].as_str().map(str::to_string)))
-}
-
 /// The verification profile digest approved for step `idx`.
 fn approved_profile(w: &WorkflowRecord, idx: usize) -> Result<Digest, CliError> {
     w.options["profile_digests"][idx]
@@ -586,14 +572,6 @@ fn approved_profile(w: &WorkflowRecord, idx: usize) -> Result<Digest, CliError> 
                 w.id, w.steps[idx].name
             ))
         })
-}
-
-fn submitted(store: &Store, task: &TaskId) -> Result<bool, CliError> {
-    Ok(store
-        .db
-        .events(task)?
-        .iter()
-        .any(|e| e.event_type == "Submitted"))
 }
 
 /// Honoured only with `AGENTOS_TEST_WORKERS=1`, like every test hook.
@@ -842,7 +820,7 @@ fn export(home: Home, id: &WorkflowId, dir: &Path) -> Result<(), CliError> {
         WorkflowState::Running => {
             return Err(CliError::other(format!(
                 "workflow {id} is {}; only a succeeded workflow can be exported",
-                label(&w, state)
+                display_label(state, w.approved)
             )));
         }
         WorkflowState::Failed { step } | WorkflowState::Cancelled { step } => {
@@ -929,7 +907,7 @@ mod tests {
             .db
             .create_step_task(&id, 0, contract, &Digest::of(b"contract"))
             .unwrap();
-        assert!(!submitted(&store, &task).unwrap());
+        assert!(home.submitted_payload(&store, &task).unwrap().is_none());
         let lock = home.lock().unwrap();
 
         run_workflow(&home, &store, &lock, &id, None).await.unwrap();

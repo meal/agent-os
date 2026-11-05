@@ -722,7 +722,11 @@ impl Home {
     }
 
     /// The `Submitted` payload of `task`, if it has one.
-    fn submitted_payload(&self, store: &Store, task: &TaskId) -> Result<Option<Value>, CliError> {
+    pub(crate) fn submitted_payload(
+        &self,
+        store: &Store,
+        task: &TaskId,
+    ) -> Result<Option<Value>, CliError> {
         Ok(store
             .db
             .events(task)?
